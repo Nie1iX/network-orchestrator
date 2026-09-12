@@ -1,0 +1,21 @@
+[package]
+name = "net-manager-app"
+version.workspace = true
+description = "Network Orchestrator — unified network interface and VPN management"
+authors = ["Artur"]
+edition.workspace = true
+
+[lib]
+name = "net_manager_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+net-manager-core = { path = "../crates/core" }
+tokio = { version = "1", features = ["full"] }
