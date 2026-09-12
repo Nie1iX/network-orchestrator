@@ -568,6 +568,61 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
     ))
 }
 
+// ── Interface state control ─────────────────────────────────────────────
+
+/// Bring an interface up or down by name.
+/// Requires administrator/root privileges.
+pub fn set_interface_state(name: &str, up: bool) -> std::io::Result<()> {
+    let action = if up { "up" } else { "down" };
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("ip")
+            .args(["link", "set", name, action])
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "ip link set {} {}: {}",
+                    name,
+                    action,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let admin = if up { "enable" } else { "disable" };
+        let output = std::process::Command::new("netsh")
+            .args(["interface", "set", "interface", name, &format!("admin={admin}")])
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "netsh interface set interface {} admin={}: {}",
+                    name,
+                    admin,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "interface state control is only implemented on Windows and Linux",
+        ))
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { NetworkInterface, formatKind } from "../types";
+import { kindIcon } from "../icons";
+import InterfaceDetail from "./InterfaceDetail";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -23,6 +25,7 @@ interface Throughput {
 export default function InterfaceList() {
   const [interfaces, setInterfaces] = useState<NetworkInterface[]>([]);
   const [throughput, setThroughput] = useState<Record<number, Throughput>>({});
+  const [selected, setSelected] = useState<NetworkInterface | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const prevStats = useRef<Record<number, { rx: number; tx: number; time: number }>>({});
@@ -99,9 +102,16 @@ export default function InterfaceList() {
             .map((iface) => {
             const tp = throughput[iface.ifIndex];
             return (
-              <div key={iface.ifIndex} className="interface-card">
+              <div
+                key={iface.ifIndex}
+                className="interface-card clickable"
+                onClick={() => setSelected(iface)}
+              >
                 <div className="interface-header">
-                  <span className="interface-name">{iface.friendlyName}</span>
+                  <div className="interface-title">
+                    {kindIcon(iface.kind, 18)}
+                    <span className="interface-name">{iface.friendlyName}</span>
+                  </div>
                   <div className="badge-group">
                     <span className={`badge ${iface.physical ? "badge-physical" : "badge-virtual"}`}>
                       {iface.physical ? "Physical" : "Virtual"}
@@ -113,7 +123,6 @@ export default function InterfaceList() {
                 </div>
                 <div className="interface-meta">
                   <span className="meta-label">{formatKind(iface.kind)}</span>
-                  <span className="meta-label">ifIndex: {iface.ifIndex}</span>
                   {iface.mtu !== null && (
                     <span className="meta-label">MTU: {iface.mtu}</span>
                   )}
@@ -186,6 +195,9 @@ export default function InterfaceList() {
             );
           })}
         </div>
+      )}
+      {selected && (
+        <InterfaceDetail iface={selected} onClose={() => setSelected(null)} />
       )}
     </section>
   );

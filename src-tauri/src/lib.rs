@@ -21,6 +21,11 @@ async fn lookup_destination(dest: String) -> Result<RouteLookupResult, String> {
     explorer::lookup_route(ip).await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn set_interface_state(name: String, up: bool) -> Result<(), String> {
+    explorer::set_interface_state(&name, up).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -35,7 +40,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_interfaces,
             get_routes,
-            lookup_destination
+            lookup_destination,
+            set_interface_state
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
