@@ -2,7 +2,7 @@
 name = "net-manager-app"
 version.workspace = true
 description = "Network Orchestrator — unified network interface and VPN management"
-authors = ["Artur"]
+authors = []
 edition.workspace = true
 
 [lib]
