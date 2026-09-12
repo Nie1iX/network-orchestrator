@@ -10,8 +10,15 @@ pub struct NetworkInterface {
     pub state: InterfaceState,
     pub addresses: Vec<InterfaceAddress>,
     pub dns_servers: Vec<IpAddr>,
+    pub dns_suffix: Option<String>,
     pub mtu: Option<u32>,
     pub if_index: u32,
+    pub physical: bool,
+    pub mac: Option<String>,
+    pub gateway: Option<IpAddr>,
+    pub rx_bytes: Option<u64>,
+    pub tx_bytes: Option<u64>,
+    pub link_speed_mbps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,11 +87,19 @@ mod tests {
             state: InterfaceState::Up,
             addresses: vec![],
             dns_servers: vec![],
+            dns_suffix: None,
             mtu: Some(1420),
             if_index: 7,
+            physical: false,
+            mac: None,
+            gateway: None,
+            rx_bytes: None,
+            tx_bytes: None,
+            link_speed_mbps: None,
         };
         let json = serde_json::to_string(&iface).unwrap();
         assert!(json.contains("\"friendlyName\""));
         assert!(json.contains("\"ifIndex\""));
+        assert!(json.contains("\"linkSpeedMbps\""));
     }
 }

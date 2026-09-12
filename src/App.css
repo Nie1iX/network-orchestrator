@@ -142,6 +142,33 @@ section {
   gap: 0.5rem;
 }
 
+.badge-group {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.badge-physical {
+  color: #646cff;
+  background-color: #1a1a3a;
+  border: 1px solid #3333aa;
+}
+
+.badge-virtual {
+  color: #ffa500;
+  background-color: #3a2d1a;
+  border: 1px solid #5a4a2a;
+}
+
 .interface-name {
   font-weight: 600;
   font-size: 1.05rem;
@@ -189,6 +216,45 @@ section {
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
+}
+
+.interface-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.row-label {
+  color: #888;
+  flex-shrink: 0;
+}
+
+.row-value {
+  text-align: right;
+  display: flex;
+  gap: 0.75rem;
+}
+
+.mono {
+  font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.traffic {
+  white-space: nowrap;
+}
+
+.traffic.rate {
+  color: #646cff;
+  font-variant-numeric: tabular-nums;
+}
+
+.traffic-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
 }
 
 .section-label {

@@ -22,8 +22,15 @@ export interface NetworkInterface {
   state: InterfaceState;
   addresses: InterfaceAddress[];
   dnsServers: string[];
+  dnsSuffix: string | null;
   mtu: number | null;
   ifIndex: number;
+  physical: boolean;
+  mac: string | null;
+  gateway: string | null;
+  rxBytes: number | null;
+  txBytes: number | null;
+  linkSpeedMbps: number | null;
 }
 
 export interface RouteEntry {

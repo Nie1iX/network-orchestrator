@@ -210,6 +210,37 @@ fn adapter_to_model(adapter: &IP_ADAPTER_ADDRESSES_LH) -> NetworkInterface {
 
     let dns_servers = collect_dns(adapter);
 
+    // MAC address
+    let mac = if adapter.PhysicalAddressLength == 6 {
+        let bytes = &adapter.PhysicalAddress[..adapter.PhysicalAddressLength as usize];
+        Some(format!(
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+        ))
+    } else {
+        None
+    };
+
+    // Gateway from FirstGatewayAddress
+    let gateway = if !adapter.FirstGatewayAddress.is_null() {
+        let gw = unsafe { &*adapter.FirstGatewayAddress };
+        sockaddr_to_ip(gw.Address.lpSockaddr)
+    } else {
+        None
+    };
+
+    // DNS suffix
+    let dns_suffix = unsafe { adapter.DnsSuffix.to_string() }
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    // Link speed ( ReceiveLinkSpeed is in bps, convert to Mbps)
+    let link_speed_mbps = if adapter.ReceiveLinkSpeed > 0 {
+        Some(adapter.ReceiveLinkSpeed / 1_000_000)
+    } else {
+        None
+    };
+
     NetworkInterface {
         name: raw_name,
         friendly_name,
@@ -217,8 +248,15 @@ fn adapter_to_model(adapter: &IP_ADAPTER_ADDRESSES_LH) -> NetworkInterface {
         state,
         addresses,
         dns_servers,
+        dns_suffix,
         mtu: Some(adapter.Mtu),
         if_index: adapter.Ipv4IfIndex,
+        physical: is_physical_windows(adapter.IfType),
+        mac,
+        gateway,
+        rx_bytes: None,       // requires GetIfEntry2 — deferred
+        tx_bytes: None,        // requires GetIfEntry2 — deferred
+        link_speed_mbps,
     }
 }
 
@@ -262,6 +300,12 @@ fn collect_dns(adapter: &IP_ADAPTER_ADDRESSES_LH) -> Vec<IpAddr> {
 }
 
 #[cfg(target_os = "windows")]
+fn is_physical_windows(if_type: u32) -> bool {
+    // IF_TYPE_ETHERNET_CSMACD = 6, IF_TYPE_IEEE80211 = 71
+    if_type == 6 || if_type == 71
+}
+
+#[cfg(target_os = "windows")]
 fn classify_interface(raw: &str, friendly: &str) -> InterfaceKind {
     let lower = friendly.to_lowercase();
     if lower.contains("wireguard") || raw.starts_with("wg") {
@@ -292,9 +336,6 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
     use std::ffi::CStr;
     use std::mem;
 
-    // Use getifaddrs(3) — available on all Linux/macOS, returns linked list
-    // of interfaces with addresses. We iterate it twice: once to collect
-    // unique interface names + indices, once to collect addresses.
     unsafe {
         let mut ifap: *mut libc::ifaddrs = mem::zeroed();
         let ret = libc::getifaddrs(&mut ifap);
@@ -303,9 +344,12 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
         }
         let head = ifap;
 
-        // First pass: collect unique interface names and indices
-        let mut name_map: std::collections::HashMap<String, (u32, bool)> =
+        // First pass: collect unique interface names in insertion order
+        let mut names: Vec<String> = Vec::new();
+        let mut name_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut is_up_map: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
+
         let mut cur = ifap;
         while !cur.is_null() {
             let ifa = &*cur;
@@ -314,21 +358,12 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
                     .to_string_lossy()
                     .into_owned();
                 let is_up = (ifa.ifa_flags & libc::IFF_UP as u32) != 0;
-                name_map
-                    .entry(name)
-                    .and_modify(|(_, up)| *up = *up || is_up)
-                    .or_insert((0, is_up));
+                if name_set.insert(name.clone()) {
+                    names.push(name.clone());
+                }
+                *is_up_map.entry(name).or_insert(false) |= is_up;
             }
             cur = ifa.ifa_next;
-        }
-
-        // Assign indices based on order
-        let mut idx: u32 = 1;
-        let mut index_map: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
-        for name in name_map.keys() {
-            index_map.insert(name.clone(), idx);
-            idx += 1;
         }
 
         // Second pass: collect addresses per interface
@@ -373,20 +408,29 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
 
         libc::freeifaddrs(head);
 
-        // Build result
+        // Build result in deterministic order
         let mut result = Vec::new();
-        for (name, (_, is_up)) in &name_map {
-            let if_index = *index_map.get(name).unwrap_or(&0);
+        for (idx, name) in names.iter().enumerate() {
+            let if_index = (idx + 1) as u32;
             let addresses = addr_map.remove(name).unwrap_or_default();
             let kind = classify_interface_linux(name);
-            let state = if *is_up {
+            let is_up = *is_up_map.get(name).unwrap_or(&false);
+            let state = if is_up {
                 InterfaceState::Up
             } else {
                 InterfaceState::Down
             };
 
-            // Try to read MTU from /sys/class/net/<name>/mtu
             let mtu = read_linux_mtu(name);
+            let physical = std::path::Path::new(&format!("/sys/class/net/{name}/device"))
+                .symlink_metadata()
+                .is_ok();
+            let mac = read_linux_mac(name);
+            let gateway = read_linux_gateway(name);
+            let dns_suffix = read_linux_dns_suffix();
+            let rx_bytes = read_linux_stat(name, "statistics/rx_bytes");
+            let tx_bytes = read_linux_stat(name, "statistics/tx_bytes");
+            let link_speed_mbps = read_linux_speed(name);
 
             result.push(NetworkInterface {
                 name: name.clone(),
@@ -394,9 +438,16 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
                 kind,
                 state,
                 addresses,
-                dns_servers: Vec::new(), // Linux DNS is system-wide, not per-interface
+                dns_servers: Vec::new(),
+                dns_suffix,
                 mtu,
                 if_index,
+                physical,
+                mac,
+                gateway,
+                rx_bytes,
+                tx_bytes,
+                link_speed_mbps,
             });
         }
 
@@ -426,6 +477,62 @@ fn read_linux_mtu(name: &str) -> Option<u32> {
     std::fs::read_to_string(format!("/sys/class/net/{name}/mtu"))
         .ok()
         .and_then(|s| s.trim().parse().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_mac(name: &str) -> Option<String> {
+    std::fs::read_to_string(format!("/sys/class/net/{name}/address"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "00:00:00:00:00:00")
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_stat(name: &str, stat: &str) -> Option<u64> {
+    std::fs::read_to_string(format!("/sys/class/net/{name}/{stat}"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_speed(name: &str) -> Option<u64> {
+    std::fs::read_to_string(format!("/sys/class/net/{name}/speed"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_gateway(_name: &str) -> Option<IpAddr> {
+    // Gateway resolution via netlink is async; for the synchronous list_interfaces
+    // we read /proc/net/route for the default route on this interface.
+    // This is a best-effort heuristic.
+    let routes = std::fs::read_to_string("/proc/net/route").ok()?;
+    for line in routes.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        // Field 1 = Destination (0.0.0.0 for default), Field 2 = Gateway
+        if fields[1] == "00000000" {
+            let gw_hex = fields[2];
+            if gw_hex.len() == 8 {
+                let gw_u32 = u32::from_str_radix(gw_hex, 16).ok()?;
+                let bytes = gw_u32.to_ne_bytes();
+                return Some(IpAddr::V4(std::net::Ipv4Addr::from(bytes)));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_dns_suffix() -> Option<String> {
+    std::fs::read_to_string("/etc/resolv.conf")
+        .ok()?
+        .lines()
+        .find(|l| l.starts_with("search "))
+        .map(|l| l.trim_start_matches("search ").trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(target_os = "linux")]
