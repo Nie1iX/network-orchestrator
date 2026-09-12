@@ -25,3 +25,6 @@ target/
 *.njsproj
 *.sln
 *.sw?
+
+# Temporary docs
+docs/plans

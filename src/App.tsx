@@ -1,11 +1,15 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import RouteLookup from "./components/RouteLookup";
 import InterfaceList from "./components/InterfaceList";
 import RouteTable from "./components/RouteTable";
+import RouteLookup from "./components/RouteLookup";
 import "./App.css";
 
+type Tab = "interfaces" | "routes";
+
 function App() {
+  const [tab, setTab] = useState<Tab>("interfaces");
+
   useEffect(() => {
     const unlisten = listen("route-changed", () => {
       window.dispatchEvent(new CustomEvent("route-changed"));
@@ -16,12 +20,38 @@ function App() {
   }, []);
 
   return (
-    <main className="container">
-      <h1>Network Explorer</h1>
-      <RouteLookup />
-      <InterfaceList />
-      <RouteTable />
-    </main>
+    <div className="app-layout">
+      <nav className="sidebar">
+        <div className="sidebar-header">Network Explorer</div>
+        <ul className="nav-items">
+          <li>
+            <button
+              className={`nav-item ${tab === "interfaces" ? "active" : ""}`}
+              onClick={() => setTab("interfaces")}
+            >
+              Interfaces
+            </button>
+          </li>
+          <li>
+            <button
+              className={`nav-item ${tab === "routes" ? "active" : ""}`}
+              onClick={() => setTab("routes")}
+            >
+              Routes
+            </button>
+          </li>
+        </ul>
+      </nav>
+      <main className="content">
+        {tab === "interfaces" && <InterfaceList />}
+        {tab === "routes" && (
+          <>
+            <RouteLookup />
+            <RouteTable />
+          </>
+        )}
+      </main>
+    </div>
   );
 }
 

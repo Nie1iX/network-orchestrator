@@ -97,25 +97,24 @@ pub async fn lookup_route(dest: IpAddr) -> std::io::Result<RouteLookupResult> {
 
 use futures::StreamExt;
 
-/// Spawn a background task that calls the callback whenever the routing table changes.
-pub fn spawn_route_watcher<F>(callback: F)
+/// Async loop that calls the callback whenever the routing table changes.
+/// The caller is responsible for spawning this on an appropriate runtime.
+pub async fn route_watcher_loop<F>(callback: F)
 where
     F: Fn() + Send + 'static,
 {
-    tokio::spawn(async move {
-        let handle = match RouteHandle::new() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("route watcher init failed: {e}");
-                return;
-            }
-        };
-        let stream = handle.route_listen_stream();
-        tokio::pin!(stream);
-        while let Some(_change) = stream.next().await {
-            callback();
+    let handle = match RouteHandle::new() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("route watcher init failed: {e}");
+            return;
         }
-    });
+    };
+    let stream = handle.route_listen_stream();
+    tokio::pin!(stream);
+    while let Some(_change) = stream.next().await {
+        callback();
+    }
 }
 
 // ── Interface inventory ─────────────────────────────────────────────────
@@ -286,13 +285,179 @@ fn classify_interface(raw: &str, friendly: &str) -> InterfaceKind {
     InterfaceKind::Other(lower)
 }
 
-// ── Non-Windows stub ────────────────────────────────────────────────────
+// ── Linux interface inventory ───────────────────────────────────────────
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
+    use std::ffi::CStr;
+    use std::mem;
+
+    // Use getifaddrs(3) — available on all Linux/macOS, returns linked list
+    // of interfaces with addresses. We iterate it twice: once to collect
+    // unique interface names + indices, once to collect addresses.
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = mem::zeroed();
+        let ret = libc::getifaddrs(&mut ifap);
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let head = ifap;
+
+        // First pass: collect unique interface names and indices
+        let mut name_map: std::collections::HashMap<String, (u32, bool)> =
+            std::collections::HashMap::new();
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_name.is_null() {
+                let name = CStr::from_ptr(ifa.ifa_name)
+                    .to_string_lossy()
+                    .into_owned();
+                let is_up = (ifa.ifa_flags & libc::IFF_UP as u32) != 0;
+                name_map
+                    .entry(name)
+                    .and_modify(|(_, up)| *up = *up || is_up)
+                    .or_insert((0, is_up));
+            }
+            cur = ifa.ifa_next;
+        }
+
+        // Assign indices based on order
+        let mut idx: u32 = 1;
+        let mut index_map: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        for name in name_map.keys() {
+            index_map.insert(name.clone(), idx);
+            idx += 1;
+        }
+
+        // Second pass: collect addresses per interface
+        let mut addr_map: std::collections::HashMap<String, Vec<InterfaceAddress>> =
+            std::collections::HashMap::new();
+
+        cur = head;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
+                let name = CStr::from_ptr(ifa.ifa_name)
+                    .to_string_lossy()
+                    .into_owned();
+                let family = (*ifa.ifa_addr).sa_family as i32;
+
+                let addr = if family == libc::AF_INET {
+                    let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    let bytes = sin.sin_addr.s_addr.to_ne_bytes();
+                    Some((IpAddr::V4(std::net::Ipv4Addr::from(bytes)), AddressFamily::Ipv4))
+                } else if family == libc::AF_INET6 {
+                    let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    let bytes = sin6.sin6_addr.s6_addr;
+                    Some((IpAddr::V6(std::net::Ipv6Addr::from(bytes)), AddressFamily::Ipv6))
+                } else {
+                    None
+                };
+
+                if let Some((ip, fam)) = addr {
+                    let prefix_len = get_prefix_len(ifa.ifa_netmask, family);
+                    addr_map
+                        .entry(name)
+                        .or_default()
+                        .push(InterfaceAddress {
+                            address: ip,
+                            prefix_len,
+                            family: fam,
+                        });
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+
+        libc::freeifaddrs(head);
+
+        // Build result
+        let mut result = Vec::new();
+        for (name, (_, is_up)) in &name_map {
+            let if_index = *index_map.get(name).unwrap_or(&0);
+            let addresses = addr_map.remove(name).unwrap_or_default();
+            let kind = classify_interface_linux(name);
+            let state = if *is_up {
+                InterfaceState::Up
+            } else {
+                InterfaceState::Down
+            };
+
+            // Try to read MTU from /sys/class/net/<name>/mtu
+            let mtu = read_linux_mtu(name);
+
+            result.push(NetworkInterface {
+                name: name.clone(),
+                friendly_name: name.clone(),
+                kind,
+                state,
+                addresses,
+                dns_servers: Vec::new(), // Linux DNS is system-wide, not per-interface
+                mtu,
+                if_index,
+            });
+        }
+
+        Ok(result)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_prefix_len(netmask: *const libc::sockaddr, family: i32) -> u8 {
+    if netmask.is_null() {
+        return if family == libc::AF_INET { 32 } else { 128 };
+    }
+    if family == libc::AF_INET {
+        let sin = unsafe { &*(netmask as *const libc::sockaddr_in) };
+        let mask = u32::from_be(sin.sin_addr.s_addr);
+        mask.count_ones() as u8
+    } else if family == libc::AF_INET6 {
+        let sin6 = unsafe { &*(netmask as *const libc::sockaddr_in6) };
+        sin6.sin6_addr.s6_addr.iter().map(|&b| b.count_ones() as u8).sum()
+    } else {
+        0
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_mtu(name: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{name}/mtu"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn classify_interface_linux(name: &str) -> InterfaceKind {
+    if name == "lo" {
+        return InterfaceKind::Loopback;
+    }
+    if name.starts_with("wg") || name.contains("wireguard") {
+        return InterfaceKind::WireGuard;
+    }
+    if name.starts_with("tun") || name.starts_with("tap") || name.contains("openvpn") {
+        return InterfaceKind::OpenVpn;
+    }
+    if name.starts_with("eth") || name.starts_with("en") {
+        return InterfaceKind::Ethernet;
+    }
+    if name.starts_with("wlan") || name.starts_with("wl") || name.starts_with("wlp") {
+        return InterfaceKind::Wifi;
+    }
+    if name.contains("xray") || name.contains("utun") {
+        return InterfaceKind::Xray;
+    }
+    InterfaceKind::Other(name.to_string())
+}
+
+// ── Non-Windows/Linux stub ──────────────────────────────────────────────
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "interface inventory is only implemented on Windows",
+        "interface inventory is only implemented on Windows and Linux",
     ))
 }
 

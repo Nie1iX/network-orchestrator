@@ -1,7 +1,7 @@
 use net_manager_core::explorer;
 use net_manager_core::models::*;
 use std::net::IpAddr;
-use tauri::Manager;
+use tauri::Emitter;
 
 #[tauri::command]
 async fn get_interfaces() -> Result<Vec<NetworkInterface>, String> {
@@ -27,9 +27,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let handle = app.handle().clone();
-            explorer::spawn_route_watcher(move || {
+            tauri::async_runtime::spawn(explorer::route_watcher_loop(move || {
                 let _ = handle.emit("route-changed", ());
-            });
+            }));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
