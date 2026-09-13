@@ -1,6 +1,7 @@
 use crate::state::{existing_profile_for_update, find_profile, AppState};
 use net_manager_core::analysis;
-use net_manager_core::config_vault::ConfigVault;
+use net_manager_core::config_security;
+use net_manager_core::config_vault::{ConfigImport, ConfigVault};
 use net_manager_core::models::*;
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, TcpListener};
@@ -50,6 +51,25 @@ pub(crate) fn loopback_port_available(port: u16) -> bool {
     TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
+pub(crate) fn store_generated_xray(
+    vault: &ConfigVault,
+    profile_id: &str,
+    plaintext_json: &[u8],
+) -> std::io::Result<ConfigImport> {
+    #[cfg(windows)]
+    {
+        let encrypted = config_security::protect_user_data(
+            plaintext_json,
+            &config_security::xray_context(profile_id),
+        )?;
+        vault.store_protected_xray_config(profile_id, &encrypted)
+    }
+    #[cfg(not(windows))]
+    {
+        vault.store_xray_config(profile_id, plaintext_json)
+    }
+}
+
 pub(crate) fn rewrite_generated_socks_port(
     vault: &ConfigVault,
     profile: &mut Profile,
@@ -61,8 +81,9 @@ pub(crate) fn rewrite_generated_socks_port(
     {
         return Err("profile does not use a managed generated Xray config".into());
     }
-    let text = std::fs::read_to_string(&profile.config_path).map_err(|e| e.to_string())?;
-    let mut doc: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let bytes = config_security::read_xray_config(&profile.config_path, &profile.id)
+        .map_err(|e| e.to_string())?;
+    let mut doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     let inbounds = doc
         .get_mut("inbounds")
         .and_then(|v| v.as_array_mut())
@@ -73,9 +94,7 @@ pub(crate) fn rewrite_generated_socks_port(
         .ok_or_else(|| "generated config has no 'socks-in' inbound".to_string())?;
     inbound["port"] = serde_json::json!(new_port);
     let body = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
-    let import = vault
-        .store_xray_config(&profile.id, &body)
-        .map_err(|e| e.to_string())?;
+    let import = store_generated_xray(vault, &profile.id, &body).map_err(|e| e.to_string())?;
     profile.config_path = import.config_path.clone();
     profile.xray_socks_port = Some(new_port);
     Ok(import.config_path)
@@ -239,10 +258,8 @@ pub(crate) async fn save_vless_profile(
     let config = net_manager_core::xray::generate_vless_config(vless_url.trim(), socks_port)
         .map_err(|e| format!("invalid VLESS URL: {e}"))?;
     let body = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
-    let import = state
-        .config_vault
-        .store_xray_config(&profile.id, &body)
-        .map_err(|e| e.to_string())?;
+    let import =
+        store_generated_xray(&state.config_vault, &profile.id, &body).map_err(|e| e.to_string())?;
     profile.config_path = import.config_path.clone();
     let doc = match state.profiles.upsert(profile) {
         Ok(doc) => doc,
@@ -305,6 +322,31 @@ mod tests {
         let mut external = profile("ext");
         external.config_path = dir.join("external.conf");
         assert!(validate_managed_save_path(&vault, None, &external).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn store_generated_xray_writes_platform_appropriate_revision() {
+        let dir = unique_dir("gen-xray");
+        let vault = ConfigVault::new(dir.join("configs"));
+        let body = br#"{"inbounds":[]}"#.to_vec();
+        let import = store_generated_xray(&vault, "node-auto", &body).unwrap();
+        #[cfg(windows)]
+        {
+            assert_eq!(import.config_path.file_name().unwrap(), "config.json.dpapi");
+            let plain = net_manager_core::config_security::read_xray_config(
+                &import.config_path,
+                "node-auto",
+            )
+            .unwrap();
+            assert_eq!(plain, body);
+            assert_ne!(fs::read(&import.config_path).unwrap(), body);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(import.config_path.file_name().unwrap(), "config.json");
+            assert_eq!(fs::read(&import.config_path).unwrap(), body);
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -387,13 +429,19 @@ mod tests {
         assert_eq!(p.config_path, new_path);
         assert_eq!(p.xray_socks_port, Some(10950));
         assert!(import.config_path.exists());
-        let text = fs::read_to_string(&new_path).unwrap();
-        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let raw = config_security::read_xray_config(&new_path, "gen").unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(doc["inbounds"][0]["port"], 10950);
         assert_eq!(doc["inbounds"][0]["tag"], "socks-in");
 
         let mut bad = p.clone();
-        fs::write(&new_path, "{oops").unwrap();
+        #[cfg(windows)]
+        let broken =
+            config_security::protect_user_data(b"{oops", &config_security::xray_context("gen"))
+                .unwrap();
+        #[cfg(not(windows))]
+        let broken = b"{oops".to_vec();
+        fs::write(&new_path, &broken).unwrap();
         assert!(rewrite_generated_socks_port(&vault, &mut bad, 10960).is_err());
         assert_eq!(bad.config_path, new_path);
         assert_eq!(bad.xray_socks_port, Some(10950));

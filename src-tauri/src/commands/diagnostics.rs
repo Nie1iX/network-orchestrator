@@ -56,11 +56,26 @@ fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
                 input.inspection_error.as_deref().unwrap_or("unknown error")
             ),
         ),
-        Some(_) if input.managed => diag_check(
-            "Configuration",
-            DiagnosticLevel::Healthy,
-            "configuration is stored in managed storage".to_string(),
-        ),
+        Some(_) if input.managed => {
+            let dpapi_protected = profile
+                .config_path
+                .file_name()
+                .map(|name| {
+                    name.to_string_lossy()
+                        .to_lowercase()
+                        .ends_with(".json.dpapi")
+                })
+                .unwrap_or(false);
+            diag_check(
+                "Configuration",
+                DiagnosticLevel::Healthy,
+                if dpapi_protected {
+                    "managed configuration is DPAPI protected".to_string()
+                } else {
+                    "configuration is stored in managed storage".to_string()
+                },
+            )
+        }
         Some(_) => diag_check(
             "Configuration",
             DiagnosticLevel::Warning,
@@ -492,6 +507,17 @@ mod tests {
         assert_eq!(applied.level, DiagnosticLevel::Healthy);
         assert_eq!(applied.message, "No app-managed routes");
         assert!(checks.iter().all(|c| c.name != "Target interface"));
+    }
+
+    #[test]
+    fn diagnostics_reports_dpapi_protected_managed_config() {
+        let mut p = profile("xray-p1");
+        p.config_path = PathBuf::from(r"C:\vault\xray-p1\rev-1\config.json.dpapi");
+        let checks = build_diagnostics(&diag_input(&p));
+        assert_eq!(
+            check_named(&checks, "Configuration").message,
+            "managed configuration is DPAPI protected"
+        );
     }
 
     #[test]

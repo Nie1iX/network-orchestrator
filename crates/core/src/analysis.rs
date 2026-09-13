@@ -31,7 +31,7 @@ pub fn analyze_profile(profile: &Profile) -> io::Result<ConfigAnalysis> {
     match profile.backend {
         TunnelBackend::WireGuard => analyze_wireguard(&profile.config_path, &mut analysis)?,
         TunnelBackend::OpenVpn => analyze_openvpn(&profile.config_path, &mut analysis)?,
-        TunnelBackend::Xray => analyze_xray(&profile.config_path, &mut analysis)?,
+        TunnelBackend::Xray => analyze_xray(profile, &mut analysis)?,
     }
     for policy in &profile.domain_policies {
         analysis
@@ -432,12 +432,12 @@ fn parse_openvpn_route(tokens: &[String]) -> Option<IpNet> {
     }
 }
 
-fn analyze_xray(path: &Path, analysis: &mut ConfigAnalysis) -> io::Result<()> {
-    let text = read_config(path)?;
-    let root: Value = serde_json::from_str(&text).map_err(|err| {
+fn analyze_xray(profile: &Profile, analysis: &mut ConfigAnalysis) -> io::Result<()> {
+    let bytes = crate::config_security::read_xray_config(&profile.config_path, &profile.id)?;
+    let root: Value = serde_json::from_slice(&bytes).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid JSON in '{}': {err}", path.display()),
+            format!("invalid JSON in '{}': {err}", profile.config_path.display()),
         )
     })?;
 
@@ -892,6 +892,40 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("bad.json"));
         assert!(!err.to_string().contains("SECRET-UUID-1234"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn xray_dpapi_config_is_decrypted_for_analysis() {
+        let dir = unique_dir("xray-dpapi");
+        let cfg = dir.join("c.json.dpapi");
+        let plaintext = br#"{"inbounds":[{"listen":"127.0.0.1","port":10888,"protocol":"socks"}]}"#;
+        let bytes = crate::config_security::protect_user_data(
+            plaintext,
+            &crate::config_security::xray_context("p-dpapi"),
+        )
+        .unwrap();
+        fs::write(&cfg, &bytes).unwrap();
+        let mut p = profile(TunnelBackend::Xray, &cfg);
+        p.id = "p-dpapi".to_string();
+
+        let result = analyze_profile(&p).unwrap();
+        assert_eq!(result.listeners.len(), 1);
+        assert_eq!(result.listeners[0].port, 10888);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn xray_dpapi_error_does_not_leak_plaintext() {
+        let dir = unique_dir("xray-dpapi-bad");
+        let cfg = dir.join("c.json.dpapi");
+        fs::write(&cfg, b"corrupt-UUID-SENTINEL-9").unwrap();
+        let p = profile(TunnelBackend::Xray, &cfg);
+
+        let err = analyze_profile(&p).unwrap_err();
+        assert!(!err.to_string().contains("UUID-SENTINEL-9"));
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -163,6 +163,23 @@ impl ConfigVault {
     }
 
     pub fn store_xray_config(&self, profile_id: &str, bytes: &[u8]) -> io::Result<ConfigImport> {
+        self.store_xray_file(profile_id, bytes, "config.json")
+    }
+
+    pub fn store_protected_xray_config(
+        &self,
+        profile_id: &str,
+        encrypted_bytes: &[u8],
+    ) -> io::Result<ConfigImport> {
+        self.store_xray_file(profile_id, encrypted_bytes, "config.json.dpapi")
+    }
+
+    fn store_xray_file(
+        &self,
+        profile_id: &str,
+        bytes: &[u8],
+        config_name: &str,
+    ) -> io::Result<ConfigImport> {
         let safe = sanitize_profile_id(profile_id)?;
         let nanos = unix_nanos()?;
         let profile_dir = self.root.join(&safe);
@@ -175,12 +192,12 @@ impl ConfigVault {
         let result = (|| -> io::Result<()> {
             fs::create_dir(&staging)?;
             protect_path(&staging)?;
-            let staged_config = staging.join("config.json");
+            let staged_config = staging.join(config_name);
             fs::write(&staged_config, bytes)?;
             protect_path(&staged_config)?;
             fs::rename(&staging, &revision)?;
             if let Err(err) =
-                protect_path(&revision).and_then(|_| protect_path(&revision.join("config.json")))
+                protect_path(&revision).and_then(|_| protect_path(&revision.join(config_name)))
             {
                 let _ = fs::remove_dir_all(&revision);
                 return Err(err);
@@ -190,7 +207,7 @@ impl ConfigVault {
 
         match result {
             Ok(()) => Ok(ConfigImport {
-                config_path: revision.join("config.json"),
+                config_path: revision.join(config_name),
                 warnings: Vec::new(),
             }),
             Err(err) => {
@@ -239,6 +256,7 @@ const CONFIG_NAMES: &[&str] = &[
     "client.ovpn",
     "client.conf",
     "config.json",
+    "config.json.dpapi",
 ];
 
 const PATH_DIRECTIVES: &[&str] = &[
@@ -1219,6 +1237,35 @@ mod tests {
             fs::read(&stored.config_path).unwrap(),
             br#"{"outbounds":[]}"#
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn store_protected_xray_config_writes_exact_bytes_into_protected_revision() {
+        let (vault, dir) = vault("xray-store-dpapi");
+        let ciphertext = b"dpapi-ciphertext-bytes";
+        let import = vault
+            .store_protected_xray_config("node-x", ciphertext)
+            .unwrap();
+        assert_eq!(import.config_path.file_name().unwrap(), "config.json.dpapi");
+        assert!(vault.is_managed_path(&import.config_path));
+        assert_eq!(fs::read(&import.config_path).unwrap(), ciphertext);
+
+        #[cfg(windows)]
+        for path in [
+            import.config_path.parent().unwrap().to_path_buf(),
+            import.config_path.clone(),
+        ] {
+            let protection = crate::config_security::inspect_path_protection(&path).unwrap();
+            assert!(
+                protection.protected_dacl
+                    && protection.current_user
+                    && protection.system
+                    && protection.administrators,
+                "{} not fully protected",
+                path.display()
+            );
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 }

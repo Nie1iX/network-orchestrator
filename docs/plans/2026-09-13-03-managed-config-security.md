@@ -23,9 +23,13 @@ Implemented: `protect_path` applies `D:P(A;OICI;FA;;;<user-sid>)(A;OICI;FA;;;SY)
 
 Implement versioned `CryptProtectData`/`CryptUnprotectData` helpers with profile-scoped entropy. Tests cover round-trip, wrong entropy, corrupt blobs, and secret-free errors.
 
+Implemented: `protect_user_data`/`unprotect_user_data` wrap `CryptProtectData`/`CryptUnprotectData` with `CRYPTPROTECT_UI_FORBIDDEN`, description `Network Orchestrator Xray config`, and the context blob as entropy. `xray_context` is `network-orchestrator:xray:<profile-id>`; empty context is `InvalidInput`. `read_xray_config` reads raw bytes and unprotects only a case-insensitive `.json.dpapi` suffix. Non-Windows returns `Unsupported` for protect/unprotect so helpers keep a cross-platform fallback.
+
 ### Task 3: Encrypt generated VLESS source
 
 Store generated VLESS material as DPAPI data. Decrypt only in memory, generate Xray JSON, and pass it through `stdin:`. Do not persist derived plaintext.
+
+Implemented: generated VLESS JSON is stored as `config.json.dpapi` via `store_protected_xray_config` (same staged ACL-protected revision flow); `ConfigVault` recognizes `config.json.dpapi` as a managed config and profile validation accepts `.json` and `.json.dpapi` for Xray. `analyze_xray` and `prepare_xray_config` decrypt through `read_xray_config` with the profile id, so no plaintext is persisted; JSON errors carry only the file path. Imported user-supplied Xray JSON stays plaintext under the ACL. Diagnostics report `managed configuration is DPAPI protected` for generated configs.
 
 ### Task 4: Support WireGuard DPAPI configs
 

@@ -139,7 +139,7 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
             file_name.ends_with(".conf") || file_name.ends_with(".conf.dpapi")
         }
         TunnelBackend::OpenVpn => file_name.ends_with(".ovpn") || file_name.ends_with(".conf"),
-        TunnelBackend::Xray => file_name.ends_with(".json"),
+        TunnelBackend::Xray => file_name.ends_with(".json") || file_name.ends_with(".json.dpapi"),
     };
     if !allowed {
         return Err(invalid_data(format!(
@@ -292,6 +292,10 @@ mod tests {
         let mut upper = xray_profile();
         upper.config_path = PathBuf::from(r"C:\configs\WORK.JSON");
         assert!(validate_profile(&upper).is_ok());
+
+        let mut protected = xray_profile();
+        protected.config_path = PathBuf::from(r"C:\configs\work.json.dpapi");
+        assert!(validate_profile(&protected).is_ok());
     }
 
     #[test]

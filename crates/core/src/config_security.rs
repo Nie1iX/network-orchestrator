@@ -1,9 +1,33 @@
+use std::io;
+use std::path::Path;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathProtection {
     pub protected_dacl: bool,
     pub current_user: bool,
     pub system: bool,
     pub administrators: bool,
+}
+
+pub fn xray_context(profile_id: &str) -> Vec<u8> {
+    format!("network-orchestrator:xray:{profile_id}").into_bytes()
+}
+
+pub fn read_xray_config(path: &Path, profile_id: &str) -> io::Result<Vec<u8>> {
+    let bytes = std::fs::read(path)?;
+    let protected = path
+        .file_name()
+        .map(|name| {
+            name.to_string_lossy()
+                .to_lowercase()
+                .ends_with(".json.dpapi")
+        })
+        .unwrap_or(false);
+    if protected {
+        unprotect_user_data(&bytes, &xray_context(profile_id))
+    } else {
+        Ok(bytes)
+    }
 }
 
 #[cfg(windows)]
@@ -17,6 +41,9 @@ mod imp {
     use windows::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     };
     use windows::Win32::Security::{
         GetFileSecurityW, GetSecurityDescriptorControl, GetTokenInformation, SetFileSecurityW,
@@ -116,6 +143,79 @@ mod imp {
         }
     }
 
+    fn data_blob(data: &[u8]) -> io::Result<CRYPT_INTEGER_BLOB> {
+        if data.len() > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "data too large for DPAPI",
+            ));
+        }
+        Ok(CRYPT_INTEGER_BLOB {
+            cbData: data.len() as u32,
+            pbData: data.as_ptr() as *mut u8,
+        })
+    }
+
+    unsafe fn take_blob(blob: CRYPT_INTEGER_BLOB) -> Vec<u8> {
+        let bytes = core::slice::from_raw_parts(blob.pbData, blob.cbData as usize).to_vec();
+        let _ = LocalFree(HLOCAL(blob.pbData as *mut _));
+        bytes
+    }
+
+    pub fn protect_user_data(data: &[u8], context: &[u8]) -> io::Result<Vec<u8>> {
+        if context.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "protection context must not be empty",
+            ));
+        }
+        let input = data_blob(data)?;
+        let entropy = data_blob(context)?;
+        let description: Vec<u16> = "Network Orchestrator Xray config"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let mut output = CRYPT_INTEGER_BLOB::default();
+            CryptProtectData(
+                &input,
+                PCWSTR::from_raw(description.as_ptr()),
+                Some(&entropy),
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+            .map_err(|_| io::Error::last_os_error())?;
+            Ok(take_blob(output))
+        }
+    }
+
+    pub fn unprotect_user_data(data: &[u8], context: &[u8]) -> io::Result<Vec<u8>> {
+        if context.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "protection context must not be empty",
+            ));
+        }
+        let input = data_blob(data)?;
+        let entropy = data_blob(context)?;
+        unsafe {
+            let mut output = CRYPT_INTEGER_BLOB::default();
+            CryptUnprotectData(
+                &input,
+                None,
+                Some(&entropy),
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+            .map_err(|_| io::Error::last_os_error())?;
+            Ok(take_blob(output))
+        }
+    }
+
     pub fn inspect_path_protection(path: &Path) -> io::Result<PathProtection> {
         let name = wide(path);
         unsafe {
@@ -187,9 +287,23 @@ mod imp {
             administrators: true,
         })
     }
+
+    pub fn protect_user_data(_data: &[u8], _context: &[u8]) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "DPAPI protection is only available on Windows",
+        ))
+    }
+
+    pub fn unprotect_user_data(_data: &[u8], _context: &[u8]) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "DPAPI protection is only available on Windows",
+        ))
+    }
 }
 
-pub use imp::{inspect_path_protection, protect_path};
+pub use imp::{inspect_path_protection, protect_path, protect_user_data, unprotect_user_data};
 
 #[cfg(test)]
 mod tests {
@@ -241,6 +355,90 @@ mod tests {
         let missing = dir.join("absent.conf");
         let err = protect_path(&missing).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn xray_context_uses_profile_id() {
+        assert_eq!(xray_context("node-1"), b"network-orchestrator:xray:node-1");
+    }
+
+    #[test]
+    fn read_xray_config_returns_plain_json_bytes() {
+        let dir = unique_dir("xray-read");
+        let path = dir.join("node.json");
+        fs::write(&path, b"{\"a\":1}").unwrap();
+        assert_eq!(read_xray_config(&path, "node-1").unwrap(), b"{\"a\":1}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protect_and_unprotect_user_data_roundtrip() {
+        let context = xray_context("node-1");
+        let plaintext = b"{\"secret\":\"UUID-777\"}";
+        let ciphertext = protect_user_data(plaintext, &context).unwrap();
+        assert_ne!(ciphertext, plaintext);
+        assert!(!ciphertext.windows(8).any(|window| window == b"UUID-777"));
+        assert_eq!(
+            unprotect_user_data(&ciphertext, &context).unwrap(),
+            plaintext
+        );
+        assert!(unprotect_user_data(&ciphertext, &xray_context("other")).is_err());
+        let mut corrupt = ciphertext.clone();
+        let mid = corrupt.len() / 2;
+        corrupt[mid] ^= 0xFF;
+        assert!(unprotect_user_data(&corrupt, &context).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protect_user_data_rejects_empty_context() {
+        assert_eq!(
+            protect_user_data(b"data", b"").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            unprotect_user_data(b"data", b"").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_xray_config_decrypts_dpapi_suffix() {
+        let dir = unique_dir("xray-dpapi");
+        let path = dir.join("config.json.DPAPI");
+        let bytes = protect_user_data(b"{\"a\":1}", &xray_context("node-1")).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_xray_config(&path, "node-1").unwrap(), b"{\"a\":1}");
+        assert!(read_xray_config(&path, "other").is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn protect_user_data_is_unsupported() {
+        assert_eq!(
+            protect_user_data(b"data", b"ctx").unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            unprotect_user_data(b"data", b"ctx").unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn read_xray_config_dpapi_suffix_is_unsupported() {
+        let dir = unique_dir("xray-dpapi");
+        let path = dir.join("config.json.dpapi");
+        fs::write(&path, b"opaque").unwrap();
+        assert_eq!(
+            read_xray_config(&path, "node-1").unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

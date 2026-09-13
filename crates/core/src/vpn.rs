@@ -254,7 +254,7 @@ fn xray_command_spec(exe: &Path, test_only: bool) -> CommandSpec {
 }
 
 fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
-    let raw = std::fs::read(&profile.config_path)?;
+    let raw = crate::config_security::read_xray_config(&profile.config_path, &profile.id)?;
     let base: serde_json::Value = serde_json::from_slice(&raw).map_err(|err| {
         invalid_data(format!(
             "profile config '{}' is not valid JSON: {err}",
@@ -962,6 +962,27 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("node.json"));
         assert!(!err.to_string().contains(sentinel));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepare_xray_config_decrypts_dpapi_config() {
+        let dir = unique_dir("xray-dpapi-prepare");
+        let path = dir.join("node.json.dpapi");
+        let ciphertext = crate::config_security::protect_user_data(
+            br#"{"outbounds":[{"tag":"proxy","protocol":"vless"}],"routing":{"rules":[]}}"#,
+            &crate::config_security::xray_context("node-dpapi"),
+        )
+        .unwrap();
+        fs::write(&path, &ciphertext).unwrap();
+        let mut profile = xray_profile();
+        profile.id = "node-dpapi".into();
+        profile.config_path = path;
+
+        let bytes = prepare_xray_config(&profile).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["outbounds"][0]["protocol"], "vless");
         fs::remove_dir_all(&dir).unwrap();
     }
 
