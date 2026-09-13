@@ -252,6 +252,31 @@ pub struct ProfileDiagnostics {
     pub checks: Vec<DiagnosticCheck>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoveryIssueKind {
+    SurvivingWireGuardService,
+    OwnedRoutes,
+    MissingOwnedRoutes,
+    OrphanRouteOwnership,
+    StatusCheckFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryIssue {
+    pub kind: RecoveryIssueKind,
+    pub profile_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryReport {
+    pub issues: Vec<RecoveryIssue>,
+    pub requires_elevation: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

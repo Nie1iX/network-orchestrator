@@ -27,7 +27,7 @@ fn diag_check(name: &str, level: DiagnosticLevel, message: String) -> Diagnostic
     }
 }
 
-fn applied_route_present(applied: &AppliedRoute, entry: &RouteEntry) -> bool {
+pub(crate) fn applied_route_present(applied: &AppliedRoute, entry: &RouteEntry) -> bool {
     applied.interface_index == entry.interface_index
         && entry.destination == applied.destination.network()
         && entry.prefix_len == applied.destination.prefix_len()

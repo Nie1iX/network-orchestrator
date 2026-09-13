@@ -38,6 +38,8 @@ pub fn run() {
             inspect_profiles,
             diagnose_profile,
             get_tunnel_statuses,
+            get_recovery_report,
+            cleanup_recovery,
             is_elevated,
             restart_elevated
         ])

@@ -212,3 +212,21 @@ export interface ProfileDiagnostics {
   inspection: ProfileInspection | null;
   checks: DiagnosticCheck[];
 }
+
+export type RecoveryIssueKind =
+  | "survivingWireGuardService"
+  | "ownedRoutes"
+  | "missingOwnedRoutes"
+  | "orphanRouteOwnership"
+  | "statusCheckFailed";
+
+export interface RecoveryIssue {
+  kind: RecoveryIssueKind;
+  profileId: string | null;
+  message: string;
+}
+
+export interface RecoveryReport {
+  issues: RecoveryIssue[];
+  requiresElevation: boolean;
+}

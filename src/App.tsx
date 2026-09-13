@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
 import InterfaceList from "./components/InterfaceList";
 import ProfileManager from "./components/ProfileManager";
+import RecoveryPrompt from "./components/RecoveryPrompt";
 import RouteTable from "./components/RouteTable";
 import RouteLookup from "./components/RouteLookup";
 import { NetworkIcon, ProfileIcon, RouteIcon, ChevronIcon } from "./icons";
@@ -87,6 +88,7 @@ function App() {
           </>
         )}
       </main>
+      <RecoveryPrompt />
     </div>
   );
 }

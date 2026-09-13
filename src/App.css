@@ -1169,3 +1169,50 @@ button:disabled {
   color: var(--down);
   background-color: var(--down-bg);
 }
+
+/* ── Recovery prompt ─────────────────────────────────────────────────── */
+
+.recovery-overlay {
+  position: fixed;
+  inset: 0;
+  background-color: var(--bg-overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.recovery-panel {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-6);
+  max-width: 480px;
+  width: 90%;
+}
+
+.recovery-panel p {
+  color: var(--text-secondary);
+  margin: 0 0 var(--sp-4);
+}
+
+.recovery-issues {
+  margin: 0 0 var(--sp-4);
+  padding-left: var(--sp-5);
+  color: var(--text-primary);
+}
+
+.recovery-issues li {
+  margin-bottom: var(--sp-2);
+}
+
+.recovery-actions {
+  display: flex;
+  gap: var(--sp-3);
+  justify-content: flex-end;
+}
+
+.recovery-cleanup-btn {
+  background-color: var(--accent-dim);
+  border-color: var(--accent-border);
+}
