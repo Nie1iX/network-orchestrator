@@ -7,9 +7,10 @@ edition.workspace = true
 net-route = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ipnet = "2"
+ipnet = { version = "2", features = ["serde"] }
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
+url = "=2.5.7"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -18,5 +19,7 @@ libc = "0.2"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_System_Services",
 ] }

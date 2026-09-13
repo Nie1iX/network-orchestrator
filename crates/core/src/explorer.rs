@@ -48,9 +48,13 @@ fn build_ifindex_name_map() -> HashMap<u32, String> {
 /// Extract metric from a net-route Route (platform-dependent field).
 fn route_metric(r: &net_route::Route) -> u32 {
     #[cfg(target_os = "linux")]
-    { r.metric.unwrap_or(0) }
+    {
+        r.metric.unwrap_or(0)
+    }
     #[cfg(not(target_os = "linux"))]
-    { r.metric }
+    {
+        r.metric.unwrap_or(0)
+    }
 }
 
 // ── Route lookup (cross-platform, pure logic) ──────────────────────────
@@ -82,9 +86,8 @@ pub async fn lookup_route(dest: IpAddr) -> std::io::Result<RouteLookupResult> {
         }
     }
 
-    let matched = best.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no matching route")
-    })?;
+    let matched =
+        best.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no matching route"))?;
 
     Ok(RouteLookupResult {
         destination: dest,
@@ -120,18 +123,19 @@ where
 // ── Interface inventory ─────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
+use windows::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH;
+
+#[cfg(target_os = "windows")]
 pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
-    use windows::Win32::Foundation::NO_ERROR;
     use windows::Win32::NetworkManagement::IpHelper::{
-        FreeMibTable, GetAdaptersAddresses, GAA_FLAG_INCLUDE_ALL_INTERFACES,
-        GAA_FLAG_INCLUDE_PREFIX, IP_ADAPTER_ADDRESSES_LH,
+        GetAdaptersAddresses, GAA_FLAG_INCLUDE_ALL_INTERFACES, GAA_FLAG_INCLUDE_PREFIX,
     };
-    use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
+    use windows::Win32::Networking::WinSock::AF_UNSPEC;
 
     let mut buf_len: u32 = 0;
     unsafe {
         GetAdaptersAddresses(
-            AF_UNSPEC as u32,
+            AF_UNSPEC.0 as u32,
             GAA_FLAG_INCLUDE_ALL_INTERFACES | GAA_FLAG_INCLUDE_PREFIX,
             None,
             None,
@@ -144,14 +148,14 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
 
     let ret = unsafe {
         GetAdaptersAddresses(
-            AF_UNSPEC as u32,
+            AF_UNSPEC.0 as u32,
             GAA_FLAG_INCLUDE_ALL_INTERFACES | GAA_FLAG_INCLUDE_PREFIX,
             None,
             Some(head),
             &mut buf_len,
         )
     };
-    if ret != NO_ERROR {
+    if ret != 0 {
         return Err(std::io::Error::from_raw_os_error(ret as i32));
     }
 
@@ -172,12 +176,16 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
 
 #[cfg(target_os = "windows")]
 fn adapter_to_model(adapter: &IP_ADAPTER_ADDRESSES_LH) -> NetworkInterface {
-    use windows::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6};
+    use windows::Win32::NetworkManagement::Ndis::IF_OPER_STATUS;
+    use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
     let friendly_name = unsafe { adapter.FriendlyName.to_string().unwrap_or_default() };
     let raw_name = unsafe { adapter.AdapterName.to_string().unwrap_or_default() };
-    let kind = classify_interface(&raw_name, &friendly_name);
-    let state = if adapter.OperStatus == 1 {
+    let description = unsafe { adapter.Description.to_string().unwrap_or_default() };
+    let if_type = adapter.IfType;
+    let tunnel_type = tunnel_type_name(adapter.TunnelType);
+    let kind = classify_interface(&raw_name, &friendly_name, &description, if_type);
+    let state = if adapter.OperStatus == IF_OPER_STATUS(1) {
         InterfaceState::Up
     } else {
         InterfaceState::Down
@@ -187,11 +195,11 @@ fn adapter_to_model(adapter: &IP_ADAPTER_ADDRESSES_LH) -> NetworkInterface {
     let mut ip = adapter.FirstUnicastAddress;
     while !ip.is_null() {
         let ua = unsafe { &*ip };
-        let sockaddr = unsafe { ua.Address.lpSockaddr };
+        let sockaddr = ua.Address.lpSockaddr;
         if !sockaddr.is_null() {
             let sa = unsafe { *sockaddr };
             let family = sa.sa_family;
-            if family == AF_INET as u16 || family == AF_INET6 as u16 {
+            if family == AF_INET || family == AF_INET6 {
                 if let Some(addr) = sockaddr_to_ip(sockaddr) {
                     addresses.push(InterfaceAddress {
                         address: addr,
@@ -205,7 +213,7 @@ fn adapter_to_model(adapter: &IP_ADAPTER_ADDRESSES_LH) -> NetworkInterface {
                 }
             }
         }
-        ip = unsafe { ua.Next };
+        ip = ua.Next;
     }
 
     let dns_servers = collect_dns(adapter);
@@ -234,12 +242,23 @@ fn adapter_to_model(adapter: &IP_ADAPTER_ADDRESSES_LH) -> NetworkInterface {
         .ok()
         .filter(|s| !s.is_empty());
 
-    // Link speed ( ReceiveLinkSpeed is in bps, convert to Mbps)
-    let link_speed_mbps = if adapter.ReceiveLinkSpeed > 0 {
-        Some(adapter.ReceiveLinkSpeed / 1_000_000)
+    // Link speed (ReceiveLinkSpeed is in bps, convert to Mbps)
+    // Some virtual adapters report u64::MAX — filter those out.
+    let link_speed_mbps =
+        if adapter.ReceiveLinkSpeed > 0 && adapter.ReceiveLinkSpeed < 1_000_000_000_000 {
+            Some(adapter.ReceiveLinkSpeed / 1_000_000)
+        } else {
+            None
+        };
+
+    // MTU: some virtual adapters report absurd values — filter those out.
+    let mtu = if adapter.Mtu > 0 && adapter.Mtu <= 65535 {
+        Some(adapter.Mtu)
     } else {
         None
     };
+
+    let category = classify_category(&friendly_name, &description, &kind, if_type);
 
     NetworkInterface {
         name: raw_name,
@@ -249,33 +268,35 @@ fn adapter_to_model(adapter: &IP_ADAPTER_ADDRESSES_LH) -> NetworkInterface {
         addresses,
         dns_servers,
         dns_suffix,
-        mtu: Some(adapter.Mtu),
-        if_index: adapter.Ipv4IfIndex,
+        mtu,
+        if_index: unsafe { adapter.Anonymous1.Anonymous.IfIndex },
         physical: is_physical_windows(adapter.IfType),
         mac,
         gateway,
-        rx_bytes: None,       // requires GetIfEntry2 — deferred
-        tx_bytes: None,        // requires GetIfEntry2 — deferred
+        rx_bytes: None, // requires GetIfEntry2 — deferred
+        tx_bytes: None, // requires GetIfEntry2 — deferred
         link_speed_mbps,
+        category,
+        description,
+        if_type,
+        tunnel_type,
     }
 }
 
 #[cfg(target_os = "windows")]
-fn sockaddr_to_ip(
-    sa: *const windows::Win32::Networking::WinSock::SOCKADDR,
-) -> Option<IpAddr> {
+fn sockaddr_to_ip(sa: *const windows::Win32::Networking::WinSock::SOCKADDR) -> Option<IpAddr> {
     use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6};
 
     let raw = unsafe { *sa };
     match raw.sa_family {
-        f if f == AF_INET as u16 => {
+        f if f == AF_INET => {
             let sin = unsafe { *(sa as *const SOCKADDR_IN) };
-            let bytes = sin.sin_addr.S_un.S_addr.to_ne_bytes();
+            let bytes = unsafe { sin.sin_addr.S_un.S_addr.to_ne_bytes() };
             Some(IpAddr::V4(std::net::Ipv4Addr::from(bytes)))
         }
-        f if f == AF_INET6 as u16 => {
+        f if f == AF_INET6 => {
             let sin6 = unsafe { *(sa as *const SOCKADDR_IN6) };
-            let bytes = sin6.sin6_addr.u.Byte;
+            let bytes = unsafe { sin6.sin6_addr.u.Byte };
             Some(IpAddr::V6(std::net::Ipv6Addr::from(bytes)))
         }
         _ => None,
@@ -306,8 +327,126 @@ fn is_physical_windows(if_type: u32) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn classify_interface(raw: &str, friendly: &str) -> InterfaceKind {
+fn tunnel_type_name(t: windows::Win32::NetworkManagement::Ndis::TUNNEL_TYPE) -> Option<String> {
+    use windows::Win32::NetworkManagement::Ndis::*;
+    match t {
+        TUNNEL_TYPE_NONE => None,
+        TUNNEL_TYPE_OTHER => Some("Other".into()),
+        TUNNEL_TYPE_DIRECT => Some("Direct".into()),
+        TUNNEL_TYPE_6TO4 => Some("6to4".into()),
+        TUNNEL_TYPE_ISATAP => Some("ISATAP".into()),
+        TUNNEL_TYPE_TEREDO => Some("Teredo".into()),
+        TUNNEL_TYPE_IPHTTPS => Some("IP-HTTPS".into()),
+        _ => Some(format!("{:?}", t)),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn classify_category(
+    friendly_name: &str,
+    description: &str,
+    kind: &InterfaceKind,
+    if_type: u32,
+) -> InterfaceCategory {
+    let lower = friendly_name.to_lowercase();
+    let desc_lower = description.to_lowercase();
+
+    // Filter drivers and lightweight filters — by friendly name suffix
+    const FILTER_KEYWORDS: &[&str] = &[
+        "lightweight filter",
+        "wfp native mac layer",
+        "wfp 802.3 mac layer",
+        "npcap packet driver",
+        "qos packet scheduler",
+        "hyper-v virtual switch extension",
+        "virtual filtering platform vmswitch",
+        "virtual wifi filter driver",
+        "native wifi filter driver",
+    ];
+    if FILTER_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return InterfaceCategory::Filter;
+    }
+
+    // Description-based classification (more reliable than friendly name)
+    // Wi-Fi Direct virtual adapters — virtual, not tunnel
+    if desc_lower.contains("wi-fi direct") {
+        return InterfaceCategory::Virtual;
+    }
+    // WAN Miniports — Windows built-in VPN miniports (PPTP, L2TP, IKEv2, SSTP, PPPOE, IP, IPv6, NetMon)
+    if desc_lower.contains("wan miniport") {
+        return InterfaceCategory::Tunnel;
+    }
+    // Kernel debug adapter — system
+    if desc_lower.contains("kernel debug") {
+        return InterfaceCategory::System;
+    }
+    // Bluetooth PAN — virtual (Windows uses if_type 6, not 7)
+    if desc_lower.contains("bluetooth") {
+        return InterfaceCategory::Virtual;
+    }
+
+    // OS-internal tunnel pseudo-interfaces by if_type
+    // IF_TYPE_TUNNEL = 131
+    if if_type == 131 {
+        return InterfaceCategory::Tunnel;
+    }
+    const TUNNEL_KEYWORDS: &[&str] = &["teredo", "6to4", "ip-https", "isatap"];
+    if TUNNEL_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return InterfaceCategory::Tunnel;
+    }
+    // Remaining "Подключение по локальной сети* N" not caught by description above
+    if lower.starts_with("подключение по локальной сети*") || lower.starts_with("lan connection*")
+    {
+        return InterfaceCategory::Tunnel;
+    }
+
+    match kind {
+        InterfaceKind::Loopback => InterfaceCategory::System,
+        InterfaceKind::WireGuard | InterfaceKind::OpenVpn | InterfaceKind::Xray => {
+            InterfaceCategory::Vpn
+        }
+        InterfaceKind::Other(s) => {
+            let s = s.to_lowercase();
+            match s.as_str() {
+                "tailscale" => InterfaceCategory::Vpn,
+                "hyper-v" | "cellular" | "bluetooth" => InterfaceCategory::Virtual,
+                _ => {
+                    // If description mentions VPN/tunnel driver, it's a VPN
+                    if desc_lower.contains("wireguard")
+                        || desc_lower.contains("wintun")
+                        || desc_lower.contains("tap-windows")
+                        || desc_lower.contains("tun/tap")
+                    {
+                        InterfaceCategory::Vpn
+                    } else {
+                        InterfaceCategory::Physical
+                    }
+                }
+            }
+        }
+        InterfaceKind::Ethernet | InterfaceKind::Wifi => InterfaceCategory::Physical,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn classify_interface(
+    raw: &str,
+    friendly: &str,
+    description: &str,
+    _if_type: u32,
+) -> InterfaceKind {
     let lower = friendly.to_lowercase();
+    let desc_lower = description.to_lowercase();
+
+    // VPN detection by driver description (most reliable)
+    if desc_lower.contains("wireguard") || desc_lower.contains("wintun") {
+        return InterfaceKind::WireGuard;
+    }
+    if desc_lower.contains("tap-windows") || desc_lower.contains("tun/tap") {
+        return InterfaceKind::OpenVpn;
+    }
+
+    // VPN by friendly name
     if lower.contains("wireguard") || raw.starts_with("wg") {
         return InterfaceKind::WireGuard;
     }
@@ -317,6 +456,40 @@ fn classify_interface(raw: &str, friendly: &str) -> InterfaceKind {
     if lower.contains("xray") || lower.contains("wintun") {
         return InterfaceKind::Xray;
     }
+    if lower.contains("tailscale") {
+        return InterfaceKind::Other("Tailscale".into());
+    }
+
+    // Bluetooth: by description (Windows uses if_type 6 for Bluetooth PAN, not 7)
+    if desc_lower.contains("bluetooth") || lower.contains("bluetooth") {
+        return InterfaceKind::Other("Bluetooth".into());
+    }
+
+    // Kernel debug adapter
+    if desc_lower.contains("kernel debug") {
+        return InterfaceKind::Other("Kernel Debug".into());
+    }
+
+    // Wi-Fi Direct virtual adapters
+    if desc_lower.contains("wi-fi direct") {
+        return InterfaceKind::Other("Wi-Fi Direct".into());
+    }
+
+    // WiFi by description (Russian friendly names like "Беспроводная сеть" don't contain "wifi")
+    if desc_lower.contains("wi-fi") || desc_lower.contains("wireless") {
+        return InterfaceKind::Wifi;
+    }
+
+    // Hyper-V virtual switches
+    if lower.starts_with("vethernet") || lower.contains("hyper-v") || lower.starts_with("vswitch") {
+        return InterfaceKind::Other("Hyper-V".into());
+    }
+
+    // Cellular (wwan) — note: real wwan adapters have if_type 106, not name-based
+    if lower.starts_with("wwan") && !desc_lower.contains("wintun") {
+        return InterfaceKind::Other("Cellular".into());
+    }
+
     if lower.contains("wi-fi") || lower.contains("wifi") || lower.contains("wireless") {
         return InterfaceKind::Wifi;
     }
@@ -354,9 +527,7 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
         while !cur.is_null() {
             let ifa = &*cur;
             if !ifa.ifa_name.is_null() {
-                let name = CStr::from_ptr(ifa.ifa_name)
-                    .to_string_lossy()
-                    .into_owned();
+                let name = CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned();
                 let is_up = (ifa.ifa_flags & libc::IFF_UP as u32) != 0;
                 if name_set.insert(name.clone()) {
                     names.push(name.clone());
@@ -374,33 +545,34 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
         while !cur.is_null() {
             let ifa = &*cur;
             if !ifa.ifa_name.is_null() && !ifa.ifa_addr.is_null() {
-                let name = CStr::from_ptr(ifa.ifa_name)
-                    .to_string_lossy()
-                    .into_owned();
+                let name = CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned();
                 let family = (*ifa.ifa_addr).sa_family as i32;
 
                 let addr = if family == libc::AF_INET {
                     let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
                     let bytes = sin.sin_addr.s_addr.to_ne_bytes();
-                    Some((IpAddr::V4(std::net::Ipv4Addr::from(bytes)), AddressFamily::Ipv4))
+                    Some((
+                        IpAddr::V4(std::net::Ipv4Addr::from(bytes)),
+                        AddressFamily::Ipv4,
+                    ))
                 } else if family == libc::AF_INET6 {
                     let sin6 = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
                     let bytes = sin6.sin6_addr.s6_addr;
-                    Some((IpAddr::V6(std::net::Ipv6Addr::from(bytes)), AddressFamily::Ipv6))
+                    Some((
+                        IpAddr::V6(std::net::Ipv6Addr::from(bytes)),
+                        AddressFamily::Ipv6,
+                    ))
                 } else {
                     None
                 };
 
                 if let Some((ip, fam)) = addr {
                     let prefix_len = get_prefix_len(ifa.ifa_netmask, family);
-                    addr_map
-                        .entry(name)
-                        .or_default()
-                        .push(InterfaceAddress {
-                            address: ip,
-                            prefix_len,
-                            family: fam,
-                        });
+                    addr_map.entry(name).or_default().push(InterfaceAddress {
+                        address: ip,
+                        prefix_len,
+                        family: fam,
+                    });
                 }
             }
             cur = ifa.ifa_next;
@@ -448,6 +620,10 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
                 rx_bytes,
                 tx_bytes,
                 link_speed_mbps,
+                category: classify_category_linux(&kind, physical, name),
+                description: read_linux_description(name),
+                if_type: read_linux_if_type(name),
+                tunnel_type: None,
             });
         }
 
@@ -466,7 +642,11 @@ fn get_prefix_len(netmask: *const libc::sockaddr, family: i32) -> u8 {
         mask.count_ones() as u8
     } else if family == libc::AF_INET6 {
         let sin6 = unsafe { &*(netmask as *const libc::sockaddr_in6) };
-        sin6.sin6_addr.s6_addr.iter().map(|&b| b.count_ones() as u8).sum()
+        sin6.sin6_addr
+            .s6_addr
+            .iter()
+            .map(|&b| b.count_ones() as u8)
+            .sum()
     } else {
         0
     }
@@ -499,6 +679,34 @@ fn read_linux_speed(name: &str) -> Option<u64> {
     std::fs::read_to_string(format!("/sys/class/net/{name}/speed"))
         .ok()
         .and_then(|s| s.trim().parse().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_description(name: &str) -> String {
+    // /sys/class/net/<name>/device/driver symlink gives the driver name
+    let driver_path = std::path::Path::new(&format!("/sys/class/net/{name}/device/driver"));
+    if let Ok(target) = std::fs::read_link(driver_path) {
+        if let Some(fname) = target.file_name() {
+            return format!("{} driver", fname.to_string_lossy());
+        }
+    }
+    // Fallback: /sys/class/net/<name>/uevent has interface info
+    std::fs::read_to_string(format!("/sys/class/net/{name}/uevent"))
+        .unwrap_or_default()
+        .lines()
+        .find(|l| l.starts_with("INTERFACE="))
+        .map(|l| l.trim_start_matches("INTERFACE=").to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_if_type(name: &str) -> u32 {
+    // /sys/class/net/<name>/type contains the ARP type (1=Ethernet, 772=Loopback,
+    // 801=Wifi, 6to4=42, etc.)
+    std::fs::read_to_string(format!("/sys/class/net/{name}/type"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1)
 }
 
 #[cfg(target_os = "linux")]
@@ -558,6 +766,31 @@ fn classify_interface_linux(name: &str) -> InterfaceKind {
     InterfaceKind::Other(name.to_string())
 }
 
+#[cfg(target_os = "linux")]
+fn classify_category_linux(kind: &InterfaceKind, physical: bool, name: &str) -> InterfaceCategory {
+    match kind {
+        InterfaceKind::Loopback => InterfaceCategory::System,
+        InterfaceKind::WireGuard | InterfaceKind::OpenVpn | InterfaceKind::Xray => {
+            InterfaceCategory::Vpn
+        }
+        InterfaceKind::Ethernet | InterfaceKind::Wifi => {
+            if physical {
+                InterfaceCategory::Physical
+            } else {
+                InterfaceCategory::Virtual
+            }
+        }
+        InterfaceKind::Other(_) => {
+            // Virtual interfaces on Linux: docker0, br-*, veth*, virbr*, etc.
+            if physical {
+                InterfaceCategory::Physical
+            } else {
+                InterfaceCategory::Virtual
+            }
+        }
+    }
+}
+
 // ── Non-Windows/Linux stub ──────────────────────────────────────────────
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -566,6 +799,66 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
         std::io::ErrorKind::Unsupported,
         "interface inventory is only implemented on Windows and Linux",
     ))
+}
+
+// ── Interface state control ─────────────────────────────────────────────
+
+/// Bring an interface up or down by name.
+/// Requires administrator/root privileges.
+pub fn set_interface_state(name: &str, up: bool) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let action = if up { "up" } else { "down" };
+        let output = std::process::Command::new("ip")
+            .args(["link", "set", name, action])
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "ip link set {} {}: {}",
+                    name,
+                    action,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let admin = if up { "enable" } else { "disable" };
+        let output = std::process::Command::new("netsh")
+            .args([
+                "interface",
+                "set",
+                "interface",
+                name,
+                &format!("admin={admin}"),
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "netsh interface set interface {} admin={}: {}",
+                    name,
+                    admin,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "interface state control is only implemented on Windows and Linux",
+        ))
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -578,7 +871,7 @@ mod tests {
 
     #[test]
     fn longest_prefix_match_logic() {
-        let routes = vec![
+        let routes = [
             RouteEntry {
                 destination: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
                 prefix_len: 0,
@@ -621,7 +914,7 @@ mod tests {
 
     #[test]
     fn default_route_matches_any_ip() {
-        let routes = vec![RouteEntry {
+        let routes = [RouteEntry {
             destination: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
             prefix_len: 0,
             gateway: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
