@@ -26,6 +26,5 @@ target/
 *.sln
 *.sw?
 
-# Temporary docs
-docs/plans
 .serena/
+.worktrees/
