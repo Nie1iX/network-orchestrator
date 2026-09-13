@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod config_security;
 pub mod config_vault;
 pub mod explorer;
 pub mod models;

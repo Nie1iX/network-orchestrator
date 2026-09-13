@@ -17,6 +17,8 @@
 
 Create an explicit protected DACL granting full access only to the current user, `SYSTEM`, and administrators. Apply it to vault/profile/revision/assets and verify effective ACLs in unit/integration tests.
 
+Implemented: `protect_path` applies `D:P(A;OICI;FA;;;<user-sid>)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` on directories and the same ACEs without `OICI` on files, via `SetFileSecurityW` with `PROTECTED_DACL_SECURITY_INFORMATION` so inherited ACEs are dropped. `inspect_path_protection` verifies `SE_DACL_PROTECTED` via `GetSecurityDescriptorControl` and the three full-access ACEs via SDDL conversion — never trusted from desired input. `ConfigVault` protects root/profile/staging/assets/revision/config at every import/store and `ensure_root_protected` hardens the vault root at startup without rewriting existing revisions; post-rename protection failure removes the renamed revision. External source files are never modified.
+
 ### Task 2: Add DPAPI envelope
 
 Implement versioned `CryptProtectData`/`CryptUnprotectData` helpers with profile-scoped entropy. Tests cover round-trip, wrong entropy, corrupt blobs, and secret-free errors.

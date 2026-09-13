@@ -28,9 +28,11 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
     let applied_routes = AppliedRouteStore::new(data_dir.join("applied-routes.json"));
     let mut policies = PolicyManager::new();
     policies.restore(applied_routes.load()?.profiles)?;
+    let config_vault = ConfigVault::new(data_dir.join("configs"));
+    config_vault.ensure_root_protected()?;
     Ok(AppState {
         profiles: store,
-        config_vault: ConfigVault::new(data_dir.join("configs")),
+        config_vault,
         applied_routes,
         shutting_down: AtomicBool::new(false),
         cleanup_complete: AtomicBool::new(false),
