@@ -5,6 +5,7 @@ use net_manager_core::profiles::{ProfileDocument, ProfileStore};
 use net_manager_core::route_state::{
     AppliedRouteDocument, AppliedRouteStore, APPLIED_ROUTE_DOCUMENT_VERSION,
 };
+use net_manager_core::system_proxy::SystemProxyManager;
 use net_manager_core::vpn::TunnelManager;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -12,6 +13,7 @@ use std::sync::atomic::AtomicBool;
 pub(crate) struct RuntimeState {
     pub(crate) tunnels: TunnelManager,
     pub(crate) policies: PolicyManager,
+    pub(crate) proxy: SystemProxyManager,
 }
 
 pub(crate) struct AppState {
@@ -39,6 +41,7 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
         runtime: tokio::sync::Mutex::new(RuntimeState {
             tunnels: TunnelManager::with_log_dir(data_dir.join("logs")),
             policies,
+            proxy: SystemProxyManager::new(data_dir.join("proxy-state.json"))?,
         }),
     })
 }

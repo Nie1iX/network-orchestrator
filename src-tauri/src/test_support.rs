@@ -5,6 +5,7 @@ use net_manager_core::models::*;
 use net_manager_core::policy::PolicyManager;
 use net_manager_core::profiles::ProfileStore;
 use net_manager_core::route_state::AppliedRouteStore;
+use net_manager_core::system_proxy::{ProxyAdapter, ProxySnapshot, SystemProxyManager};
 use net_manager_core::vpn::TunnelManager;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,6 +59,8 @@ pub(crate) fn profile(interface_name: &str) -> Profile {
         auto_connect: false,
         domain_policies: vec![],
         xray_socks_port: None,
+        use_system_proxy: false,
+        proxy_bypass: vec![],
     }
 }
 
@@ -90,6 +93,20 @@ impl net_manager_core::policy::RouteExecutor for NoopExecutor {
     }
 }
 
+pub(crate) struct NoopProxyAdapter;
+
+impl ProxyAdapter for NoopProxyAdapter {
+    fn snapshot(&mut self) -> std::io::Result<ProxySnapshot> {
+        Ok(ProxySnapshot::default())
+    }
+    fn apply(&mut self, _server: &str, _bypass: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn restore(&mut self, _snapshot: &ProxySnapshot) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) fn app_state(dir: &Path) -> AppState {
     AppState {
         profiles: ProfileStore::new(dir.join("profiles.json")),
@@ -100,6 +117,11 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
         runtime: tokio::sync::Mutex::new(RuntimeState {
             tunnels: TunnelManager::new(),
             policies: PolicyManager::with_executor(Box::new(NoopExecutor)),
+            proxy: SystemProxyManager::with_adapter(
+                dir.join("proxy-state.json"),
+                Box::new(NoopProxyAdapter),
+            )
+            .unwrap(),
         }),
     }
 }
@@ -155,6 +177,7 @@ pub(crate) fn diag_input(p: &Profile) -> DiagnosticsInput {
             tx_bytes: None,
             log_tail: None,
         },
+        proxy_owner: None,
     }
 }
 

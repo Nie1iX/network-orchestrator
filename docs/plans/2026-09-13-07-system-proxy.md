@@ -39,3 +39,16 @@ cargo test -p net-manager-core system_proxy
 cargo test -p net-manager-app system_proxy
 npm run build
 ```
+
+---
+
+## Implemented notes (stage 7)
+
+- `Profile` gained `use_system_proxy` / `proxy_bypass` (`#[serde(default)]`); validation: Xray only, requires nonzero `xray_socks_port`, bypass entries nonblank and `;`-free.
+- Core `system_proxy`: `ProxySnapshot`/`ProxyOwnership`/`ProxyStateDocument` (versioned atomic JSON at `data_dir/proxy-state.json`), `ProxyAdapter` trait, `SystemProxyManager`. Apply persists ownership **before** the adapter call, applies `socks=127.0.0.1:<port>` + `;`-joined bypass, and rolls back snapshot + clears ownership on adapter failure (combined error). `restore` requires matching owner (NotFound/InvalidInput otherwise); `restore_any` is idempotent for shutdown/recovery.
+- Windows adapter: HKCU `Internet Settings` via `RegGetValueW`/`RegSetValueExW`/`RegDeleteValueW` (missing values deleted on restore), `WM_SETTINGCHANGE` broadcast via `SendMessageTimeoutW`. Non-Windows adapter returns `Unsupported`. No real-HKCU tests — fake adapter only.
+- Connect flow: ownership pre-check blocks a second system-proxy profile; after Xray connect, bounded poll (10 s / 200 ms) on `127.0.0.1:<socks>`; listener timeout or proxy-apply failure disconnects; route-apply failures restore proxy before disconnect.
+- Disconnect restores proxy before routes/tunnel and aborts on restore failure (Xray stays up). `cleanup_all` runs `restore_any` first. Recovery report surfaces `proxyOwnership`; diagnostics adds a `System proxy` check (healthy owner+running, warning configured-not-applied, error stale/other owner).
+- UI: `Use Windows system proxy` checkbox for generated Xray profiles (VLESS import or existing with SOCKS port), comma-separated bypass editor with `<local>, localhost, 127.*, 10.*, 192.168.*` default, `System proxy` badge + bypass row on the card, disabled-with-explanation for plain imported JSON.
+- Review fixes: `WM_SETTINGCHANGE` broadcast passes lParam = pointer to the UTF-16 `Internet Settings` subkey string; proxy-state file is `protect_path`-ed on temp write, after rename, and for legacy files on load; Windows adapter verifies values via registry read-back before broadcast (`snapshot_matches`, generic mismatch errors without proxy values).
+- Not implemented (follow-up): WinHTTP/winhttp settings untouched; real-VM validation (Task 6) pending fixtures.

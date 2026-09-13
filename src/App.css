@@ -1310,3 +1310,21 @@ button:disabled {
     padding: 0.35rem 0.5rem;
   }
 }
+
+/* ── System proxy form ───────────────────────────────────────────────── */
+
+.profile-proxy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+.profile-proxy-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  cursor: pointer;
+}

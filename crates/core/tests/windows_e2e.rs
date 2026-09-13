@@ -161,6 +161,8 @@ fn fixture_profile(
         auto_connect: false,
         domain_policies: vec![],
         xray_socks_port: None,
+        use_system_proxy: false,
+        proxy_bypass: vec![],
     }
 }
 

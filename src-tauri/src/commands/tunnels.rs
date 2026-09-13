@@ -8,6 +8,8 @@ use net_manager_core::explorer;
 use net_manager_core::models::*;
 use net_manager_core::vpn::TunnelManager;
 use std::io::ErrorKind;
+use std::net::{Ipv4Addr, TcpStream};
+use std::time::{Duration, Instant};
 use tauri::{Emitter, State};
 
 fn has_target_interface(profile: &Profile, interfaces: &[NetworkInterface]) -> bool {
@@ -102,6 +104,19 @@ fn active_profile_conflicts(
     Ok(conflicts)
 }
 
+async fn wait_for_tcp_listener(port: u16, timeout: Duration, interval: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn connect_profile(
     id: String,
@@ -159,12 +174,44 @@ pub(crate) async fn connect_profile(
             "connection blocked by active profile conflict: {joined}"
         ));
     }
+    if profile.use_system_proxy {
+        if let Some(owner) = runtime.proxy.ownership() {
+            return Err(format!(
+                "system proxy is already owned by profile '{}'",
+                owner.profile_id
+            ));
+        }
+    }
     let mut status = runtime
         .tunnels
         .connect(&profile)
         .map_err(|e| e.to_string())?;
     if let Some(notice) = port_notice {
         status.message = Some(notice);
+    }
+
+    let mut proxy_applied = false;
+    if profile.use_system_proxy {
+        let port = profile.xray_socks_port.unwrap_or(0);
+        if !wait_for_tcp_listener(port, Duration::from_secs(10), Duration::from_millis(200)).await {
+            let mut message =
+                format!("timed out waiting for Xray SOCKS listener on 127.0.0.1:{port}");
+            if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
+                message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
+            }
+            return Err(message);
+        }
+        if let Err(err) = runtime
+            .proxy
+            .apply(&profile.id, port, &profile.proxy_bypass)
+        {
+            let mut message = format!("failed to apply system proxy: {err}");
+            if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
+                message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
+            }
+            return Err(message);
+        }
+        proxy_applied = true;
     }
 
     if !profile.routes.is_empty() {
@@ -187,6 +234,11 @@ pub(crate) async fn connect_profile(
         }
         if let Some(err) = list_error {
             let mut message = format!("failed to enumerate interfaces: {err}");
+            if proxy_applied {
+                if let Err(cleanup) = runtime.proxy.restore(&id) {
+                    message.push_str(&format!("; proxy restore failed: {cleanup}"));
+                }
+            }
             if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
                 message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
             }
@@ -197,6 +249,11 @@ pub(crate) async fn connect_profile(
                 "timed out waiting for interface '{}' to come up",
                 profile.interface_name
             );
+            if proxy_applied {
+                if let Err(cleanup) = runtime.proxy.restore(&id) {
+                    message.push_str(&format!("; proxy restore failed: {cleanup}"));
+                }
+            }
             if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
                 message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
             }
@@ -204,6 +261,11 @@ pub(crate) async fn connect_profile(
         };
         if let Err(err) = runtime.policies.apply_profile(&profile, &interfaces) {
             let mut message = err.to_string();
+            if proxy_applied {
+                if let Err(cleanup) = runtime.proxy.restore(&id) {
+                    message.push_str(&format!("; proxy restore failed: {cleanup}"));
+                }
+            }
             if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
                 message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
             }
@@ -213,6 +275,11 @@ pub(crate) async fn connect_profile(
             let mut message = format!("failed to persist applied routes: {err}");
             if let Err(cleanup) = runtime.policies.remove_profile(&id) {
                 message.push_str(&format!("; route rollback failed: {cleanup}"));
+            }
+            if proxy_applied {
+                if let Err(cleanup) = runtime.proxy.restore(&id) {
+                    message.push_str(&format!("; proxy restore failed: {cleanup}"));
+                }
             }
             if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
                 message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
@@ -233,6 +300,17 @@ pub(crate) async fn disconnect_profile(
 ) -> Result<TunnelStatus, String> {
     let profile = find_profile(&state.profiles, &id)?;
     let mut runtime = state.runtime.lock().await;
+    if runtime
+        .proxy
+        .ownership()
+        .map(|owner| owner.profile_id.as_str())
+        == Some(id.as_str())
+    {
+        runtime
+            .proxy
+            .restore(&id)
+            .map_err(|e| format!("failed to restore system proxy: {e}"))?;
+    }
     if let Err(err) = runtime.policies.remove_profile(&id) {
         if err.kind() != ErrorKind::NotFound {
             return Err(err.to_string());
@@ -423,5 +501,26 @@ mod tests {
             source: "test".into(),
         });
         assert!(unknown_route_conflicts(&candidate, &other, &known_other).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[tokio::test]
+    async fn wait_for_tcp_listener_detects_live_and_dead_ports() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(
+            wait_for_tcp_listener(port, Duration::from_millis(500), Duration::from_millis(50))
+                .await
+        );
+        drop(listener);
+        assert!(
+            !wait_for_tcp_listener(port, Duration::from_millis(200), Duration::from_millis(50))
+                .await
+        );
     }
 }

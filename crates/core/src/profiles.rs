@@ -129,6 +129,29 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
             return Err(invalid_data("xray socks port must be nonzero"));
         }
     }
+    if profile.use_system_proxy {
+        if profile.backend != TunnelBackend::Xray {
+            return Err(invalid_data(
+                "system proxy is only supported for Xray profiles",
+            ));
+        }
+        match profile.xray_socks_port {
+            Some(port) if port != 0 => {}
+            _ => {
+                return Err(invalid_data(
+                    "system proxy requires a nonzero xray socks port",
+                ));
+            }
+        }
+    }
+    for entry in &profile.proxy_bypass {
+        if entry.trim().is_empty() {
+            return Err(invalid_data("proxy bypass entries must not be blank"));
+        }
+        if entry.contains(';') {
+            return Err(invalid_data("proxy bypass entries must not contain ';'"));
+        }
+    }
     let file_name = profile
         .config_path
         .file_name()
@@ -189,6 +212,8 @@ mod tests {
             auto_connect: true,
             domain_policies: vec![],
             xray_socks_port: None,
+            use_system_proxy: false,
+            proxy_bypass: vec![],
         }
     }
 
@@ -277,6 +302,8 @@ mod tests {
                 target: DomainRouteTarget::Proxy,
             }],
             xray_socks_port: Some(10808),
+            use_system_proxy: false,
+            proxy_bypass: vec![],
         }
     }
 
@@ -345,6 +372,48 @@ mod tests {
         }];
         assert_eq!(
             validate_profile(&blank).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn system_proxy_requires_xray_with_socks_port() {
+        let mut ok = xray_profile();
+        ok.use_system_proxy = true;
+        ok.proxy_bypass = vec!["<local>".into(), "10.*".into()];
+        assert!(validate_profile(&ok).is_ok());
+
+        let mut wg = wg_profile();
+        wg.use_system_proxy = true;
+        assert_eq!(
+            validate_profile(&wg).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut no_port = xray_profile();
+        no_port.use_system_proxy = true;
+        no_port.xray_socks_port = None;
+        assert_eq!(
+            validate_profile(&no_port).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn proxy_bypass_rejects_blank_and_semicolon() {
+        let mut blank = xray_profile();
+        blank.use_system_proxy = true;
+        blank.proxy_bypass = vec!["   ".into()];
+        assert_eq!(
+            validate_profile(&blank).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut semicolon = xray_profile();
+        semicolon.use_system_proxy = true;
+        semicolon.proxy_bypass = vec!["a;b".into()];
+        assert_eq!(
+            validate_profile(&semicolon).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
     }

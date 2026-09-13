@@ -134,6 +134,10 @@ pub struct Profile {
     pub domain_policies: Vec<DomainPolicy>,
     #[serde(default)]
     pub xray_socks_port: Option<u16>,
+    #[serde(default)]
+    pub use_system_proxy: bool,
+    #[serde(default)]
+    pub proxy_bypass: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -299,6 +303,7 @@ pub enum RecoveryIssueKind {
     MissingOwnedRoutes,
     OrphanRouteOwnership,
     StatusCheckFailed,
+    ProxyOwnership,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

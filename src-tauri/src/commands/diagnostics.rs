@@ -18,6 +18,7 @@ pub(crate) struct DiagnosticsInput {
     pub(crate) os_routes: Result<Vec<RouteEntry>, String>,
     pub(crate) owned_routes: Option<Vec<AppliedRoute>>,
     pub(crate) protocol_health: ProtocolHealth,
+    pub(crate) proxy_owner: Option<String>,
 }
 
 fn diag_check(name: &str, level: DiagnosticLevel, message: String) -> DiagnosticCheck {
@@ -139,6 +140,42 @@ fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
             },
             tail.clone(),
         ));
+    }
+
+    if profile.use_system_proxy || input.proxy_owner.is_some() {
+        let check = match &input.proxy_owner {
+            Some(owner) if owner == &profile.id => {
+                if input.status.state == TunnelState::Running {
+                    diag_check(
+                        "System proxy",
+                        DiagnosticLevel::Healthy,
+                        "system proxy is applied for this profile (127.0.0.1 SOCKS5)".to_string(),
+                    )
+                } else {
+                    diag_check(
+                        "System proxy",
+                        DiagnosticLevel::Error,
+                        "stale ownership: system proxy still applied while the profile is not running".to_string(),
+                    )
+                }
+            }
+            Some(owner) => diag_check(
+                "System proxy",
+                DiagnosticLevel::Error,
+                format!("system proxy is owned by another profile '{owner}'"),
+            ),
+            None if profile.use_system_proxy => diag_check(
+                "System proxy",
+                DiagnosticLevel::Warning,
+                "system proxy is configured but not currently applied".to_string(),
+            ),
+            None => diag_check(
+                "System proxy",
+                DiagnosticLevel::Warning,
+                "stale system proxy record without a known owner".to_string(),
+            ),
+        };
+        checks.push(check);
     }
 
     match &input.inspection {
@@ -389,6 +426,7 @@ pub(crate) async fn diagnose_profile(
     } else {
         None
     };
+    let proxy_owner = runtime.proxy.ownership().map(|o| o.profile_id.clone());
     drop(runtime);
     let managed = state
         .config_vault
@@ -404,6 +442,7 @@ pub(crate) async fn diagnose_profile(
         os_routes,
         owned_routes,
         protocol_health,
+        proxy_owner,
     });
     Ok(ProfileDiagnostics {
         profile_id: profile.id,
@@ -536,6 +575,46 @@ mod tests {
         assert_eq!(applied.level, DiagnosticLevel::Healthy);
         assert_eq!(applied.message, "No app-managed routes");
         assert!(checks.iter().all(|c| c.name != "Target interface"));
+    }
+
+    #[test]
+    fn diagnostics_maps_system_proxy_states() {
+        let mut p = profile("xray-p1");
+        p.backend = TunnelBackend::Xray;
+        p.use_system_proxy = true;
+        p.xray_socks_port = Some(10808);
+
+        let mut input = diag_input(&p);
+        input.proxy_owner = Some(p.id.clone());
+        let checks = build_diagnostics(&input);
+        assert_eq!(
+            check_named(&checks, "System proxy").level,
+            DiagnosticLevel::Healthy
+        );
+
+        let mut stale = diag_input(&p);
+        stale.status.state = TunnelState::Stopped;
+        stale.proxy_owner = Some(p.id.clone());
+        let checks = build_diagnostics(&stale);
+        let check = check_named(&checks, "System proxy");
+        assert_eq!(check.level, DiagnosticLevel::Error);
+        assert!(check.message.contains("stale"));
+
+        let mut other = diag_input(&p);
+        other.proxy_owner = Some("other-id".into());
+        let checks = build_diagnostics(&other);
+        let check = check_named(&checks, "System proxy");
+        assert_eq!(check.level, DiagnosticLevel::Error);
+        assert!(check.message.contains("other-id"));
+
+        let checks = build_diagnostics(&diag_input(&p));
+        let check = check_named(&checks, "System proxy");
+        assert_eq!(check.level, DiagnosticLevel::Warning);
+        assert!(check.message.contains("not currently applied"));
+
+        let plain = profile("wg-p1");
+        let checks = build_diagnostics(&diag_input(&plain));
+        assert!(checks.iter().all(|c| c.name != "System proxy"));
     }
 
     #[test]

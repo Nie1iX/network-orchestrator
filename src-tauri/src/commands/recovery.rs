@@ -3,6 +3,7 @@ use crate::lifecycle::cleanup_all;
 use crate::state::AppState;
 use net_manager_core::explorer;
 use net_manager_core::models::*;
+use net_manager_core::system_proxy::ProxyOwnership;
 use tauri::{Emitter, State};
 
 pub(crate) fn build_recovery_report(
@@ -10,8 +11,19 @@ pub(crate) fn build_recovery_report(
     statuses: &[(String, TunnelStatus)],
     ownership: &[AppliedProfileRoutes],
     os_routes: &[RouteEntry],
+    proxy_ownership: Option<&ProxyOwnership>,
 ) -> RecoveryReport {
     let mut issues = Vec::new();
+    if let Some(owner) = proxy_ownership {
+        issues.push(RecoveryIssue {
+            kind: RecoveryIssueKind::ProxyOwnership,
+            profile_id: Some(owner.profile_id.clone()),
+            message: format!(
+                "system proxy settings owned by profile '{}' are still applied",
+                owner.profile_id
+            ),
+        });
+    }
     for (profile_id, status) in statuses {
         let Some(profile) = profiles.iter().find(|p| &p.id == profile_id) else {
             continue;
@@ -100,9 +112,14 @@ async fn collect_report(state: &AppState) -> Result<RecoveryReport, String> {
         .map(|p| (p.id.clone(), runtime.tunnels.status(p)))
         .collect();
     let ownership = runtime.policies.snapshot();
+    let proxy_ownership = runtime.proxy.ownership().cloned();
     drop(runtime);
     Ok(build_recovery_report(
-        &profiles, &statuses, &ownership, &os_routes,
+        &profiles,
+        &statuses,
+        &ownership,
+        &os_routes,
+        proxy_ownership.as_ref(),
     ))
 }
 
@@ -157,7 +174,7 @@ mod tests {
         let ownership = vec![owned("p1", "10.1.0.0/24", 5)];
         let os_routes = vec![route_entry("10.1.0.0", 24, 5, 99)];
 
-        let report = build_recovery_report(&profiles, &statuses, &ownership, &os_routes);
+        let report = build_recovery_report(&profiles, &statuses, &ownership, &os_routes, None);
 
         assert!(report.requires_elevation);
         assert_eq!(report.issues.len(), 2);
@@ -175,7 +192,7 @@ mod tests {
         let statuses = vec![status("p1", TunnelState::Stopped)];
         let ownership = vec![owned("p1", "10.1.0.0/24", 5)];
 
-        let report = build_recovery_report(&profiles, &statuses, &ownership, &[]);
+        let report = build_recovery_report(&profiles, &statuses, &ownership, &[], None);
 
         assert!(report.requires_elevation);
         assert_eq!(report.issues.len(), 1);
@@ -190,7 +207,7 @@ mod tests {
         let ownership = vec![owned("gone", "10.1.0.0/24", 5)];
         let os_routes = vec![route_entry("10.1.0.0", 24, 5, 10)];
 
-        let report = build_recovery_report(&profiles, &statuses, &ownership, &os_routes);
+        let report = build_recovery_report(&profiles, &statuses, &ownership, &os_routes, None);
 
         assert_eq!(report.issues.len(), 1);
         assert_eq!(
@@ -205,7 +222,7 @@ mod tests {
         let profiles = vec![profile("wg-work")];
         let statuses = vec![status("p1", TunnelState::Stopped)];
 
-        let report = build_recovery_report(&profiles, &statuses, &[], &[]);
+        let report = build_recovery_report(&profiles, &statuses, &[], &[], None);
 
         assert!(report.issues.is_empty());
         assert!(!report.requires_elevation);
@@ -217,11 +234,29 @@ mod tests {
         let mut failed = status("p1", TunnelState::Failed);
         failed.1.message = Some("service query failed".into());
 
-        let report = build_recovery_report(&profiles, &[failed], &[], &[]);
+        let report = build_recovery_report(&profiles, &[failed], &[], &[], None);
 
         assert!(report.requires_elevation);
         assert_eq!(report.issues.len(), 1);
         assert_eq!(report.issues[0].kind, RecoveryIssueKind::StatusCheckFailed);
         assert!(report.issues[0].message.contains("service query failed"));
+    }
+
+    #[test]
+    fn proxy_ownership_produces_cleanup_issue() {
+        let ownership = ProxyOwnership {
+            profile_id: "stale".into(),
+            snapshot: net_manager_core::system_proxy::ProxySnapshot::default(),
+            applied_server: "socks=127.0.0.1:10808".into(),
+            applied_override: "<local>".into(),
+        };
+
+        let report = build_recovery_report(&[], &[], &[], &[], Some(&ownership));
+
+        assert!(report.requires_elevation);
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].kind, RecoveryIssueKind::ProxyOwnership);
+        assert_eq!(report.issues[0].profile_id.as_deref(), Some("stale"));
+        assert!(report.issues[0].message.contains("stale"));
     }
 }

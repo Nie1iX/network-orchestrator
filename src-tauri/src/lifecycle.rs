@@ -7,6 +7,9 @@ pub(crate) async fn cleanup_all(state: &AppState) -> Result<(), String> {
     let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let mut runtime = state.runtime.lock().await;
     let mut errors: Vec<String> = Vec::new();
+    if let Err(err) = runtime.proxy.restore_any() {
+        errors.push(format!("system proxy: {err}"));
+    }
     for id in runtime.policies.applied_profile_ids() {
         if let Err(err) = runtime.policies.remove_profile(&id) {
             errors.push(format!("routes for '{id}': {err}"));

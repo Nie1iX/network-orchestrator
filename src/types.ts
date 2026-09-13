@@ -145,6 +145,8 @@ export interface Profile {
   autoConnect: boolean;
   domainPolicies: DomainPolicy[];
   xraySocksPort: number | null;
+  useSystemProxy: boolean;
+  proxyBypass: string[];
 }
 
 export type TunnelState = "stopped" | "running" | "failed";
@@ -218,7 +220,8 @@ export type RecoveryIssueKind =
   | "ownedRoutes"
   | "missingOwnedRoutes"
   | "orphanRouteOwnership"
-  | "statusCheckFailed";
+  | "statusCheckFailed"
+  | "proxyOwnership";
 
 export interface RecoveryIssue {
   kind: RecoveryIssueKind;
