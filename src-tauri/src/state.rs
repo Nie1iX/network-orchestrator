@@ -37,7 +37,7 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
         shutting_down: AtomicBool::new(false),
         cleanup_complete: AtomicBool::new(false),
         runtime: tokio::sync::Mutex::new(RuntimeState {
-            tunnels: TunnelManager::new(),
+            tunnels: TunnelManager::with_log_dir(data_dir.join("logs")),
             policies,
         }),
     })

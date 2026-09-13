@@ -147,6 +147,14 @@ pub(crate) fn diag_input(p: &Profile) -> DiagnosticsInput {
         interfaces: Ok(vec![iface("if0", "if0", InterfaceState::Up)]),
         os_routes: Ok(vec![]),
         owned_routes: None,
+        protocol_health: ProtocolHealth {
+            state: ProtocolHealthState::Unknown,
+            summary: "not checked".into(),
+            last_handshake_unix: None,
+            rx_bytes: None,
+            tx_bytes: None,
+            log_tail: None,
+        },
     }
 }
 

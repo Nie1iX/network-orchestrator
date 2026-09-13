@@ -1,4 +1,6 @@
-use crate::models::{Profile, TunnelBackend, TunnelState, TunnelStatus};
+use crate::models::{
+    Profile, ProtocolHealth, ProtocolHealthState, TunnelBackend, TunnelState, TunnelStatus,
+};
 use crate::windows_job::ChildJob;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -309,14 +311,14 @@ fn run_xray_validation(exe: &Path, config: &[u8]) -> io::Result<()> {
     Err(io::Error::other(message))
 }
 
-fn spawn_xray(exe: &Path, config: &[u8]) -> io::Result<Child> {
+fn spawn_xray(exe: &Path, config: &[u8], stdout: Stdio, stderr: Stdio) -> io::Result<Child> {
     let spec = xray_command_spec(exe, false);
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(stdout)
+        .stderr(stderr);
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     let mut child = command.spawn()?;
@@ -365,10 +367,219 @@ fn run_service_command(spec: &CommandSpec) -> io::Result<()> {
     Err(io::Error::other(message))
 }
 
+const LOG_TAIL_BYTES: usize = 16 * 1024;
+const SENSITIVE_KEYS: &[&str] = &["privatekey", "password", "token", "authorization"];
+
+fn starts_with_ascii_ci(bytes: &[u8], i: usize, pattern: &str) -> bool {
+    let pat = pattern.as_bytes();
+    i + pat.len() <= bytes.len()
+        && bytes[i..i + pat.len()]
+            .iter()
+            .zip(pat)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+pub fn redact_runtime_log(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        if starts_with_ascii_ci(bytes, i, "vless://") {
+            let mut j = i + "vless://".len();
+            while j < n && !bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            out.push_str("[redacted]");
+            i = j;
+            continue;
+        }
+        let mut redacted = false;
+        for key in SENSITIVE_KEYS {
+            if starts_with_ascii_ci(bytes, i, key)
+                && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            {
+                let mut j = i + key.len();
+                while j < n && matches!(bytes[j], b' ' | b'\t') {
+                    j += 1;
+                }
+                if j < n && matches!(bytes[j], b'=' | b':') {
+                    j += 1;
+                    while j < n && matches!(bytes[j], b' ' | b'\t') {
+                        j += 1;
+                    }
+                    let mut k = j;
+                    while k < n && bytes[k] != b'\n' && bytes[k] != b'\r' {
+                        k += 1;
+                    }
+                    out.push_str(&text[i..j]);
+                    out.push_str("[redacted]");
+                    i = k;
+                    redacted = true;
+                    break;
+                }
+            }
+        }
+        if redacted {
+            continue;
+        }
+        if is_uuid_at(bytes, i)
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && (i + 36 >= n || !bytes[i + 36].is_ascii_alphanumeric())
+        {
+            out.push_str("[redacted]");
+            i += 36;
+            continue;
+        }
+        let len = utf8_len(bytes[i]);
+        out.push_str(&text[i..i + len]);
+        i += len;
+    }
+    out
+}
+
+fn utf8_len(lead: u8) -> usize {
+    if lead < 0x80 {
+        1
+    } else if lead < 0xE0 {
+        2
+    } else if lead < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
+fn is_uuid_at(bytes: &[u8], i: usize) -> bool {
+    if i + 36 > bytes.len() {
+        return false;
+    }
+    for (offset, b) in bytes[i..i + 36].iter().enumerate() {
+        let expected_dash = matches!(offset, 8 | 13 | 18 | 23);
+        if expected_dash {
+            if *b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn health(state: ProtocolHealthState, summary: impl Into<String>) -> ProtocolHealth {
+    ProtocolHealth {
+        state,
+        summary: summary.into(),
+        last_handshake_unix: None,
+        rx_bytes: None,
+        tx_bytes: None,
+        log_tail: None,
+    }
+}
+
+fn openvpn_health(status: &TunnelStatus, log: Option<String>) -> ProtocolHealth {
+    let tail = log.filter(|t| !t.trim().is_empty());
+    let state = match status.state {
+        TunnelState::Stopped => return health(ProtocolHealthState::Unknown, "not running"),
+        TunnelState::Failed => ProtocolHealthState::Failed,
+        TunnelState::Running => match &tail {
+            Some(t) if t.contains("AUTH_FAILED") => ProtocolHealthState::Failed,
+            Some(t) if t.contains("Initialization Sequence Completed") => {
+                ProtocolHealthState::Healthy
+            }
+            _ => ProtocolHealthState::Degraded,
+        },
+    };
+    let summary = match state {
+        ProtocolHealthState::Failed => status
+            .message
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "authentication or startup failure (see runtime log)".into()),
+        ProtocolHealthState::Healthy => "initialization sequence completed".into(),
+        ProtocolHealthState::Degraded => "process running; connection not confirmed".into(),
+        ProtocolHealthState::Unknown => "not running".into(),
+    };
+    ProtocolHealth {
+        state,
+        summary,
+        log_tail: tail,
+        ..health(state, "")
+    }
+}
+
+fn xray_health(status: &TunnelStatus, log: Option<String>) -> ProtocolHealth {
+    let tail = log.filter(|t| !t.trim().is_empty());
+    let (state, summary) = match status.state {
+        TunnelState::Stopped => return health(ProtocolHealthState::Unknown, "not running"),
+        TunnelState::Failed => (
+            ProtocolHealthState::Failed,
+            status
+                .message
+                .clone()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "xray process failed".into()),
+        ),
+        TunnelState::Running => (
+            ProtocolHealthState::Degraded,
+            "process running; outbound connectivity is not handshake-verified".to_string(),
+        ),
+    };
+    ProtocolHealth {
+        state,
+        summary,
+        log_tail: tail,
+        ..health(state, "")
+    }
+}
+
+fn parse_wg_dump(dump: &str) -> (u64, u64, u64) {
+    let mut max_handshake = 0u64;
+    let mut rx = 0u64;
+    let mut tx = 0u64;
+    for line in dump.lines().skip(1) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        if let Ok(handshake) = fields[4].trim().parse::<u64>() {
+            max_handshake = max_handshake.max(handshake);
+        }
+        rx = rx.saturating_add(fields[5].trim().parse::<u64>().unwrap_or(0));
+        tx = tx.saturating_add(fields[6].trim().parse::<u64>().unwrap_or(0));
+    }
+    (max_handshake, rx, tx)
+}
+
+fn wireguard_health_from_dump(dump: &str) -> ProtocolHealth {
+    let (handshake, rx, tx) = parse_wg_dump(dump);
+    let (state, summary) = if handshake > 0 {
+        (
+            ProtocolHealthState::Healthy,
+            format!("latest handshake at unix {handshake}"),
+        )
+    } else {
+        (
+            ProtocolHealthState::Degraded,
+            "no WireGuard handshake recorded yet".to_string(),
+        )
+    };
+    ProtocolHealth {
+        state,
+        summary,
+        last_handshake_unix: (handshake > 0).then_some(handshake),
+        rx_bytes: Some(rx),
+        tx_bytes: Some(tx),
+        log_tail: None,
+    }
+}
+
 pub struct TunnelManager {
     wireguard_exe: Option<PathBuf>,
     openvpn_exe: Option<PathBuf>,
     xray_exe: Option<PathBuf>,
+    log_dir: Option<PathBuf>,
     wireguard_services: HashSet<String>,
     openvpn_children: HashMap<String, Child>,
     xray_children: HashMap<String, Child>,
@@ -379,6 +590,12 @@ pub struct TunnelManager {
 impl TunnelManager {
     pub fn new() -> Self {
         Self::with_all_executables(None, None, None)
+    }
+
+    pub fn with_log_dir(log_dir: PathBuf) -> Self {
+        let mut manager = Self::with_all_executables(None, None, None);
+        manager.log_dir = Some(log_dir);
+        manager
     }
 
     pub fn with_executables(wireguard: Option<PathBuf>, openvpn: Option<PathBuf>) -> Self {
@@ -394,11 +611,178 @@ impl TunnelManager {
             wireguard_exe: wireguard,
             openvpn_exe: openvpn,
             xray_exe: xray,
+            log_dir: None,
             wireguard_services: HashSet::new(),
             openvpn_children: HashMap::new(),
             xray_children: HashMap::new(),
             failures: HashMap::new(),
             child_job: None,
+        }
+    }
+
+    fn child_log_stdio(&self, profile_id: &str, tag: &str) -> io::Result<(Stdio, Stdio)> {
+        let Some(dir) = &self.log_dir else {
+            return Ok((Stdio::null(), Stdio::null()));
+        };
+        std::fs::create_dir_all(dir)?;
+        crate::config_security::protect_path(dir)?;
+        let path = dir.join(format!(
+            "{}-{tag}.log",
+            crate::config_vault::sanitize_profile_id(profile_id)?
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)?;
+        crate::config_security::protect_path(&path)?;
+        let err = file.try_clone()?;
+        Ok((Stdio::from(file), Stdio::from(err)))
+    }
+
+    fn log_tail_for_tag(
+        &self,
+        profile_id: &str,
+        tag: &str,
+        max_bytes: usize,
+    ) -> io::Result<Option<String>> {
+        if max_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_bytes must be nonzero",
+            ));
+        }
+        let Some(dir) = &self.log_dir else {
+            return Ok(None);
+        };
+        let safe = crate::config_vault::sanitize_profile_id(profile_id)?;
+        let path = dir.join(format!("{safe}-{tag}.log"));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path)?;
+        let mut slice = &bytes[bytes.len().saturating_sub(max_bytes)..];
+        while !slice.is_empty() && (slice[0] & 0b1100_0000) == 0b1000_0000 {
+            slice = &slice[1..];
+        }
+        let text = String::from_utf8_lossy(slice);
+        if text.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(redact_runtime_log(&text)))
+        }
+    }
+
+    pub fn log_tail(&self, profile_id: &str, max_bytes: usize) -> io::Result<Option<String>> {
+        let mut combined = String::new();
+        for tag in ["openvpn", "xray"] {
+            if let Some(tail) = self.log_tail_for_tag(profile_id, tag, max_bytes)? {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&tail);
+            }
+        }
+        if combined.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(combined))
+        }
+    }
+
+    pub fn protocol_health(&mut self, profile: &Profile) -> ProtocolHealth {
+        let status = self.status(profile);
+        match profile.backend {
+            TunnelBackend::OpenVpn => {
+                let log = self
+                    .log_tail_for_tag(&profile.id, "openvpn", LOG_TAIL_BYTES)
+                    .ok()
+                    .flatten();
+                openvpn_health(&status, log)
+            }
+            TunnelBackend::Xray => {
+                let log = self
+                    .log_tail_for_tag(&profile.id, "xray", LOG_TAIL_BYTES)
+                    .ok()
+                    .flatten();
+                xray_health(&status, log)
+            }
+            TunnelBackend::WireGuard => match status.state {
+                TunnelState::Stopped => health(ProtocolHealthState::Unknown, "not running"),
+                TunnelState::Failed => ProtocolHealth {
+                    state: ProtocolHealthState::Failed,
+                    summary: status
+                        .message
+                        .unwrap_or_else(|| "wireguard service check failed".into()),
+                    ..health(ProtocolHealthState::Failed, "")
+                },
+                TunnelState::Running => match self.wg_dump(profile) {
+                    Ok(dump) => wireguard_health_from_dump(&dump),
+                    Err(err) => health(
+                        ProtocolHealthState::Degraded,
+                        format!("WireGuard statistics unavailable: {err}"),
+                    ),
+                },
+            },
+        }
+    }
+
+    fn wg_dump(&self, profile: &Profile) -> io::Result<String> {
+        let exe = self.wg_query_exe()?;
+        let name = wireguard_tunnel_name(&profile.config_path)?;
+        let output = Command::new(&exe)
+            .args([
+                OsString::from("show"),
+                OsString::from(&name),
+                OsString::from("dump"),
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "wg show failed with {}",
+                output.status
+            )));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|_| invalid_data("wg dump output was not valid UTF-8"))
+    }
+
+    fn wg_query_exe(&self) -> io::Result<PathBuf> {
+        #[cfg(windows)]
+        {
+            if let Ok(service_exe) = resolve_wireguard_executable(self.wireguard_exe.as_deref()) {
+                if let Some(dir) = service_exe.parent() {
+                    let sibling = dir.join("wg.exe");
+                    if sibling.is_file() {
+                        return Ok(sibling);
+                    }
+                }
+            }
+            if let Some(root) = env::var_os("ProgramFiles") {
+                let candidate = PathBuf::from(root).join("WireGuard").join("wg.exe");
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+            if let Some(path_var) = env::var_os("PATH") {
+                for dir in env::split_paths(&path_var) {
+                    let candidate = dir.join("wg.exe");
+                    if candidate.is_file() {
+                        return Ok(candidate);
+                    }
+                }
+            }
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "wg.exe not found next to wireguard.exe, in Program Files, or on PATH",
+            ))
+        }
+        #[cfg(not(windows))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "WireGuard statistics query is only supported on Windows",
+            ))
         }
     }
 
@@ -471,12 +855,13 @@ impl TunnelManager {
             TunnelBackend::OpenVpn => {
                 let exe = resolve_openvpn_executable(self.openvpn_exe.as_deref())?;
                 let spec = openvpn_connect_spec(&exe, profile)?;
+                let (out, err) = self.child_log_stdio(&profile.id, "openvpn")?;
                 let mut command = Command::new(&spec.program);
                 command
                     .args(&spec.args)
                     .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
+                    .stdout(out)
+                    .stderr(err);
                 #[cfg(windows)]
                 command.creation_flags(CREATE_NO_WINDOW);
                 let mut child = command.spawn()?;
@@ -493,7 +878,8 @@ impl TunnelManager {
                 let exe = resolve_xray_executable(self.xray_exe.as_deref())?;
                 let config = prepare_xray_config(profile)?;
                 run_xray_validation(&exe, &config)?;
-                let mut child = spawn_xray(&exe, &config)?;
+                let (out, err) = self.child_log_stdio(&profile.id, "xray")?;
+                let mut child = spawn_xray(&exe, &config, out, err)?;
                 if let Err(err) = self.ensure_child_job().and_then(|job| job.assign(&child)) {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1074,6 +1460,243 @@ mod tests {
         let err = manager.connect(&profile).unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn redact_runtime_log_strips_all_secret_classes() {
+        let text = concat!(
+            "connecting vless://550e8400-e29b-41d4-a716-446655440000@host:443?sni=x ok\n",
+            "password=hunter2 end\n",
+            "PASSWORD: hunter3\n",
+            "PrivateKey = PRIVVAL-1\n",
+            "Authorization: Bearer SECRET-TOKEN-9\n",
+            "plain uuid 123e4567-e89b-12d3-a456-426614174000 tail\n",
+            "useful line kept\n",
+        );
+        let out = redact_runtime_log(text);
+        for sentinel in [
+            "550e8400-e29b-41d4-a716-446655440000",
+            "hunter2",
+            "hunter3",
+            "PRIVVAL-1",
+            "SECRET-TOKEN-9",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "vless://",
+        ] {
+            assert!(!out.contains(sentinel), "leaked {sentinel}: {out}");
+        }
+        assert!(out.contains("[redacted]"));
+        assert!(out.contains("useful line kept"));
+        assert!(out.contains("password=[redacted]"));
+    }
+
+    #[test]
+    fn redact_runtime_log_preserves_unicode_and_still_redacts() {
+        let text = concat!(
+            "Привет ✓ İ юникод ✓ password=секрет-ЗНАЧ\n",
+            "vless://550e8400-e29b-41d4-a716-446655440000@хост:443\n",
+            "uuid 123e4567-e89b-12d3-a456-426614174000 ✓\n",
+        );
+        let out = redact_runtime_log(text);
+        for sentinel in [
+            "секрет-ЗНАЧ",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "vless://",
+        ] {
+            assert!(!out.contains(sentinel), "leaked {sentinel}: {out}");
+        }
+        assert!(out.contains("Привет ✓ İ юникод ✓"));
+        assert!(out.contains("✓\n"));
+    }
+
+    #[test]
+    fn child_log_stdio_creates_protected_log_file() {
+        let dir = unique_dir("logs");
+        let manager = TunnelManager::with_log_dir(dir.join("logs"));
+        let (out, err) = manager.child_log_stdio("p1", "openvpn").unwrap();
+        drop((out, err));
+        let path = dir.join("logs").join("p1-openvpn.log");
+        assert!(path.is_file());
+        #[cfg(windows)]
+        {
+            let protection = crate::config_security::inspect_path_protection(&path).unwrap();
+            assert!(protection.protected_dacl && protection.current_user);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn log_tail_returns_redacted_tail() {
+        let dir = unique_dir("tail");
+        let logs = dir.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("p1-openvpn.log"),
+            "line1\npassword=sentinel-x\nline3",
+        )
+        .unwrap();
+        let manager = TunnelManager::with_log_dir(logs);
+
+        let tail = manager.log_tail("p1", 1024).unwrap().unwrap();
+        assert!(!tail.contains("sentinel-x"));
+        assert!(tail.contains("line3"));
+
+        let short = manager.log_tail("p1", 5).unwrap().unwrap();
+        assert!(!short.contains("line1"));
+
+        assert!(manager.log_tail("p1", 0).is_err());
+        assert!(manager.log_tail("nobody", 100).unwrap().is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn openvpn_health_maps_status_and_log_markers() {
+        let running = status_for("p", TunnelState::Running, None);
+        assert_eq!(
+            openvpn_health(
+                &running,
+                Some("note\nInitialization Sequence Completed".into())
+            )
+            .state,
+            ProtocolHealthState::Healthy
+        );
+        assert_eq!(
+            openvpn_health(
+                &running,
+                Some("Initialization Sequence Completed\nAUTH_FAILED".into())
+            )
+            .state,
+            ProtocolHealthState::Failed
+        );
+        assert_eq!(
+            openvpn_health(&running, Some("connecting...".into())).state,
+            ProtocolHealthState::Degraded
+        );
+        assert_eq!(
+            openvpn_health(&running, None).state,
+            ProtocolHealthState::Degraded
+        );
+        let failed = status_for("p", TunnelState::Failed, Some("exited".into()));
+        assert_eq!(
+            openvpn_health(&failed, Some("tail".into())).state,
+            ProtocolHealthState::Failed
+        );
+        let stopped = status_for("p", TunnelState::Stopped, None);
+        assert_eq!(
+            openvpn_health(&stopped, None).state,
+            ProtocolHealthState::Unknown
+        );
+    }
+
+    #[test]
+    fn xray_health_uses_not_handshake_verified_wording() {
+        let running = status_for("p", TunnelState::Running, None);
+        let health = xray_health(&running, Some("tail".into()));
+        assert_eq!(health.state, ProtocolHealthState::Degraded);
+        assert_eq!(
+            health.summary,
+            "process running; outbound connectivity is not handshake-verified"
+        );
+        assert_eq!(health.log_tail.as_deref(), Some("tail"));
+        assert_eq!(
+            xray_health(&status_for("p", TunnelState::Stopped, None), None).state,
+            ProtocolHealthState::Unknown
+        );
+        let failed = status_for("p", TunnelState::Failed, Some("xray exited".into()));
+        let health = xray_health(&failed, Some("tail".into()));
+        assert_eq!(health.state, ProtocolHealthState::Failed);
+        assert!(health.summary.contains("xray exited"));
+    }
+
+    #[test]
+    fn parse_wg_dump_sums_peers_without_echoing_keys() {
+        let dump = concat!(
+            "IFACEKEY\tPUB\t9000\t0\n",
+            "PEERKEY-ONE\tpsk\t(none)\t10.0.0.0/24\t1700000000\t100\t200\toff\n",
+            "PEERKEY-TWO\tpsk\t10.1.2.3:51820\t10.1.0.0/24\t1700000100\t300\t400\toff\n",
+        );
+        let (handshake, rx, tx) = parse_wg_dump(dump);
+        assert_eq!(handshake, 1700000100);
+        assert_eq!(rx, 400);
+        assert_eq!(tx, 600);
+
+        let health = wireguard_health_from_dump(dump);
+        assert_eq!(health.state, ProtocolHealthState::Healthy);
+        assert_eq!(health.last_handshake_unix, Some(1700000100));
+        assert_eq!(health.rx_bytes, Some(400));
+        assert!(!health.summary.contains("PEERKEY"));
+        assert!(!health.summary.contains("10.1.2.3"));
+
+        let zero = "IFACE\tPUB\t0\t0\nPEER\tpsk\t(none)\tip\t0\t0\t0\toff\n";
+        assert_eq!(
+            wireguard_health_from_dump(zero).state,
+            ProtocolHealthState::Degraded
+        );
+        assert_eq!(
+            wireguard_health_from_dump("garbage\n\n").state,
+            ProtocolHealthState::Degraded
+        );
+    }
+
+    #[test]
+    fn log_tail_for_tag_reads_only_matching_backend_log() {
+        let dir = unique_dir("tag-logs");
+        let logs = dir.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("p-openvpn.log"), "AUTH_FAILED: bad creds\n").unwrap();
+        fs::write(logs.join("p-xray.log"), "xray started\n").unwrap();
+        let manager = TunnelManager::with_log_dir(logs);
+
+        let xray_tail = manager
+            .log_tail_for_tag("p", "xray", 1024)
+            .unwrap()
+            .unwrap();
+        assert!(!xray_tail.contains("AUTH_FAILED"), "{xray_tail}");
+        let openvpn_tail = manager
+            .log_tail_for_tag("p", "openvpn", 1024)
+            .unwrap()
+            .unwrap();
+        assert!(openvpn_tail.contains("AUTH_FAILED"));
+        let combined = manager.log_tail("p", 4096).unwrap().unwrap();
+        assert!(combined.contains("AUTH_FAILED"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protocol_health_uses_backend_specific_log() {
+        let dir = unique_dir("health-logs");
+        let logs = dir.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("p-openvpn.log"), "AUTH_FAILED\n").unwrap();
+        fs::write(logs.join("p-xray.log"), "xray started\n").unwrap();
+        let mut manager = TunnelManager::with_log_dir(logs);
+
+        let mut xray = xray_profile();
+        xray.id = "p".into();
+        let child = Command::new("cmd")
+            .args(["/C", "ping", "-n", "30", "127.0.0.1", ">NUL"])
+            .spawn()
+            .unwrap();
+        manager.xray_children.insert("p".into(), child);
+        let health = manager.protocol_health(&xray);
+        assert_ne!(health.state, ProtocolHealthState::Failed);
+        let tail = health.log_tail.unwrap_or_default();
+        assert!(!tail.contains("AUTH_FAILED"), "{tail}");
+
+        let mut ovpn = ovpn_profile();
+        ovpn.id = "p".into();
+        let child = Command::new("cmd")
+            .args(["/C", "ping", "-n", "30", "127.0.0.1", ">NUL"])
+            .spawn()
+            .unwrap();
+        manager.openvpn_children.insert("p".into(), child);
+        let health = manager.protocol_health(&ovpn);
+        assert_eq!(health.state, ProtocolHealthState::Failed);
+        assert!(health.log_tail.unwrap().contains("AUTH_FAILED"));
+
         fs::remove_dir_all(&dir).unwrap();
     }
 }

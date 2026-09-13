@@ -468,7 +468,7 @@ fn quote_token(token: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-fn sanitize_profile_id(id: &str) -> io::Result<String> {
+pub(crate) fn sanitize_profile_id(id: &str) -> io::Result<String> {
     let safe: String = id
         .chars()
         .map(|c| {

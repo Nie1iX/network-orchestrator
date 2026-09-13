@@ -17,6 +17,7 @@ pub(crate) struct DiagnosticsInput {
     pub(crate) interfaces: Result<Vec<NetworkInterface>, String>,
     pub(crate) os_routes: Result<Vec<RouteEntry>, String>,
     pub(crate) owned_routes: Option<Vec<AppliedRoute>>,
+    pub(crate) protocol_health: ProtocolHealth,
 }
 
 fn diag_check(name: &str, level: DiagnosticLevel, message: String) -> DiagnosticCheck {
@@ -113,6 +114,32 @@ fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
             ),
         ),
     });
+
+    let health = &input.protocol_health;
+    checks.push(diag_check(
+        "Protocol health",
+        match health.state {
+            ProtocolHealthState::Healthy => DiagnosticLevel::Healthy,
+            ProtocolHealthState::Degraded => DiagnosticLevel::Warning,
+            ProtocolHealthState::Failed => DiagnosticLevel::Error,
+            ProtocolHealthState::Unknown => DiagnosticLevel::Warning,
+        },
+        health.summary.clone(),
+    ));
+    if let Some(tail) = health.log_tail.as_ref().filter(|t| !t.trim().is_empty()) {
+        checks.push(diag_check(
+            "Runtime log",
+            if matches!(
+                health.state,
+                ProtocolHealthState::Failed | ProtocolHealthState::Degraded
+            ) {
+                DiagnosticLevel::Warning
+            } else {
+                DiagnosticLevel::Healthy
+            },
+            tail.clone(),
+        ));
+    }
 
     match &input.inspection {
         None => checks.push(diag_check(
@@ -356,6 +383,7 @@ pub(crate) async fn diagnose_profile(
     let executable = resolve_backend_executable(&profile);
     let mut runtime = state.runtime.lock().await;
     let status = runtime.tunnels.status(&profile);
+    let protocol_health = runtime.tunnels.protocol_health(&profile);
     let owned_routes = if runtime.policies.has_applied_profile(&id) {
         Some(runtime.policies.applied_for(&id).to_vec())
     } else {
@@ -375,6 +403,7 @@ pub(crate) async fn diagnose_profile(
         interfaces,
         os_routes,
         owned_routes,
+        protocol_health,
     });
     Ok(ProfileDiagnostics {
         profile_id: profile.id,
@@ -507,6 +536,42 @@ mod tests {
         assert_eq!(applied.level, DiagnosticLevel::Healthy);
         assert_eq!(applied.message, "No app-managed routes");
         assert!(checks.iter().all(|c| c.name != "Target interface"));
+    }
+
+    #[test]
+    fn diagnostics_maps_protocol_health_and_runtime_log() {
+        let p = profile("xray-p1");
+        let mut input = diag_input(&p);
+        input.protocol_health = ProtocolHealth {
+            state: ProtocolHealthState::Degraded,
+            summary: "process running; connection not confirmed".into(),
+            last_handshake_unix: None,
+            rx_bytes: None,
+            tx_bytes: None,
+            log_tail: Some("redacted tail".into()),
+        };
+        let checks = build_diagnostics(&input);
+        let health = check_named(&checks, "Protocol health");
+        assert_eq!(health.level, DiagnosticLevel::Warning);
+        assert_eq!(health.message, "process running; connection not confirmed");
+        let log = check_named(&checks, "Runtime log");
+        assert_eq!(log.level, DiagnosticLevel::Warning);
+        assert_eq!(log.message, "redacted tail");
+
+        input.protocol_health = ProtocolHealth {
+            state: ProtocolHealthState::Healthy,
+            summary: "ok".into(),
+            last_handshake_unix: None,
+            rx_bytes: None,
+            tx_bytes: None,
+            log_tail: None,
+        };
+        let checks = build_diagnostics(&input);
+        assert_eq!(
+            check_named(&checks, "Protocol health").level,
+            DiagnosticLevel::Healthy
+        );
+        assert!(checks.iter().all(|c| c.name != "Runtime log"));
     }
 
     #[test]
