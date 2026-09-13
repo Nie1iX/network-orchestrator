@@ -230,3 +230,32 @@ export interface RecoveryReport {
   issues: RecoveryIssue[];
   requiresElevation: boolean;
 }
+
+export interface PlannedRoute {
+  destination: string;
+  ownerProfileId: string;
+  ownerName: string;
+  source: string;
+  interfaceName: string | null;
+  metric: number | null;
+  active: boolean;
+}
+
+export type RoutePlanDiffKind =
+  | "missing"
+  | "interfaceMismatch"
+  | "exactCompetition";
+
+export interface RoutePlanDiff {
+  kind: RoutePlanDiffKind;
+  destination: string;
+  message: string;
+  profileIds: string[];
+}
+
+export interface RouteMap {
+  predicted: PlannedRoute[];
+  effective: RouteEntry[];
+  diffs: RoutePlanDiff[];
+  warnings: string[];
+}

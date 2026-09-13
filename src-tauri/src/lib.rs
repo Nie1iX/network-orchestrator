@@ -41,7 +41,8 @@ pub fn run() {
             get_recovery_report,
             cleanup_recovery,
             is_elevated,
-            restart_elevated
+            restart_elevated,
+            get_route_map
         ])
         .on_window_event(lifecycle::handle_window_event)
         .build(tauri::generate_context!())

@@ -24,6 +24,7 @@ pub fn analyze_profile(profile: &Profile) -> io::Result<ConfigAnalysis> {
     };
     for route in &profile.routes {
         analysis.os_routes.push(AnalyzedRoute {
+            metric: Some(route.metric),
             destination: route.destination,
             source: "profile policy".to_string(),
         });
@@ -277,6 +278,7 @@ fn analyze_wireguard(path: &Path, analysis: &mut ConfigAnalysis) -> io::Result<(
                     }
                     match part.parse::<IpNet>() {
                         Ok(destination) => allowed.push(AnalyzedRoute {
+                            metric: None,
                             destination,
                             source: "WireGuard AllowedIPs".to_string(),
                         }),
@@ -348,6 +350,7 @@ fn analyze_openvpn(path: &Path, analysis: &mut ConfigAnalysis) -> io::Result<()>
         match directive.as_str() {
             "route" => match parse_openvpn_route(&tokens) {
                 Some(destination) => analysis.os_routes.push(AnalyzedRoute {
+                    metric: None,
                     destination,
                     source: "OpenVPN route".to_string(),
                 }),
@@ -357,6 +360,7 @@ fn analyze_openvpn(path: &Path, analysis: &mut ConfigAnalysis) -> io::Result<()>
             },
             "route-ipv6" => match tokens.get(1).and_then(|t| t.parse::<IpNet>().ok()) {
                 Some(destination @ IpNet::V6(_)) => analysis.os_routes.push(AnalyzedRoute {
+                    metric: None,
                     destination,
                     source: "OpenVPN route".to_string(),
                 }),
@@ -365,10 +369,12 @@ fn analyze_openvpn(path: &Path, analysis: &mut ConfigAnalysis) -> io::Result<()>
                     .push(format!("line {line_no}: invalid route-ipv6 directive")),
             },
             "redirect-gateway" => analysis.os_routes.push(AnalyzedRoute {
+                metric: None,
                 destination: IpNet::V4(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).unwrap()),
                 source: "OpenVPN route".to_string(),
             }),
             "redirect-gateway-ipv6" => analysis.os_routes.push(AnalyzedRoute {
+                metric: None,
                 destination: net6_any(),
                 source: "OpenVPN route".to_string(),
             }),
@@ -451,6 +457,7 @@ fn analyze_xray(profile: &Profile, analysis: &mut ConfigAnalysis) -> io::Result<
                 for entry in ips {
                     match entry.as_str().and_then(parse_xray_ip) {
                         Some(destination) => analysis.internal_routes.push(AnalyzedRoute {
+                            metric: None,
                             destination,
                             source: "Xray routing rule".to_string(),
                         }),
@@ -621,6 +628,7 @@ mod tests {
     fn analysis_with_route(id: &str, dest: &str, source: &str) -> ConfigAnalysis {
         let mut a = empty_analysis(id);
         a.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: net(dest),
             source: source.into(),
         });
@@ -972,6 +980,7 @@ mod tests {
     fn conflicts_detect_route_overlap_and_listener_collision() {
         let mut candidate = empty_analysis("new");
         candidate.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: net("10.0.0.0/24"),
             source: "test".into(),
         });
@@ -982,6 +991,7 @@ mod tests {
         });
         let mut other = empty_analysis("existing");
         other.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: net("10.0.0.0/24"),
             source: "test".into(),
         });
@@ -1010,6 +1020,7 @@ mod tests {
             protocol: "socks".into(),
         });
         distinct.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: net("172.16.0.0/16"),
             source: "t".into(),
         });
@@ -1122,11 +1133,13 @@ mod tests {
     fn xray_internal_route_alone_is_not_blocking_conflict() {
         let mut candidate = empty_analysis("new");
         candidate.internal_routes.push(AnalyzedRoute {
+            metric: None,
             destination: net("10.0.0.0/8"),
             source: "Xray routing rule".into(),
         });
         let mut other = empty_analysis("existing");
         other.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: net("10.0.0.0/8"),
             source: "WireGuard AllowedIPs".into(),
         });
@@ -1139,6 +1152,7 @@ mod tests {
 
         let mut overlapping = empty_analysis("c1");
         overlapping.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: net("10.1.0.0/16"),
             source: "test".into(),
         });
@@ -1150,6 +1164,7 @@ mod tests {
 
         let mut only_default = empty_analysis("c2");
         only_default.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: net("192.168.0.0/24"),
             source: "test".into(),
         });
@@ -1157,6 +1172,7 @@ mod tests {
 
         let mut candidate_default = empty_analysis("c3");
         candidate_default.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: net("0.0.0.0/0"),
             source: "test".into(),
         });

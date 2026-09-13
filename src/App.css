@@ -1216,3 +1216,97 @@ button:disabled {
   background-color: var(--accent-dim);
   border-color: var(--accent-border);
 }
+
+/* ── Route map ───────────────────────────────────────────────────────── */
+
+.route-map-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+
+.route-map-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.route-map-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.route-map-table th,
+.route-map-table td {
+  text-align: left;
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.route-map-table th {
+  font-weight: 600;
+  color: var(--text-secondary);
+  background-color: var(--bg-card);
+}
+
+.route-map-table tbody tr.inactive {
+  color: var(--text-muted, var(--text-secondary));
+}
+
+.route-map-indent {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+.owner-badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: var(--r-md);
+  background-color: var(--bg-card);
+  border: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+
+.route-map-ok {
+  color: var(--up, #4caf50);
+}
+
+.route-map-warnings,
+.route-map-diffs {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--sp-3);
+}
+
+.route-map-warnings li.warning,
+.route-map-diffs li.route-diff {
+  padding: var(--sp-2) var(--sp-3);
+  margin-bottom: var(--sp-2);
+  border-radius: var(--r-md);
+  border: 1px solid var(--warn-border, #6b5b1e);
+  background-color: var(--warn-bg, rgba(255, 193, 7, 0.08));
+  color: var(--warn, #e6b800);
+}
+
+.route-map-diffs li.diff-exactCompetition,
+.route-map-diffs li.diff-interfaceMismatch {
+  border-color: #5a2a2a;
+  background-color: var(--down-bg);
+  color: var(--down);
+}
+
+@media (max-width: 640px) {
+  .route-map-table {
+    font-size: 0.78rem;
+  }
+  .route-map-table th,
+  .route-map-table td {
+    padding: 0.35rem 0.5rem;
+  }
+}

@@ -308,6 +308,7 @@ mod tests {
         let candidate = ConfigAnalysis {
             profile_id: "a".into(),
             os_routes: vec![AnalyzedRoute {
+                metric: None,
                 destination: "10.0.0.0/8".parse().unwrap(),
                 source: "test".into(),
             }],
@@ -361,6 +362,7 @@ mod tests {
 
         let mut complete_with_route = blank_analysis("a");
         complete_with_route.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: "10.0.0.0/8".parse().unwrap(),
             source: "test".into(),
         });
@@ -379,6 +381,7 @@ mod tests {
         incomplete_candidate.route_knowledge_complete = false;
         let mut known_other = blank_analysis("b");
         known_other.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: "10.0.0.0/8".parse().unwrap(),
             source: "test".into(),
         });
@@ -390,6 +393,7 @@ mod tests {
         let mut both_incomplete_other = blank_analysis("b");
         both_incomplete_other.route_knowledge_complete = false;
         both_incomplete_other.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: "10.0.0.0/8".parse().unwrap(),
             source: "test".into(),
         });
@@ -414,6 +418,7 @@ mod tests {
 
         let mut known_other = blank_analysis("b");
         known_other.os_routes.push(AnalyzedRoute {
+            metric: None,
             destination: "10.0.0.0/8".parse().unwrap(),
             source: "test".into(),
         });

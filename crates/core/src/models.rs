@@ -72,7 +72,7 @@ pub enum AddressFamily {
     Ipv6,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteEntry {
     pub destination: IpAddr,
@@ -157,6 +157,45 @@ pub struct TunnelStatus {
 pub struct AnalyzedRoute {
     pub destination: IpNet,
     pub source: String,
+    pub metric: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedRoute {
+    pub destination: IpNet,
+    pub owner_profile_id: String,
+    pub owner_name: String,
+    pub source: String,
+    pub interface_name: Option<String>,
+    pub metric: Option<u32>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RoutePlanDiffKind {
+    Missing,
+    InterfaceMismatch,
+    ExactCompetition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutePlanDiff {
+    pub kind: RoutePlanDiffKind,
+    pub destination: IpNet,
+    pub message: String,
+    pub profile_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteMap {
+    pub predicted: Vec<PlannedRoute>,
+    pub effective: Vec<RouteEntry>,
+    pub diffs: Vec<RoutePlanDiff>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
