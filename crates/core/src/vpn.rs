@@ -1,4 +1,5 @@
 use crate::models::{Profile, TunnelBackend, TunnelState, TunnelStatus};
+use crate::windows_job::ChildJob;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
@@ -372,6 +373,7 @@ pub struct TunnelManager {
     openvpn_children: HashMap<String, Child>,
     xray_children: HashMap<String, Child>,
     failures: HashMap<String, String>,
+    child_job: Option<ChildJob>,
 }
 
 impl TunnelManager {
@@ -396,7 +398,15 @@ impl TunnelManager {
             openvpn_children: HashMap::new(),
             xray_children: HashMap::new(),
             failures: HashMap::new(),
+            child_job: None,
         }
+    }
+
+    fn ensure_child_job(&mut self) -> io::Result<&ChildJob> {
+        if self.child_job.is_none() {
+            self.child_job = Some(ChildJob::new()?);
+        }
+        Ok(self.child_job.as_ref().unwrap())
     }
 
     fn reap_child_if_exited(
@@ -469,7 +479,12 @@ impl TunnelManager {
                     .stderr(Stdio::null());
                 #[cfg(windows)]
                 command.creation_flags(CREATE_NO_WINDOW);
-                let child = command.spawn()?;
+                let mut child = command.spawn()?;
+                if let Err(err) = self.ensure_child_job().and_then(|job| job.assign(&child)) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(err);
+                }
                 self.openvpn_children.insert(profile.id.clone(), child);
                 self.failures.remove(&profile.id);
                 Ok(status_for(&profile.id, TunnelState::Running, None))
@@ -478,7 +493,12 @@ impl TunnelManager {
                 let exe = resolve_xray_executable(self.xray_exe.as_deref())?;
                 let config = prepare_xray_config(profile)?;
                 run_xray_validation(&exe, &config)?;
-                let child = spawn_xray(&exe, &config)?;
+                let mut child = spawn_xray(&exe, &config)?;
+                if let Err(err) = self.ensure_child_job().and_then(|job| job.assign(&child)) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(err);
+                }
                 self.xray_children.insert(profile.id.clone(), child);
                 self.failures.remove(&profile.id);
                 Ok(status_for(&profile.id, TunnelState::Running, None))

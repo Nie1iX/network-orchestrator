@@ -6,4 +6,5 @@ pub mod policy;
 pub mod profiles;
 pub mod route_state;
 pub mod vpn;
+pub mod windows_job;
 pub mod xray;
