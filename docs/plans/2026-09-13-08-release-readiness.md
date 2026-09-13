@@ -51,3 +51,14 @@ npm run tauri build
 ```
 
 Release only when the worktree is clean and all required artifacts/results are recorded.
+
+---
+
+## Implemented notes (stage 8)
+
+- Task 5 done first: `get_backend_availability` resolves `wireguard.exe`/`openvpn.exe`/`xray.exe` (never executes them); `BackendStatus` strip on the Profiles tab shows Available/Missing + path/message + refresh. No download links guessed, no auto-install.
+- Task 1: README rewritten for MVP-0–4 reality; `docs/security.md` (threat model, vault ACL, DPAPI, redaction, unsigned build + `csp: null` gaps); `docs/recovery.md` (Job Object, ownership records, close/crash flows); `analysis.md` got a status section.
+- Task 2: `AGENTS.md` with setup/gates/safety (never run ignored E2E outside a disposable VM).
+- Task 3: `.github/workflows/ci.yml` — windows-latest, pinned actions, rustup 1.98.1 MSVC, fmt/test/check/clippy/npm build/audit.
+- Task 4: `.github/workflows/package-windows.yml` — manual/`v*` tags, full gates + `tauri build --bundles nsis`, unsigned artifact upload only.
+- Pending: Task 6 release-candidate gate (CI run, packaged smoke, real-VM E2E, secret scan, uninstall check) — requires CI/VM infrastructure.

@@ -336,6 +336,15 @@ pub struct RecoveryIssue {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct BackendAvailability {
+    pub backend: TunnelBackend,
+    pub available: bool,
+    pub path: Option<PathBuf>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RecoveryReport {
     pub issues: Vec<RecoveryIssue>,
     pub requires_elevation: bool,

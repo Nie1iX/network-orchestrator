@@ -1328,3 +1328,40 @@ button:disabled {
   gap: var(--sp-2);
   cursor: pointer;
 }
+
+/* ── Backend prerequisites ───────────────────────────────────────────── */
+
+.backend-status {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  margin-bottom: var(--sp-3);
+}
+
+.backend-status-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+
+.backend-status-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  font-size: 0.82rem;
+  flex-wrap: wrap;
+}
+
+.backend-name {
+  min-width: 5.5rem;
+  font-weight: 600;
+}
+
+.backend-detail {
+  color: var(--text-secondary);
+  word-break: break-all;
+}

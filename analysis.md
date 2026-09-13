@@ -105,3 +105,25 @@
 - имеет аудиторию (power users, DevOps, homelab);
 - не упирается в самые тяжёлые технические проблемы (WFP, chaining, process routing, кроссплатформа);
 - Network Explorer полезен как самостоятельный продукт, даже если VPN-часть не взлетит.
+
+## Текущий статус (post-MVP-4)
+
+Все пункты из «Порядок реализации» выше выполнены: Explorer, WG/OpenVPN/Xray
+backends, profiles + IP/CIDR policy routing, Xray domain routing через
+генерацию config. Сверх первоначального плана добавлены:
+
+- **Managed config vault** — версионированные ревизии конфигов с explicit
+  DACL (текущий пользователь + SYSTEM + Administrators); generated Xray
+  configs дополнительно зашифрованы DPAPI и расшифровываются только в памяти.
+- **Crash recovery** — Job Object containment для OpenVPN/Xray, персистентный
+  route/proxy ownership, startup recovery prompt с explicit cleanup.
+- **Diagnostics** — per-backend protocol health, bounded redacted log tails,
+  проверки конфигурации/executable/маршрутов.
+- **Route map** — predicted (статический анализ) vs. effective (OS table)
+  с LPM+metric winner и diff-правилами.
+- **Optional system proxy** — HKCU Internet Settings для generated Xray
+  профилей со snapshot/verify/restore.
+
+Оставшиеся follow-ups: верификация listener/outbound для Xray health,
+OpenVPN management API, real-VM E2E прогон (harness готов, fixtures нет),
+подпись артефактов и CSP hardening (сейчас `csp: null`).

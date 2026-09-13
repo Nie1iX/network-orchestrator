@@ -262,3 +262,10 @@ export interface RouteMap {
   diffs: RoutePlanDiff[];
   warnings: string[];
 }
+
+export interface BackendAvailability {
+  backend: TunnelBackend;
+  available: boolean;
+  path: string | null;
+  message: string;
+}

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ensureElevation } from "../elevation";
+import BackendStatus from "./BackendStatus";
 import {
   DomainPolicy,
   DomainRouteTarget,
@@ -414,6 +415,7 @@ export default function ProfileManager() {
 
   return (
     <section>
+      <BackendStatus />
       <div className="profiles-toolbar">
         <h2>VPN Profiles</h2>
         <span className="profiles-note">
