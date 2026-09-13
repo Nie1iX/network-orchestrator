@@ -72,7 +72,7 @@ pub enum AddressFamily {
     Ipv6,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteEntry {
     pub destination: IpAddr,
@@ -134,6 +134,10 @@ pub struct Profile {
     pub domain_policies: Vec<DomainPolicy>,
     #[serde(default)]
     pub xray_socks_port: Option<u16>,
+    #[serde(default)]
+    pub use_system_proxy: bool,
+    #[serde(default)]
+    pub proxy_bypass: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +161,45 @@ pub struct TunnelStatus {
 pub struct AnalyzedRoute {
     pub destination: IpNet,
     pub source: String,
+    pub metric: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedRoute {
+    pub destination: IpNet,
+    pub owner_profile_id: String,
+    pub owner_name: String,
+    pub source: String,
+    pub interface_name: Option<String>,
+    pub metric: Option<u32>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RoutePlanDiffKind {
+    Missing,
+    InterfaceMismatch,
+    ExactCompetition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutePlanDiff {
+    pub kind: RoutePlanDiffKind,
+    pub destination: IpNet,
+    pub message: String,
+    pub profile_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteMap {
+    pub predicted: Vec<PlannedRoute>,
+    pub effective: Vec<RouteEntry>,
+    pub diffs: Vec<RoutePlanDiff>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -250,6 +293,61 @@ pub struct ProfileDiagnostics {
     pub status: TunnelStatus,
     pub inspection: Option<ProfileInspection>,
     pub checks: Vec<DiagnosticCheck>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoveryIssueKind {
+    SurvivingWireGuardService,
+    OwnedRoutes,
+    MissingOwnedRoutes,
+    OrphanRouteOwnership,
+    StatusCheckFailed,
+    ProxyOwnership,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProtocolHealthState {
+    Unknown,
+    Healthy,
+    Degraded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolHealth {
+    pub state: ProtocolHealthState,
+    pub summary: String,
+    pub last_handshake_unix: Option<u64>,
+    pub rx_bytes: Option<u64>,
+    pub tx_bytes: Option<u64>,
+    pub log_tail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryIssue {
+    pub kind: RecoveryIssueKind,
+    pub profile_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendAvailability {
+    pub backend: TunnelBackend,
+    pub available: bool,
+    pub path: Option<PathBuf>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryReport {
+    pub issues: Vec<RecoveryIssue>,
+    pub requires_elevation: bool,
 }
 
 #[cfg(test)]

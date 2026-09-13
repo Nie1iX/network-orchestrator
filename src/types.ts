@@ -145,6 +145,8 @@ export interface Profile {
   autoConnect: boolean;
   domainPolicies: DomainPolicy[];
   xraySocksPort: number | null;
+  useSystemProxy: boolean;
+  proxyBypass: string[];
 }
 
 export type TunnelState = "stopped" | "running" | "failed";
@@ -211,4 +213,59 @@ export interface ProfileDiagnostics {
   status: TunnelStatus;
   inspection: ProfileInspection | null;
   checks: DiagnosticCheck[];
+}
+
+export type RecoveryIssueKind =
+  | "survivingWireGuardService"
+  | "ownedRoutes"
+  | "missingOwnedRoutes"
+  | "orphanRouteOwnership"
+  | "statusCheckFailed"
+  | "proxyOwnership";
+
+export interface RecoveryIssue {
+  kind: RecoveryIssueKind;
+  profileId: string | null;
+  message: string;
+}
+
+export interface RecoveryReport {
+  issues: RecoveryIssue[];
+  requiresElevation: boolean;
+}
+
+export interface PlannedRoute {
+  destination: string;
+  ownerProfileId: string;
+  ownerName: string;
+  source: string;
+  interfaceName: string | null;
+  metric: number | null;
+  active: boolean;
+}
+
+export type RoutePlanDiffKind =
+  | "missing"
+  | "interfaceMismatch"
+  | "exactCompetition";
+
+export interface RoutePlanDiff {
+  kind: RoutePlanDiffKind;
+  destination: string;
+  message: string;
+  profileIds: string[];
+}
+
+export interface RouteMap {
+  predicted: PlannedRoute[];
+  effective: RouteEntry[];
+  diffs: RoutePlanDiff[];
+  warnings: string[];
+}
+
+export interface BackendAvailability {
+  backend: TunnelBackend;
+  available: boolean;
+  path: string | null;
+  message: string;
 }

@@ -1,9 +1,13 @@
 pub mod analysis;
+pub mod config_security;
 pub mod config_vault;
 pub mod explorer;
 pub mod models;
 pub mod policy;
 pub mod profiles;
+pub mod route_plan;
 pub mod route_state;
+pub mod system_proxy;
 pub mod vpn;
+pub mod windows_job;
 pub mod xray;

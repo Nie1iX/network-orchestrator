@@ -1,3 +1,4 @@
+use crate::config_security::protect_path;
 use crate::models::TunnelBackend;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -23,6 +24,11 @@ impl ConfigVault {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn ensure_root_protected(&self) -> io::Result<()> {
+        fs::create_dir_all(&self.root)?;
+        protect_path(&self.root)
     }
 
     pub fn is_managed_path(&self, path: &Path) -> bool {
@@ -118,18 +124,29 @@ impl ConfigVault {
         let profile_dir = self.root.join(&safe);
         let staging = profile_dir.join(format!("rev-{nanos}.tmp"));
         let revision = profile_dir.join(format!("rev-{nanos}"));
+        self.ensure_root_protected()?;
         fs::create_dir_all(&profile_dir)?;
+        protect_path(&profile_dir)?;
 
         let result = (|| -> io::Result<Vec<String>> {
             fs::create_dir(&staging)?;
+            protect_path(&staging)?;
             let warnings = match backend {
                 TunnelBackend::OpenVpn => stage_openvpn(source, &staging, &config_name)?,
                 _ => {
-                    fs::copy(source, staging.join(&config_name))?;
+                    let staged_config = staging.join(&config_name);
+                    fs::copy(source, &staged_config)?;
+                    protect_path(&staged_config)?;
                     Vec::new()
                 }
             };
             fs::rename(&staging, &revision)?;
+            if let Err(err) =
+                protect_path(&revision).and_then(|_| protect_path(&revision.join(&config_name)))
+            {
+                let _ = fs::remove_dir_all(&revision);
+                return Err(err);
+            }
             Ok(warnings)
         })();
 
@@ -146,22 +163,51 @@ impl ConfigVault {
     }
 
     pub fn store_xray_config(&self, profile_id: &str, bytes: &[u8]) -> io::Result<ConfigImport> {
+        self.store_xray_file(profile_id, bytes, "config.json")
+    }
+
+    pub fn store_protected_xray_config(
+        &self,
+        profile_id: &str,
+        encrypted_bytes: &[u8],
+    ) -> io::Result<ConfigImport> {
+        self.store_xray_file(profile_id, encrypted_bytes, "config.json.dpapi")
+    }
+
+    fn store_xray_file(
+        &self,
+        profile_id: &str,
+        bytes: &[u8],
+        config_name: &str,
+    ) -> io::Result<ConfigImport> {
         let safe = sanitize_profile_id(profile_id)?;
         let nanos = unix_nanos()?;
         let profile_dir = self.root.join(&safe);
         let staging = profile_dir.join(format!("rev-{nanos}.tmp"));
         let revision = profile_dir.join(format!("rev-{nanos}"));
+        self.ensure_root_protected()?;
         fs::create_dir_all(&profile_dir)?;
+        protect_path(&profile_dir)?;
 
         let result = (|| -> io::Result<()> {
             fs::create_dir(&staging)?;
-            fs::write(staging.join("config.json"), bytes)?;
-            fs::rename(&staging, &revision)
+            protect_path(&staging)?;
+            let staged_config = staging.join(config_name);
+            fs::write(&staged_config, bytes)?;
+            protect_path(&staged_config)?;
+            fs::rename(&staging, &revision)?;
+            if let Err(err) =
+                protect_path(&revision).and_then(|_| protect_path(&revision.join(config_name)))
+            {
+                let _ = fs::remove_dir_all(&revision);
+                return Err(err);
+            }
+            Ok(())
         })();
 
         match result {
             Ok(()) => Ok(ConfigImport {
-                config_path: revision.join("config.json"),
+                config_path: revision.join(config_name),
                 warnings: Vec::new(),
             }),
             Err(err) => {
@@ -210,6 +256,7 @@ const CONFIG_NAMES: &[&str] = &[
     "client.ovpn",
     "client.conf",
     "config.json",
+    "config.json.dpapi",
 ];
 
 const PATH_DIRECTIVES: &[&str] = &[
@@ -296,6 +343,7 @@ fn stage_openvpn(source: &Path, staging: &Path, config_name: &str) -> io::Result
                 None => {
                     if !assets_created {
                         fs::create_dir(&assets_dir)?;
+                        protect_path(&assets_dir)?;
                         assets_created = true;
                     }
                     let file_name = format!(
@@ -303,7 +351,9 @@ fn stage_openvpn(source: &Path, staging: &Path, config_name: &str) -> io::Result
                         copied.len(),
                         sanitize_basename(resolved.file_name())
                     );
-                    fs::copy(&resolved, assets_dir.join(&file_name))?;
+                    let staged_asset = assets_dir.join(&file_name);
+                    fs::copy(&resolved, &staged_asset)?;
+                    protect_path(&staged_asset)?;
                     let relative = format!("assets/{file_name}");
                     copied.insert(resolved.clone(), relative.clone());
                     relative
@@ -326,7 +376,9 @@ fn stage_openvpn(source: &Path, staging: &Path, config_name: &str) -> io::Result
 
     let mut text_out = output.join("\n");
     text_out.push('\n');
-    fs::write(staging.join(config_name), text_out)?;
+    let staged_config = staging.join(config_name);
+    fs::write(&staged_config, text_out)?;
+    protect_path(&staged_config)?;
     Ok(warnings)
 }
 
@@ -416,7 +468,7 @@ fn quote_token(token: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-fn sanitize_profile_id(id: &str) -> io::Result<String> {
+pub(crate) fn sanitize_profile_id(id: &str) -> io::Result<String> {
     let safe: String = id
         .chars()
         .map(|c| {
@@ -1125,6 +1177,95 @@ mod tests {
         assert!(vault
             .import("///..", TunnelBackend::WireGuard, &source)
             .is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn import_and_store_protect_managed_paths() {
+        use crate::config_security::inspect_path_protection;
+        let (vault, dir) = vault("protected");
+        let cfg_dir = dir.join("cfg");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        fs::write(cfg_dir.join("ca.crt"), b"CA").unwrap();
+        let source = cfg_dir.join("client.ovpn");
+        fs::write(&source, "client\ndev tun\nca ca.crt\n").unwrap();
+        let source_bytes = fs::read(&source).unwrap();
+        #[cfg(windows)]
+        let source_acl_before = inspect_path_protection(&source).unwrap();
+
+        let import = vault
+            .import("home", TunnelBackend::OpenVpn, &source)
+            .unwrap();
+        let revision = import.config_path.parent().unwrap();
+        let profile_dir = revision.parent().unwrap();
+        let asset = revision.join("assets").join("0-ca.crt");
+
+        #[cfg(windows)]
+        for path in [
+            vault.root().to_path_buf(),
+            profile_dir.to_path_buf(),
+            revision.to_path_buf(),
+            import.config_path.clone(),
+            revision.join("assets"),
+            asset,
+        ] {
+            let protection = inspect_path_protection(&path).unwrap();
+            assert!(
+                protection.protected_dacl
+                    && protection.current_user
+                    && protection.system
+                    && protection.administrators,
+                "{} not fully protected",
+                path.display()
+            );
+        }
+
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        #[cfg(windows)]
+        assert_eq!(inspect_path_protection(&source).unwrap(), source_acl_before);
+
+        let stored = vault
+            .store_xray_config("node", br#"{"outbounds":[]}"#)
+            .unwrap();
+        let stored_revision = stored.config_path.parent().unwrap();
+        #[cfg(windows)]
+        for path in [stored_revision.to_path_buf(), stored.config_path.clone()] {
+            let protection = inspect_path_protection(&path).unwrap();
+            assert!(protection.protected_dacl, "{} unprotected", path.display());
+        }
+        assert_eq!(
+            fs::read(&stored.config_path).unwrap(),
+            br#"{"outbounds":[]}"#
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn store_protected_xray_config_writes_exact_bytes_into_protected_revision() {
+        let (vault, dir) = vault("xray-store-dpapi");
+        let ciphertext = b"dpapi-ciphertext-bytes";
+        let import = vault
+            .store_protected_xray_config("node-x", ciphertext)
+            .unwrap();
+        assert_eq!(import.config_path.file_name().unwrap(), "config.json.dpapi");
+        assert!(vault.is_managed_path(&import.config_path));
+        assert_eq!(fs::read(&import.config_path).unwrap(), ciphertext);
+
+        #[cfg(windows)]
+        for path in [
+            import.config_path.parent().unwrap().to_path_buf(),
+            import.config_path.clone(),
+        ] {
+            let protection = crate::config_security::inspect_path_protection(&path).unwrap();
+            assert!(
+                protection.protected_dacl
+                    && protection.current_user
+                    && protection.system
+                    && protection.administrators,
+                "{} not fully protected",
+                path.display()
+            );
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 }

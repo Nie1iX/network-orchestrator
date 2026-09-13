@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ensureElevation } from "../elevation";
+import BackendStatus from "./BackendStatus";
 import {
   DomainPolicy,
   DomainRouteTarget,
@@ -51,6 +52,15 @@ function requiresElevation(profile: Profile): boolean {
   );
 }
 
+const DEFAULT_PROXY_BYPASS = "<local>, localhost, 127.*, 10.*, 192.168.*";
+
+function parseBypass(text: string): string[] {
+  return text
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
 interface FormState {
   id: string;
   name: string;
@@ -62,6 +72,8 @@ interface FormState {
   vlessUrl: string;
   xraySocksPort: number | null;
   domainPolicies: DomainPolicy[];
+  useSystemProxy: boolean;
+  proxyBypass: string;
   isNew: boolean;
 }
 
@@ -216,6 +228,8 @@ export default function ProfileManager() {
       vlessUrl: "",
       xraySocksPort: null,
       domainPolicies: [],
+      useSystemProxy: false,
+      proxyBypass: DEFAULT_PROXY_BYPASS,
       isNew: true,
     });
   };
@@ -236,6 +250,8 @@ export default function ProfileManager() {
         domains: [...p.domains],
         target: p.target,
       })),
+      useSystemProxy: profile.useSystemProxy,
+      proxyBypass: profile.proxyBypass.join(", "),
       isNew: false,
     });
   };
@@ -293,6 +309,15 @@ export default function ProfileManager() {
     }
     const isXray = editing.backend === "xray";
     const isVlessImport = isXray && editing.isNew && editing.xraySource === "vless";
+    const proxyBypass = parseBypass(editing.proxyBypass);
+    if (isXray && editing.useSystemProxy) {
+      for (const entry of proxyBypass) {
+        if (entry.includes(";")) {
+          setFormError("Proxy bypass entries must not contain ';'.");
+          return;
+        }
+      }
+    }
     const domainPolicies = editing.domainPolicies.map((p) => ({
       domains: p.domains.map((d) => d.trim()).filter((d) => d.length > 0),
       target: p.target,
@@ -339,6 +364,8 @@ export default function ProfileManager() {
           : editing.isNew
             ? null
             : editing.xraySocksPort,
+      useSystemProxy: isXray && editing.useSystemProxy,
+      proxyBypass: isXray ? proxyBypass : [],
     };
     setSaving(true);
     try {
@@ -381,9 +408,14 @@ export default function ProfileManager() {
   if (loading) return <p>Loading profiles...</p>;
 
   const targetable = interfaces.filter((i) => i.category !== "filter");
+  const systemProxyAvailable = editing
+    ? editing.xraySocksPort !== null ||
+      (editing.isNew && editing.xraySource === "vless")
+    : false;
 
   return (
     <section>
+      <BackendStatus />
       <div className="profiles-toolbar">
         <h2>VPN Profiles</h2>
         <span className="profiles-note">
@@ -565,6 +597,44 @@ export default function ProfileManager() {
                 </span>
               </div>
             )}
+          {editing.backend === "xray" && (
+            <div className="profile-proxy">
+              <label className="profile-proxy-toggle">
+                <input
+                  type="checkbox"
+                  checked={editing.useSystemProxy}
+                  disabled={!systemProxyAvailable}
+                  onChange={(e) =>
+                    setEditing({ ...editing, useSystemProxy: e.target.checked })
+                  }
+                />
+                Use Windows system proxy
+              </label>
+              {!systemProxyAvailable ? (
+                <span className="profile-help">
+                  System proxy requires a generated Xray profile with a SOCKS5
+                  listener — this existing JSON config has none.
+                </span>
+              ) : (
+                <span className="profile-help">
+                  Applies only to apps that honor Windows proxy settings.
+                </span>
+              )}
+              {editing.useSystemProxy && systemProxyAvailable && (
+                <label>
+                  Proxy bypass (comma-separated)
+                  <input
+                    type="text"
+                    value={editing.proxyBypass}
+                    onChange={(e) =>
+                      setEditing({ ...editing, proxyBypass: e.target.value })
+                    }
+                    placeholder={DEFAULT_PROXY_BYPASS}
+                  />
+                </label>
+              )}
+            </div>
+          )}
           <label>
             Target interface (required for policy routes)
             <input
@@ -730,6 +800,9 @@ export default function ProfileManager() {
                     {inspection?.managedConfig === true && (
                       <span className="badge badge-managed">Managed config</span>
                     )}
+                    {profile.useSystemProxy && (
+                      <span className="badge badge-managed">System proxy</span>
+                    )}
                     {inspection?.managedConfig === false && (
                       <span className="badge badge-external">
                         External config — resave to import
@@ -756,6 +829,14 @@ export default function ProfileManager() {
                     <span className="row-label">SOCKS5</span>
                     <span className="row-value mono">
                       127.0.0.1:{profile.xraySocksPort}
+                    </span>
+                  </div>
+                )}
+                {profile.useSystemProxy && (
+                  <div className="interface-row">
+                    <span className="row-label">Proxy bypass</span>
+                    <span className="row-value mono">
+                      {profile.proxyBypass.join("; ") || "none"}
                     </span>
                   </div>
                 )}
