@@ -7,6 +7,7 @@ import RecoveryPrompt from "./components/RecoveryPrompt";
 import RouteMap from "./components/RouteMap";
 import RouteTable from "./components/RouteTable";
 import RouteLookup from "./components/RouteLookup";
+import UpdateChecker from "./components/UpdateChecker";
 import { NetworkIcon, ProfileIcon, RouteIcon, ChevronIcon } from "./icons";
 import "./App.css";
 
@@ -78,6 +79,7 @@ function App() {
             </button>
           </li>
         </ul>
+        <UpdateChecker />
       </nav>
       <main className="content">
         {tab === "interfaces" && <InterfaceList />}
