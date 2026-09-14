@@ -58,6 +58,7 @@ pub fn build_route_map(profiles: &[(Profile, bool)], effective: &[RouteEntry]) -
         effective: effective_sorted,
         diffs,
         warnings,
+        pushed_routes: Vec::new(),
     }
 }
 

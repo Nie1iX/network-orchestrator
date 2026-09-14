@@ -124,6 +124,11 @@ pub(crate) async fn connect_profile(
     app: tauri::AppHandle,
 ) -> Result<TunnelStatus, String> {
     let mut profile = find_profile(&state.profiles, &id)?;
+    if profile.backend != TunnelBackend::None {
+        state
+            .resolve_backend_executable(profile.backend)
+            .map_err(|e| e.to_string())?;
+    }
     let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let mut runtime = state.runtime.lock().await;
     cleanup_stale_routes_before_connect(&state, &mut runtime, &profile)?;

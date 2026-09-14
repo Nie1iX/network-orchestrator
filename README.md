@@ -5,6 +5,14 @@ on Windows with versioned profiles, transactional policy routes, and a
 predicted/effective route map — plus a cross-platform read-only network
 explorer.
 
+## Development status
+
+The project is in pre-release stabilization. MVP-0–4 functionality is implemented, but the current release candidate has not yet completed disposable-VM E2E, packaged install/uninstall smoke testing, crash-recovery drills with real backends, or code signing.
+
+Local development and release builds are supported and do not require CI/CD. GitHub Actions workflows exist in the repository, but CI/CD is intentionally deferred as a release gate until the application is stable.
+
+The repository and documentation currently use **Network Orchestrator**. The Tauri package and window still use **Network Manager** and **Network Explorer**; choosing and applying one product name remains a future decision.
+
 ## Quick Start
 
 ```bash
@@ -12,9 +20,11 @@ npm install
 npm run tauri dev
 ```
 
-Requires Windows for tunnel management. Backend executables
-(`wireguard.exe`, `openvpn.exe`, `xray.exe`) must be installed separately —
-the app never downloads or installs them; the Profiles tab shows which
+Requires Windows for tunnel management. WireGuard (`wireguard.exe`) and
+OpenVPN (`openvpn.exe`) must be installed separately or selected as an
+existing executable; Xray may likewise be selected, or explicitly installed
+as a verified app-managed version from the Backend prerequisites section.
+No backend is silently downloaded or updated; the Profiles tab shows which
 backends were found.
 
 ## Features (MVP-0–4)
@@ -42,11 +52,20 @@ backends were found.
   tunnel status, protocol health (WireGuard `wg.exe show` dump, OpenVPN log
   markers, Xray process state), redacted bounded log tails, endpoints and
   listeners.
+- **Backend management** — persistent custom executable paths for
+  WireGuard, OpenVPN, and Xray; explicit managed Xray v26.7.28
+  install/remove from the Backend prerequisites section with progress and
+  cancellation. The managed archive is pinned (SHA-256
+  `c7172078fca4711bcd92a4774dcd1822544579c58816197575c47533317fd8d1`, plus
+  required-file hashes), installed under the app data directory, and
+  integrity-checked before use; the fixed official release URL is shown in
+  the install confirmation and there is no automatic update.
 - **Recovery** — on startup the app detects leftover WireGuard services,
   owned routes, and stale system-proxy ownership, and offers explicit
   cleanup. Graceful close restores proxy settings and removes owned routes
   before stopping tunnels.
-- **Optional system proxy** — generated Xray profiles can set the Windows
+- **Optional system proxy** — Xray profiles with a configured local SOCKS5
+  port can set the Windows
   per-user proxy (`socks=127.0.0.1:<port>`) with a bypass list; previous
   settings are snapshotted, verified, and restored on disconnect/shutdown.
 - **Elevation** — interface changes, WireGuard/OpenVPN, and policy routes
@@ -67,9 +86,11 @@ backends were found.
 
 - Windows 10/11, [Rust](https://rustup.rs/) (MSVC toolchain),
   [Node.js](https://nodejs.org/), Visual Studio C++ build tools, WebView2.
-- Backend executables are needed only for the profiles you actually use:
-  WireGuard (`wireguard.exe`/`wg.exe`), OpenVPN (`openvpn.exe`), Xray
-  (`xray.exe`).
+- Backend executables are needed only for the profiles you actually use.
+  WireGuard (`wireguard.exe`/`wg.exe`) and OpenVPN (`openvpn.exe`) external
+  packages remain required because their drivers/services are not managed by
+  the app; an external Xray (`xray.exe`) install is optional because a
+  verified managed install exists.
 
 ### Quality gates
 
@@ -81,20 +102,23 @@ cargo test --workspace
 npm run build
 ```
 
-### Build
+### Local Windows installer
+
+No CI/CD service is required:
 
 ```bash
-npm run tauri build
+npm ci
+npm run tauri build -- --bundles nsis
 ```
 
-Produces an unsigned NSIS installer under `target/release/bundle/nsis/`.
+Produces an unsigned release-mode NSIS installer under `target/release/bundle/nsis/`.
 
 ## Limitations
 
 - Tunnel management and mutations are Windows-only; on Linux the explorer is
   read-only and VPN/proxy features return `Unsupported`.
-- No process-based routing, no VPN chaining, no custom TUN — Xray runs as a
-  local SOCKS/HTTP proxy.
+- No process-based routing, no VPN chaining, and no custom TUN. Generated Xray configurations expose a local SOCKS5 inbound; imported Xray JSON may define other inbounds.
+- The release-candidate gate is incomplete: real-backend VM E2E, packaged install/uninstall smoke testing, crash-recovery drills, and a secret scan remain pending.
 - The destructive E2E harness runs only on a disposable Windows VM with
   explicit env acknowledgement (see `docs/testing.md`).
 - Release artifacts are unsigned; expect SmartScreen warnings.

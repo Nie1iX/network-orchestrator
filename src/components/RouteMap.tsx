@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PlannedRoute, RouteMap as RouteMapData } from "../types";
 
@@ -55,6 +55,13 @@ function parentPrefixIndex(index: number, routes: PlannedRoute[]): number | null
   return null;
 }
 
+function hasChildren(index: number, routes: PlannedRoute[]): boolean {
+  const target = routes[index];
+  return routes.some(
+    (r, i) => i > index && cidrContains(target.destination, r.destination),
+  );
+}
+
 function treeDepth(index: number, routes: PlannedRoute[]): number {
   let depth = 0;
   let current = index;
@@ -68,11 +75,35 @@ function treeDepth(index: number, routes: PlannedRoute[]): number {
   }
 }
 
+function ancestors(index: number, routes: PlannedRoute[]): number[] {
+  const result: number[] = [];
+  let current = index;
+  const seen = new Set<number>();
+  while (true) {
+    const parent = parentPrefixIndex(current, routes);
+    if (parent === null || seen.has(parent)) return result;
+    seen.add(parent);
+    result.push(parent);
+    current = parent;
+  }
+}
+
+function nodeKey(route: PlannedRoute): string {
+  return `${route.destination}|${route.ownerProfileId}`;
+}
+
+function groupKey(route: PlannedRoute): string {
+  return route.interfaceName ?? "auto";
+}
+
 export default function RouteMap() {
   const [map, setMap] = useState<RouteMapData | null>(null);
   const [includeInactive, setIncludeInactive] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState("");
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const [collapsedNodes, setCollapsedNodes] = useState<Set<string>>(new Set());
 
   const load = useCallback(async (include: boolean) => {
     setLoading(true);
@@ -99,6 +130,57 @@ export default function RouteMap() {
     return () => window.removeEventListener("route-changed", handler);
   }, [includeInactive, load]);
 
+  const diffDestinations = useMemo(() => {
+    const set = new Set<string>();
+    if (map) {
+      for (const d of map.diffs) set.add(d.destination);
+    }
+    return set;
+  }, [map]);
+
+  const predictedGroups = useMemo(() => {
+    if (!map) return new Map<string, PlannedRoute[]>();
+    const groups = new Map<string, PlannedRoute[]>();
+    for (const route of map.predicted) {
+      const key = groupKey(route);
+      const list = groups.get(key);
+      if (list) list.push(route);
+      else groups.set(key, [route]);
+    }
+    return groups;
+  }, [map]);
+
+  const effectiveGroups = useMemo(() => {
+    if (!map) return new Map<string, { destination: string; prefixLen: number; metric: number }[]>();
+    const groups = new Map<string, { destination: string; prefixLen: number; metric: number }[]>();
+    for (const route of map.effective) {
+      const list = groups.get(route.interfaceName);
+      if (list) list.push(route);
+      else groups.set(route.interfaceName, [route]);
+    }
+    return groups;
+  }, [map]);
+
+  const toggleGroup = (key: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const toggleNode = (key: string) => {
+    setCollapsedNodes((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const filterText = filter.trim().toLowerCase();
+
   return (
     <section className="route-map">
       <div className="route-map-header">
@@ -112,6 +194,14 @@ export default function RouteMap() {
           Include stopped profiles
         </label>
       </div>
+
+      <input
+        className="route-map-filter"
+        type="text"
+        value={filter}
+        onChange={(e) => setFilter(e.target.value)}
+        placeholder="Filter by destination or owner (e.g. 10.0.0.0/8, work-vpn)"
+      />
 
       {loading && <p>Loading route map...</p>}
       {error && <p className="error">Error loading route map: {error}</p>}
@@ -132,43 +222,131 @@ export default function RouteMap() {
           {map.predicted.length === 0 ? (
             <p>No predicted routes.</p>
           ) : (
-            <table className="route-map-table">
-              <thead>
-                <tr>
-                  <th>Destination</th>
-                  <th>Owner</th>
-                  <th>Source</th>
-                  <th>Interface</th>
-                  <th>Metric</th>
-                  <th>State</th>
-                </tr>
-              </thead>
-              <tbody>
-                {map.predicted.map((route, i) => {
-                  const depth = treeDepth(i, map.predicted);
+            <div className="route-map-groups">
+              {[...predictedGroups.entries()].map(([key, routes]) => {
+                const collapsed = collapsedGroups.has(key);
+                const visible = routes.filter((r) => {
+                  if (!filterText) return true;
                   return (
-                    <tr key={i} className={route.active ? "" : "inactive"}>
-                      <td>
-                        <span
-                          className="route-map-indent"
-                          style={{ paddingLeft: `${depth * 1.25}rem` }}
-                        >
-                          {depth > 0 ? "↳ " : ""}
-                          {route.destination}
-                        </span>
-                      </td>
-                      <td>
-                        <span className="owner-badge">{route.ownerName}</span>
-                      </td>
-                      <td>{route.source}</td>
-                      <td>{route.interfaceName ?? "auto"}</td>
-                      <td>{route.metric ?? "auto"}</td>
-                      <td>{route.active ? "active" : "stopped"}</td>
-                    </tr>
+                    r.destination.toLowerCase().includes(filterText) ||
+                    r.ownerName.toLowerCase().includes(filterText)
                   );
-                })}
-              </tbody>
-            </table>
+                });
+                return (
+                  <div className="route-map-group" key={key}>
+                    <button
+                      type="button"
+                      className="route-map-group-header"
+                      onClick={() => toggleGroup(key)}
+                    >
+                      <span className="route-map-caret">{collapsed ? "▸" : "▾"}</span>
+                      <span className="route-map-group-name">
+                        {key === "auto" ? "auto interface" : key}
+                      </span>
+                      <span className="route-map-group-count">{routes.length}</span>
+                    </button>
+                    {!collapsed && visible.length > 0 && (
+                      <table className="route-map-table">
+                        <thead>
+                          <tr>
+                            <th>Destination</th>
+                            <th>Owner</th>
+                            <th>Source</th>
+                            <th>Metric</th>
+                            <th>State</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {visible.map((route) => {
+                            const index = routes.indexOf(route);
+                            const depth = treeDepth(index, routes);
+                            const key = nodeKey(route);
+                            const branchable = hasChildren(index, routes);
+                            const isCollapsed = collapsedNodes.has(key);
+                            const hiddenByAncestor = ancestors(index, routes).some(
+                              (a) => collapsedNodes.has(nodeKey(routes[a])),
+                            );
+                            if (hiddenByAncestor) return null;
+                            const flagged = diffDestinations.has(route.destination);
+                            return (
+                              <tr
+                                key={key}
+                                className={`${route.active ? "" : "inactive"}${flagged ? " flagged" : ""}`}
+                              >
+                                <td>
+                                  <span
+                                    className="route-map-indent"
+                                    style={{ paddingLeft: `${depth * 1.25}rem` }}
+                                  >
+                                    {branchable ? (
+                                      <button
+                                        type="button"
+                                        className="route-map-node-toggle"
+                                        onClick={() => toggleNode(key)}
+                                        aria-label={isCollapsed ? "Expand" : "Collapse"}
+                                      >
+                                        {isCollapsed ? "▸" : "▾"}
+                                      </button>
+                                    ) : depth > 0 ? (
+                                      "↳ "
+                                    ) : (
+                                      ""
+                                    )}
+                                    {route.destination}
+                                  </span>
+                                </td>
+                                <td>
+                                  <span className="owner-badge">{route.ownerName}</span>
+                                </td>
+                                <td>{route.source}</td>
+                                <td>{route.metric ?? "auto"}</td>
+                                <td>{route.active ? "active" : "stopped"}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
+                    {!collapsed && visible.length === 0 && filterText && (
+                      <p className="route-map-empty">No routes match the filter.</p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {map.pushedRoutes.length > 0 && (
+            <>
+              <h3>Server-pushed routes (OpenVPN, runtime)</h3>
+              <table className="route-map-table pushed">
+                <thead>
+                  <tr>
+                    <th>Destination</th>
+                    <th>Owner</th>
+                    <th>State</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {map.pushedRoutes
+                    .filter(
+                      (r) =>
+                        !filterText ||
+                        r.destination.toLowerCase().includes(filterText) ||
+                        r.ownerName.toLowerCase().includes(filterText),
+                    )
+                    .map((route, i) => (
+                      <tr key={i}>
+                        <td>{route.destination}</td>
+                        <td>
+                          <span className="owner-badge">{route.ownerName}</span>
+                        </td>
+                        <td>active</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </>
           )}
 
           <h3>Differences</h3>
@@ -190,26 +368,47 @@ export default function RouteMap() {
           {map.effective.length === 0 ? (
             <p>No effective routes reported.</p>
           ) : (
-            <table className="route-map-table effective">
-              <thead>
-                <tr>
-                  <th>Destination</th>
-                  <th>Interface</th>
-                  <th>Metric</th>
-                </tr>
-              </thead>
-              <tbody>
-                {map.effective.map((route, i) => (
-                  <tr key={i}>
-                    <td>
-                      {route.destination}/{route.prefixLen}
-                    </td>
-                    <td>{route.interfaceName}</td>
-                    <td>{route.metric}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <div className="route-map-groups">
+              {[...effectiveGroups.entries()].map(([key, routes]) => {
+                const collapsed = collapsedGroups.has(`eff::${key}`);
+                const visible = routes.filter((r) =>
+                  filterText ? r.destination.toLowerCase().includes(filterText) : true,
+                );
+                return (
+                  <div className="route-map-group" key={`eff::${key}`}>
+                    <button
+                      type="button"
+                      className="route-map-group-header"
+                      onClick={() => toggleGroup(`eff::${key}`)}
+                    >
+                      <span className="route-map-caret">{collapsed ? "▸" : "▾"}</span>
+                      <span className="route-map-group-name">{key}</span>
+                      <span className="route-map-group-count">{routes.length}</span>
+                    </button>
+                    {!collapsed && visible.length > 0 && (
+                      <table className="route-map-table effective">
+                        <thead>
+                          <tr>
+                            <th>Destination</th>
+                            <th>Metric</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {visible.map((route, i) => (
+                            <tr key={i}>
+                              <td>
+                                {route.destination}/{route.prefixLen}
+                              </td>
+                              <td>{route.metric}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           )}
         </>
       )}

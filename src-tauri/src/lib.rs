@@ -31,6 +31,8 @@ pub fn run() {
             get_profiles,
             save_profile,
             save_vless_profile,
+            import_configs_batch,
+            import_subscription,
             delete_profile,
             connect_profile,
             disconnect_profile,
@@ -43,10 +45,14 @@ pub fn run() {
             is_elevated,
             restart_elevated,
             discover_wireguard_configs,
-            import_configs_batch,
-            import_subscription,
             get_route_map,
-            get_backend_availability
+            get_backend_availability,
+            set_backend_executable,
+            reset_backend_executable,
+            install_managed_xray,
+            cancel_managed_xray_install,
+            remove_managed_xray,
+            get_managed_xray_offer
         ])
         .on_window_event(lifecycle::handle_window_event)
         .build(tauri::generate_context!())

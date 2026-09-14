@@ -3,7 +3,6 @@ use net_manager_core::analysis;
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::explorer;
 use net_manager_core::models::*;
-use net_manager_core::vpn;
 use std::path::PathBuf;
 use tauri::State;
 
@@ -35,15 +34,14 @@ pub(crate) fn applied_route_present(applied: &AppliedRoute, entry: &RouteEntry) 
         && entry.prefix_len == applied.destination.prefix_len()
 }
 
-fn resolve_backend_executable(profile: &Profile) -> Result<PathBuf, String> {
-    match profile.backend {
-        TunnelBackend::None => Ok(PathBuf::new()),
-        TunnelBackend::WireGuard => {
-            vpn::resolve_wireguard_executable(None).map_err(|e| e.to_string())
-        }
-        TunnelBackend::OpenVpn => vpn::resolve_openvpn_executable(None).map_err(|e| e.to_string()),
-        TunnelBackend::Xray => vpn::resolve_xray_executable(None).map_err(|e| e.to_string()),
+fn resolve_backend_executable(state: &AppState, profile: &Profile) -> Result<PathBuf, String> {
+    if profile.backend == TunnelBackend::None {
+        return Ok(PathBuf::new());
     }
+    state
+        .resolve_backend_executable(profile.backend)
+        .map(|resolved| resolved.path)
+        .map_err(|e| e.to_string())
 }
 
 fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
@@ -140,6 +138,23 @@ fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
                 DiagnosticLevel::Healthy
             },
             tail.clone(),
+        ));
+    }
+
+    if !health.pushed_routes.is_empty() {
+        let list = health
+            .pushed_routes
+            .iter()
+            .map(|r| r.destination.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        checks.push(diag_check(
+            "Pushed routes",
+            DiagnosticLevel::Healthy,
+            format!(
+                "{} server-pushed route(s): {list}",
+                health.pushed_routes.len()
+            ),
         ));
     }
 
@@ -418,7 +433,7 @@ pub(crate) async fn diagnose_profile(
             Ok(inspection) => (Some(inspection), None),
             Err(err) => (None, Some(err)),
         };
-    let executable = resolve_backend_executable(&profile);
+    let executable = resolve_backend_executable(&state, &profile);
     let mut runtime = state.runtime.lock().await;
     let status = runtime.tunnels.status(&profile);
     let protocol_health = runtime.tunnels.protocol_health(&profile);
@@ -629,6 +644,7 @@ mod tests {
             rx_bytes: None,
             tx_bytes: None,
             log_tail: Some("redacted tail".into()),
+            pushed_routes: Vec::new(),
         };
         let checks = build_diagnostics(&input);
         let health = check_named(&checks, "Protocol health");
@@ -645,6 +661,7 @@ mod tests {
             rx_bytes: None,
             tx_bytes: None,
             log_tail: None,
+            pushed_routes: Vec::new(),
         };
         let checks = build_diagnostics(&input);
         assert_eq!(

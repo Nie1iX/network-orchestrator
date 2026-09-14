@@ -1,4 +1,6 @@
+use net_manager_core::backend_settings::BackendSettingsStore;
 use net_manager_core::config_vault::ConfigVault;
+use net_manager_core::managed_xray::{self, MANAGED_XRAY_VERSION};
 use net_manager_core::models::*;
 use net_manager_core::policy::PolicyManager;
 use net_manager_core::profiles::{ProfileDocument, ProfileStore};
@@ -6,8 +8,9 @@ use net_manager_core::route_state::{
     AppliedRouteDocument, AppliedRouteStore, APPLIED_ROUTE_DOCUMENT_VERSION,
 };
 use net_manager_core::system_proxy::SystemProxyManager;
-use net_manager_core::vpn::TunnelManager;
-use std::path::PathBuf;
+use net_manager_core::vpn::{self, TunnelManager};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 pub(crate) struct RuntimeState {
@@ -16,13 +19,88 @@ pub(crate) struct RuntimeState {
     pub(crate) proxy: SystemProxyManager,
 }
 
+#[derive(Debug)]
+pub(crate) struct ResolvedBackendExecutable {
+    pub(crate) path: PathBuf,
+    pub(crate) source: BackendExecutableSource,
+    pub(crate) version: Option<String>,
+}
+
 pub(crate) struct AppState {
     pub(crate) profiles: ProfileStore,
     pub(crate) config_vault: ConfigVault,
     pub(crate) applied_routes: AppliedRouteStore,
+    pub(crate) backend_settings: BackendSettingsStore,
+    pub(crate) managed_xray_root: PathBuf,
+    pub(crate) backend_install_lock: tokio::sync::Mutex<()>,
+    pub(crate) backend_install_cancel: AtomicBool,
     pub(crate) shutting_down: AtomicBool,
     pub(crate) cleanup_complete: AtomicBool,
     pub(crate) runtime: tokio::sync::Mutex<RuntimeState>,
+}
+
+pub(crate) fn resolve_backend_path(
+    backend: TunnelBackend,
+    configured: Option<&Path>,
+) -> io::Result<PathBuf> {
+    match backend {
+        TunnelBackend::None => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "static-routes backend has no executable",
+        )),
+        TunnelBackend::WireGuard => vpn::resolve_wireguard_executable(configured),
+        TunnelBackend::OpenVpn => vpn::resolve_openvpn_executable(configured),
+        TunnelBackend::Xray => vpn::resolve_xray_executable(configured),
+    }
+}
+
+impl AppState {
+    pub(crate) fn resolve_backend_executable(
+        &self,
+        backend: TunnelBackend,
+    ) -> io::Result<ResolvedBackendExecutable> {
+        match self.backend_settings.get(backend)? {
+            None => Ok(ResolvedBackendExecutable {
+                path: resolve_backend_path(backend, None)?,
+                source: BackendExecutableSource::AutoDetected,
+                version: None,
+            }),
+            Some(setting) => match setting.source {
+                BackendExecutableSource::AutoDetected => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "persisted auto-detected backend source is not valid",
+                )),
+                BackendExecutableSource::Configured => Ok(ResolvedBackendExecutable {
+                    path: resolve_backend_path(backend, Some(&setting.path))?,
+                    source: BackendExecutableSource::Configured,
+                    version: setting.version,
+                }),
+                BackendExecutableSource::Managed => {
+                    if backend != TunnelBackend::Xray {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "managed executables are only supported for the Xray backend",
+                        ));
+                    }
+                    if setting.version.as_deref() != Some(MANAGED_XRAY_VERSION) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "managed Xray setting does not match the managed version",
+                        ));
+                    }
+                    managed_xray::verify_managed_executable(
+                        &self.managed_xray_root,
+                        &setting.path,
+                    )?;
+                    Ok(ResolvedBackendExecutable {
+                        path: vpn::resolve_xray_executable(Some(&setting.path))?,
+                        source: BackendExecutableSource::Managed,
+                        version: setting.version,
+                    })
+                }
+            },
+        }
+    }
 }
 
 pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
@@ -32,14 +110,28 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
     policies.restore(applied_routes.load()?.profiles)?;
     let config_vault = ConfigVault::new(data_dir.join("configs"));
     config_vault.ensure_root_protected()?;
+    let backend_settings = BackendSettingsStore::new(data_dir.join("backend-settings.json"));
+    let backend_document = backend_settings.load()?;
+    let setting_path = |setting: Option<net_manager_core::models::BackendExecutableSetting>| {
+        setting.map(|s| s.path)
+    };
     Ok(AppState {
         profiles: store,
         config_vault,
         applied_routes,
+        backend_settings,
+        managed_xray_root: data_dir.join("backends").join("xray"),
+        backend_install_lock: tokio::sync::Mutex::new(()),
+        backend_install_cancel: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
         cleanup_complete: AtomicBool::new(false),
         runtime: tokio::sync::Mutex::new(RuntimeState {
-            tunnels: TunnelManager::with_log_dir(data_dir.join("logs")),
+            tunnels: TunnelManager::with_all_executables_and_log_dir(
+                setting_path(backend_document.wire_guard),
+                setting_path(backend_document.open_vpn),
+                setting_path(backend_document.xray),
+                data_dir.join("logs"),
+            ),
             policies,
             proxy: SystemProxyManager::new(data_dir.join("proxy-state.json"))?,
         }),
@@ -104,6 +196,89 @@ mod tests {
             profiles: vec![profile("wg-work")],
         };
         assert!(existing_profile_for_update(&document, "other-id").is_none());
+    }
+
+    #[test]
+    fn configured_backend_resolution_uses_persisted_path() {
+        let dir = unique_dir("resolve-cfg");
+        let state = app_state(&dir);
+        let exe = dir.join("custom-xray.exe");
+        fs::write(&exe, b"MZ").unwrap();
+        state
+            .backend_settings
+            .set(
+                TunnelBackend::Xray,
+                Some(BackendExecutableSetting {
+                    path: exe.clone(),
+                    source: BackendExecutableSource::Configured,
+                    version: None,
+                }),
+            )
+            .unwrap();
+
+        let resolved = state
+            .resolve_backend_executable(TunnelBackend::Xray)
+            .unwrap();
+
+        assert_eq!(resolved.path, exe);
+        assert_eq!(resolved.source, BackendExecutableSource::Configured);
+        assert_eq!(resolved.version, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn managed_backend_resolution_rejects_tampered_binary() {
+        let dir = unique_dir("resolve-mg");
+        let state = app_state(&dir);
+        let version_dir = state
+            .managed_xray_root
+            .join(net_manager_core::managed_xray::MANAGED_XRAY_VERSION);
+        fs::create_dir_all(&version_dir).unwrap();
+        for name in ["xray.exe", "geoip.dat", "geosite.dat"] {
+            fs::write(version_dir.join(name), b"tampered").unwrap();
+        }
+        state
+            .backend_settings
+            .set(
+                TunnelBackend::Xray,
+                Some(BackendExecutableSetting {
+                    path: version_dir.join("xray.exe"),
+                    source: BackendExecutableSource::Managed,
+                    version: Some(net_manager_core::managed_xray::MANAGED_XRAY_VERSION.into()),
+                }),
+            )
+            .unwrap();
+
+        let err = state
+            .resolve_backend_executable(TunnelBackend::Xray)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn managed_backend_resolution_rejects_non_xray_backend() {
+        let dir = unique_dir("resolve-mg-wg");
+        let state = app_state(&dir);
+        state
+            .backend_settings
+            .set(
+                TunnelBackend::WireGuard,
+                Some(BackendExecutableSetting {
+                    path: dir.join("wg.exe"),
+                    source: BackendExecutableSource::Managed,
+                    version: Some("v1".into()),
+                }),
+            )
+            .unwrap();
+
+        let err = state
+            .resolve_backend_executable(TunnelBackend::WireGuard)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1281,6 +1281,90 @@ button:disabled {
   white-space: nowrap;
 }
 
+.route-map-filter {
+  width: 100%;
+  margin: var(--sp-2) 0 var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+}
+
+.route-map-groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+}
+
+.route-map-group {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+
+.route-map-group-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: none;
+  background-color: var(--bg-card);
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+  text-align: left;
+}
+
+.route-map-group-header:hover {
+  background-color: var(--bg-hover, var(--bg-card));
+}
+
+.route-map-caret {
+  display: inline-block;
+  width: 1ch;
+  font-size: 0.75rem;
+}
+
+.route-map-group-name {
+  flex: 1;
+}
+
+.route-map-group-count {
+  padding: 0.05rem 0.45rem;
+  border-radius: var(--r-md);
+  background-color: var(--bg);
+  border: 1px solid var(--border);
+  font-size: 0.75rem;
+  font-weight: 400;
+}
+
+.route-map-node-toggle {
+  display: inline-block;
+  width: 1.25rem;
+  padding: 0;
+  margin-right: 0.15rem;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+
+.route-map-empty {
+  padding: var(--sp-2) var(--sp-3);
+  margin: 0;
+  color: var(--text-muted, var(--text-secondary));
+  font-size: 0.8rem;
+}
+
+.route-map-table tbody tr.flagged {
+  background-color: var(--down-bg, rgba(244, 67, 54, 0.08));
+}
+
+.route-map-table tbody tr.flagged td:first-child {
+  box-shadow: inset 2px 0 0 var(--down, #f44336);
+}
+
 .owner-badge {
   display: inline-block;
   padding: 0.1rem 0.5rem;
@@ -1381,4 +1465,43 @@ button:disabled {
 .backend-detail {
   color: var(--text-secondary);
   word-break: break-all;
+}
+
+.badge-source-autodetected {
+  color: var(--text-secondary);
+  border-color: var(--border);
+}
+
+.badge-source-configured {
+  color: var(--virtual);
+  background-color: var(--virtual-bg);
+  border-color: var(--virtual-border);
+}
+
+.badge-source-managed {
+  color: var(--up);
+  background-color: var(--up-bg);
+}
+
+.badge-version {
+  color: var(--text-muted);
+  border-color: var(--border);
+}
+
+.backend-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  margin-left: auto;
+}
+
+.backend-install-progress {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: var(--sp-2) var(--sp-3);
+  font-size: 0.78rem;
 }

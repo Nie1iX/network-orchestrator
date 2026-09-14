@@ -339,12 +339,30 @@ pub struct RecoveryIssue {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BackendExecutableSource {
+    AutoDetected,
+    Configured,
+    Managed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendExecutableSetting {
+    pub path: PathBuf,
+    pub source: BackendExecutableSource,
+    pub version: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendAvailability {
     pub backend: TunnelBackend,
     pub available: bool,
     pub path: Option<PathBuf>,
+    pub source: Option<BackendExecutableSource>,
+    pub version: Option<String>,
     pub message: String,
 }
 
@@ -353,6 +371,20 @@ pub struct BackendAvailability {
 pub struct RecoveryReport {
     pub issues: Vec<RecoveryIssue>,
     pub requires_elevation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportError {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportResult {
+    pub profiles: Vec<Profile>,
+    pub errors: Vec<BatchImportError>,
 }
 
 #[cfg(test)]

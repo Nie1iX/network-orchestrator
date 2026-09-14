@@ -11,6 +11,8 @@ ipnet = { version = "2", features = ["serde"] }
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 url = "=2.5.7"
+sha2 = "=0.10.9"
+zip = { version = "=6.0.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

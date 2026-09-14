@@ -5,7 +5,8 @@ Guidance for agents/contributors working in this repository.
 ## Layout
 
 - `crates/core` — pure Rust library: models, static analysis, config vault,
-  DPAPI, policy routes, tunnel manager, route plan, system proxy, explorer.
+  DPAPI, policy routes, tunnel manager, route plan, system proxy, explorer,
+  backend executable settings, managed Xray verification.
 - `src-tauri` — Tauri 2 shell: commands in `src-tauri/src/commands/`,
   `state.rs` (AppState + runtime mutex), `lifecycle.rs` (shutdown cleanup),
   `test_support.rs` fixtures.
@@ -13,7 +14,6 @@ Guidance for agents/contributors working in this repository.
   (camelCase).
 - `docs/plans` — per-stage implementation plans; `docs/testing.md` — E2E env
   contract.
-- Active development may happen in `.worktrees/stabilize-network-orchestrator`.
 
 ## Setup
 
@@ -57,6 +57,9 @@ npm run build
 - Managed configs must be written only through `ConfigVault` (ACL +
   revisioning); generated Xray plaintext must go through
   `store_generated_xray` (DPAPI on Windows).
+- Managed backend downloads must stay fixed-version, hash-pinned, bounded,
+  allowlisted, and atomic; tests use synthetic archives and never hit the
+  network or install into real app data.
 - Do not commit unless explicitly asked; do not push to `main`/`master`.
 
 ## Conventions

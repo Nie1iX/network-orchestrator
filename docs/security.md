@@ -60,9 +60,22 @@ processes). The main concerns:
 
 - `wireguard.exe`, `openvpn.exe`, `xray.exe` (and `wg.exe` for health) are
   resolved from configured paths, install directories, or PATH and executed
-  as-is. The app does not verify signatures — installing a trusted backend
-  is the operator's responsibility. The Profiles tab reports resolution
-  results; nothing is downloaded automatically.
+  as-is. The app does not signature-verify configured or auto-detected
+  executables — selecting a trusted backend is the operator's
+  responsibility. The Profiles tab reports resolution results.
+- Managed Xray is the single exception: it is installed only on explicit
+  user action from the fixed official v26.7.28 release URL shown in the
+  confirmation dialog. The compressed archive is checked against pinned
+  SHA-256
+  `c7172078fca4711bcd92a4774dcd1822544579c58816197575c47533317fd8d1`;
+  required extracted files (`xray.exe`, `geoip.dat`, `geosite.dat`) are
+  individually hash-verified; extraction is limited to a strict root-level
+  allowlist with bounded compressed/uncompressed sizes; the versioned
+  directory under app data is ACL-protected; the installed binary is
+  validated with `xray version`; and integrity is rechecked before
+  diagnostics and connect. There is no silent or automatic download/update.
+- WireGuard and OpenVPN are not managed-downloaded because their installers
+  carry drivers and services.
 - OpenVPN and Xray child processes run inside a Windows Job Object with
   `KILL_ON_JOB_CLOSE`, so a crashed app cannot orphan them.
 - Xray receives its (decrypted) config via stdin, not a world-readable file.

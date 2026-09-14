@@ -1299,10 +1299,7 @@ mod tests {
         let analysis = analyze_profile(&p).unwrap();
         assert!(analysis.warnings.is_empty());
         assert!(analysis.route_knowledge_complete);
-        assert_eq!(
-            destinations(&analysis.os_routes),
-            vec![net("10.0.0.0/24")]
-        );
+        assert_eq!(destinations(&analysis.os_routes), vec![net("10.0.0.0/24")]);
         assert_eq!(analysis.os_routes[0].source, "profile policy");
         assert!(analysis.internal_routes.is_empty());
         assert!(analysis.listeners.is_empty());

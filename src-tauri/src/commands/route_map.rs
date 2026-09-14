@@ -1,6 +1,6 @@
 use crate::state::AppState;
 use net_manager_core::explorer;
-use net_manager_core::models::{Profile, RouteMap, TunnelState};
+use net_manager_core::models::{PlannedRoute, Profile, RouteMap, TunnelBackend, TunnelState};
 use net_manager_core::route_plan::build_route_map;
 use std::collections::HashMap;
 use tauri::State;
@@ -25,19 +25,33 @@ pub(crate) async fn get_route_map(
     let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
 
     let mut running = HashMap::new();
+    let mut pushed_routes = Vec::new();
     {
         let mut runtime = state.runtime.lock().await;
         for profile in &profiles {
-            running.insert(
-                profile.id.clone(),
-                runtime.tunnels.status(profile).state == TunnelState::Running,
-            );
+            let is_running = runtime.tunnels.status(profile).state == TunnelState::Running;
+            running.insert(profile.id.clone(), is_running);
+            if is_running && profile.backend == TunnelBackend::OpenVpn {
+                for route in runtime.tunnels.openvpn_pushed_routes(&profile.id) {
+                    pushed_routes.push(PlannedRoute {
+                        destination: route.destination,
+                        owner_profile_id: profile.id.clone(),
+                        owner_name: profile.name.clone(),
+                        source: route.source,
+                        interface_name: None,
+                        metric: route.metric,
+                        active: true,
+                    });
+                }
+            }
         }
     }
 
     let selected = select_route_profiles(&profiles, &running, include_inactive);
     let effective = explorer::list_routes().await.map_err(|e| e.to_string())?;
-    Ok(build_route_map(&selected, &effective))
+    let mut map = build_route_map(&selected, &effective);
+    map.pushed_routes = pushed_routes;
+    Ok(map)
 }
 
 #[cfg(test)]

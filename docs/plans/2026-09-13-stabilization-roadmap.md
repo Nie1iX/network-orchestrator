@@ -6,6 +6,8 @@
 
 **Tech Stack:** Rust, Windows API, Tauri 2, React 19, TypeScript, Vite
 
+**Current status:** Stages 1–7 are implemented. Stage 8 is partially complete: documentation, Windows workflow definitions, backend prerequisite UX, and unsigned local packaging exist; the release-candidate gate is still pending. Backend executable management (persisted executable settings, verified managed Xray install/remove, Backend prerequisites UI) is implemented and locally checked. CI/CD adoption is deferred during stabilization, so local gates are currently authoritative.
+
 ---
 
 ## Execution order
@@ -18,6 +20,7 @@
 6. [Predicted/effective route map](2026-09-13-06-route-map.md)
 7. [Optional Xray Windows system proxy](2026-09-13-07-system-proxy.md)
 8. [Documentation, CI, packaging, release](2026-09-13-08-release-readiness.md)
+9. [Backend executable management](2026-09-13-09-backend-management.md)
 
 ## Invariants
 
@@ -42,11 +45,18 @@ npm audit --audit-level=high
 git diff --check
 ```
 
-## Completion criteria
+## Target completion criteria (not fully verified)
 
 - Normal exit leaves no app-owned tunnels, routes, proxy settings, or child processes.
 - Crash recovery identifies and resolves all durable app-owned state.
 - Managed secrets have explicit Windows ACLs; encryptable secrets use DPAPI.
 - Diagnostics distinguish process/service state from actual protocol health.
 - Predicted route decisions match the effective Windows route table after connect.
-- Windows CI builds and tests every commit; packaged artifacts pass a VM smoke test.
+- Local quality gates pass; packaged artifacts pass a VM smoke test. CI/CD can be adopted after stabilization.
+
+## Verification still pending
+
+- Disposable-Windows-VM E2E with real WireGuard, OpenVPN, and Xray fixtures.
+- Packaged NSIS install, launch, shutdown, and uninstall smoke testing.
+- Forced-crash recovery drills for child processes, owned routes, WireGuard services, and system proxy state.
+- Release artifact secret scan and code signing.

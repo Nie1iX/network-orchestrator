@@ -1,5 +1,6 @@
 use crate::commands::diagnostics::DiagnosticsInput;
 use crate::state::{AppState, RuntimeState};
+use net_manager_core::backend_settings::BackendSettingsStore;
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::models::*;
 use net_manager_core::policy::PolicyManager;
@@ -112,6 +113,10 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
         profiles: ProfileStore::new(dir.join("profiles.json")),
         config_vault: ConfigVault::new(dir.join("configs")),
         applied_routes: AppliedRouteStore::new(dir.join("applied-routes.json")),
+        backend_settings: BackendSettingsStore::new(dir.join("backend-settings.json")),
+        managed_xray_root: dir.join("backends").join("xray"),
+        backend_install_lock: tokio::sync::Mutex::new(()),
+        backend_install_cancel: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
         cleanup_complete: AtomicBool::new(false),
         runtime: tokio::sync::Mutex::new(RuntimeState {
@@ -176,6 +181,7 @@ pub(crate) fn diag_input(p: &Profile) -> DiagnosticsInput {
             rx_bytes: None,
             tx_bytes: None,
             log_tail: None,
+            pushed_routes: Vec::new(),
         },
         proxy_owner: None,
     }

@@ -1,7 +1,9 @@
 pub mod analysis;
+pub mod backend_settings;
 pub mod config_security;
 pub mod config_vault;
 pub mod explorer;
+pub mod managed_xray;
 pub mod models;
 pub mod policy;
 pub mod profiles;

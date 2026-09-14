@@ -6,6 +6,8 @@
 
 **Tech Stack:** GitHub Actions, Rust, npm, Tauri 2, Windows runner
 
+**Current status:** Tasks 1–5 are implemented. Task 6 remains pending. CI/CD execution is intentionally deferred during stabilization; local quality gates and local unsigned NSIS builds are the current workflow.
+
 ---
 
 ### Task 1: Update documentation
@@ -61,4 +63,4 @@ Release only when the worktree is clean and all required artifacts/results are r
 - Task 2: `AGENTS.md` with setup/gates/safety (never run ignored E2E outside a disposable VM).
 - Task 3: `.github/workflows/ci.yml` — windows-latest, pinned actions, rustup 1.98.1 MSVC, fmt/test/check/clippy/npm build/audit.
 - Task 4: `.github/workflows/package-windows.yml` — manual/`v*` tags, full gates + `tauri build --bundles nsis`, unsigned artifact upload only.
-- Pending: Task 6 release-candidate gate (CI run, packaged smoke, real-VM E2E, secret scan, uninstall check) — requires CI/VM infrastructure.
+- Pending: Task 6 release-candidate gate (packaged smoke, real-VM E2E, secret scan, uninstall check) — requires a disposable Windows VM and real fixture configs; CI/CD execution is deferred during stabilization.
