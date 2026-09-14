@@ -1,44 +1,50 @@
 :root {
   /* ── Design tokens ─────────────────────────────────────────────────── */
 
-  /* Surfaces */
-  --bg-app: #0f0f0f;
-  --bg-sidebar: #161616;
-  --bg-card: #1c1c1c;
-  --bg-card-hover: #232323;
-  --bg-input: #1c1c1c;
-  --bg-overlay: rgba(0, 0, 0, 0.6);
+  /* Surfaces — softer dark, not pure black */
+  --bg-app: #131315;
+  --bg-sidebar: #1a1a1d;
+  --bg-card: #1e1e22;
+  --bg-card-hover: #25252a;
+  --bg-elev: #28282d;
+  --bg-input: #18181b;
+  --bg-overlay: rgba(0, 0, 0, 0.65);
 
-  /* Borders */
-  --border: #2a2a2a;
-  --border-hover: #3a3a3a;
+  /* Borders — subtler, with hover states */
+  --border: #2e2e33;
+  --border-hover: #3a3a40;
   --border-focus: #646cff;
 
-  /* Text */
-  --text-primary: #e6e6e6;
-  --text-secondary: #aaa;
-  --text-muted: #666;
+  /* Text — better contrast hierarchy */
+  --text-primary: #f0f0f2;
+  --text-secondary: #b0b0b8;
+  --text-muted: #6a6a72;
 
-  /* Accent */
+  /* Accent — vibrant indigo */
   --accent: #646cff;
-  --accent-dim: #1a1a3a;
-  --accent-border: #3333aa;
+  --accent-hover: #7c7fff;
+  --accent-dim: rgba(100, 108, 255, 0.12);
+  --accent-border: rgba(100, 108, 255, 0.35);
+  --accent-glow: rgba(100, 108, 255, 0.2);
 
-  /* Status */
-  --up: #22c55e;
-  --up-bg: #0f3d0f;
-  --down: #ef4444;
-  --down-bg: #3a1d1d;
-  --unknown: #999;
-  --unknown-bg: #333;
+  /* Status — more vibrant */
+  --up: #34d399;
+  --up-bg: rgba(52, 211, 153, 0.12);
+  --up-border: rgba(52, 211, 153, 0.3);
+  --down: #f87171;
+  --down-bg: rgba(248, 113, 113, 0.12);
+  --down-border: rgba(248, 113, 113, 0.3);
+  --unknown: #9ca3af;
+  --unknown-bg: rgba(156, 163, 175, 0.1);
+  --unknown-border: rgba(156, 163, 175, 0.25);
 
   /* Virtual / physical */
   --physical: #646cff;
-  --physical-bg: #1a1a3a;
-  --physical-border: #3333aa;
+  --physical-bg: rgba(100, 108, 255, 0.1);
+  --physical-border: rgba(100, 108, 255, 0.3);
   --virtual: #f59e0b;
-  --virtual-bg: #3a2d1a;
-  --virtual-border: #5a4a2a;
+  --virtual-bg: rgba(245, 158, 11, 0.1);
+  --virtual-border: rgba(245, 158, 11, 0.3);
 
   /* Spacing scale */
   --sp-1: 0.25rem;
@@ -49,25 +55,28 @@
   --sp-6: 1.5rem;
   --sp-8: 2rem;
 
-  /* Radii */
-  --r-sm: 4px;
-  --r-md: 6px;
-  --r-lg: 10px;
+  /* Radii — slightly larger for modern feel */
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
   --r-full: 999px;
 
-  /* Shadows */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
-  --shadow-panel: -4px 0 24px rgba(0, 0, 0, 0.5);
+  /* Shadows — softer, more layered */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.4);
+  --shadow-panel: -4px 0 24px rgba(0, 0, 0, 0.4);
+  --shadow-glow: 0 0 20px var(--accent-glow);
 
   /* Sidebar */
-  --sidebar-w: 220px;
-  --sidebar-w-collapsed: 56px;
+  --sidebar-w: 240px;
+  --sidebar-w-collapsed: 60px;
 
   /* Typography */
   font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  font-size: 15px;
-  line-height: 1.5;
+  font-size: 14px;
+  line-height: 1.55;
   font-weight: 400;
   color: var(--text-primary);
   background-color: var(--bg-app);
@@ -99,6 +108,17 @@
   display: flex;
   flex-direction: column;
   transition: width 0.2s ease;
+  position: relative;
+}
+
+.sidebar::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 1px;
+  background: linear-gradient(180deg, transparent, var(--border) 20%, var(--border) 80%, transparent);
 }
 
 .sidebar.collapsed {
@@ -108,14 +128,15 @@
 .sidebar-header {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
-  padding: var(--sp-4) var(--sp-5);
+  gap: var(--sp-3);
+  padding: var(--sp-5) var(--sp-4);
   border-bottom: 1px solid var(--border);
   font-weight: 700;
-  font-size: 0.95rem;
+  font-size: 1rem;
   white-space: nowrap;
   overflow: hidden;
   flex-shrink: 0;
+  letter-spacing: -0.01em;
 }
 
 .sidebar.collapsed .sidebar-header .label {
@@ -133,6 +154,7 @@
   align-items: center;
   cursor: pointer;
   flex-shrink: 0;
+  transition: color 0.15s, background-color 0.15s;
 }
 
 .sidebar-toggle:hover {
@@ -196,6 +218,7 @@
   padding: var(--sp-2) var(--sp-3);
   font-size: 0.9rem;
   font-family: inherit;
+  font-weight: 500;
   color: var(--text-secondary);
   background-color: transparent;
   cursor: pointer;
@@ -215,6 +238,7 @@
 .nav-item.active {
   background-color: var(--accent-dim);
   color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent-border);
 }
 
 .nav-item .label {
@@ -247,6 +271,7 @@ h2 {
   margin: 0 0 var(--sp-4);
   padding-bottom: var(--sp-2);
   border-bottom: 1px solid var(--border);
+  letter-spacing: -0.01em;
 }
 
 section {
@@ -278,7 +303,8 @@ section {
   display: flex;
   flex-direction: column;
   gap: var(--sp-3);
-  transition: border-color 0.15s, background-color 0.15s;
+  transition: border-color 0.15s, background-color 0.15s, box-shadow 0.15s;
+  box-shadow: var(--shadow-sm);
 }
 
 .interface-card.clickable {
@@ -288,6 +314,7 @@ section {
 .interface-card.clickable:hover {
   border-color: var(--border-hover);
   background-color: var(--bg-card-hover);
+  box-shadow: var(--shadow-md);
 }
 
 .interface-header {
@@ -309,6 +336,7 @@ section {
   font-size: 1rem;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .badge-group {
@@ -319,13 +347,14 @@ section {
 }
 
 .badge {
-  font-size: 0.65rem;
+  font-size: 0.68rem;
   font-weight: 600;
-  padding: 0.15rem 0.4rem;
-  border-radius: var(--r-sm);
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--r-full);
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.04em;
   border: 1px solid transparent;
+  line-height: 1.2;
 }
 
 .badge-physical {
@@ -618,8 +647,13 @@ section {
 
 .empty-state {
   color: var(--text-muted);
-  padding: var(--sp-4);
+  padding: var(--sp-8) var(--sp-4);
   text-align: center;
+  font-size: 0.95rem;
+  background: var(--bg-card);
+  border: 1px dashed var(--border);
+  border-radius: var(--r-lg);
+  margin: var(--sp-4) 0;
 }
 
 /* Category badge in detail panel */
@@ -740,21 +774,23 @@ button {
   font-family: inherit;
   color: var(--text-primary);
   background-color: var(--bg-input);
-  transition: border-color 0.15s;
+  transition: border-color 0.15s, background-color 0.15s, box-shadow 0.15s;
   outline: none;
 }
 
 input:focus {
   border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px var(--accent-dim);
 }
 
 button {
   cursor: pointer;
-  background-color: var(--border);
+  background-color: var(--bg-elev);
 }
 
 button:hover:not(:disabled) {
   border-color: var(--border-focus);
+  background-color: var(--bg-card-hover);
 }
 
 button:disabled {
@@ -947,12 +983,37 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
+  position: relative;
+  overflow: hidden;
+}
+
+.profile-card.state-active {
+  border-color: var(--up-border);
+  box-shadow: var(--shadow-md), 0 0 0 1px var(--up-border);
+}
+
+.profile-card.state-active::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--up), var(--up-border));
+}
+
+.profile-card.state-failed {
+  border-color: var(--down-border);
 }
 
 .profile-status-msg {
   margin: 0;
   font-size: 0.78rem;
   color: var(--down);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--down-bg);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--down-border);
 }
 
 .profile-route-list {
@@ -969,7 +1030,7 @@ button:disabled {
   display: flex;
   gap: var(--sp-2);
   margin-top: auto;
-  padding-top: var(--sp-2);
+  padding-top: var(--sp-3);
 }
 
 .profile-actions button {
@@ -979,13 +1040,61 @@ button:disabled {
 }
 
 .profile-connect-btn {
-  background-color: var(--accent-dim);
-  border-color: var(--accent-border);
+  background-color: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  flex: 2;
 }
 
-.state-running { color: var(--up); background-color: var(--up-bg); }
-.state-stopped { color: var(--unknown); background-color: var(--unknown-bg); }
-.state-failed { color: var(--down); background-color: var(--down-bg); }
+.profile-connect-btn:hover:not(:disabled) {
+  background-color: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.profile-disconnect-btn {
+  background-color: var(--down-bg);
+  border-color: var(--down-border);
+  color: var(--down);
+  font-weight: 600;
+  flex: 2;
+}
+
+.profile-disconnect-btn:hover:not(:disabled) {
+  background-color: var(--down);
+  color: #fff;
+}
+
+.state-running { color: var(--up); background-color: var(--up-bg); border: 1px solid var(--up-border); }
+.state-stopped { color: var(--unknown); background-color: var(--unknown-bg); border: 1px solid var(--unknown-border); }
+.state-failed { color: var(--down); background-color: var(--down-bg); border: 1px solid var(--down-border); }
+
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--r-full);
+  flex-shrink: 0;
+}
+
+.status-dot.running {
+  background: var(--up);
+  box-shadow: 0 0 8px var(--up);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.status-dot.stopped {
+  background: var(--unknown);
+}
+
+.status-dot.failed {
+  background: var(--down);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
 
 /* ── Profile form ─────────────────────────────────────────────────────── */
 
@@ -1540,4 +1649,39 @@ button:disabled {
   border-radius: var(--r-sm);
   padding: var(--sp-2) var(--sp-3);
   font-size: 0.78rem;
+}
+
+/* ── Scrollbars ──────────────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-hover);
+  border-radius: var(--r-full);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ── Selection ───────────────────────────────────────────────────────── */
+
+::selection {
+  background: var(--accent-dim);
+  color: var(--text-primary);
 }

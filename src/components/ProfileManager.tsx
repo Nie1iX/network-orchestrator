@@ -1017,9 +1017,18 @@ export default function ProfileManager() {
             const isBusy = busy.has(profile.id);
             const inspection = inspections[profile.id];
             return (
-              <div key={profile.id} className="interface-card profile-card">
+              <div
+                key={profile.id}
+                className={`interface-card profile-card ${
+                  status.state === "running" ? "state-active" : ""
+                } ${status.state === "failed" ? "state-failed" : ""}`}
+              >
                 <div className="interface-header">
                   <div className="interface-title">
+                    <span
+                      className={`status-dot ${status.state}`}
+                      title={status.state}
+                    />
                     <span className="interface-name">{profile.name}</span>
                   </div>
                   <div className="badge-group">
@@ -1027,19 +1036,14 @@ export default function ProfileManager() {
                       {BACKEND_LABELS[profile.backend]}
                     </span>
                     {inspection?.managedConfig === true && (
-                      <span className="badge badge-managed">Managed config</span>
+                      <span className="badge badge-managed">Managed</span>
                     )}
                     {profile.useSystemProxy && (
-                      <span className="badge badge-managed">System proxy</span>
+                      <span className="badge badge-managed">Proxy</span>
                     )}
                     {inspection?.managedConfig === false && (
-                      <span className="badge badge-external">
-                        External config — resave to import
-                      </span>
+                      <span className="badge badge-external">External</span>
                     )}
-                    <span className={`state-badge state-${status.state}`}>
-                      {status.state}
-                    </span>
                   </div>
                 </div>
                 {status.state === "failed" && status.message && (
