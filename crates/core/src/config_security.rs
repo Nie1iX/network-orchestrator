@@ -216,6 +216,49 @@ mod imp {
         }
     }
 
+    /// Decrypt data that was protected with machine-scope DPAPI and no entropy
+    /// (e.g. WireGuard's `.conf.dpapi` files encrypted by the tunnel service).
+    /// Any process on the machine can decrypt machine-scope blobs.
+    pub fn unprotect_machine_data(data: &[u8]) -> io::Result<Vec<u8>> {
+        let input = data_blob(data)?;
+        unsafe {
+            let mut output = CRYPT_INTEGER_BLOB::default();
+            CryptUnprotectData(
+                &input,
+                None,
+                None,
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+            .map_err(|_| io::Error::last_os_error())?;
+            Ok(take_blob(output))
+        }
+    }
+
+    /// Encrypt data with machine-scope DPAPI and no entropy. Test-only
+    /// helper to create blobs compatible with WireGuard's `.conf.dpapi`.
+    #[cfg(test)]
+    pub fn protect_machine_data(data: &[u8]) -> io::Result<Vec<u8>> {
+        use windows::Win32::Security::Cryptography::CRYPTPROTECT_LOCAL_MACHINE;
+        let input = data_blob(data)?;
+        unsafe {
+            let mut output = CRYPT_INTEGER_BLOB::default();
+            CryptProtectData(
+                &input,
+                PCWSTR::null(),
+                None,
+                None,
+                None,
+                CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE,
+                &mut output,
+            )
+            .map_err(|_| io::Error::last_os_error())?;
+            Ok(take_blob(output))
+        }
+    }
+
     pub fn inspect_path_protection(path: &Path) -> io::Result<PathProtection> {
         let name = wide(path);
         unsafe {
@@ -301,9 +344,22 @@ mod imp {
             "DPAPI protection is only available on Windows",
         ))
     }
+
+    pub fn unprotect_machine_data(_data: &[u8]) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "DPAPI protection is only available on Windows",
+        ))
+    }
 }
 
-pub use imp::{inspect_path_protection, protect_path, protect_user_data, unprotect_user_data};
+pub use imp::{
+    inspect_path_protection, protect_path, protect_user_data, unprotect_machine_data,
+    unprotect_user_data,
+};
+
+#[cfg(test)]
+pub use imp::protect_machine_data;
 
 #[cfg(test)]
 mod tests {
@@ -440,5 +496,34 @@ mod tests {
             std::io::ErrorKind::Unsupported
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protect_and_unprotect_machine_data_roundtrip() {
+        let plaintext = b"[Interface]\nPrivateKey = test\n\n[Peer]\nAllowedIPs = 10.0.0.0/24\n";
+        let ciphertext = protect_machine_data(plaintext).unwrap();
+        assert_ne!(ciphertext, plaintext);
+        assert!(!ciphertext.windows(8).any(|w| w == b"PrivateKey"));
+        assert_eq!(unprotect_machine_data(&ciphertext).unwrap(), plaintext);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unprotect_machine_data_rejects_corrupt_input() {
+        let ciphertext = protect_machine_data(b"test data").unwrap();
+        let mut corrupt = ciphertext.clone();
+        let mid = corrupt.len() / 2;
+        corrupt[mid] ^= 0xFF;
+        assert!(unprotect_machine_data(&corrupt).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unprotect_machine_data_is_unsupported() {
+        assert_eq!(
+            unprotect_machine_data(b"data").unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
     }
 }

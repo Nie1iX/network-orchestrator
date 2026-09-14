@@ -30,6 +30,7 @@ pub fn analyze_profile(profile: &Profile) -> io::Result<ConfigAnalysis> {
         });
     }
     match profile.backend {
+        TunnelBackend::None => {}
         TunnelBackend::WireGuard => analyze_wireguard(&profile.config_path, &mut analysis)?,
         TunnelBackend::OpenVpn => analyze_openvpn(&profile.config_path, &mut analysis)?,
         TunnelBackend::Xray => analyze_xray(profile, &mut analysis)?,
@@ -238,14 +239,37 @@ fn analyze_wireguard(path: &Path, analysis: &mut ConfigAnalysis) -> io::Result<(
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if name.ends_with(".dpapi") {
-        analysis
-            .warnings
-            .push("encrypted WireGuard config cannot be statically analyzed".to_string());
-        analysis.route_knowledge_complete = false;
-        return Ok(());
-    }
-    let text = read_config(path)?;
+    let text = if name.ends_with(".dpapi") {
+        match std::fs::read(path)
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("cannot read config '{}': {err}", path.display()),
+                )
+            })
+            .and_then(|bytes| {
+                // WireGuard `.conf.dpapi` files are encrypted with machine-scope
+                // DPAPI (no entropy) by the tunnel service. Any process on the
+                // machine can decrypt them via CryptUnprotectData.
+                crate::config_security::unprotect_machine_data(&bytes)
+            }) {
+            Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
+            Err(_) => {
+                analysis
+                    .warnings
+                    .push("encrypted WireGuard config cannot be statically analyzed".to_string());
+                analysis.route_knowledge_complete = false;
+                return Ok(());
+            }
+        }
+    } else {
+        read_config(path)?
+    };
+    parse_wireguard_text(&text, analysis);
+    Ok(())
+}
+
+fn parse_wireguard_text(text: &str, analysis: &mut ConfigAnalysis) {
     let mut section = String::new();
     let mut table_off = false;
     let mut allowed = Vec::new();
@@ -304,7 +328,6 @@ fn analyze_wireguard(path: &Path, analysis: &mut ConfigAnalysis) -> io::Result<(
     if !table_off {
         analysis.os_routes.extend(allowed);
     }
-    Ok(())
 }
 
 fn parse_endpoint(value: &str) -> Option<(String, u16)> {
@@ -693,6 +716,44 @@ mod tests {
         );
         assert_eq!(destinations(&result.os_routes), vec![net("192.168.7.0/24")]);
         assert_eq!(result.os_routes[0].source, "profile policy");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wireguard_dpapi_config_is_decrypted_for_analysis() {
+        let dir = unique_dir("wg-dpapi");
+        let plaintext =
+            b"[Interface]\nPrivateKey = redacted\n\n[Peer]\nAllowedIPs = 10.20.0.0/16\nEndpoint = peer.example.com:51820\n";
+        let ciphertext = crate::config_security::protect_machine_data(plaintext).unwrap();
+        let cfg = dir.join("wg.conf.dpapi");
+        fs::write(&cfg, &ciphertext).unwrap();
+
+        let result = analyze_profile(&profile(TunnelBackend::WireGuard, &cfg)).unwrap();
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.route_knowledge_complete);
+        assert_eq!(destinations(&result.os_routes), vec![net("10.20.0.0/16")]);
+        assert_eq!(result.os_routes[0].source, "WireGuard AllowedIPs");
+        assert_eq!(result.endpoints.len(), 1);
+        assert_eq!(result.endpoints[0].address, "peer.example.com");
+        assert_eq!(result.endpoints[0].port, Some(51820));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wireguard_dpapi_corrupt_falls_back_to_warning() {
+        let dir = unique_dir("wg-dpapi-corrupt");
+        let cfg = dir.join("wg.conf.dpapi");
+        fs::write(&cfg, b"not-a-valid-dpapi-blob").unwrap();
+
+        let result = analyze_profile(&profile(TunnelBackend::WireGuard, &cfg)).unwrap();
+        assert_eq!(
+            result.warnings,
+            vec!["encrypted WireGuard config cannot be statically analyzed".to_string()]
+        );
+        assert!(!result.route_knowledge_complete);
+        assert!(result.os_routes.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1226,5 +1287,25 @@ mod tests {
             protocol: "x".into(),
         });
         assert!(conflicts_between(&c, &b, false).is_empty());
+    }
+
+    #[test]
+    fn none_backend_reports_only_policy_routes() {
+        let mut p = profile(TunnelBackend::None, Path::new(""));
+        p.routes = vec![PolicyRoute {
+            destination: "10.0.0.0/24".parse().unwrap(),
+            metric: 5,
+        }];
+        let analysis = analyze_profile(&p).unwrap();
+        assert!(analysis.warnings.is_empty());
+        assert!(analysis.route_knowledge_complete);
+        assert_eq!(
+            destinations(&analysis.os_routes),
+            vec![net("10.0.0.0/24")]
+        );
+        assert_eq!(analysis.os_routes[0].source, "profile policy");
+        assert!(analysis.internal_routes.is_empty());
+        assert!(analysis.listeners.is_empty());
+        assert!(analysis.endpoints.is_empty());
     }
 }

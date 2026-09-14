@@ -1,12 +1,15 @@
 use crate::models::{
-    Profile, ProtocolHealth, ProtocolHealthState, TunnelBackend, TunnelState, TunnelStatus,
+    AnalyzedRoute, Profile, ProtocolHealth, ProtocolHealthState, TunnelBackend, TunnelState,
+    TunnelStatus,
 };
 use crate::windows_job::ChildJob;
+use ipnet::{IpNet, Ipv4Net};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::io;
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -77,13 +80,87 @@ struct CommandSpec {
 }
 
 fn wireguard_connect_spec(exe: &Path, profile: &Profile) -> io::Result<CommandSpec> {
+    let config_path = if !profile.routes.is_empty() {
+        // When the app manages policy routes, inject `Table = off` into a
+        // transient copy so the WireGuard tunnel service does not install its
+        // own routes from AllowedIPs. The app then becomes the sole route
+        // installer via IP Helper API. The transient file is cleaned up on
+        // disconnect by `TunnelManager::cleanup_wireguard_transient`.
+        wireguard_table_off_config(&profile.config_path, &profile.id)?
+    } else {
+        std::path::absolute(&profile.config_path)?
+    };
     Ok(CommandSpec {
         program: exe.to_path_buf(),
         args: vec![
             OsString::from("/installtunnelservice"),
-            std::path::absolute(&profile.config_path)?.into_os_string(),
+            config_path.into_os_string(),
         ],
     })
+}
+
+/// Create a transient copy of `source` with `Table = off` appended to the
+/// `[Interface]` section. The copy is placed next to the original (in the
+/// managed vault revision directory) under a `.table-off.conf` name so it
+/// inherits the vault's ACL protection. Returns the path to the transient
+/// file.
+fn wireguard_table_off_config(source: &Path, profile_id: &str) -> io::Result<PathBuf> {
+    let text = std::fs::read_to_string(source).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot read WireGuard config for Table=off injection: {err}"),
+        )
+    })?;
+    let injected = inject_table_off(&text);
+    let dir = source
+        .parent()
+        .ok_or_else(|| invalid_data("WireGuard config path has no parent directory"))?;
+    let safe = crate::config_vault::sanitize_profile_id(profile_id)?;
+    let transient = dir.join(format!("{safe}.table-off.conf"));
+    std::fs::write(&transient, injected)?;
+    crate::config_security::protect_path(&transient)?;
+    Ok(transient)
+}
+
+/// Append `Table = off` to the `[Interface]` section of a WireGuard config.
+/// If `[Interface]` already contains a `Table` directive, it is replaced.
+/// If there is no `[Interface]` section, one is prepended.
+fn inject_table_off(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut in_interface = false;
+    let mut table_seen = false;
+    let mut interface_start: Option<usize> = None;
+    let mut table_line: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_interface = trimmed.eq_ignore_ascii_case("[interface]");
+            if in_interface && interface_start.is_none() {
+                interface_start = Some(i);
+            }
+            continue;
+        }
+        if in_interface {
+            let lower = trimmed.to_lowercase();
+            if lower.starts_with("table") {
+                table_line = Some(i);
+            }
+        }
+    }
+    if let Some(i) = table_line {
+        lines[i] = "Table = off".to_string();
+        table_seen = true;
+    }
+    if !table_seen {
+        if let Some(start) = interface_start {
+            lines.insert(start + 1, "Table = off".to_string());
+        } else {
+            lines.insert(0, "[Interface]".to_string());
+            lines.insert(1, "Table = off".to_string());
+            lines.insert(2, String::new());
+        }
+    }
+    lines.join("\n")
 }
 
 fn wireguard_disconnect_spec(exe: &Path, profile: &Profile) -> io::Result<CommandSpec> {
@@ -475,10 +552,15 @@ fn health(state: ProtocolHealthState, summary: impl Into<String>) -> ProtocolHea
         rx_bytes: None,
         tx_bytes: None,
         log_tail: None,
+        pushed_routes: Vec::new(),
     }
 }
 
-fn openvpn_health(status: &TunnelStatus, log: Option<String>) -> ProtocolHealth {
+fn openvpn_health(
+    status: &TunnelStatus,
+    log: Option<String>,
+    pushed_routes: Vec<AnalyzedRoute>,
+) -> ProtocolHealth {
     let tail = log.filter(|t| !t.trim().is_empty());
     let state = match status.state {
         TunnelState::Stopped => return health(ProtocolHealthState::Unknown, "not running"),
@@ -505,7 +587,92 @@ fn openvpn_health(status: &TunnelStatus, log: Option<String>) -> ProtocolHealth 
         state,
         summary,
         log_tail: tail,
+        pushed_routes,
         ..health(state, "")
+    }
+}
+
+/// Extract server-pushed routes from OpenVPN log text by parsing `PUSH_REPLY`
+/// control messages. OpenVPN logs lines like:
+///   `PUSH: Received control message: 'PUSH_REPLY,route 10.0.0.0 255.255.255.0,route-ipv6 fd00::/64,...'`
+/// The directives inside the quotes are comma-separated; `route <net> <mask>`
+/// and `route-ipv6 <prefix>` are the route directives we extract.
+pub fn parse_openvpn_pushed_reply(text: &str) -> Vec<AnalyzedRoute> {
+    let mut routes = Vec::new();
+    let mut seen = HashSet::new();
+    for line in text.lines() {
+        let Some(payload) = extract_push_reply_payload(line) else {
+            continue;
+        };
+        for directive in payload.split(',') {
+            let trimmed = directive.trim();
+            if let Some(route) = parse_pushed_route_directive(trimmed) {
+                if seen.insert(route.destination) {
+                    routes.push(route);
+                }
+            }
+        }
+    }
+    routes
+}
+
+fn extract_push_reply_payload(line: &str) -> Option<&str> {
+    let start = line.find("PUSH_REPLY")?;
+    let rest = &line[start..];
+    // The opening quote is before PUSH_REPLY in the log line; the closing
+    // quote (or end-of-line) delimits the payload. Take everything after
+    // "PUSH_REPLY" up to the next quote or end of line.
+    let payload_start = rest.find(',').map(|i| i + 1).unwrap_or(rest.len());
+    let payload = &rest[payload_start..];
+    let end = payload
+        .find('\'')
+        .or_else(|| payload.find('"'))
+        .unwrap_or(payload.len());
+    Some(payload[..end].trim_end())
+}
+
+fn parse_pushed_route_directive(directive: &str) -> Option<AnalyzedRoute> {
+    let tokens: Vec<&str> = directive.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    match tokens[0] {
+        "route" => {
+            let net = tokens.get(1)?;
+            if let Ok(ipnet) = net.parse::<IpNet>() {
+                return Some(AnalyzedRoute {
+                    destination: ipnet,
+                    source: "OpenVPN pushed".to_string(),
+                    metric: None,
+                });
+            }
+            let addr = net.parse::<Ipv4Addr>().ok()?;
+            let prefix = match tokens.get(2) {
+                Some(mask) => {
+                    let mask = mask.parse::<Ipv4Addr>().ok()?;
+                    Ipv4Net::with_netmask(addr, mask).ok()?.prefix_len()
+                }
+                None => 32,
+            };
+            Ipv4Net::new(addr, prefix)
+                .ok()
+                .map(IpNet::V4)
+                .map(|destination| AnalyzedRoute {
+                    destination,
+                    source: "OpenVPN pushed".to_string(),
+                    metric: None,
+                })
+        }
+        "route-ipv6" => tokens
+            .get(1)
+            .and_then(|t| t.parse::<IpNet>().ok())
+            .filter(|net| matches!(net, IpNet::V6(_)))
+            .map(|destination| AnalyzedRoute {
+                destination,
+                source: "OpenVPN pushed".to_string(),
+                metric: None,
+            }),
+        _ => None,
     }
 }
 
@@ -572,6 +739,7 @@ fn wireguard_health_from_dump(dump: &str) -> ProtocolHealth {
         rx_bytes: Some(rx),
         tx_bytes: Some(tx),
         log_tail: None,
+        pushed_routes: Vec::new(),
     }
 }
 
@@ -581,6 +749,8 @@ pub struct TunnelManager {
     xray_exe: Option<PathBuf>,
     log_dir: Option<PathBuf>,
     wireguard_services: HashSet<String>,
+    wireguard_transient_configs: HashMap<String, PathBuf>,
+    static_route_profiles: HashSet<String>,
     openvpn_children: HashMap<String, Child>,
     xray_children: HashMap<String, Child>,
     failures: HashMap<String, String>,
@@ -593,9 +763,27 @@ impl TunnelManager {
     }
 
     pub fn with_log_dir(log_dir: PathBuf) -> Self {
-        let mut manager = Self::with_all_executables(None, None, None);
+        Self::with_all_executables_and_log_dir(None, None, None, log_dir)
+    }
+
+    pub fn with_all_executables_and_log_dir(
+        wireguard: Option<PathBuf>,
+        openvpn: Option<PathBuf>,
+        xray: Option<PathBuf>,
+        log_dir: PathBuf,
+    ) -> Self {
+        let mut manager = Self::with_all_executables(wireguard, openvpn, xray);
         manager.log_dir = Some(log_dir);
         manager
+    }
+
+    pub fn set_executable(&mut self, backend: TunnelBackend, path: Option<PathBuf>) {
+        match backend {
+            TunnelBackend::None => {}
+            TunnelBackend::WireGuard => self.wireguard_exe = path,
+            TunnelBackend::OpenVpn => self.openvpn_exe = path,
+            TunnelBackend::Xray => self.xray_exe = path,
+        }
     }
 
     pub fn with_executables(wireguard: Option<PathBuf>, openvpn: Option<PathBuf>) -> Self {
@@ -613,6 +801,8 @@ impl TunnelManager {
             xray_exe: xray,
             log_dir: None,
             wireguard_services: HashSet::new(),
+            wireguard_transient_configs: HashMap::new(),
+            static_route_profiles: HashSet::new(),
             openvpn_children: HashMap::new(),
             xray_children: HashMap::new(),
             failures: HashMap::new(),
@@ -690,15 +880,41 @@ impl TunnelManager {
         }
     }
 
+    /// Read the full OpenVPN log for `profile_id` and extract server-pushed
+    /// routes from `PUSH_REPLY` lines. Unlike `log_tail_for_tag`, this reads
+    /// the entire log file because `PUSH_REPLY` appears during the handshake,
+    /// not at the tail.
+    pub fn openvpn_pushed_routes(&self, profile_id: &str) -> Vec<AnalyzedRoute> {
+        let Some(dir) = &self.log_dir else {
+            return Vec::new();
+        };
+        let Ok(safe) = crate::config_vault::sanitize_profile_id(profile_id) else {
+            return Vec::new();
+        };
+        let path = dir.join(format!("{safe}-openvpn.log"));
+        match std::fs::read_to_string(&path) {
+            Ok(text) => parse_openvpn_pushed_reply(&text),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn protocol_health(&mut self, profile: &Profile) -> ProtocolHealth {
         let status = self.status(profile);
         match profile.backend {
+            TunnelBackend::None => match status.state {
+                TunnelState::Running => {
+                    health(ProtocolHealthState::Healthy, "static routes active")
+                }
+                TunnelState::Stopped => health(ProtocolHealthState::Unknown, "not active"),
+                TunnelState::Failed => health(ProtocolHealthState::Failed, "failed"),
+            },
             TunnelBackend::OpenVpn => {
                 let log = self
                     .log_tail_for_tag(&profile.id, "openvpn", LOG_TAIL_BYTES)
                     .ok()
                     .flatten();
-                openvpn_health(&status, log)
+                let pushed = self.openvpn_pushed_routes(&profile.id);
+                openvpn_health(&status, log, pushed)
             }
             TunnelBackend::Xray => {
                 let log = self
@@ -819,11 +1035,23 @@ impl TunnelManager {
         if self.wireguard_services.contains(&profile.id)
             || self.openvpn_children.contains_key(&profile.id)
             || self.xray_children.contains_key(&profile.id)
+            || self.static_route_profiles.contains(&profile.id)
         {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("profile '{}' is already running", profile.id),
             ));
+        }
+        if profile.backend == TunnelBackend::None {
+            if profile.routes.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "static-routes profile has no routes to apply",
+                ));
+            }
+            self.static_route_profiles.insert(profile.id.clone());
+            self.failures.remove(&profile.id);
+            return Ok(status_for(&profile.id, TunnelState::Running, None));
         }
         if !profile.config_path.is_file() {
             return Err(io::Error::new(
@@ -847,8 +1075,17 @@ impl TunnelManager {
                     ));
                 }
                 let spec = wireguard_connect_spec(&exe, profile)?;
+                let transient_path = if !profile.routes.is_empty() {
+                    spec.args.get(1).and_then(|a| a.to_str().map(PathBuf::from))
+                } else {
+                    None
+                };
                 run_service_command(&spec)?;
                 self.wireguard_services.insert(profile.id.clone());
+                if let Some(path) = transient_path {
+                    self.wireguard_transient_configs
+                        .insert(profile.id.clone(), path);
+                }
                 self.failures.remove(&profile.id);
                 Ok(status_for(&profile.id, TunnelState::Running, None))
             }
@@ -889,16 +1126,23 @@ impl TunnelManager {
                 self.failures.remove(&profile.id);
                 Ok(status_for(&profile.id, TunnelState::Running, None))
             }
+            TunnelBackend::None => unreachable!("None handled before config_path check"),
         }
     }
 
     pub fn disconnect(&mut self, profile: &Profile) -> io::Result<TunnelStatus> {
         match profile.backend {
+            TunnelBackend::None => {
+                self.static_route_profiles.remove(&profile.id);
+                self.failures.remove(&profile.id);
+                Ok(status_for(&profile.id, TunnelState::Stopped, None))
+            }
             TunnelBackend::WireGuard => {
                 let exe = resolve_wireguard_executable(self.wireguard_exe.as_deref())?;
                 let spec = wireguard_disconnect_spec(&exe, profile)?;
                 run_service_command(&spec)?;
                 self.wireguard_services.remove(&profile.id);
+                self.cleanup_wireguard_transient(&profile.id);
                 self.failures.remove(&profile.id);
                 Ok(status_for(&profile.id, TunnelState::Stopped, None))
             }
@@ -908,6 +1152,15 @@ impl TunnelManager {
             TunnelBackend::Xray => {
                 Self::disconnect_child(&mut self.xray_children, &mut self.failures, profile)
             }
+        }
+    }
+
+    /// Remove the transient `Table = off` config created for `profile_id` if
+    /// one exists. Errors are ignored — the file is best-effort cleanup and
+    /// its absence does not affect the already-stopped tunnel.
+    fn cleanup_wireguard_transient(&mut self, profile_id: &str) {
+        if let Some(path) = self.wireguard_transient_configs.remove(profile_id) {
+            let _ = std::fs::remove_file(&path);
         }
     }
 
@@ -938,10 +1191,18 @@ impl TunnelManager {
 
     pub fn status(&mut self, profile: &Profile) -> TunnelStatus {
         match profile.backend {
+            TunnelBackend::None => {
+                if self.static_route_profiles.contains(&profile.id) {
+                    status_for(&profile.id, TunnelState::Running, None)
+                } else {
+                    status_for(&profile.id, TunnelState::Stopped, None)
+                }
+            }
             TunnelBackend::WireGuard => match self.query_wireguard_service(profile) {
                 Ok(true) => status_for(&profile.id, TunnelState::Running, None),
                 Ok(false) => {
                     self.wireguard_services.remove(&profile.id);
+                    self.cleanup_wireguard_transient(&profile.id);
                     status_for(&profile.id, TunnelState::Stopped, None)
                 }
                 Err(err) => status_for(&profile.id, TunnelState::Failed, Some(err.to_string())),
@@ -1030,6 +1291,53 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn set_executable_replaces_backend_path() {
+        let mut manager = TunnelManager::new();
+
+        manager.set_executable(
+            TunnelBackend::Xray,
+            Some(PathBuf::from(r"C:\custom\xray.exe")),
+        );
+        assert_eq!(manager.xray_exe, Some(PathBuf::from(r"C:\custom\xray.exe")));
+        assert_eq!(manager.wireguard_exe, None);
+        assert_eq!(manager.openvpn_exe, None);
+
+        manager.set_executable(
+            TunnelBackend::WireGuard,
+            Some(PathBuf::from(r"C:\custom\wireguard.exe")),
+        );
+        assert_eq!(
+            manager.wireguard_exe,
+            Some(PathBuf::from(r"C:\custom\wireguard.exe"))
+        );
+
+        manager.set_executable(TunnelBackend::Xray, None);
+        assert_eq!(manager.xray_exe, None);
+    }
+
+    #[test]
+    fn with_all_executables_and_log_dir_sets_paths_and_log_dir() {
+        let dir = unique_dir("exelog");
+        let manager = TunnelManager::with_all_executables_and_log_dir(
+            Some(PathBuf::from(r"C:\bin\wireguard.exe")),
+            Some(PathBuf::from(r"C:\bin\openvpn.exe")),
+            Some(PathBuf::from(r"C:\bin\xray.exe")),
+            dir.clone(),
+        );
+        assert_eq!(
+            manager.wireguard_exe,
+            Some(PathBuf::from(r"C:\bin\wireguard.exe"))
+        );
+        assert_eq!(
+            manager.openvpn_exe,
+            Some(PathBuf::from(r"C:\bin\openvpn.exe"))
+        );
+        assert_eq!(manager.xray_exe, Some(PathBuf::from(r"C:\bin\xray.exe")));
+        assert_eq!(manager.log_dir, Some(dir));
+        fs::remove_dir_all(manager.log_dir.clone().unwrap()).unwrap();
     }
 
     fn wg_profile() -> Profile {
@@ -1563,7 +1871,8 @@ mod tests {
         assert_eq!(
             openvpn_health(
                 &running,
-                Some("note\nInitialization Sequence Completed".into())
+                Some("note\nInitialization Sequence Completed".into()),
+                Vec::new()
             )
             .state,
             ProtocolHealthState::Healthy
@@ -1571,27 +1880,28 @@ mod tests {
         assert_eq!(
             openvpn_health(
                 &running,
-                Some("Initialization Sequence Completed\nAUTH_FAILED".into())
+                Some("Initialization Sequence Completed\nAUTH_FAILED".into()),
+                Vec::new()
             )
             .state,
             ProtocolHealthState::Failed
         );
         assert_eq!(
-            openvpn_health(&running, Some("connecting...".into())).state,
+            openvpn_health(&running, Some("connecting...".into()), Vec::new()).state,
             ProtocolHealthState::Degraded
         );
         assert_eq!(
-            openvpn_health(&running, None).state,
+            openvpn_health(&running, None, Vec::new()).state,
             ProtocolHealthState::Degraded
         );
         let failed = status_for("p", TunnelState::Failed, Some("exited".into()));
         assert_eq!(
-            openvpn_health(&failed, Some("tail".into())).state,
+            openvpn_health(&failed, Some("tail".into()), Vec::new()).state,
             ProtocolHealthState::Failed
         );
         let stopped = status_for("p", TunnelState::Stopped, None);
         assert_eq!(
-            openvpn_health(&stopped, None).state,
+            openvpn_health(&stopped, None, Vec::new()).state,
             ProtocolHealthState::Unknown
         );
     }
@@ -1704,5 +2014,363 @@ mod tests {
         assert!(health.log_tail.unwrap().contains("AUTH_FAILED"));
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pushed_route_tests {
+    use super::*;
+
+    #[test]
+    fn parses_ipv4_routes_with_netmask() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,route 10.0.0.0 255.255.255.0,route 192.168.1.0 255.255.255.0,ifconfig 10.8.0.2 255.255.255.0'";
+        let routes = parse_openvpn_pushed_reply(log);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].destination, "10.0.0.0/24".parse().unwrap());
+        assert_eq!(routes[1].destination, "192.168.1.0/24".parse().unwrap());
+        assert_eq!(routes[0].source, "OpenVPN pushed");
+    }
+
+    #[test]
+    fn parses_host_route_without_netmask() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,route 10.8.0.1'";
+        let routes = parse_openvpn_pushed_reply(log);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].destination, "10.8.0.1/32".parse().unwrap());
+    }
+
+    #[test]
+    fn parses_ipv6_routes() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,route-ipv6 fd00::/64,route-ipv6 2001:db8::/32'";
+        let routes = parse_openvpn_pushed_reply(log);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].destination, "fd00::/64".parse().unwrap());
+        assert_eq!(routes[1].destination, "2001:db8::/32".parse().unwrap());
+    }
+
+    #[test]
+    fn deduplicates_repeated_routes() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,route 10.0.0.0 255.255.255.0,route 10.0.0.0 255.255.255.0'";
+        let routes = parse_openvpn_pushed_reply(log);
+        assert_eq!(routes.len(), 1);
+    }
+
+    #[test]
+    fn ignores_non_route_directives() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,ifconfig 10.8.0.2 255.255.255.0,topology subnet,route-gateway 10.8.0.1,dhcp-option DNS 8.8.8.8'";
+        let routes = parse_openvpn_pushed_reply(log);
+        assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn handles_multiple_push_reply_lines() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,route 10.0.0.0 255.255.255.0'\nSome other line\nPUSH: Received control message: 'PUSH_REPLY,route 192.168.1.0 255.255.255.0'";
+        let routes = parse_openvpn_pushed_reply(log);
+        assert_eq!(routes.len(), 2);
+    }
+
+    #[test]
+    fn returns_empty_when_no_push_reply() {
+        let log = "Initialization Sequence Completed\nSome warning\nAUTH_FAILED";
+        let routes = parse_openvpn_pushed_reply(log);
+        assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn handles_double_quoted_payload() {
+        let log = "PUSH: Received control message: \"PUSH_REPLY,route 10.0.0.0 255.255.255.0\"";
+        let routes = parse_openvpn_pushed_reply(log);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].destination, "10.0.0.0/24".parse().unwrap());
+    }
+
+    #[test]
+    fn handles_cidr_format_route() {
+        let log = "PUSH: Received control message: 'PUSH_REPLY,route 10.0.0.0/24'";
+        let routes = parse_openvpn_pushed_reply(log);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].destination, "10.0.0.0/24".parse().unwrap());
+    }
+
+    #[test]
+    fn openvpn_pushed_routes_reads_full_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "netmgr-pushed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("testprof-openvpn.log"),
+            "PUSH: Received control message: 'PUSH_REPLY,route 10.0.0.0 255.255.255.0,route 10.8.0.1'\nInitialization Sequence Completed\n",
+        )
+        .unwrap();
+        let manager = TunnelManager::with_log_dir(logs);
+        let routes = manager.openvpn_pushed_routes("testprof");
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].destination, "10.0.0.0/24".parse().unwrap());
+        assert_eq!(routes[1].destination, "10.8.0.1/32".parse().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn openvpn_pushed_routes_returns_empty_without_log_dir() {
+        let manager = TunnelManager::new();
+        let routes = manager.openvpn_pushed_routes("any");
+        assert!(routes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod table_off_tests {
+    use super::*;
+    use crate::models::{PolicyRoute, Profile, TunnelBackend};
+    use std::path::PathBuf;
+
+    fn wg_profile_with_routes(routes: Vec<PolicyRoute>) -> Profile {
+        Profile {
+            id: "test-wg".into(),
+            name: "Test WG".into(),
+            backend: TunnelBackend::WireGuard,
+            config_path: PathBuf::from(r"C:\configs\test.conf"),
+            interface_name: "wg-test".into(),
+            routes,
+            auto_connect: false,
+            domain_policies: vec![],
+            xray_socks_port: None,
+            use_system_proxy: false,
+            proxy_bypass: vec![],
+        }
+    }
+
+    #[test]
+    fn inject_table_off_appends_to_interface_section() {
+        let config =
+            "[Interface]\nPrivateKey = abc\n\n[Peer]\nPublicKey = def\nAllowedIPs = 10.0.0.0/24\n";
+        let result = inject_table_off(config);
+        assert!(result.contains("Table = off"));
+        assert!(result.contains("[Interface]"));
+        assert!(result.contains("PrivateKey = abc"));
+        assert!(result.contains("[Peer]"));
+        assert!(result.contains("AllowedIPs = 10.0.0.0/24"));
+    }
+
+    #[test]
+    fn inject_table_off_replaces_existing_table_directive() {
+        let config = "[Interface]\nPrivateKey = abc\nTable = auto\n\n[Peer]\nPublicKey = def\n";
+        let result = inject_table_off(config);
+        assert!(result.contains("Table = off"));
+        assert!(!result.contains("Table = auto"));
+    }
+
+    #[test]
+    fn inject_table_off_prepends_interface_if_missing() {
+        let config = "[Peer]\nPublicKey = def\nAllowedIPs = 10.0.0.0/24\n";
+        let result = inject_table_off(config);
+        assert!(result.starts_with("[Interface]"));
+        assert!(result.contains("Table = off"));
+        assert!(result.contains("[Peer]"));
+    }
+
+    #[test]
+    fn inject_table_off_preserves_comments() {
+        let config = "[Interface]\n# my private key\nPrivateKey = abc\n\n[Peer]\nPublicKey = def\n";
+        let result = inject_table_off(config);
+        assert!(result.contains("# my private key"));
+        assert!(result.contains("Table = off"));
+    }
+
+    #[test]
+    fn wireguard_connect_spec_uses_transient_when_routes_nonempty() {
+        let dir = std::env::temp_dir().join(format!(
+            "netmgr-tableoff-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("test.conf");
+        std::fs::write(
+            &config_path,
+            "[Interface]\nPrivateKey = abc\n\n[Peer]\nPublicKey = def\nAllowedIPs = 10.0.0.0/24\n",
+        )
+        .unwrap();
+
+        let mut profile = wg_profile_with_routes(vec![PolicyRoute {
+            destination: "10.20.0.0/16".parse().unwrap(),
+            metric: 5,
+        }]);
+        profile.config_path = config_path.clone();
+
+        let spec = wireguard_connect_spec(Path::new(r"C:\wg\wireguard.exe"), &profile).unwrap();
+        assert_eq!(spec.program, PathBuf::from(r"C:\wg\wireguard.exe"));
+        assert_eq!(spec.args[0], OsString::from("/installtunnelservice"));
+        let transient_path: PathBuf = spec.args[1].clone().into();
+        assert!(transient_path
+            .to_string_lossy()
+            .ends_with(".table-off.conf"));
+        assert!(transient_path.is_file(), "transient config should exist");
+        let content = std::fs::read_to_string(&transient_path).unwrap();
+        assert!(content.contains("Table = off"));
+        assert!(content.contains("PrivateKey = abc"));
+        assert!(content.contains("AllowedIPs = 10.0.0.0/24"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wireguard_connect_spec_uses_original_when_no_routes() {
+        let dir = std::env::temp_dir().join(format!(
+            "netmgr-tableoff-noroutes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("test.conf");
+        std::fs::write(&config_path, "[Interface]\nPrivateKey = abc\n").unwrap();
+
+        let mut profile = wg_profile_with_routes(vec![]);
+        profile.config_path = config_path.clone();
+
+        let spec = wireguard_connect_spec(Path::new(r"C:\wg\wireguard.exe"), &profile).unwrap();
+        let used_path: PathBuf = spec.args[1].clone().into();
+        assert_eq!(used_path, std::path::absolute(&config_path).unwrap());
+        // No transient file should be created
+        assert!(!dir.join("test-wg.table-off.conf").is_file());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wireguard_table_off_config_creates_protected_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "netmgr-tableoff-protect-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.conf");
+        std::fs::write(&source, "[Interface]\nPrivateKey = abc\n").unwrap();
+
+        let transient = wireguard_table_off_config(&source, "test-prof").unwrap();
+        assert!(transient.is_file());
+        assert!(transient
+            .to_string_lossy()
+            .ends_with("test-prof.table-off.conf"));
+        let content = std::fs::read_to_string(&transient).unwrap();
+        assert!(content.contains("Table = off"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_wireguard_transient_removes_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "netmgr-tableoff-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transient = dir.join("test.table-off.conf");
+        std::fs::write(&transient, "[Interface]\nTable = off\n").unwrap();
+
+        let mut manager = TunnelManager::new();
+        manager
+            .wireguard_transient_configs
+            .insert("test".into(), transient.clone());
+        assert!(transient.is_file());
+        manager.cleanup_wireguard_transient("test");
+        assert!(!transient.is_file());
+        assert!(!manager.wireguard_transient_configs.contains_key("test"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn static_routes_profile(id: &str, routes: Vec<PolicyRoute>) -> Profile {
+        Profile {
+            id: id.into(),
+            name: id.into(),
+            backend: TunnelBackend::None,
+            config_path: PathBuf::new(),
+            interface_name: "Ethernet".into(),
+            routes,
+            auto_connect: false,
+            domain_policies: vec![],
+            xray_socks_port: None,
+            use_system_proxy: false,
+            proxy_bypass: vec![],
+        }
+    }
+
+    #[test]
+    fn static_routes_connect_requires_routes() {
+        let mut manager = TunnelManager::new();
+        let profile = static_routes_profile("static", vec![]);
+        let err = manager.connect(&profile).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn static_routes_connect_and_disconnect_lifecycle() {
+        let mut manager = TunnelManager::new();
+        let profile = static_routes_profile(
+            "static",
+            vec![PolicyRoute {
+                destination: "10.0.0.0/24".parse().unwrap(),
+                metric: 10,
+            }],
+        );
+        let status = manager.connect(&profile).unwrap();
+        assert_eq!(status.state, TunnelState::Running);
+        assert!(manager.static_route_profiles.contains("static"));
+
+        let status = manager.status(&profile);
+        assert_eq!(status.state, TunnelState::Running);
+
+        let status = manager.disconnect(&profile).unwrap();
+        assert_eq!(status.state, TunnelState::Stopped);
+        assert!(!manager.static_route_profiles.contains("static"));
+
+        let status = manager.status(&profile);
+        assert_eq!(status.state, TunnelState::Stopped);
+    }
+
+    #[test]
+    fn static_routes_protocol_health_reports_active_state() {
+        let mut manager = TunnelManager::new();
+        let profile = static_routes_profile(
+            "static",
+            vec![PolicyRoute {
+                destination: "10.0.0.0/24".parse().unwrap(),
+                metric: 10,
+            }],
+        );
+        let health = manager.protocol_health(&profile);
+        assert_eq!(health.state, ProtocolHealthState::Unknown);
+
+        manager.connect(&profile).unwrap();
+        let health = manager.protocol_health(&profile);
+        assert_eq!(health.state, ProtocolHealthState::Healthy);
+        assert_eq!(health.summary, "static routes active");
+
+        manager.disconnect(&profile).unwrap();
+        let health = manager.protocol_health(&profile);
+        assert_eq!(health.state, ProtocolHealthState::Unknown);
     }
 }
