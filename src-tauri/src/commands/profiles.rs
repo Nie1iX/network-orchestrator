@@ -397,6 +397,7 @@ pub(crate) fn import_configs_into(
             xray_socks_port: None,
             use_system_proxy: false,
             proxy_bypass: vec![],
+            subscription: None,
         };
         if let Err(err) = store.upsert(profile) {
             let _ = vault.remove_revision_for_config(&import.config_path);
@@ -452,9 +453,10 @@ fn base64_decode(input: &str) -> Option<String> {
 }
 
 /// Pure, testable core of `import_subscription`: fetches the subscription
-/// URL with the given HWID, decodes the body, and creates one Xray/VLESS
-/// profile per `vless://` entry. Per-entry errors are collected instead of
-/// aborting the batch.
+/// URL with the given HWID, decodes the body, and creates a single grouped
+/// Xray/VLESS profile containing all endpoints. The first valid endpoint
+/// becomes the active config; the rest are stored in a sidecar file for
+/// endpoint switching.
 pub(crate) async fn import_subscription_into(
     vault: &ConfigVault,
     store: &net_manager_core::profiles::ProfileStore,
@@ -484,22 +486,31 @@ pub(crate) async fn import_subscription_into(
     }
 
     let document = store.load().map_err(|e| e.to_string())?;
-    let mut used_ports = profile_listener_ports(&document.profiles, "");
+    let used_ports = profile_listener_ports(&document.profiles, "");
+    let socks_port = select_available_socks_port(&used_ports, loopback_port_available)
+        .map_err(|e| e.to_string())?;
+
+    let id = generate_import_id(0);
     let mut errors: Vec<BatchImportError> = Vec::new();
+    let mut endpoints: Vec<net_manager_core::config_vault::SubscriptionEndpoint> = Vec::new();
+    let mut active_index: usize = 0;
+    let mut first_config_path: Option<PathBuf> = None;
 
     for (index, vless_url) in urls.iter().enumerate() {
-        let id = generate_import_id(index);
-        let socks_port = match select_available_socks_port(&used_ports, loopback_port_available) {
-            Ok(port) => port,
-            Err(err) => {
-                errors.push(BatchImportError {
-                    path: vless_url.clone(),
-                    error: err,
-                });
-                continue;
-            }
-        };
-        used_ports.insert(socks_port);
+        let parsed = net_manager_core::xray::parse_vless_url(vless_url.trim()).ok();
+        let name = parsed
+            .as_ref()
+            .and_then(|p| p.name.clone())
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| format!("Endpoint {}", index + 1));
+        endpoints.push(net_manager_core::config_vault::SubscriptionEndpoint {
+            url: vless_url.trim().to_string(),
+            name,
+        });
+
+        if first_config_path.is_some() {
+            continue;
+        }
 
         let config =
             match net_manager_core::xray::generate_vless_config(vless_url.trim(), socks_port) {
@@ -509,6 +520,7 @@ pub(crate) async fn import_subscription_into(
                         path: vless_url.clone(),
                         error: format!("invalid VLESS URL: {err}"),
                     });
+                    active_index = index + 1;
                     continue;
                 }
             };
@@ -519,6 +531,7 @@ pub(crate) async fn import_subscription_into(
                     path: vless_url.clone(),
                     error: err.to_string(),
                 });
+                active_index = index + 1;
                 continue;
             }
         };
@@ -529,35 +542,52 @@ pub(crate) async fn import_subscription_into(
                     path: vless_url.clone(),
                     error: err.to_string(),
                 });
+                active_index = index + 1;
                 continue;
             }
         };
-        let name = net_manager_core::xray::parse_vless_url(vless_url.trim())
-            .ok()
-            .and_then(|p| p.name)
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| format!("VLESS {}", index + 1));
-        let profile = Profile {
-            id: id.clone(),
-            name,
-            backend: TunnelBackend::Xray,
-            config_path: import.config_path.clone(),
-            interface_name: String::new(),
-            routes: vec![],
-            auto_connect: false,
-            domain_policies: vec![],
-            xray_socks_port: Some(socks_port),
-            use_system_proxy: false,
-            proxy_bypass: vec![],
-        };
-        if let Err(err) = store.upsert(profile) {
-            let _ = vault.remove_revision_for_config(&import.config_path);
-            errors.push(BatchImportError {
-                path: vless_url.clone(),
-                error: err.to_string(),
-            });
-        }
+        first_config_path = Some(import.config_path);
     }
+
+    let Some(config_path) = first_config_path else {
+        return Err("no valid VLESS endpoint found in subscription".into());
+    };
+    if active_index >= endpoints.len() {
+        active_index = 0;
+    }
+
+    vault
+        .store_subscription_endpoints(&id, &endpoints)
+        .map_err(|e| format!("failed to store subscription sidecar: {e}"))?;
+
+    let profile_name = net_manager_core::xray::parse_vless_url(urls[active_index].trim())
+        .ok()
+        .and_then(|p| p.name)
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "Subscription".to_string());
+    let profile = Profile {
+        id: id.clone(),
+        name: profile_name,
+        backend: TunnelBackend::Xray,
+        config_path: config_path.clone(),
+        interface_name: String::new(),
+        routes: vec![],
+        auto_connect: false,
+        domain_policies: vec![],
+        xray_socks_port: Some(socks_port),
+        use_system_proxy: false,
+        proxy_bypass: vec![],
+        subscription: Some(SubscriptionMeta {
+            url: url.to_string(),
+            hwid: hwid.to_string(),
+            endpoint_count: endpoints.len(),
+            active_index,
+        }),
+    };
+    store.upsert(profile).map_err(|e| {
+        let _ = vault.remove_revision_for_config(&config_path);
+        e.to_string()
+    })?;
 
     let profiles = store.load().map_err(|e| e.to_string())?.profiles;
     Ok(BatchImportResult { profiles, errors })
@@ -575,6 +605,89 @@ pub(crate) async fn import_subscription(
         .build()
         .map_err(|e| format!("failed to build HTTP client: {e}"))?;
     import_subscription_into(&state.config_vault, &state.profiles, &client, &url, &hwid).await
+}
+
+#[tauri::command]
+pub(crate) async fn get_subscription_endpoints(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SubscriptionEndpointInfo>, String> {
+    let profile = find_profile(&state.profiles, &profile_id)?;
+    let endpoints = state
+        .config_vault
+        .read_subscription_endpoints(&profile_id)
+        .map_err(|e| e.to_string())?;
+    let active_index = profile
+        .subscription
+        .as_ref()
+        .map(|s| s.active_index)
+        .unwrap_or(0);
+    Ok(endpoints
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| SubscriptionEndpointInfo {
+            name: e.name,
+            active: i == active_index,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub(crate) async fn switch_subscription_endpoint(
+    profile_id: String,
+    endpoint_index: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let mut profile = find_profile(&state.profiles, &profile_id)?;
+    let subscription = profile
+        .subscription
+        .as_ref()
+        .ok_or_else(|| "profile is not a subscription".to_string())?
+        .clone();
+    if endpoint_index >= subscription.endpoint_count {
+        return Err("endpoint index out of range".into());
+    }
+    let endpoints = state
+        .config_vault
+        .read_subscription_endpoints(&profile_id)
+        .map_err(|e| e.to_string())?;
+    if endpoint_index >= endpoints.len() {
+        return Err("endpoint index out of range".into());
+    }
+    let endpoint = &endpoints[endpoint_index];
+    let socks_port = profile.xray_socks_port.unwrap_or(10808);
+    let config = net_manager_core::xray::generate_vless_config(&endpoint.url, socks_port)
+        .map_err(|e| format!("invalid VLESS URL: {e}"))?;
+    let body = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
+    let old_path = profile.config_path.clone();
+    let import =
+        store_generated_xray(&state.config_vault, &profile_id, &body).map_err(|e| e.to_string())?;
+    profile.config_path = import.config_path.clone();
+    profile.name = if endpoint.name.trim().is_empty() {
+        "Subscription".to_string()
+    } else {
+        endpoint.name.clone()
+    };
+    let mut updated = profile.clone();
+    updated.subscription = Some(SubscriptionMeta {
+        url: subscription.url,
+        hwid: subscription.hwid,
+        endpoint_count: endpoints.len(),
+        active_index: endpoint_index,
+    });
+    let doc = state.profiles.upsert(updated).map_err(|e| {
+        let _ = state
+            .config_vault
+            .remove_revision_for_config(&import.config_path);
+        e.to_string()
+    })?;
+    remove_managed_revision(
+        &state.config_vault,
+        &profile_id,
+        &old_path,
+        "subscription endpoint switch",
+    )?;
+    Ok(doc.profiles)
 }
 
 #[cfg(test)]

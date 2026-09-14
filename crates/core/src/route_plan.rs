@@ -222,6 +222,7 @@ mod tests {
             xray_socks_port: None,
             use_system_proxy: false,
             proxy_bypass: vec![],
+            subscription: None,
         }
     }
 

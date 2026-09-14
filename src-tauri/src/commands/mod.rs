@@ -9,8 +9,8 @@ pub(crate) mod tunnels;
 pub(crate) use diagnostics::{diagnose_profile, inspect_profile_by_id, inspect_profiles};
 pub(crate) use explorer::{get_interfaces, get_routes, lookup_destination, set_interface_state};
 pub(crate) use profiles::{
-    delete_profile, get_profiles, import_configs_batch, import_subscription, save_profile,
-    save_vless_profile,
+    delete_profile, get_profiles, get_subscription_endpoints, import_configs_batch,
+    import_subscription, save_profile, save_vless_profile, switch_subscription_endpoint,
 };
 pub(crate) use recovery::{cleanup_recovery, get_recovery_report};
 pub(crate) use route_map::get_route_map;

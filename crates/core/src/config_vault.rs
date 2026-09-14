@@ -1,5 +1,6 @@
 use crate::config_security::protect_path;
 use crate::models::TunnelBackend;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -11,6 +12,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct ConfigImport {
     pub config_path: PathBuf,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionEndpoint {
+    pub url: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SubscriptionSidecar {
+    endpoints: Vec<SubscriptionEndpoint>,
 }
 
 pub struct ConfigVault {
@@ -215,6 +229,47 @@ impl ConfigVault {
                 Err(err)
             }
         }
+    }
+
+    /// Store subscription endpoint metadata as a sidecar JSON file at the
+    /// profile level (not inside a revision directory). This persists across
+    /// config revisions so switching endpoints doesn't lose the endpoint list.
+    pub fn store_subscription_endpoints(
+        &self,
+        profile_id: &str,
+        endpoints: &[SubscriptionEndpoint],
+    ) -> io::Result<PathBuf> {
+        let safe = sanitize_profile_id(profile_id)?;
+        let profile_dir = self.root.join(&safe);
+        self.ensure_root_protected()?;
+        fs::create_dir_all(&profile_dir)?;
+        protect_path(&profile_dir)?;
+        let path = profile_dir.join("subscription.json");
+        let json = serde_json::to_string_pretty(&SubscriptionSidecar {
+            endpoints: endpoints.to_vec(),
+        })
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut temp = path.clone().into_os_string();
+        temp.push(".tmp");
+        let temp_path = PathBuf::from(temp);
+        fs::write(&temp_path, &json)?;
+        protect_path(&temp_path)?;
+        fs::rename(&temp_path, &path)?;
+        protect_path(&path)?;
+        Ok(path)
+    }
+
+    /// Read subscription endpoint metadata from the sidecar file.
+    pub fn read_subscription_endpoints(
+        &self,
+        profile_id: &str,
+    ) -> io::Result<Vec<SubscriptionEndpoint>> {
+        let safe = sanitize_profile_id(profile_id)?;
+        let path = self.root.join(&safe).join("subscription.json");
+        let raw = fs::read_to_string(&path)?;
+        let sidecar: SubscriptionSidecar = serde_json::from_str(&raw)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(sidecar.endpoints)
     }
 
     pub fn remove_revision_for_config(&self, config_path: &Path) -> io::Result<()> {

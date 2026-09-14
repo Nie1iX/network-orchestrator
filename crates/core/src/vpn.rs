@@ -1353,6 +1353,7 @@ mod tests {
             xray_socks_port: None,
             use_system_proxy: false,
             proxy_bypass: vec![],
+            subscription: None,
         }
     }
 
@@ -1369,6 +1370,7 @@ mod tests {
             xray_socks_port: Some(10808),
             use_system_proxy: false,
             proxy_bypass: vec![],
+            subscription: None,
         }
     }
 
@@ -1385,6 +1387,7 @@ mod tests {
             xray_socks_port: None,
             use_system_proxy: false,
             proxy_bypass: vec![],
+            subscription: None,
         }
     }
 
@@ -2145,6 +2148,7 @@ mod table_off_tests {
             xray_socks_port: None,
             use_system_proxy: false,
             proxy_bypass: vec![],
+            subscription: None,
         }
     }
 
@@ -2315,6 +2319,7 @@ mod table_off_tests {
             xray_socks_port: None,
             use_system_proxy: false,
             proxy_bypass: vec![],
+            subscription: None,
         }
     }
 

@@ -12,6 +12,8 @@ import {
   Profile,
   ProfileDiagnostics,
   ProfileInspection,
+  SubscriptionEndpointInfo,
+  SubscriptionMeta,
   TunnelBackend,
   TunnelStatus,
 } from "../types";
@@ -78,6 +80,7 @@ interface FormState {
   useSystemProxy: boolean;
   proxyBypass: string;
   isNew: boolean;
+  subscription: SubscriptionMeta | null;
 }
 
 export default function ProfileManager() {
@@ -106,6 +109,8 @@ export default function ProfileManager() {
   const [subHwid, setSubHwid] = useState("");
   const [subOpen, setSubOpen] = useState(false);
   const [subLoading, setSubLoading] = useState(false);
+  const [endpoints, setEndpoints] = useState<Record<string, SubscriptionEndpointInfo[]>>({});
+  const [switching, setSwitching] = useState<string | null>(null);
 
   const statusFor = useCallback(
     (id: string): TunnelStatus =>
@@ -160,6 +165,35 @@ export default function ProfileManager() {
     const interval = setInterval(refreshStatuses, 2000);
     return () => clearInterval(interval);
   }, [refreshStatuses]);
+
+  useEffect(() => {
+    const subProfiles = profiles.filter((p) => p.subscription !== null);
+    if (subProfiles.length === 0) {
+      if (Object.keys(endpoints).length > 0) setEndpoints({});
+      return;
+    }
+    const subKey = subProfiles.map((p) => p.id).join(",");
+    if (Object.keys(endpoints).sort().join(",") === subKey) return;
+    let cancelled = false;
+    (async () => {
+      const next: Record<string, SubscriptionEndpointInfo[]> = {};
+      for (const p of subProfiles) {
+        try {
+          next[p.id] = await invoke<SubscriptionEndpointInfo[]>(
+            "get_subscription_endpoints",
+            { profileId: p.id },
+          );
+        } catch {
+          // ignore — sidecar may be missing or unreadable
+        }
+      }
+      if (!cancelled) setEndpoints(next);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profiles]);
 
   const withBusy = async (id: string, action: () => Promise<unknown>) => {
     setBusy((prev) => new Set(prev).add(id));
@@ -222,6 +256,33 @@ export default function ProfileManager() {
   const onDelete = (profile: Profile) => {
     if (!window.confirm(`Delete profile "${profile.name}"?`)) return;
     withBusy(profile.id, () => invoke("delete_profile", { id: profile.id }));
+  };
+
+  const onSwitchEndpoint = async (profile: Profile, index: number) => {
+    setSwitching(profile.id);
+    try {
+      const updated = await invoke<Profile[]>("switch_subscription_endpoint", {
+        profileId: profile.id,
+        endpointIndex: index,
+      });
+      setProfiles(updated);
+      const next: Record<string, SubscriptionEndpointInfo[]> = {};
+      for (const p of updated.filter((p) => p.subscription !== null)) {
+        try {
+          next[p.id] = await invoke<SubscriptionEndpointInfo[]>(
+            "get_subscription_endpoints",
+            { profileId: p.id },
+          );
+        } catch {
+          // ignore
+        }
+      }
+      setEndpoints(next);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSwitching(null);
+    }
   };
 
   const onImportFiles = async () => {
@@ -326,6 +387,7 @@ export default function ProfileManager() {
       useSystemProxy: false,
       proxyBypass: DEFAULT_PROXY_BYPASS,
       isNew: true,
+      subscription: null,
     });
   };
 
@@ -348,6 +410,7 @@ export default function ProfileManager() {
       useSystemProxy: profile.useSystemProxy,
       proxyBypass: profile.proxyBypass.join(", "),
       isNew: false,
+      subscription: profile.subscription,
     });
   };
 
@@ -465,6 +528,7 @@ export default function ProfileManager() {
             : editing.xraySocksPort,
       useSystemProxy: isXray && editing.useSystemProxy,
       proxyBypass: isXray ? proxyBypass : [],
+      subscription: editing.isNew ? null : editing.subscription ?? null,
     };
     setSaving(true);
     try {
@@ -994,6 +1058,33 @@ export default function ProfileManager() {
                     <span className="row-label">SOCKS5</span>
                     <span className="row-value mono">
                       127.0.0.1:{profile.xraySocksPort}
+                    </span>
+                  </div>
+                )}
+                {profile.subscription && endpoints[profile.id] && (
+                  <div className="interface-row">
+                    <span className="row-label">Endpoint</span>
+                    <span className="row-value">
+                      <select
+                        value={
+                          endpoints[profile.id].findIndex((e) => e.active)
+                        }
+                        onChange={(e) =>
+                          onSwitchEndpoint(profile, Number(e.target.value))
+                        }
+                        disabled={
+                          switching === profile.id ||
+                          isBusy ||
+                          status.state === "running"
+                        }
+                      >
+                        {endpoints[profile.id].map((ep, i) => (
+                          <option key={i} value={i}>
+                            {ep.name}
+                          </option>
+                        ))}
+                      </select>
+                      {switching === profile.id && " switching…"}
                     </span>
                   </div>
                 )}

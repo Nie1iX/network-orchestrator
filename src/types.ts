@@ -135,6 +135,18 @@ export interface DomainPolicy {
   target: DomainRouteTarget;
 }
 
+export interface SubscriptionMeta {
+  url: string;
+  hwid: string;
+  endpointCount: number;
+  activeIndex: number;
+}
+
+export interface SubscriptionEndpointInfo {
+  name: string;
+  active: boolean;
+}
+
 export interface Profile {
   id: string;
   name: string;
@@ -147,6 +159,7 @@ export interface Profile {
   xraySocksPort: number | null;
   useSystemProxy: boolean;
   proxyBypass: string[];
+  subscription: SubscriptionMeta | null;
 }
 
 export type TunnelState = "stopped" | "running" | "failed";

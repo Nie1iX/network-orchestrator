@@ -139,6 +139,24 @@ pub struct Profile {
     pub use_system_proxy: bool,
     #[serde(default)]
     pub proxy_bypass: Vec<String>,
+    #[serde(default)]
+    pub subscription: Option<SubscriptionMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionMeta {
+    pub url: String,
+    pub hwid: String,
+    pub endpoint_count: usize,
+    pub active_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionEndpointInfo {
+    pub name: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
