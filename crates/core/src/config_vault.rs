@@ -548,6 +548,7 @@ fn unix_nanos() -> io::Result<u128> {
 
 fn backend_label(backend: TunnelBackend) -> &'static str {
     match backend {
+        TunnelBackend::None => "none",
         TunnelBackend::WireGuard => "wireguard",
         TunnelBackend::OpenVpn => "openvpn",
         TunnelBackend::Xray => "xray",

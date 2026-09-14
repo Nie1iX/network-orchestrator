@@ -94,6 +94,7 @@ pub struct RouteLookupResult {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum TunnelBackend {
+    None,
     WireGuard,
     OpenVpn,
     Xray,
@@ -200,6 +201,8 @@ pub struct RouteMap {
     pub effective: Vec<RouteEntry>,
     pub diffs: Vec<RoutePlanDiff>,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub pushed_routes: Vec<PlannedRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -324,6 +327,8 @@ pub struct ProtocolHealth {
     pub rx_bytes: Option<u64>,
     pub tx_bytes: Option<u64>,
     pub log_tail: Option<String>,
+    #[serde(default)]
+    pub pushed_routes: Vec<AnalyzedRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

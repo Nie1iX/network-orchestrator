@@ -121,7 +121,7 @@ export function ifTypeName(ifType: number): string {
   return IF_TYPE_NAMES[ifType] ?? `Type ${ifType}`;
 }
 
-export type TunnelBackend = "wireGuard" | "openVpn" | "xray";
+export type TunnelBackend = "none" | "wireGuard" | "openVpn" | "xray";
 
 export interface PolicyRoute {
   destination: string;
@@ -261,11 +261,46 @@ export interface RouteMap {
   effective: RouteEntry[];
   diffs: RoutePlanDiff[];
   warnings: string[];
+  pushedRoutes: PlannedRoute[];
 }
+
+export type BackendExecutableSource = "autoDetected" | "configured" | "managed";
 
 export interface BackendAvailability {
   backend: TunnelBackend;
   available: boolean;
   path: string | null;
+  source: BackendExecutableSource | null;
+  version: string | null;
   message: string;
+}
+
+export interface BackendInstallProgress {
+  backend: TunnelBackend;
+  stage:
+    | "downloading"
+    | "verifying"
+    | "installing"
+    | "validating"
+    | "ready"
+    | "cancelled";
+  downloaded: number;
+  total: number | null;
+}
+
+export interface ManagedXrayOffer {
+  version: string;
+  sourceUrl: string;
+  sha256: string;
+  maxDownloadBytes: number;
+}
+
+export interface BatchImportError {
+  path: string;
+  error: string;
+}
+
+export interface BatchImportResult {
+  profiles: Profile[];
+  errors: BatchImportError[];
 }

@@ -884,6 +884,23 @@ button:disabled {
   border-color: var(--accent-border);
 }
 
+.profile-import-btn {
+  margin-left: var(--sp-2);
+}
+
+.subscription-form {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+  margin-top: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.subscription-form input {
+  flex: 1;
+  min-width: 200px;
+}
+
 .profile-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));

@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { ensureElevation } from "../elevation";
 import BackendStatus from "./BackendStatus";
 import {
+  BatchImportResult,
   DomainPolicy,
   DomainRouteTarget,
   NetworkInterface,
@@ -16,12 +17,14 @@ import {
 } from "../types";
 
 const BACKEND_LABELS: Record<TunnelBackend, string> = {
+  none: "Static routes",
   wireGuard: "WireGuard",
   openVpn: "OpenVPN",
   xray: "Xray/VLESS",
 };
 
 const BACKEND_EXTENSIONS: Record<TunnelBackend, string[]> = {
+  none: [],
   wireGuard: ["conf", "dpapi"],
   openVpn: ["ovpn", "conf"],
   xray: ["json"],
@@ -97,6 +100,12 @@ export default function ProfileManager() {
   const [diagnostics, setDiagnostics] = useState<ProfileDiagnostics | null>(null);
   const [diagBusy, setDiagBusy] = useState<string | null>(null);
   const [runtimeNotice, setRuntimeNotice] = useState<string | null>(null);
+  const [importErrors, setImportErrors] = useState<string[] | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [subUrl, setSubUrl] = useState("");
+  const [subHwid, setSubHwid] = useState("");
+  const [subOpen, setSubOpen] = useState(false);
+  const [subLoading, setSubLoading] = useState(false);
 
   const statusFor = useCallback(
     (id: string): TunnelStatus =>
@@ -215,6 +224,92 @@ export default function ProfileManager() {
     withBusy(profile.id, () => invoke("delete_profile", { id: profile.id }));
   };
 
+  const onImportFiles = async () => {
+    setImportErrors(null);
+    try {
+      const selected = await open({
+        multiple: true,
+        directory: false,
+        filters: [
+          {
+            name: "Tunnel configs",
+            extensions: ["conf", "dpapi", "ovpn", "json"],
+          },
+        ],
+      });
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      if (paths.length === 0) return;
+      setImporting(true);
+      const result = await invoke<BatchImportResult>("import_configs_batch", {
+        paths,
+        defaultBackend: null,
+      });
+      setProfiles(result.profiles);
+      await refreshAll();
+      if (result.errors.length > 0) {
+        setImportErrors(
+          result.errors.map((e) => `${e.path}: ${e.error}`),
+        );
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const onImportSubscription = async () => {
+    setImportErrors(null);
+    if (!subUrl.trim()) return;
+    setSubLoading(true);
+    try {
+      const result = await invoke<BatchImportResult>("import_subscription", {
+        url: subUrl.trim(),
+        hwid: subHwid.trim(),
+      });
+      setProfiles(result.profiles);
+      await refreshAll();
+      setSubOpen(false);
+      if (result.errors.length > 0) {
+        setImportErrors(
+          result.errors.map((e) => `${e.path}: ${e.error}`),
+        );
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSubLoading(false);
+    }
+  };
+
+  const onImportWireGuardStandard = async () => {
+    setImportErrors(null);
+    if (!(await ensureElevation("Importing WireGuard configs"))) return;
+    setImporting(true);
+    try {
+      const paths = await invoke<string[]>("discover_wireguard_configs");
+      if (paths.length === 0) {
+        setError("No WireGuard configs found in the standard location");
+        return;
+      }
+      const result = await invoke<BatchImportResult>("import_configs_batch", {
+        paths,
+        defaultBackend: "wireGuard",
+      });
+      setProfiles(result.profiles);
+      await refreshAll();
+      if (result.errors.length > 0) {
+        setImportErrors(
+          result.errors.map((e) => `${e.path}: ${e.error}`),
+        );
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setImporting(false);
+    }
+  };
+
   const openNew = () => {
     setFormError(null);
     setEditing({
@@ -305,6 +400,10 @@ export default function ProfileManager() {
     }
     if (editing.routes.length > 0 && !editing.interfaceName.trim()) {
       setFormError("Target interface is required when policy routes are set.");
+      return;
+    }
+    if (editing.backend === "none" && editing.routes.length === 0) {
+      setFormError("Static-routes profile requires at least one policy route.");
       return;
     }
     const isXray = editing.backend === "xray";
@@ -424,7 +523,67 @@ export default function ProfileManager() {
         <button className="profile-new-btn" onClick={openNew}>
           New profile
         </button>
+        <button
+          className="profile-import-btn"
+          onClick={onImportFiles}
+          disabled={importing}
+        >
+          {importing ? "Importing…" : "Import files…"}
+        </button>
+        <button
+          className="profile-import-btn"
+          onClick={() => setSubOpen((v) => !v)}
+          disabled={subLoading}
+        >
+          {subLoading ? "Fetching…" : "Import subscription…"}
+        </button>
+        <button
+          className="profile-import-btn"
+          onClick={onImportWireGuardStandard}
+          disabled={importing}
+        >
+          Import WireGuard (standard)
+        </button>
+        {subOpen && (
+          <div className="subscription-form">
+            <input
+              type="text"
+              placeholder="Subscription URL"
+              value={subUrl}
+              onChange={(e) => setSubUrl(e.target.value)}
+            />
+            <input
+              type="text"
+              placeholder="HWID (X-HWID header)"
+              value={subHwid}
+              onChange={(e) => setSubHwid(e.target.value)}
+            />
+            <button
+              className="profile-import-btn"
+              onClick={onImportSubscription}
+              disabled={subLoading || !subUrl.trim()}
+            >
+              Fetch
+            </button>
+          </div>
+        )}
       </div>
+
+      {importErrors && (
+        <div className="save-notice">
+          <div className="diagnostics-head">
+            <span>Import finished with errors</span>
+            <button type="button" onClick={() => setImportErrors(null)}>
+              Dismiss
+            </button>
+          </div>
+          <ul className="save-notice-list">
+            {importErrors.map((e, i) => (
+              <li key={i}>{e}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {error && <p className="error">{error}</p>}
 
@@ -519,12 +678,13 @@ export default function ProfileManager() {
                 });
               }}
             >
+              <option value="none">Static routes (no tunnel)</option>
               <option value="wireGuard">WireGuard</option>
               <option value="openVpn">OpenVPN</option>
               <option value="xray">Xray/VLESS</option>
             </select>
           </label>
-          {editing.backend === "xray" && editing.isNew && (
+          {editing.backend !== "none" && editing.backend === "xray" && editing.isNew && (
             <label>
               Config source
               <select
@@ -563,7 +723,7 @@ export default function ProfileManager() {
                 saved.
               </span>
             </>
-          ) : (
+          ) : editing.backend !== "none" ? (
             <label>
               Config file
               <div className="profile-config-row">
@@ -586,6 +746,11 @@ export default function ProfileManager() {
                 </button>
               </div>
             </label>
+          ) : (
+            <span className="profile-help">
+              Static-routes profiles apply policy routes through an existing
+              interface (e.g. Ethernet) without starting a tunnel.
+            </span>
           )}
           {editing.backend === "xray" &&
             !editing.isNew &&

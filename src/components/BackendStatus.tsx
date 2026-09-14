@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { BackendAvailability, TunnelBackend } from "../types";
 
 const BACKEND_LABELS: Record<TunnelBackend, string> = {
+  none: "Static routes",
   wireGuard: "WireGuard",
   openVpn: "OpenVPN",
   xray: "Xray",

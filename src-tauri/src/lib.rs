@@ -42,6 +42,9 @@ pub fn run() {
             cleanup_recovery,
             is_elevated,
             restart_elevated,
+            discover_wireguard_configs,
+            import_configs_batch,
+            import_subscription,
             get_route_map,
             get_backend_availability
         ])

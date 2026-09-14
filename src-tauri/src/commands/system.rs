@@ -11,6 +11,41 @@ pub(crate) async fn is_elevated() -> Result<bool, String> {
     elevation::is_elevated().map_err(|e| e.to_string())
 }
 
+/// Discover WireGuard configs in the standard Windows service location
+/// `C:\Program Files\WireGuard\Data\Configurations\`. Requires elevation to
+/// read the ACL-protected directory. Returns sorted absolute paths to
+/// `.conf.dpapi` (and `.conf`) files.
+#[tauri::command]
+pub(crate) async fn discover_wireguard_configs() -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    {
+        let dir = PathBuf::from(r"C:\Program Files\WireGuard\Data\Configurations");
+        let mut paths = Vec::new();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(err) => {
+                return Err(format!(
+                    "cannot read WireGuard configs directory '{}': {err}. Run as administrator.",
+                    dir.display()
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if name.ends_with(".conf") || name.ends_with(".conf.dpapi") {
+                paths.push(entry.path().to_string_lossy().to_string());
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Vec::new())
+    }
+}
+
 fn backend_entry(
     backend: TunnelBackend,
     resolved: Result<PathBuf, std::io::Error>,

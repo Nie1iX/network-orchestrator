@@ -4,8 +4,10 @@ use net_manager_core::config_security;
 use net_manager_core::config_vault::{ConfigImport, ConfigVault};
 use net_manager_core::models::*;
 use std::collections::HashSet;
+use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
 
 const AUTO_SOCKS_PORT_START: u16 = 10808;
@@ -167,7 +169,9 @@ pub(crate) async fn save_profile(
         }
     }
     validate_managed_save_path(&state.config_vault, stored.as_ref(), &profile)?;
-    let imported = if state.config_vault.is_managed_path(&profile.config_path) {
+    let imported = if profile.backend == TunnelBackend::None
+        || state.config_vault.is_managed_path(&profile.config_path)
+    {
         None
     } else {
         let import = state
@@ -283,10 +287,301 @@ pub(crate) async fn save_vless_profile(
     Ok(doc.profiles)
 }
 
+/// Detect a tunnel backend for `path` by extension, with a small content sniff
+/// for the ambiguous `.conf` case (WireGuard and OpenVPN both use it).
+/// Returns `None` when the extension is unrecognized and no `default` hint is
+/// given.
+pub(crate) fn detect_backend(path: &Path, default: Option<TunnelBackend>) -> Option<TunnelBackend> {
+    let lower = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if lower.ends_with(".ovpn") {
+        return Some(TunnelBackend::OpenVpn);
+    }
+    if lower.ends_with(".json") {
+        return Some(TunnelBackend::Xray);
+    }
+    if lower.ends_with(".conf.dpapi") {
+        return Some(TunnelBackend::WireGuard);
+    }
+    if lower.ends_with(".conf") {
+        if let Ok(bytes) = fs::read(path) {
+            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
+            if head.contains("[Interface]") {
+                return Some(TunnelBackend::WireGuard);
+            }
+            for line in head.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("dev ")
+                    || trimmed.starts_with("proto ")
+                    || trimmed == "client"
+                    || trimmed.starts_with("remote ")
+                {
+                    return Some(TunnelBackend::OpenVpn);
+                }
+            }
+        }
+        return default;
+    }
+    default
+}
+
+fn backend_label(backend: TunnelBackend) -> &'static str {
+    match backend {
+        TunnelBackend::None => "Static routes",
+        TunnelBackend::WireGuard => "WireGuard",
+        TunnelBackend::OpenVpn => "OpenVPN",
+        TunnelBackend::Xray => "Xray",
+    }
+}
+
+fn generate_import_id(index: usize) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("import-{nanos:x}-{index}")
+}
+
+/// Pure, testable core of `import_configs_batch`: imports each path into the
+/// vault and upserts a profile, collecting per-file errors instead of aborting.
+pub(crate) fn import_configs_into(
+    vault: &ConfigVault,
+    store: &net_manager_core::profiles::ProfileStore,
+    paths: &[String],
+    default_backend: Option<TunnelBackend>,
+) -> std::io::Result<BatchImportResult> {
+    let mut errors: Vec<BatchImportError> = Vec::new();
+    for (index, raw) in paths.iter().enumerate() {
+        let path = PathBuf::from(raw);
+        let backend = match detect_backend(&path, default_backend) {
+            Some(b) => b,
+            None => {
+                errors.push(BatchImportError {
+                    path: raw.clone(),
+                    error: "could not determine backend from extension; set a default backend"
+                        .into(),
+                });
+                continue;
+            }
+        };
+        let id = generate_import_id(index);
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{} {}", backend_label(backend), index + 1));
+        let import = match vault.import(&id, backend, &path) {
+            Ok(import) => import,
+            Err(err) => {
+                errors.push(BatchImportError {
+                    path: raw.clone(),
+                    error: err.to_string(),
+                });
+                continue;
+            }
+        };
+        let config_path = import.config_path.clone();
+        let profile = Profile {
+            id: id.clone(),
+            name,
+            backend,
+            config_path,
+            interface_name: String::new(),
+            routes: vec![],
+            auto_connect: false,
+            domain_policies: vec![],
+            xray_socks_port: None,
+            use_system_proxy: false,
+            proxy_bypass: vec![],
+        };
+        if let Err(err) = store.upsert(profile) {
+            let _ = vault.remove_revision_for_config(&import.config_path);
+            errors.push(BatchImportError {
+                path: raw.clone(),
+                error: err.to_string(),
+            });
+        }
+    }
+    let profiles = store.load()?.profiles;
+    Ok(BatchImportResult { profiles, errors })
+}
+
+#[tauri::command]
+pub(crate) async fn import_configs_batch(
+    paths: Vec<String>,
+    default_backend: Option<TunnelBackend>,
+    state: State<'_, AppState>,
+) -> Result<BatchImportResult, String> {
+    import_configs_into(
+        &state.config_vault,
+        &state.profiles,
+        &paths,
+        default_backend,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Decode a v2ray-style subscription body (base64) into a list of proxy URLs.
+/// Non-base64 input is treated as plain text (one URL per line). Only
+/// `vless://` lines are returned; others are silently skipped.
+pub(crate) fn parse_subscription_body(body: &str) -> Vec<String> {
+    let decoded = base64_decode(body.trim()).unwrap_or_else(|| body.to_string());
+    decoded
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("vless://"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Best-effort standard base64 decoder that tolerates missing padding and
+/// whitespace. Returns `None` if the input is not valid base64.
+fn base64_decode(input: &str) -> Option<String> {
+    use base64::Engine;
+    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let engine = base64::engine::general_purpose::STANDARD;
+    let decoded = engine.decode(&cleaned).ok()?;
+    String::from_utf8(decoded).ok()
+}
+
+/// Pure, testable core of `import_subscription`: fetches the subscription
+/// URL with the given HWID, decodes the body, and creates one Xray/VLESS
+/// profile per `vless://` entry. Per-entry errors are collected instead of
+/// aborting the batch.
+pub(crate) async fn import_subscription_into(
+    vault: &ConfigVault,
+    store: &net_manager_core::profiles::ProfileStore,
+    client: &reqwest::Client,
+    url: &str,
+    hwid: &str,
+) -> Result<BatchImportResult, String> {
+    let response = client
+        .get(url)
+        .header("X-HWID", hwid)
+        .send()
+        .await
+        .map_err(|e| format!("subscription fetch failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "subscription fetch returned HTTP {}",
+            response.status()
+        ));
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("failed to read subscription body: {e}"))?;
+    let urls = parse_subscription_body(&body);
+    if urls.is_empty() {
+        return Err("subscription contained no vless:// entries".into());
+    }
+
+    let document = store.load().map_err(|e| e.to_string())?;
+    let mut used_ports = profile_listener_ports(&document.profiles, "");
+    let mut errors: Vec<BatchImportError> = Vec::new();
+
+    for (index, vless_url) in urls.iter().enumerate() {
+        let id = generate_import_id(index);
+        let socks_port = match select_available_socks_port(&used_ports, loopback_port_available) {
+            Ok(port) => port,
+            Err(err) => {
+                errors.push(BatchImportError {
+                    path: vless_url.clone(),
+                    error: err,
+                });
+                continue;
+            }
+        };
+        used_ports.insert(socks_port);
+
+        let config =
+            match net_manager_core::xray::generate_vless_config(vless_url.trim(), socks_port) {
+                Ok(config) => config,
+                Err(err) => {
+                    errors.push(BatchImportError {
+                        path: vless_url.clone(),
+                        error: format!("invalid VLESS URL: {err}"),
+                    });
+                    continue;
+                }
+            };
+        let body = match serde_json::to_vec_pretty(&config) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                errors.push(BatchImportError {
+                    path: vless_url.clone(),
+                    error: err.to_string(),
+                });
+                continue;
+            }
+        };
+        let import = match store_generated_xray(vault, &id, &body) {
+            Ok(import) => import,
+            Err(err) => {
+                errors.push(BatchImportError {
+                    path: vless_url.clone(),
+                    error: err.to_string(),
+                });
+                continue;
+            }
+        };
+        let name = net_manager_core::xray::parse_vless_url(vless_url.trim())
+            .ok()
+            .and_then(|p| p.name)
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| format!("VLESS {}", index + 1));
+        let profile = Profile {
+            id: id.clone(),
+            name,
+            backend: TunnelBackend::Xray,
+            config_path: import.config_path.clone(),
+            interface_name: String::new(),
+            routes: vec![],
+            auto_connect: false,
+            domain_policies: vec![],
+            xray_socks_port: Some(socks_port),
+            use_system_proxy: false,
+            proxy_bypass: vec![],
+        };
+        if let Err(err) = store.upsert(profile) {
+            let _ = vault.remove_revision_for_config(&import.config_path);
+            errors.push(BatchImportError {
+                path: vless_url.clone(),
+                error: err.to_string(),
+            });
+        }
+    }
+
+    let profiles = store.load().map_err(|e| e.to_string())?.profiles;
+    Ok(BatchImportResult { profiles, errors })
+}
+
+#[tauri::command]
+pub(crate) async fn import_subscription(
+    url: String,
+    hwid: String,
+    state: State<'_, AppState>,
+) -> Result<BatchImportResult, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("v2rayng/1.0")
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+    import_subscription_into(&state.config_vault, &state.profiles, &client, &url, &hwid).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use base64::Engine;
     use std::fs;
 
     #[test]
@@ -459,5 +754,178 @@ mod tests {
         assert!(rewrite_generated_socks_port(&vault, &mut no_port, 10960).is_err());
         assert!(no_port.xray_socks_port.is_none());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn detect_backend_uses_extension_for_unambiguous_cases() {
+        let dir = unique_dir("detect-ext");
+        let wg = dir.join("t.conf");
+        fs::write(&wg, b"[Interface]\nPrivateKey=x\n").unwrap();
+        let ovpn = dir.join("c.ovpn");
+        fs::write(&ovpn, b"client\ndev tun\n").unwrap();
+        let xray = dir.join("n.json");
+        fs::write(&xray, b"{}").unwrap();
+        let dpapi = dir.join("t.conf.dpapi");
+        fs::write(&dpapi, b"bytes").unwrap();
+
+        assert_eq!(detect_backend(&wg, None), Some(TunnelBackend::WireGuard));
+        assert_eq!(detect_backend(&ovpn, None), Some(TunnelBackend::OpenVpn));
+        assert_eq!(detect_backend(&xray, None), Some(TunnelBackend::Xray));
+        assert_eq!(detect_backend(&dpapi, None), Some(TunnelBackend::WireGuard));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn detect_backend_sniffs_conf_content_to_distinguish_wireguard_and_openvpn() {
+        let dir = unique_dir("detect-sniff");
+        let wg = dir.join("wg.conf");
+        fs::write(
+            &wg,
+            b"[Interface]\nPrivateKey=AAAA\n[Peer]\nPublicKey=BBBB\n",
+        )
+        .unwrap();
+        let ovpn = dir.join("client.conf");
+        fs::write(&ovpn, b"client\ndev tun\nproto udp\nremote host 443\n").unwrap();
+        let ovpn_remote = dir.join("r.conf");
+        fs::write(&ovpn_remote, b"remote example.com 1194\n").unwrap();
+
+        assert_eq!(detect_backend(&wg, None), Some(TunnelBackend::WireGuard));
+        assert_eq!(detect_backend(&ovpn, None), Some(TunnelBackend::OpenVpn));
+        assert_eq!(
+            detect_backend(&ovpn_remote, None),
+            Some(TunnelBackend::OpenVpn)
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn detect_backend_falls_back_to_default_for_ambiguous_conf() {
+        let dir = unique_dir("detect-fallback");
+        let unknown = dir.join("x.conf");
+        fs::write(&unknown, b"# no recognizable directives\n").unwrap();
+
+        assert_eq!(detect_backend(&unknown, None), None);
+        assert_eq!(
+            detect_backend(&unknown, Some(TunnelBackend::OpenVpn)),
+            Some(TunnelBackend::OpenVpn)
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn detect_backend_returns_none_for_unrecognized_extension_without_default() {
+        let dir = unique_dir("detect-none");
+        let txt = dir.join("notes.txt");
+        fs::write(&txt, b"hello").unwrap();
+        assert_eq!(detect_backend(&txt, None), None);
+        assert_eq!(
+            detect_backend(&txt, Some(TunnelBackend::WireGuard)),
+            Some(TunnelBackend::WireGuard)
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn import_configs_into_creates_profiles_and_collects_errors() {
+        let dir = unique_dir("batch-import");
+        let vault = ConfigVault::new(dir.join("configs"));
+        let store = net_manager_core::profiles::ProfileStore::new(dir.join("profiles.json"));
+
+        let wg = dir.join("work.conf");
+        fs::write(
+            &wg,
+            b"[Interface]\nPrivateKey=AAAA\n[Peer]\nPublicKey=BBBB\n",
+        )
+        .unwrap();
+        let ovpn = dir.join("client.ovpn");
+        fs::write(&ovpn, b"client\ndev tun\nproto udp\nremote host 443\n").unwrap();
+        let xray = dir.join("node.json");
+        fs::write(&xray, br#"{"outbounds":[]}"#).unwrap();
+        let bad = dir.join("missing.conf");
+
+        let paths = vec![
+            wg.to_string_lossy().to_string(),
+            ovpn.to_string_lossy().to_string(),
+            xray.to_string_lossy().to_string(),
+            bad.to_string_lossy().to_string(),
+        ];
+        let result = import_configs_into(&vault, &store, &paths, None).unwrap();
+
+        assert_eq!(result.profiles.len(), 3);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].path, bad.to_string_lossy());
+        let backends: Vec<_> = result
+            .profiles
+            .iter()
+            .map(|p| (p.name.as_str(), p.backend))
+            .collect();
+        assert!(backends.contains(&("work", TunnelBackend::WireGuard)));
+        assert!(backends.contains(&("client", TunnelBackend::OpenVpn)));
+        assert!(backends.contains(&("node", TunnelBackend::Xray)));
+        for p in &result.profiles {
+            assert!(p.id.starts_with("import-"));
+            assert!(p.config_path.starts_with(vault.root()));
+            assert!(p.routes.is_empty());
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn import_configs_into_reports_unknown_extension_without_default() {
+        let dir = unique_dir("batch-unknown");
+        let vault = ConfigVault::new(dir.join("configs"));
+        let store = net_manager_core::profiles::ProfileStore::new(dir.join("profiles.json"));
+        let txt = dir.join("readme.txt");
+        fs::write(&txt, b"hello").unwrap();
+
+        let result =
+            import_configs_into(&vault, &store, &[txt.to_string_lossy().to_string()], None)
+                .unwrap();
+        assert!(result.profiles.is_empty());
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].error.contains("default backend"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_subscription_body_decodes_base64_vless_urls() {
+        let raw = "vless://uuid@host:443?encryption=none\ntrojan://other@host2:443\nvless://uuid2@host3:8443?encryption=none";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        let urls = parse_subscription_body(&encoded);
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].starts_with("vless://uuid@host"));
+        assert!(urls[1].starts_with("vless://uuid2@host3"));
+    }
+
+    #[test]
+    fn parse_subscription_body_accepts_plain_text() {
+        let raw = "vless://uuid@host:443?encryption=none\nnot-a-url\nvless://uuid2@host2:443";
+        let urls = parse_subscription_body(raw);
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].starts_with("vless://uuid@host"));
+        assert!(urls[1].starts_with("vless://uuid2@host2"));
+    }
+
+    #[test]
+    fn parse_subscription_body_returns_empty_for_no_vless() {
+        let raw = "trojan://other@host:443\nss://something@host:443";
+        let urls = parse_subscription_body(raw);
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn parse_subscription_body_handles_whitespace_and_padding() {
+        let raw = "vless://uuid@host:443?encryption=none";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        let with_whitespace = format!("  \n{}\n  ", encoded);
+        let urls = parse_subscription_body(&with_whitespace);
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].starts_with("vless://uuid@host"));
+    }
+
+    #[test]
+    fn base64_decode_returns_none_for_invalid_input() {
+        assert!(base64_decode("!!!not-base64!!!").is_none());
+        assert!(base64_decode("").is_none());
     }
 }

@@ -158,6 +158,7 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     let allowed = match profile.backend {
+        TunnelBackend::None => true,
         TunnelBackend::WireGuard => {
             file_name.ends_with(".conf") || file_name.ends_with(".conf.dpapi")
         }

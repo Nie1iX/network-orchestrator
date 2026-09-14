@@ -37,6 +37,7 @@ pub(crate) fn applied_route_present(applied: &AppliedRoute, entry: &RouteEntry) 
 
 fn resolve_backend_executable(profile: &Profile) -> Result<PathBuf, String> {
     match profile.backend {
+        TunnelBackend::None => Ok(PathBuf::new()),
         TunnelBackend::WireGuard => {
             vpn::resolve_wireguard_executable(None).map_err(|e| e.to_string())
         }
