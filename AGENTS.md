@@ -69,5 +69,7 @@ npm run build
   report RED/GREEN.
 - Frontend: components subscribe to `route-changed` window events for
   refresh; types stay in `src/types.ts`.
+- App version has one source of truth: `[workspace.package].version` in the
+  root `Cargo.toml`; do not duplicate it in `package.json` or `tauri.conf.json`.
 - Store files are versioned documents written atomically (temp + rename)
   and ACL-protected via `config_security::protect_path`.
