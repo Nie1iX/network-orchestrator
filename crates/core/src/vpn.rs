@@ -80,16 +80,17 @@ struct CommandSpec {
 }
 
 fn wireguard_connect_spec(exe: &Path, profile: &Profile) -> io::Result<CommandSpec> {
-    let config_path = if !profile.routes.is_empty() {
-        // When the app manages policy routes, inject `Table = off` into a
-        // transient copy so the WireGuard tunnel service does not install its
-        // own routes from AllowedIPs. The app then becomes the sole route
-        // installer via IP Helper API. The transient file is cleaned up on
-        // disconnect by `TunnelManager::cleanup_wireguard_transient`.
-        wireguard_table_off_config(&profile.config_path, &profile.id)?
-    } else {
-        std::path::absolute(&profile.config_path)?
-    };
+    // Always inject `Table = off` into a transient copy so the WireGuard tunnel
+    // service does not install its own routes from AllowedIPs. The app is the
+    // sole route installer via IP Helper API — it derives routes from
+    // AllowedIPs (when `profile.routes` is empty) or from explicit policy
+    // routes, and installs them through `PolicyManager`. When policy routes
+    // are set, the transient config's `AllowedIPs` is expanded to cover them,
+    // ensuring WireGuard cryptokey routing accepts all policy-routed traffic.
+    // The transient file is cleaned up on disconnect by
+    // `TunnelManager::cleanup_wireguard_transient`.
+    let routes: Vec<IpNet> = profile.routes.iter().map(|r| r.destination).collect();
+    let config_path = wireguard_table_off_config(&profile.config_path, &profile.id, &routes)?;
     Ok(CommandSpec {
         program: exe.to_path_buf(),
         args: vec![
@@ -100,18 +101,30 @@ fn wireguard_connect_spec(exe: &Path, profile: &Profile) -> io::Result<CommandSp
 }
 
 /// Create a transient copy of `source` with `Table = off` appended to the
-/// `[Interface]` section. The copy is placed next to the original (in the
-/// managed vault revision directory) under a `.table-off.conf` name so it
+/// `[Interface]` section. If `routes` is non-empty, the first `[Peer]`'s
+/// `AllowedIPs` is expanded to include any policy route destinations not
+/// already covered, ensuring WireGuard cryptokey routing accepts all
+/// application-managed traffic. The copy is placed next to the original (in
+/// the managed vault revision directory) under a `.table-off.conf` name so it
 /// inherits the vault's ACL protection. Returns the path to the transient
 /// file.
-fn wireguard_table_off_config(source: &Path, profile_id: &str) -> io::Result<PathBuf> {
+fn wireguard_table_off_config(
+    source: &Path,
+    profile_id: &str,
+    routes: &[IpNet],
+) -> io::Result<PathBuf> {
     let text = std::fs::read_to_string(source).map_err(|err| {
         io::Error::new(
             err.kind(),
             format!("cannot read WireGuard config for Table=off injection: {err}"),
         )
     })?;
-    let injected = inject_table_off(&text);
+    let with_table_off = inject_table_off(&text);
+    let injected = if routes.is_empty() {
+        with_table_off
+    } else {
+        expand_allowedips(&with_table_off, routes)
+    };
     let dir = source
         .parent()
         .ok_or_else(|| invalid_data("WireGuard config path has no parent directory"))?;
@@ -120,6 +133,67 @@ fn wireguard_table_off_config(source: &Path, profile_id: &str) -> io::Result<Pat
     std::fs::write(&transient, injected)?;
     crate::config_security::protect_path(&transient)?;
     Ok(transient)
+}
+
+/// Expand the `AllowedIPs` of the first `[Peer]` section to include any policy
+/// route destinations that are not already covered by existing AllowedIPs.
+/// This ensures WireGuard cryptokey routing accepts traffic for all
+/// application-managed policy routes. Routes already covered by an existing
+/// AllowedIPs prefix are skipped (no duplication). If there is no `[Peer]`
+/// section or no `AllowedIPs` line, the config is returned unchanged.
+fn expand_allowedips(text: &str, routes: &[IpNet]) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut in_peer = false;
+    let mut peer_allowedips_line: Option<usize> = None;
+    let mut existing: Vec<IpNet> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_peer = trimmed.eq_ignore_ascii_case("[peer]");
+            continue;
+        }
+        if in_peer {
+            let lower = trimmed.to_lowercase();
+            if lower.starts_with("allowedips") && peer_allowedips_line.is_none() {
+                peer_allowedips_line = Some(i);
+                if let Some(rest) = trimmed.split('=').nth(1) {
+                    for part in rest.split(',') {
+                        if let Ok(net) = part.trim().parse::<IpNet>() {
+                            existing.push(net);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let Some(line_idx) = peer_allowedips_line else {
+        return lines.join("\n");
+    };
+
+    // Collect routes not already covered by existing AllowedIPs.
+    let mut to_add: Vec<IpNet> = Vec::new();
+    for route in routes {
+        if existing.iter().any(|net| net.contains(route)) {
+            continue;
+        }
+        if to_add.iter().any(|net| net == route) {
+            continue;
+        }
+        to_add.push(*route);
+    }
+    if to_add.is_empty() {
+        return lines.join("\n");
+    }
+
+    existing.extend(to_add);
+    existing.sort_by_key(|net| net.prefix_len());
+    let rendered = existing
+        .iter()
+        .map(|net| net.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines[line_idx] = format!("AllowedIPs = {rendered}");
+    lines.join("\n")
 }
 
 /// Append `Table = off` to the `[Interface]` section of a WireGuard config.
@@ -174,13 +248,16 @@ fn wireguard_disconnect_spec(exe: &Path, profile: &Profile) -> io::Result<Comman
 }
 
 fn openvpn_connect_spec(exe: &Path, profile: &Profile) -> io::Result<CommandSpec> {
+    // Always pass `--route-nopull` so OpenVPN does not install server-pushed
+    // routes itself. The app is the sole route installer — it reads pushed
+    // routes from the OpenVPN log after handshake (via
+    // `openvpn_pushed_routes`) and installs them through `PolicyManager`.
     let mut args = vec![
         OsString::from("--config"),
         std::path::absolute(&profile.config_path)?.into_os_string(),
+        OsString::from("--route-nopull"),
     ];
-    if !profile.routes.is_empty() {
-        args.push(OsString::from("--route-nopull"));
-    }
+    let _ = &mut args; // silence unused-mut when no extra args are added
     Ok(CommandSpec {
         program: exe.to_path_buf(),
         args,
@@ -340,13 +417,28 @@ fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
             profile.config_path.display()
         ))
     })?;
-    let merged =
-        crate::xray::apply_domain_policies(&base, &profile.domain_policies).map_err(|err| {
+    let with_policies = crate::xray::apply_domain_policies(&base, &profile.domain_policies)
+        .map_err(|err| {
             invalid_data(format!(
                 "failed to apply domain policies to '{}': {err}",
                 profile.config_path.display()
             ))
         })?;
+    let merged = if profile.xray_mode == crate::models::XrayMode::Tun {
+        crate::xray::apply_tun_inbound(
+            &with_policies,
+            profile.xray_tun_interface.as_deref(),
+            profile.xray_tun_ip.as_deref(),
+        )
+        .map_err(|err| {
+            invalid_data(format!(
+                "failed to apply TUN inbound to '{}': {err}",
+                profile.config_path.display()
+            ))
+        })?
+    } else {
+        with_policies
+    };
     serde_json::to_vec(&merged).map_err(|err| {
         invalid_data(format!(
             "failed to serialize xray config for '{}': {err}",
@@ -1075,11 +1167,9 @@ impl TunnelManager {
                     ));
                 }
                 let spec = wireguard_connect_spec(&exe, profile)?;
-                let transient_path = if !profile.routes.is_empty() {
-                    spec.args.get(1).and_then(|a| a.to_str().map(PathBuf::from))
-                } else {
-                    None
-                };
+                // `wireguard_connect_spec` always produces a transient config
+                // (Table = off), so always record it for cleanup on disconnect.
+                let transient_path = spec.args.get(1).and_then(|a| a.to_str().map(PathBuf::from));
                 run_service_command(&spec)?;
                 self.wireguard_services.insert(profile.id.clone());
                 if let Some(path) = transient_path {
@@ -1347,13 +1437,7 @@ mod tests {
             backend: TunnelBackend::WireGuard,
             config_path: PathBuf::from(r"C:\configs\work.conf"),
             interface_name: "wg-work".into(),
-            routes: vec![],
-            auto_connect: false,
-            domain_policies: vec![],
-            xray_socks_port: None,
-            use_system_proxy: false,
-            proxy_bypass: vec![],
-            subscription: None,
+            ..Default::default()
         }
     }
 
@@ -1364,13 +1448,8 @@ mod tests {
             backend: TunnelBackend::Xray,
             config_path: PathBuf::from(r"C:\configs\node.json"),
             interface_name: String::new(),
-            routes: vec![],
-            auto_connect: false,
-            domain_policies: vec![],
             xray_socks_port: Some(10808),
-            use_system_proxy: false,
-            proxy_bypass: vec![],
-            subscription: None,
+            ..Default::default()
         }
     }
 
@@ -1381,13 +1460,7 @@ mod tests {
             backend: TunnelBackend::OpenVpn,
             config_path: PathBuf::from(r"C:\configs\home.ovpn"),
             interface_name: "ovpn-home".into(),
-            routes: vec![],
-            auto_connect: false,
-            domain_policies: vec![],
-            xray_socks_port: None,
-            use_system_proxy: false,
-            proxy_bypass: vec![],
-            subscription: None,
+            ..Default::default()
         }
     }
 
@@ -1409,16 +1482,30 @@ mod tests {
 
     #[test]
     fn wireguard_connect_spec_is_install_service_with_config_path() {
-        let spec =
-            wireguard_connect_spec(Path::new(r"C:\wg\wireguard.exe"), &wg_profile()).unwrap();
+        // `wireguard_connect_spec` always reads the config to inject
+        // `Table = off`, so the config file must exist on disk.
+        let dir = std::env::temp_dir().join(format!(
+            "netmgr-spec-install-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("work.conf");
+        std::fs::write(&config_path, "[Interface]\nPrivateKey = abc\n").unwrap();
+
+        let mut profile = wg_profile();
+        profile.config_path = config_path.clone();
+
+        let spec = wireguard_connect_spec(Path::new(r"C:\wg\wireguard.exe"), &profile).unwrap();
         assert_eq!(spec.program, PathBuf::from(r"C:\wg\wireguard.exe"));
-        assert_eq!(
-            spec.args,
-            vec![
-                OsString::from("/installtunnelservice"),
-                OsString::from(r"C:\configs\work.conf"),
-            ]
-        );
+        assert_eq!(spec.args[0], OsString::from("/installtunnelservice"));
+        let used_path: PathBuf = spec.args[1].clone().into();
+        assert!(used_path.to_string_lossy().ends_with(".table-off.conf"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1436,15 +1523,17 @@ mod tests {
     }
 
     #[test]
-    fn openvpn_spec_is_config_only_when_routes_empty() {
+    fn openvpn_spec_always_appends_route_nopull() {
         let spec =
             openvpn_connect_spec(Path::new(r"C:\ovpn\openvpn.exe"), &ovpn_profile()).unwrap();
         assert_eq!(spec.program, PathBuf::from(r"C:\ovpn\openvpn.exe"));
+        // --route-nopull is always passed: the app is the sole route installer.
         assert_eq!(
             spec.args,
             vec![
                 OsString::from("--config"),
                 OsString::from(r"C:\configs\home.ovpn"),
+                OsString::from("--route-nopull"),
             ]
         );
     }
@@ -2143,12 +2232,7 @@ mod table_off_tests {
             config_path: PathBuf::from(r"C:\configs\test.conf"),
             interface_name: "wg-test".into(),
             routes,
-            auto_connect: false,
-            domain_policies: vec![],
-            xray_socks_port: None,
-            use_system_proxy: false,
-            proxy_bypass: vec![],
-            subscription: None,
+            ..Default::default()
         }
     }
 
@@ -2190,6 +2274,64 @@ mod table_off_tests {
     }
 
     #[test]
+    fn expand_allowedips_adds_uncovered_routes_to_first_peer() {
+        let config =
+            "[Interface]\nPrivateKey = abc\n\n[Peer]\nPublicKey = def\nAllowedIPs = 10.0.0.0/8\n";
+        let routes = vec!["192.168.50.0/24".parse().unwrap()];
+        let result = expand_allowedips(config, &routes);
+        assert!(result.contains("AllowedIPs = 10.0.0.0/8, 192.168.50.0/24"));
+    }
+
+    #[test]
+    fn expand_allowedips_skips_already_covered_routes() {
+        let config =
+            "[Interface]\nPrivateKey = abc\n\n[Peer]\nPublicKey = def\nAllowedIPs = 10.0.0.0/8\n";
+        // 10.20.0.0/16 is already inside 10.0.0.0/8 — no expansion needed.
+        let routes = vec!["10.20.0.0/16".parse().unwrap()];
+        let result = expand_allowedips(config, &routes);
+        assert!(result.contains("AllowedIPs = 10.0.0.0/8"));
+        assert!(!result.contains("10.20.0.0/16"));
+    }
+
+    #[test]
+    fn expand_allowedips_handles_default_route_no_expansion() {
+        // 0.0.0.0/0 already covers everything — no expansion needed.
+        let config =
+            "[Interface]\nPrivateKey = abc\n\n[Peer]\nPublicKey = def\nAllowedIPs = 0.0.0.0/0\n";
+        let routes = vec!["192.168.50.0/24".parse().unwrap()];
+        let result = expand_allowedips(config, &routes);
+        assert!(result.contains("AllowedIPs = 0.0.0.0/0"));
+        assert!(!result.contains("192.168.50.0/24"));
+    }
+
+    #[test]
+    fn expand_allowedips_preserves_ipv6_and_deduplicates() {
+        let config = "[Interface]\nPrivateKey = abc\n\n[Peer]\nPublicKey = def\nAllowedIPs = 10.0.0.0/8, ::/0\n";
+        let routes = vec![
+            "192.168.50.0/24".parse().unwrap(),
+            "10.20.0.0/16".parse().unwrap(), // already covered
+        ];
+        let result = expand_allowedips(config, &routes);
+        assert!(result.contains("10.0.0.0/8"));
+        assert!(result.contains("::/0"));
+        assert!(result.contains("192.168.50.0/24"));
+        assert!(!result.contains("10.20.0.0/16"));
+    }
+
+    #[test]
+    fn expand_allowedips_no_peer_section_is_noop() {
+        let config = "[Interface]\nPrivateKey = abc\n";
+        let routes = vec!["192.168.50.0/24".parse().unwrap()];
+        let result = expand_allowedips(config, &routes);
+        // No [Peer] section — no AllowedIPs to expand. Config content is
+        // preserved (lines are rejoined without a trailing newline).
+        assert!(result.contains("[Interface]"));
+        assert!(result.contains("PrivateKey = abc"));
+        assert!(!result.contains("AllowedIPs"));
+        assert!(!result.contains("192.168.50.0/24"));
+    }
+
+    #[test]
     fn wireguard_connect_spec_uses_transient_when_routes_nonempty() {
         let dir = std::env::temp_dir().join(format!(
             "netmgr-tableoff-{}-{}",
@@ -2224,15 +2366,20 @@ mod table_off_tests {
         let content = std::fs::read_to_string(&transient_path).unwrap();
         assert!(content.contains("Table = off"));
         assert!(content.contains("PrivateKey = abc"));
-        assert!(content.contains("AllowedIPs = 10.0.0.0/24"));
+        // Policy route 10.20.0.0/16 is not inside 10.0.0.0/24, so AllowedIPs
+        // is expanded to include it for cryptokey routing. The expanded line
+        // contains both prefixes (sorted by prefix length).
+        assert!(content.contains("AllowedIPs = "));
+        assert!(content.contains("10.0.0.0/24"));
+        assert!(content.contains("10.20.0.0/16"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn wireguard_connect_spec_uses_original_when_no_routes() {
+    fn wireguard_connect_spec_always_uses_transient() {
         let dir = std::env::temp_dir().join(format!(
-            "netmgr-tableoff-noroutes-{}-{}",
+            "netmgr-tableoff-always-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2243,14 +2390,20 @@ mod table_off_tests {
         let config_path = dir.join("test.conf");
         std::fs::write(&config_path, "[Interface]\nPrivateKey = abc\n").unwrap();
 
+        // Even with no policy routes, the app is the sole route installer, so
+        // a transient Table = off config is always produced.
         let mut profile = wg_profile_with_routes(vec![]);
         profile.config_path = config_path.clone();
 
         let spec = wireguard_connect_spec(Path::new(r"C:\wg\wireguard.exe"), &profile).unwrap();
         let used_path: PathBuf = spec.args[1].clone().into();
-        assert_eq!(used_path, std::path::absolute(&config_path).unwrap());
-        // No transient file should be created
-        assert!(!dir.join("test-wg.table-off.conf").is_file());
+        assert!(
+            used_path.to_string_lossy().ends_with(".table-off.conf"),
+            "expected transient Table = off config, got {used_path:?}"
+        );
+        assert!(used_path.is_file(), "transient config should exist");
+        let content = std::fs::read_to_string(&used_path).unwrap();
+        assert!(content.contains("Table = off"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2269,7 +2422,7 @@ mod table_off_tests {
         let source = dir.join("source.conf");
         std::fs::write(&source, "[Interface]\nPrivateKey = abc\n").unwrap();
 
-        let transient = wireguard_table_off_config(&source, "test-prof").unwrap();
+        let transient = wireguard_table_off_config(&source, "test-prof", &[]).unwrap();
         assert!(transient.is_file());
         assert!(transient
             .to_string_lossy()
@@ -2314,12 +2467,7 @@ mod table_off_tests {
             config_path: PathBuf::new(),
             interface_name: "Ethernet".into(),
             routes,
-            auto_connect: false,
-            domain_policies: vec![],
-            xray_socks_port: None,
-            use_system_proxy: false,
-            proxy_bypass: vec![],
-            subscription: None,
+            ..Default::default()
         }
     }
 

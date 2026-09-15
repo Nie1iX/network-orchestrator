@@ -10,7 +10,8 @@ pub(crate) use diagnostics::{diagnose_profile, inspect_profile_by_id, inspect_pr
 pub(crate) use explorer::{get_interfaces, get_routes, lookup_destination, set_interface_state};
 pub(crate) use profiles::{
     delete_profile, get_profiles, get_subscription_endpoints, import_configs_batch,
-    import_subscription, save_profile, save_vless_profile, switch_subscription_endpoint,
+    import_subscription, save_profile, save_vless_profile, save_wireguard_profile,
+    switch_subscription_endpoint,
 };
 pub(crate) use recovery::{cleanup_recovery, get_recovery_report};
 pub(crate) use route_map::get_route_map;
@@ -19,4 +20,6 @@ pub(crate) use system::{
     get_managed_xray_offer, install_managed_xray, is_elevated, remove_managed_xray,
     reset_backend_executable, restart_elevated, set_backend_executable,
 };
-pub(crate) use tunnels::{connect_profile, disconnect_profile, get_tunnel_statuses};
+pub(crate) use tunnels::{
+    connect_profile, disconnect_profile, get_tunnel_statuses, probe_openvpn_routes,
+};

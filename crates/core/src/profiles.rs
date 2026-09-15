@@ -211,11 +211,7 @@ mod tests {
                 metric: 5,
             }],
             auto_connect: true,
-            domain_policies: vec![],
-            xray_socks_port: None,
-            use_system_proxy: false,
-            proxy_bypass: vec![],
-            subscription: None,
+            ..Default::default()
         }
     }
 
@@ -297,16 +293,12 @@ mod tests {
             backend: TunnelBackend::Xray,
             config_path: PathBuf::from(r"C:\configs\work.json"),
             interface_name: String::new(),
-            routes: vec![],
-            auto_connect: false,
             domain_policies: vec![DomainPolicy {
                 domains: vec!["example.com".into()],
                 target: DomainRouteTarget::Proxy,
             }],
             xray_socks_port: Some(10808),
-            use_system_proxy: false,
-            proxy_bypass: vec![],
-            subscription: None,
+            ..Default::default()
         }
     }
 

@@ -323,6 +323,55 @@ pub fn apply_domain_policies(base: &Value, policies: &[DomainPolicy]) -> io::Res
     Ok(doc)
 }
 
+/// Replace the SOCKS inbound in an Xray config with a TUN inbound (Wintun on
+/// Windows). If no inbound exists, a TUN inbound is added. The TUN interface
+/// captures all IP traffic at the interface level, making Xray a full-tunnel
+/// backend. The `interface_name` and `ip` parameters configure the TUN
+/// adapter; if `None`, sensible defaults are used.
+pub fn apply_tun_inbound(
+    base: &Value,
+    interface_name: Option<&str>,
+    ip: Option<&str>,
+) -> io::Result<Value> {
+    let mut doc = base.clone();
+    let root = doc
+        .as_object_mut()
+        .ok_or_else(|| invalid_data("xray config root must be an object"))?;
+    let inbounds = root
+        .entry("inbounds")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| invalid_data("xray config inbounds must be an array"))?;
+
+    // Remove existing SOCKS inbound(s) — TUN mode replaces system-proxy-based
+    // traffic capture with interface-level capture.
+    inbounds.retain(|inbound| inbound["protocol"].as_str() != Some("socks"));
+
+    let tun_inbound = json!({
+        "tag": "tun-in",
+        "protocol": "tun",
+        "settings": {
+            "interfaceName": interface_name.unwrap_or("xray-tun"),
+            "ip": ip.unwrap_or("172.19.0.1/30"),
+            "mtu": 1500,
+        },
+    });
+    inbounds.insert(0, tun_inbound);
+    Ok(doc)
+}
+
+/// Check whether an Xray config has a TUN inbound.
+pub fn has_tun_inbound(config: &Value) -> bool {
+    config["inbounds"]
+        .as_array()
+        .map(|inbounds| {
+            inbounds
+                .iter()
+                .any(|inbound| inbound["protocol"].as_str() == Some("tun"))
+        })
+        .unwrap_or(false)
+}
+
 fn resolve_outbound_tag(
     outbound: &mut Value,
     base_tag: &str,
@@ -775,5 +824,51 @@ mod tests {
             result["routing"]["rules"][0],
             json!({"type": "field", "domain": ["a.com"], "outboundTag": "p"})
         );
+    }
+
+    #[test]
+    fn apply_tun_inbound_replaces_socks_with_tun() {
+        let base = json!({
+            "inbounds": [{"tag": "socks-in", "protocol": "socks", "port": 10808}],
+            "outbounds": [{"tag": "proxy", "protocol": "vless"}],
+        });
+        let result = apply_tun_inbound(&base, None, None).unwrap();
+        assert_eq!(result["inbounds"].as_array().unwrap().len(), 1);
+        assert_eq!(result["inbounds"][0]["protocol"], "tun");
+        assert_eq!(result["inbounds"][0]["tag"], "tun-in");
+        assert_eq!(
+            result["inbounds"][0]["settings"]["interfaceName"],
+            "xray-tun"
+        );
+        assert_eq!(result["inbounds"][0]["settings"]["ip"], "172.19.0.1/30");
+        assert_eq!(result["inbounds"][0]["settings"]["mtu"], 1500);
+        // Outbounds preserved.
+        assert_eq!(result["outbounds"][0]["tag"], "proxy");
+    }
+
+    #[test]
+    fn apply_tun_inbound_uses_custom_interface_and_ip() {
+        let base = json!({"outbounds": [{"tag": "proxy", "protocol": "vless"}]});
+        let result = apply_tun_inbound(&base, Some("my-tun"), Some("10.5.0.1/24")).unwrap();
+        assert_eq!(result["inbounds"][0]["settings"]["interfaceName"], "my-tun");
+        assert_eq!(result["inbounds"][0]["settings"]["ip"], "10.5.0.1/24");
+    }
+
+    #[test]
+    fn apply_tun_inbound_adds_inbound_when_none_exists() {
+        let base = json!({"outbounds": [{"tag": "proxy", "protocol": "vless"}]});
+        let result = apply_tun_inbound(&base, None, None).unwrap();
+        assert_eq!(result["inbounds"].as_array().unwrap().len(), 1);
+        assert_eq!(result["inbounds"][0]["protocol"], "tun");
+    }
+
+    #[test]
+    fn has_tun_inbound_detects_tun_protocol() {
+        let with_tun = json!({"inbounds": [{"protocol": "tun"}]});
+        assert!(has_tun_inbound(&with_tun));
+        let with_socks = json!({"inbounds": [{"protocol": "socks"}]});
+        assert!(!has_tun_inbound(&with_socks));
+        let no_inbounds = json!({"outbounds": []});
+        assert!(!has_tun_inbound(&no_inbounds));
     }
 }

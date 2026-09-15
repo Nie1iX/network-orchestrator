@@ -50,7 +50,12 @@ mod imp {
         TokenUser, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
     };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, ReadFile, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, OPEN_EXISTING,
+    };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const GENERIC_READ: u32 = 0x8000_0000;
 
     struct OwnedHandle(HANDLE);
 
@@ -67,6 +72,52 @@ mod imp {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect()
+    }
+
+    /// Read a file bypassing its DACL by opening it with
+    /// `FILE_FLAG_BACKUP_SEMANTICS`. Requires `SeBackupPrivilege` to be
+    /// enabled on the process token (see `enable_backup_privilege`).
+    /// Used to import ACL-protected files such as WireGuard `.conf.dpapi`
+    /// configs that are owned by SYSTEM and deny access to administrators.
+    pub fn read_with_backup_semantics(path: &Path) -> io::Result<Vec<u8>> {
+        let name = wide(path);
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR::from_raw(name.as_ptr()),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+        }
+        .map_err(|err| {
+            let raw = err.code().0;
+            if raw < 0 && (raw & 0x1FFF_0000) == (0x0007 << 16) {
+                io::Error::from_raw_os_error(raw & 0xFFFF)
+            } else {
+                io::Error::other(err.to_string())
+            }
+        })?;
+        let handle = OwnedHandle(handle);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let mut read = 0u32;
+            let ok =
+                unsafe { ReadFile(handle.0, Some(&mut buf), Some(&mut read as *mut u32), None) };
+            match ok {
+                Ok(()) => {
+                    if read == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..read as usize]);
+                }
+                Err(err) => return Err(io::Error::other(err.to_string())),
+            }
+        }
+        Ok(out)
     }
 
     unsafe fn read_wide_string(ptr: *const u16) -> io::Result<String> {
@@ -354,12 +405,17 @@ mod imp {
 }
 
 pub use imp::{
-    inspect_path_protection, protect_path, protect_user_data, unprotect_machine_data,
-    unprotect_user_data,
+    inspect_path_protection, protect_path, protect_user_data, read_with_backup_semantics,
+    unprotect_machine_data, unprotect_user_data,
 };
 
 #[cfg(test)]
 pub use imp::protect_machine_data;
+
+#[cfg(not(windows))]
+pub fn read_with_backup_semantics(path: &Path) -> io::Result<Vec<u8>> {
+    std::fs::read(path)
+}
 
 #[cfg(test)]
 mod tests {

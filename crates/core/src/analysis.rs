@@ -505,6 +505,24 @@ fn analyze_xray(profile: &Profile, analysis: &mut ConfigAnalysis) -> io::Result<
 
     if let Some(inbounds) = root.get("inbounds").and_then(Value::as_array) {
         for inbound in inbounds {
+            let protocol = inbound
+                .get("protocol")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("xray")
+                .to_string();
+            // TUN inbound captures all IP traffic at the interface level,
+            // making Xray a full-tunnel backend. Treat it as a 0.0.0.0/0 OS
+            // route so conflict detection and route maps account for it.
+            if protocol == "tun" {
+                analysis.os_routes.push(AnalyzedRoute {
+                    metric: None,
+                    destination: IpNet::V4(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).unwrap()),
+                    source: "Xray TUN".to_string(),
+                });
+                continue;
+            }
             match inbound.get("port").and_then(json_port) {
                 Some(port) => {
                     let address = inbound
@@ -513,13 +531,6 @@ fn analyze_xray(profile: &Profile, analysis: &mut ConfigAnalysis) -> io::Result<
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .unwrap_or("0.0.0.0")
-                        .to_string();
-                    let protocol = inbound
-                        .get("protocol")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("xray")
                         .to_string();
                     analysis.listeners.push(LocalListener {
                         address,
@@ -532,6 +543,20 @@ fn analyze_xray(profile: &Profile, analysis: &mut ConfigAnalysis) -> io::Result<
                     .push("Xray inbound is missing a valid port".to_string()),
             }
         }
+    }
+
+    // If the profile is configured for TUN mode, the TUN inbound is injected
+    // at connect time by `prepare_xray_config` and may not be present in the
+    // stored config yet. Add the 0.0.0.0/0 OS route proactively so conflict
+    // detection works before connect.
+    if profile.xray_mode == crate::models::XrayMode::Tun
+        && !analysis.os_routes.iter().any(|r| r.source == "Xray TUN")
+    {
+        analysis.os_routes.push(AnalyzedRoute {
+            metric: None,
+            destination: IpNet::V4(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).unwrap()),
+            source: "Xray TUN".to_string(),
+        });
     }
 
     if let Some(outbounds) = root.get("outbounds").and_then(Value::as_array) {
@@ -583,7 +608,7 @@ mod tests {
     use super::*;
     use crate::models::{
         AnalyzedRoute, ConflictKind, DomainPolicy, DomainRouteTarget, LocalListener, PolicyRoute,
-        TunnelBackend,
+        TunnelBackend, XrayMode,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -609,13 +634,7 @@ mod tests {
             backend,
             config_path: path.to_path_buf(),
             interface_name: "tun0".into(),
-            routes: vec![],
-            auto_connect: false,
-            domain_policies: vec![],
-            xray_socks_port: None,
-            use_system_proxy: false,
-            proxy_bypass: vec![],
-            subscription: None,
+            ..Default::default()
         }
     }
 
@@ -938,6 +957,54 @@ mod tests {
             vec!["domain:example.com", "full:api.example.com"]
         );
         assert_eq!(result.warnings.len(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn xray_tun_inbound_adds_default_route_to_os_routes() {
+        let dir = unique_dir("xray-tun");
+        let cfg = dir.join("c.json");
+        fs::write(
+            &cfg,
+            r#"{
+              "inbounds": [{"protocol": "tun", "settings": {"interfaceName": "xray-tun"}}],
+              "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "vpn.example.com", "port": 443}]}}]
+            }"#,
+        )
+        .unwrap();
+        let p = profile(TunnelBackend::Xray, &cfg);
+        let result = analyze_profile(&p).unwrap();
+        // TUN inbound produces a 0.0.0.0/0 OS route.
+        assert!(result
+            .os_routes
+            .iter()
+            .any(|r| r.destination == net("0.0.0.0/0") && r.source == "Xray TUN"));
+        // No listener — TUN has no port.
+        assert!(result.listeners.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn xray_tun_mode_adds_default_route_even_without_tun_inbound_in_config() {
+        let dir = unique_dir("xray-tun-mode");
+        let cfg = dir.join("c.json");
+        fs::write(
+            &cfg,
+            r#"{
+              "inbounds": [{"protocol": "socks", "port": 10808}],
+              "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "vpn.example.com", "port": 443}]}}]
+            }"#,
+        )
+        .unwrap();
+        let mut p = profile(TunnelBackend::Xray, &cfg);
+        p.xray_mode = XrayMode::Tun;
+        let result = analyze_profile(&p).unwrap();
+        // Profile is configured for TUN mode — 0.0.0.0/0 OS route is added
+        // proactively even though the stored config still has a SOCKS inbound.
+        assert!(result
+            .os_routes
+            .iter()
+            .any(|r| r.destination == net("0.0.0.0/0") && r.source == "Xray TUN"));
         fs::remove_dir_all(&dir).unwrap();
     }
 
