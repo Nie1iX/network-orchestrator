@@ -40,6 +40,38 @@ export function VpnIcon({ size = 18, className }: IconProps) {
   );
 }
 
+export function OpenVpnIcon({ size = 18, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <path d="M12 2a9 9 0 0 0-9 9c0 3.5 2 6.5 5 8" />
+      <path d="M12 2a9 9 0 0 1 9 9c0 3.5-2 6.5-5 8" />
+      <path d="M8 19h8" />
+      <path d="M9 22h6" />
+      <circle cx="12" cy="11" r="2" />
+    </svg>
+  );
+}
+
+export function XrayIcon({ size = 18, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M5 5l14 14M19 5L5 19" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  );
+}
+
+export function StaticRoutesIcon({ size = 18, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <path d="M3 12h4l2-6 4 12 2-6h6" />
+      <circle cx="3" cy="12" r="1" />
+      <circle cx="21" cy="12" r="1" />
+    </svg>
+  );
+}
+
 export function LoopbackIcon({ size = 18, className }: IconProps) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
@@ -83,9 +115,9 @@ export function ChevronIcon({ size = 18, className, collapsed }: IconProps & { c
       strokeLinecap="round"
       strokeLinejoin="round"
       className={className}
-      style={{ transform: collapsed ? "rotate(180deg)" : "none", transition: "transform 0.2s" }}
+      style={{ transform: collapsed ? "none" : "rotate(180deg)", transition: "transform 0.2s" }}
     >
-      <polyline points="15 18 9 12 15 6" />
+      <polyline points="6 9 12 15 18 9" />
     </svg>
   );
 }
@@ -109,8 +141,37 @@ export function ProfileIcon({ size = 18, className }: IconProps) {
   );
 }
 
+export function ImportIcon({ size = 18, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <path d="M12 3v12" />
+      <path d="M7 10l5 5 5-5" />
+      <path d="M4 19h16" />
+    </svg>
+  );
+}
+
+export function HomeIcon({ size = 18, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <path d="M3 11.5 12 4l9 7.5" />
+      <path d="M5 10v9a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1v-9" />
+    </svg>
+  );
+}
+
+export function SettingsIcon({ size = 18, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+    </svg>
+  );
+}
+
 import { InterfaceKind } from "./types";
 import { InterfaceCategory } from "./types";
+import { TunnelBackend } from "./types";
 
 export function kindIcon(kind: InterfaceKind, size = 18): React.ReactElement {
   const props = { size };
@@ -119,13 +180,24 @@ export function kindIcon(kind: InterfaceKind, size = 18): React.ReactElement {
       case "ethernet": return <EthernetIcon {...props} />;
       case "wifi": return <WifiIcon {...props} />;
       case "wireGuard": return <WireGuardIcon {...props} />;
-      case "openVpn": return <VpnIcon {...props} />;
-      case "xray": return <VpnIcon {...props} />;
+      case "openVpn": return <OpenVpnIcon {...props} />;
+      case "xray": return <XrayIcon {...props} />;
       case "loopback": return <LoopbackIcon {...props} />;
       default: return <NetworkIcon {...props} />;
     }
   }
   return <NetworkIcon {...props} />;
+}
+
+export function backendIcon(backend: TunnelBackend, size = 18): React.ReactElement {
+  const props = { size };
+  switch (backend) {
+    case "wireGuard": return <WireGuardIcon {...props} />;
+    case "openVpn": return <OpenVpnIcon {...props} />;
+    case "xray": return <XrayIcon {...props} />;
+    case "none": return <StaticRoutesIcon {...props} />;
+    default: return <NetworkIcon {...props} />;
+  }
 }
 
 export function categoryIcon(category: InterfaceCategory, size = 18): React.ReactElement {

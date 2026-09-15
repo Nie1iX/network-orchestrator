@@ -1,21 +1,20 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
+import Home from "./components/Home";
 import InterfaceList from "./components/InterfaceList";
+import NavRail, { type Tab } from "./components/NavRail";
 import ProfileManager from "./components/ProfileManager";
 import RecoveryPrompt from "./components/RecoveryPrompt";
-import RouteMap from "./components/RouteMap";
-import RouteTable from "./components/RouteTable";
-import RouteLookup from "./components/RouteLookup";
-import UpdateChecker from "./components/UpdateChecker";
-import { NetworkIcon, ProfileIcon, RouteIcon, ChevronIcon } from "./icons";
+import RouteView from "./components/RouteView";
+import Settings from "./components/Settings";
+import { TunnelStatus } from "./types";
 import "./App.css";
 
-type Tab = "interfaces" | "profiles" | "routes";
-
 function App() {
-  const [tab, setTab] = useState<Tab>("interfaces");
-  const [collapsed, setCollapsed] = useState(false);
+  const [tab, setTab] = useState<Tab>("home");
+  const [activeCount, setActiveCount] = useState(0);
 
   useEffect(() => {
     const unlisten = listen("route-changed", () => {
@@ -33,64 +32,30 @@ function App() {
     };
   }, []);
 
+  const pollActiveCount = useCallback(async () => {
+    try {
+      const statuses = await invoke<TunnelStatus[]>("get_tunnel_statuses");
+      setActiveCount(statuses.filter((s) => s.state === "running").length);
+    } catch {
+      // keep last known count on poll failure
+    }
+  }, []);
+
+  useEffect(() => {
+    pollActiveCount();
+    const interval = setInterval(pollActiveCount, 2000);
+    return () => clearInterval(interval);
+  }, [pollActiveCount]);
+
   return (
     <div className="app-layout">
-      <nav className={`sidebar ${collapsed ? "collapsed" : ""}`}>
-        <div className="sidebar-header">
-          <NetworkIcon size={24} />
-          <span className="label">Network Explorer</span>
-          <button
-            className="sidebar-toggle"
-            onClick={() => setCollapsed(!collapsed)}
-            title={collapsed ? "Expand" : "Collapse"}
-          >
-            <ChevronIcon size={16} collapsed={collapsed} />
-          </button>
-        </div>
-        <ul className="nav-items">
-          <li>
-            <button
-              className={`nav-item ${tab === "interfaces" ? "active" : ""}`}
-              onClick={() => setTab("interfaces")}
-              title="Interfaces"
-            >
-              <NetworkIcon size={16} />
-              <span className="label">Interfaces</span>
-            </button>
-          </li>
-          <li>
-            <button
-              className={`nav-item ${tab === "profiles" ? "active" : ""}`}
-              onClick={() => setTab("profiles")}
-              title="Profiles"
-            >
-              <ProfileIcon size={16} />
-              <span className="label">Profiles</span>
-            </button>
-          </li>
-          <li>
-            <button
-              className={`nav-item ${tab === "routes" ? "active" : ""}`}
-              onClick={() => setTab("routes")}
-              title="Routes"
-            >
-              <RouteIcon size={16} />
-              <span className="label">Routes</span>
-            </button>
-          </li>
-        </ul>
-        <UpdateChecker />
-      </nav>
+      <NavRail tab={tab} setTab={setTab} activeCount={activeCount} />
       <main className="content">
-        {tab === "interfaces" && <InterfaceList />}
-        {tab === "profiles" && <ProfileManager />}
-        {tab === "routes" && (
-          <>
-            <RouteMap />
-            <RouteLookup />
-            <RouteTable />
-          </>
-        )}
+        {tab === "home" && <Home onNavigate={setTab} />}
+        {tab === "connections" && <ProfileManager />}
+        {tab === "network" && <InterfaceList />}
+        {tab === "routes" && <RouteView />}
+        {tab === "settings" && <Settings />}
       </main>
       <RecoveryPrompt />
     </div>

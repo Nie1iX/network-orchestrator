@@ -11,6 +11,8 @@ import {
 } from "../types";
 import { kindIcon, categoryIcon, ChevronIcon } from "../icons";
 import InterfaceDetail from "./InterfaceDetail";
+import Page from "./Page";
+import Skeleton from "./ui/Skeleton";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -181,11 +183,40 @@ export default function InterfaceList() {
     });
   };
 
-  if (loading) return <p>Loading interfaces...</p>;
-  if (error) return <p className="error">Error loading interfaces: {error}</p>;
+  if (loading) {
+    return (
+      <Page width="wide">
+        <section>
+          <h2>Network</h2>
+          <div className="interface-grid">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <div key={i} className="interface-card">
+                <div className="interface-header">
+                  <div className="interface-title">
+                    <Skeleton width="18px" height="18px" radius="4px" />
+                    <Skeleton width="120px" height="1rem" />
+                  </div>
+                </div>
+                <Skeleton width="80%" height="0.8rem" />
+                <Skeleton width="60%" height="0.8rem" />
+              </div>
+            ))}
+          </div>
+        </section>
+      </Page>
+    );
+  }
+  if (error)
+    return (
+      <Page width="wide">
+        <p className="error">Error loading interfaces: {error}</p>
+      </Page>
+    );
 
   return (
+    <Page width="wide">
     <section>
+      <h2>Network</h2>
       <div className="filter-bar">
         <input
           className="filter-search"
@@ -382,5 +413,6 @@ export default function InterfaceList() {
         <InterfaceDetail iface={selected} onClose={() => setSelected(null)} />
       )}
     </section>
+    </Page>
   );
 }
