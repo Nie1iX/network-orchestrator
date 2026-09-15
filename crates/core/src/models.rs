@@ -107,6 +107,46 @@ pub enum DomainRouteTarget {
     Direct,
 }
 
+/// Xray operating mode. `Socks` (default) creates a SOCKS5 inbound on
+/// 127.0.0.1 and relies on system proxy for traffic capture. `Tun` creates a
+/// TUN inbound (Wintun on Windows) that captures all IP traffic at the
+/// interface level, making Xray a full-tunnel backend comparable to
+/// WireGuard/OpenVPN.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum XrayMode {
+    #[default]
+    Socks,
+    Tun,
+}
+
+/// User-supplied WireGuard tunnel fields for manual profile creation.
+/// All values are written verbatim into the generated `.conf`; the vault
+/// directory ACL protects the resulting file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardFields {
+    /// Interface private key (base64).
+    pub private_key: String,
+    /// Interface address(es), comma-separated, e.g. `10.0.0.2/24`.
+    pub address: String,
+    /// Optional DNS servers, comma-separated.
+    #[serde(default)]
+    pub dns: String,
+    /// Peer public key (base64).
+    pub peer_public_key: String,
+    /// Peer endpoint `host:port`.
+    pub peer_endpoint: String,
+    /// Peer allowed IPs, comma-separated, e.g. `0.0.0.0/0`.
+    pub allowed_ips: String,
+    /// Optional pre-shared key (base64).
+    #[serde(default)]
+    pub preshared_key: String,
+    /// Optional persistent keepalive interval (seconds).
+    #[serde(default)]
+    pub persistent_keepalive: Option<u16>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainPolicy {
@@ -141,6 +181,38 @@ pub struct Profile {
     pub proxy_bypass: Vec<String>,
     #[serde(default)]
     pub subscription: Option<SubscriptionMeta>,
+    #[serde(default)]
+    pub xray_mode: XrayMode,
+    /// TUN interface name for Xray TUN mode (e.g. "xray-tun"). Ignored in
+    /// SOCKS mode.
+    #[serde(default)]
+    pub xray_tun_interface: Option<String>,
+    /// TUN interface IPv4 address with prefix (e.g. "172.19.0.1/30"). Ignored
+    /// in SOCKS mode.
+    #[serde(default)]
+    pub xray_tun_ip: Option<String>,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            backend: TunnelBackend::None,
+            config_path: PathBuf::new(),
+            interface_name: String::new(),
+            routes: Vec::new(),
+            auto_connect: false,
+            domain_policies: Vec::new(),
+            xray_socks_port: None,
+            use_system_proxy: false,
+            proxy_bypass: Vec::new(),
+            subscription: None,
+            xray_mode: XrayMode::default(),
+            xray_tun_interface: None,
+            xray_tun_ip: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

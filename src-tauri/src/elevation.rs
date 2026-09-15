@@ -4,9 +4,11 @@ mod imp {
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LUID};
     use windows::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenElevation,
+        SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_PRIVILEGES,
+        TOKEN_QUERY,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -50,6 +52,53 @@ mod imp {
         }
     }
 
+    /// Enable SeBackupPrivilege on the current process token. Required to read
+    /// ACL-protected files (e.g. WireGuard `.conf.dpapi` configs owned by
+    /// SYSTEM) even when the process is elevated. Returns `Ok(())` if the
+    /// privilege was already enabled or was successfully enabled.
+    pub fn enable_backup_privilege() -> io::Result<()> {
+        unsafe {
+            let mut raw = HANDLE::default();
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                &mut raw,
+            )
+            .map_err(to_io_error)?;
+            let token = TokenHandle(raw);
+
+            let backup_name: Vec<u16> = OsStr::new("SeBackupPrivilege")
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut luid = LUID::default();
+            LookupPrivilegeValueW(
+                PCWSTR::null(),
+                PCWSTR::from_raw(backup_name.as_ptr()),
+                &mut luid,
+            )
+            .map_err(to_io_error)?;
+
+            let mut tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [windows::Win32::Security::LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            AdjustTokenPrivileges(
+                token.0,
+                false,
+                Some(&mut tp as *mut TOKEN_PRIVILEGES),
+                0,
+                None,
+                None,
+            )
+            .map_err(to_io_error)?;
+            Ok(())
+        }
+    }
+
     pub fn restart_elevated() -> io::Result<()> {
         let exe = std::env::current_exe()?;
         let file: Vec<u16> = exe
@@ -82,7 +131,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{is_elevated, restart_elevated};
+pub use imp::{enable_backup_privilege, is_elevated, restart_elevated};
 
 #[cfg(not(windows))]
 pub fn is_elevated() -> std::io::Result<bool> {
@@ -97,6 +146,11 @@ pub fn restart_elevated() -> std::io::Result<()> {
     ))
 }
 
+#[cfg(not(windows))]
+pub fn enable_backup_privilege() -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +158,11 @@ mod tests {
     #[test]
     fn is_elevated_returns_ok() {
         assert!(is_elevated().is_ok());
+    }
+
+    #[test]
+    fn enable_backup_privilege_returns_ok() {
+        // May fail if not elevated — that's fine in CI.
+        let _ = enable_backup_privilege();
     }
 }

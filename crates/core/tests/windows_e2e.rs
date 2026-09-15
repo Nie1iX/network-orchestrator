@@ -157,13 +157,7 @@ fn fixture_profile(
         backend,
         config_path,
         interface_name: interface.into(),
-        routes: vec![],
-        auto_connect: false,
-        domain_policies: vec![],
-        xray_socks_port: None,
-        use_system_proxy: false,
-        proxy_bypass: vec![],
-        subscription: None,
+        ..Default::default()
     }
 }
 

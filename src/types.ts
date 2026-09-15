@@ -147,6 +147,19 @@ export interface SubscriptionEndpointInfo {
   active: boolean;
 }
 
+export interface WireGuardFields {
+  privateKey: string;
+  address: string;
+  dns: string;
+  peerPublicKey: string;
+  peerEndpoint: string;
+  allowedIps: string;
+  presharedKey: string;
+  persistentKeepalive: number | null;
+}
+
+export type XrayMode = "socks" | "tun";
+
 export interface Profile {
   id: string;
   name: string;
@@ -160,6 +173,9 @@ export interface Profile {
   useSystemProxy: boolean;
   proxyBypass: string[];
   subscription: SubscriptionMeta | null;
+  xrayMode: XrayMode;
+  xrayTunInterface: string | null;
+  xrayTunIp: string | null;
 }
 
 export type TunnelState = "stopped" | "running" | "failed";

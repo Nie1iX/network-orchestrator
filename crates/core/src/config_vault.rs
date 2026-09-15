@@ -1,4 +1,4 @@
-use crate::config_security::protect_path;
+use crate::config_security::{protect_path, read_with_backup_semantics};
 use crate::models::TunnelBackend;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -29,6 +29,26 @@ struct SubscriptionSidecar {
 
 pub struct ConfigVault {
     root: PathBuf,
+}
+
+/// Copy `source` to `dest`, falling back to `FILE_FLAG_BACKUP_SEMANTICS`
+/// when the regular copy fails with access denied. The fallback bypasses
+/// DACLs on ACL-protected files (e.g. WireGuard `.conf.dpapi` configs owned
+/// by SYSTEM) and requires `SeBackupPrivilege` to be enabled on the process
+/// token.
+fn copy_source_with_backup_fallback(source: &Path, dest: &Path) -> io::Result<()> {
+    match fs::copy(source, dest) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            let bytes = read_with_backup_semantics(source)?;
+            fs::write(dest, bytes)
+        }
+        Err(err) if err.raw_os_error() == Some(5) => {
+            let bytes = read_with_backup_semantics(source)?;
+            fs::write(dest, bytes)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 impl ConfigVault {
@@ -149,7 +169,7 @@ impl ConfigVault {
                 TunnelBackend::OpenVpn => stage_openvpn(source, &staging, &config_name)?,
                 _ => {
                     let staged_config = staging.join(&config_name);
-                    fs::copy(source, &staged_config)?;
+                    copy_source_with_backup_fallback(source, &staged_config)?;
                     protect_path(&staged_config)?;
                     Vec::new()
                 }
@@ -186,6 +206,52 @@ impl ConfigVault {
         encrypted_bytes: &[u8],
     ) -> io::Result<ConfigImport> {
         self.store_xray_file(profile_id, encrypted_bytes, "config.json.dpapi")
+    }
+
+    /// Store a generated WireGuard `.conf` as a new managed revision. The
+    /// config is written as plaintext (WireGuard reads `.conf` directly; the
+    /// vault directory is ACL-protected to current user + SYSTEM + admins).
+    pub fn store_wireguard_config(
+        &self,
+        profile_id: &str,
+        bytes: &[u8],
+    ) -> io::Result<ConfigImport> {
+        let safe = sanitize_profile_id(profile_id)?;
+        let config_name = format!("{safe}.conf");
+        let nanos = unix_nanos()?;
+        let profile_dir = self.root.join(&safe);
+        let staging = profile_dir.join(format!("rev-{nanos}.tmp"));
+        let revision = profile_dir.join(format!("rev-{nanos}"));
+        self.ensure_root_protected()?;
+        fs::create_dir_all(&profile_dir)?;
+        protect_path(&profile_dir)?;
+
+        let result = (|| -> io::Result<()> {
+            fs::create_dir(&staging)?;
+            protect_path(&staging)?;
+            let staged_config = staging.join(&config_name);
+            fs::write(&staged_config, bytes)?;
+            protect_path(&staged_config)?;
+            fs::rename(&staging, &revision)?;
+            if let Err(err) =
+                protect_path(&revision).and_then(|_| protect_path(&revision.join(&config_name)))
+            {
+                let _ = fs::remove_dir_all(&revision);
+                return Err(err);
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => Ok(ConfigImport {
+                config_path: revision.join(config_name),
+                warnings: Vec::new(),
+            }),
+            Err(err) => {
+                let _ = fs::remove_dir_all(&staging);
+                Err(err)
+            }
+        }
     }
 
     fn store_xray_file(
@@ -523,7 +589,7 @@ fn quote_token(token: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-pub(crate) fn sanitize_profile_id(id: &str) -> io::Result<String> {
+pub fn sanitize_profile_id(id: &str) -> io::Result<String> {
     let safe: String = id
         .chars()
         .map(|c| {

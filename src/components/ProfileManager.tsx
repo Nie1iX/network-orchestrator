@@ -1,19 +1,29 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation } from "../elevation";
-import BackendStatus from "./BackendStatus";
+import { backendIcon, ChevronIcon } from "../icons";
+import AddConnectionMenu from "./AddConnectionMenu";
+import DiagnosticsModal from "./DiagnosticsModal";
+import ImportModal from "./ImportModal";
+import Modal from "./Modal";
+import Page from "./Page";
+import Skeleton from "./ui/Skeleton";
+import ToggleSwitch from "./ui/ToggleSwitch";
+import OverflowMenu from "./ui/OverflowMenu";
+import ProfileFormModal, {
+  editFormState,
+  newFormState,
+  type ProfileFormState,
+} from "./ProfileFormModal";
 import {
   BatchImportResult,
-  DomainPolicy,
   DomainRouteTarget,
   NetworkInterface,
-  PolicyRoute,
   Profile,
   ProfileDiagnostics,
   ProfileInspection,
   SubscriptionEndpointInfo,
-  SubscriptionMeta,
   TunnelBackend,
   TunnelStatus,
 } from "../types";
@@ -25,29 +35,10 @@ const BACKEND_LABELS: Record<TunnelBackend, string> = {
   xray: "Xray/VLESS",
 };
 
-const BACKEND_EXTENSIONS: Record<TunnelBackend, string[]> = {
-  none: [],
-  wireGuard: ["conf", "dpapi"],
-  openVpn: ["ovpn", "conf"],
-  xray: ["json"],
-};
-
 const DOMAIN_TARGET_LABELS: Record<DomainRouteTarget, string> = {
   proxy: "Through proxy",
   direct: "Direct",
 };
-
-function newProfileId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-function clampMetric(value: number): number {
-  if (Number.isNaN(value)) return 0;
-  return Math.max(0, Math.min(9999, Math.trunc(value)));
-}
 
 function requiresElevation(profile: Profile): boolean {
   return (
@@ -57,30 +48,69 @@ function requiresElevation(profile: Profile): boolean {
   );
 }
 
-const DEFAULT_PROXY_BYPASS = "<local>, localhost, 127.*, 10.*, 192.168.*";
-
-function parseBypass(text: string): string[] {
-  return text
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
+function formatRate(bytesPerSec: number): string {
+  if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`;
+  if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
+  return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
 }
 
-interface FormState {
+const COLLAPSED_GROUPS_KEY = "netmanager.connections.collapsedGroups";
+
+function loadCollapsedGroups(): Set<TunnelBackend> {
+  try {
+    const raw = localStorage.getItem(COLLAPSED_GROUPS_KEY);
+    if (!raw) return new Set();
+    return new Set(JSON.parse(raw) as TunnelBackend[]);
+  } catch {
+    return new Set();
+  }
+}
+
+const SNIPPETS_KEY = "netmanager.connections.snippets";
+
+interface ConnectionSnippet {
   id: string;
   name: string;
-  backend: TunnelBackend;
-  configPath: string;
-  interfaceName: string;
-  routes: PolicyRoute[];
-  xraySource: "json" | "vless";
-  vlessUrl: string;
-  xraySocksPort: number | null;
-  domainPolicies: DomainPolicy[];
-  useSystemProxy: boolean;
-  proxyBypass: string;
-  isNew: boolean;
-  subscription: SubscriptionMeta | null;
+  profileIds: string[];
+}
+
+function newSnippetId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function loadSnippets(): ConnectionSnippet[] {
+  try {
+    const raw = localStorage.getItem(SNIPPETS_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw) as ConnectionSnippet[];
+  } catch {
+    return [];
+  }
+}
+
+function sameIds(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const setA = new Set(a);
+  return b.every((id) => setA.has(id));
+}
+
+function ConnectionCardSkeleton() {
+  return (
+    <div className="connection-card">
+      <div className="connection-card-main">
+        <Skeleton width="36px" height="36px" radius="50%" />
+        <div className="connection-card-info">
+          <Skeleton width="140px" height="0.95rem" />
+          <Skeleton width="90px" height="0.78rem" />
+        </div>
+        <Skeleton width="40px" height="24px" radius="999px" />
+        <Skeleton width="32px" height="32px" radius="8px" />
+      </div>
+    </div>
+  );
 }
 
 export default function ProfileManager() {
@@ -90,27 +120,119 @@ export default function ProfileManager() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<Set<string>>(new Set());
-  const [editing, setEditing] = useState<FormState | null>(null);
-  const [formError, setFormError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [inspections, setInspections] = useState<Record<string, ProfileInspection>>(
-    {}
-  );
+  const [editing, setEditing] = useState<ProfileFormState | null>(null);
+  const [formOpen, setFormOpen] = useState(false);
+  const [inspections, setInspections] = useState<
+    Record<string, ProfileInspection>
+  >({});
   const [saveNotice, setSaveNotice] = useState<{
     profileName: string;
     inspection: ProfileInspection;
   } | null>(null);
-  const [diagnostics, setDiagnostics] = useState<ProfileDiagnostics | null>(null);
+  const [diagnostics, setDiagnostics] = useState<ProfileDiagnostics | null>(
+    null,
+  );
+  const [diagOpen, setDiagOpen] = useState(false);
   const [diagBusy, setDiagBusy] = useState<string | null>(null);
   const [runtimeNotice, setRuntimeNotice] = useState<string | null>(null);
   const [importErrors, setImportErrors] = useState<string[] | null>(null);
-  const [importing, setImporting] = useState(false);
-  const [subUrl, setSubUrl] = useState("");
-  const [subHwid, setSubHwid] = useState("");
-  const [subOpen, setSubOpen] = useState(false);
-  const [subLoading, setSubLoading] = useState(false);
-  const [endpoints, setEndpoints] = useState<Record<string, SubscriptionEndpointInfo[]>>({});
+  const [importOpen, setImportOpen] = useState(false);
+  const [endpoints, setEndpoints] = useState<
+    Record<string, SubscriptionEndpointInfo[]>
+  >({});
   const [switching, setSwitching] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<TunnelBackend>>(
+    loadCollapsedGroups,
+  );
+  const [search, setSearch] = useState("");
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [snippets, setSnippets] = useState<ConnectionSnippet[]>(loadSnippets);
+  const [activeSnippetId, setActiveSnippetId] = useState<string | null>(null);
+  const [saveModalOpen, setSaveModalOpen] = useState(false);
+  const [newSnippetName, setNewSnippetName] = useState("");
+  const [throughput, setThroughput] = useState<
+    Record<number, { rxRate: number; txRate: number }>
+  >({});
+  const prevStats = useRef<Record<number, { rx: number; tx: number; time: number }>>({});
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        COLLAPSED_GROUPS_KEY,
+        JSON.stringify([...collapsedGroups]),
+      );
+    } catch {
+      // ignore storage errors (e.g. storage disabled)
+    }
+  }, [collapsedGroups]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SNIPPETS_KEY, JSON.stringify(snippets));
+    } catch {
+      // ignore storage errors (e.g. storage disabled)
+    }
+  }, [snippets]);
+
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const data = await invoke<NetworkInterface[]>("get_interfaces");
+        setInterfaces(data);
+        const now = Date.now();
+        const next: Record<number, { rxRate: number; txRate: number }> = {};
+        for (const iface of data) {
+          if (iface.rxBytes === null || iface.txBytes === null) continue;
+          const prev = prevStats.current[iface.ifIndex];
+          if (prev) {
+            const dt = (now - prev.time) / 1000;
+            if (dt > 0) {
+              next[iface.ifIndex] = {
+                rxRate: Math.max(0, (iface.rxBytes - prev.rx) / dt),
+                txRate: Math.max(0, (iface.txBytes - prev.tx) / dt),
+              };
+            }
+          }
+          prevStats.current[iface.ifIndex] = {
+            rx: iface.rxBytes,
+            tx: iface.txBytes,
+            time: now,
+          };
+        }
+        setThroughput(next);
+      } catch {
+        // ignore polling errors
+      }
+    };
+    poll();
+    const interval = setInterval(poll, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const rateFor = (profile: Profile) => {
+    const iface = interfaces.find(
+      (i) => i.name === profile.interfaceName || i.friendlyName === profile.interfaceName,
+    );
+    if (!iface) return null;
+    return throughput[iface.ifIndex] ?? null;
+  };
+
+  const toggleGroupCollapsed = (backend: TunnelBackend) =>
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(backend)) next.delete(backend);
+      else next.add(backend);
+      return next;
+    });
+
+  const toggleExpanded = (id: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
 
   const statusFor = useCallback(
     (id: string): TunnelStatus =>
@@ -119,7 +241,7 @@ export default function ProfileManager() {
         state: "stopped",
         message: null,
       },
-    [statuses]
+    [statuses],
   );
 
   const refreshStatuses = useCallback(async () => {
@@ -145,7 +267,9 @@ export default function ProfileManager() {
         const inspectionData =
           await invoke<ProfileInspection[]>("inspect_profiles");
         setInspections(
-          Object.fromEntries(inspectionData.map((i) => [i.analysis.profileId, i]))
+          Object.fromEntries(
+            inspectionData.map((i) => [i.analysis.profileId, i]),
+          ),
         );
       } catch (err) {
         setError(String(err));
@@ -237,15 +361,19 @@ export default function ProfileManager() {
         return;
       }
     }
-    withBusy(profile.id, () => invoke("disconnect_profile", { id: profile.id }));
+    withBusy(profile.id, () =>
+      invoke("disconnect_profile", { id: profile.id }),
+    );
   };
 
   const onDiagnose = async (profile: Profile) => {
     setDiagBusy(profile.id);
     try {
-      setDiagnostics(
-        await invoke<ProfileDiagnostics>("diagnose_profile", { id: profile.id })
-      );
+      const result = await invoke<ProfileDiagnostics>("diagnose_profile", {
+        id: profile.id,
+      });
+      setDiagnostics(result);
+      setDiagOpen(true);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -253,9 +381,15 @@ export default function ProfileManager() {
     }
   };
 
-  const onDelete = (profile: Profile) => {
-    if (!window.confirm(`Delete profile "${profile.name}"?`)) return;
-    withBusy(profile.id, () => invoke("delete_profile", { id: profile.id }));
+  const onDelete = async (profile: Profile) => {
+    const ok = await confirm(`Delete profile "${profile.name}"?`, {
+      title: "Delete profile",
+      kind: "warning",
+    });
+    if (!ok) return;
+    withBusy(profile.id, () =>
+      invoke("delete_profile", { id: profile.id }),
+    );
   };
 
   const onSwitchEndpoint = async (profile: Profile, index: number) => {
@@ -285,353 +419,232 @@ export default function ProfileManager() {
     }
   };
 
-  const onImportFiles = async () => {
-    setImportErrors(null);
-    try {
-      const selected = await open({
-        multiple: true,
-        directory: false,
-        filters: [
-          {
-            name: "Tunnel configs",
-            extensions: ["conf", "dpapi", "ovpn", "json"],
-          },
-        ],
-      });
-      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
-      if (paths.length === 0) return;
-      setImporting(true);
-      const result = await invoke<BatchImportResult>("import_configs_batch", {
-        paths,
-        defaultBackend: null,
-      });
-      setProfiles(result.profiles);
-      await refreshAll();
-      if (result.errors.length > 0) {
-        setImportErrors(
-          result.errors.map((e) => `${e.path}: ${e.error}`),
-        );
+  const applySnippet = (snippet: ConnectionSnippet) => {
+    const targetIds = new Set(snippet.profileIds);
+    for (const profile of profiles) {
+      const running = statusFor(profile.id).state === "running";
+      if (targetIds.has(profile.id) && !running) {
+        onConnect(profile);
+      } else if (!targetIds.has(profile.id) && running) {
+        onDisconnect(profile);
       }
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setImporting(false);
     }
+    setActiveSnippetId(snippet.id);
   };
 
-  const onImportSubscription = async () => {
-    setImportErrors(null);
-    if (!subUrl.trim()) return;
-    setSubLoading(true);
-    try {
-      const result = await invoke<BatchImportResult>("import_subscription", {
-        url: subUrl.trim(),
-        hwid: subHwid.trim(),
-      });
-      setProfiles(result.profiles);
-      await refreshAll();
-      setSubOpen(false);
-      if (result.errors.length > 0) {
-        setImportErrors(
-          result.errors.map((e) => `${e.path}: ${e.error}`),
-        );
-      }
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setSubLoading(false);
-    }
+  const deleteSnippet = (id: string) => {
+    setSnippets((prev) => prev.filter((s) => s.id !== id));
+    setActiveSnippetId((prev) => (prev === id ? null : prev));
   };
 
-  const onImportWireGuardStandard = async () => {
-    setImportErrors(null);
-    if (!(await ensureElevation("Importing WireGuard configs"))) return;
-    setImporting(true);
-    try {
-      const paths = await invoke<string[]>("discover_wireguard_configs");
-      if (paths.length === 0) {
-        setError("No WireGuard configs found in the standard location");
-        return;
-      }
-      const result = await invoke<BatchImportResult>("import_configs_batch", {
-        paths,
-        defaultBackend: "wireGuard",
-      });
-      setProfiles(result.profiles);
-      await refreshAll();
-      if (result.errors.length > 0) {
-        setImportErrors(
-          result.errors.map((e) => `${e.path}: ${e.error}`),
-        );
-      }
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setImporting(false);
-    }
+  const openSaveModal = () => {
+    setNewSnippetName("");
+    setSaveModalOpen(true);
   };
 
-  const openNew = () => {
-    setFormError(null);
-    setEditing({
-      id: newProfileId(),
-      name: "",
-      backend: "wireGuard",
-      configPath: "",
-      interfaceName: "",
-      routes: [],
-      xraySource: "json",
-      vlessUrl: "",
-      xraySocksPort: null,
-      domainPolicies: [],
-      useSystemProxy: false,
-      proxyBypass: DEFAULT_PROXY_BYPASS,
-      isNew: true,
-      subscription: null,
-    });
+  const overwriteActiveSnippet = () => {
+    if (!activeSnippetId) return;
+    const profileIds = runningProfiles.map((p) => p.id);
+    setSnippets((prev) =>
+      prev.map((s) => (s.id === activeSnippetId ? { ...s, profileIds } : s)),
+    );
+    setSaveModalOpen(false);
+  };
+
+  const createSnippet = () => {
+    const name = newSnippetName.trim();
+    if (!name) return;
+    const profileIds = runningProfiles.map((p) => p.id);
+    const id = newSnippetId();
+    setSnippets((prev) => [...prev, { id, name, profileIds }]);
+    setActiveSnippetId(id);
+    setSaveModalOpen(false);
+  };
+
+  const openNew = (backend?: TunnelBackend) => {
+    setEditing(newFormState(backend));
+    setFormOpen(true);
+  };
+
+  const handleChooseImport = () => {
+    setAddMenuOpen(false);
+    setImportOpen(true);
+  };
+
+  const handleChooseBackend = (backend: TunnelBackend) => {
+    setAddMenuOpen(false);
+    openNew(backend);
   };
 
   const openEdit = (profile: Profile) => {
-    setFormError(null);
-    setEditing({
-      id: profile.id,
-      name: profile.name,
-      backend: profile.backend,
-      configPath: profile.configPath,
-      interfaceName: profile.interfaceName,
-      routes: profile.routes.map((r) => ({ ...r })),
-      xraySource: "json",
-      vlessUrl: "",
-      xraySocksPort: profile.xraySocksPort,
-      domainPolicies: profile.domainPolicies.map((p) => ({
-        domains: [...p.domains],
-        target: p.target,
-      })),
-      useSystemProxy: profile.useSystemProxy,
-      proxyBypass: profile.proxyBypass.join(", "),
-      isNew: false,
-      subscription: profile.subscription,
-    });
+    setEditing(editFormState(profile));
+    setFormOpen(true);
   };
 
-  const browseConfig = async () => {
-    if (!editing) return;
-    try {
-      const selected = await open({
-        multiple: false,
-        directory: false,
-        filters: [
-          {
-            name: `${BACKEND_LABELS[editing.backend]} config`,
-            extensions: BACKEND_EXTENSIONS[editing.backend],
-          },
-        ],
-      });
-      if (typeof selected === "string") {
-        setEditing({ ...editing, configPath: selected });
-      }
-    } catch (err) {
-      setFormError(String(err));
+  const onFormSaved = (
+    updated: Profile[],
+    inspection: ProfileInspection | null,
+  ) => {
+    setProfiles(updated);
+    setFormOpen(false);
+    setEditing(null);
+    setError(null);
+    void refreshAll();
+    if (inspection && editing) {
+      const notes = [
+        ...inspection.analysis.warnings,
+        ...inspection.conflicts.map((c) => c.message),
+      ];
+      setSaveNotice(
+        notes.length > 0
+          ? {
+              profileName: editing.name || editing.id,
+              inspection,
+            }
+          : null,
+      );
     }
   };
 
-  const updateDomainRule = (index: number, patch: Partial<DomainPolicy>) => {
-    if (!editing) return;
-    setEditing({
-      ...editing,
-      domainPolicies: editing.domainPolicies.map((p, i) =>
-        i === index ? { ...p, ...patch } : p
-      ),
-    });
-  };
-
-  const updateRoute = (index: number, patch: Partial<PolicyRoute>) => {
-    if (!editing) return;
-    setEditing({
-      ...editing,
-      routes: editing.routes.map((r, i) => (i === index ? { ...r, ...patch } : r)),
-    });
-  };
-
-  const save = async () => {
-    if (!editing) return;
-    for (const route of editing.routes) {
-      if (!route.destination.trim()) {
-        setFormError("Route destination cannot be blank.");
-        return;
-      }
-    }
-    if (editing.routes.length > 0 && !editing.interfaceName.trim()) {
-      setFormError("Target interface is required when policy routes are set.");
-      return;
-    }
-    if (editing.backend === "none" && editing.routes.length === 0) {
-      setFormError("Static-routes profile requires at least one policy route.");
-      return;
-    }
-    const isXray = editing.backend === "xray";
-    const isVlessImport = isXray && editing.isNew && editing.xraySource === "vless";
-    const proxyBypass = parseBypass(editing.proxyBypass);
-    if (isXray && editing.useSystemProxy) {
-      for (const entry of proxyBypass) {
-        if (entry.includes(";")) {
-          setFormError("Proxy bypass entries must not contain ';'.");
-          return;
-        }
-      }
-    }
-    const domainPolicies = editing.domainPolicies.map((p) => ({
-      domains: p.domains.map((d) => d.trim()).filter((d) => d.length > 0),
-      target: p.target,
-    }));
-    if (isXray) {
-      for (const policy of domainPolicies) {
-        if (policy.domains.length === 0) {
-          setFormError("Each domain rule must list at least one domain.");
-          return;
-        }
-      }
-    }
-    if (isVlessImport) {
-      if (!editing.vlessUrl.trim()) {
-        setFormError("VLESS URL is required.");
-        return;
-      }
-      if (
-        editing.xraySocksPort !== null &&
-        (!Number.isInteger(editing.xraySocksPort) ||
-          editing.xraySocksPort < 1 ||
-          editing.xraySocksPort > 65535)
-      ) {
-        setFormError("SOCKS port must be an integer between 1 and 65535.");
-        return;
-      }
-    }
-    const payload: Profile = {
-      id: editing.id,
-      name: editing.name.trim(),
-      backend: editing.backend,
-      configPath: editing.configPath.trim(),
-      interfaceName: editing.interfaceName.trim(),
-      routes: editing.routes.map((r) => ({
-        destination: r.destination.trim(),
-        metric: clampMetric(r.metric),
-      })),
-      autoConnect: false,
-      domainPolicies: isXray ? domainPolicies : [],
-      xraySocksPort: !isXray
-        ? null
-        : isVlessImport
-          ? editing.xraySocksPort
-          : editing.isNew
-            ? null
-            : editing.xraySocksPort,
-      useSystemProxy: isXray && editing.useSystemProxy,
-      proxyBypass: isXray ? proxyBypass : [],
-      subscription: editing.isNew ? null : editing.subscription ?? null,
-    };
-    setSaving(true);
-    try {
-      const updated = isVlessImport
-        ? await invoke<Profile[]>("save_vless_profile", {
-            profile: payload,
-            vlessUrl: editing.vlessUrl.trim(),
-          })
-        : await invoke<Profile[]>("save_profile", { profile: payload });
-      setProfiles(updated);
-      setEditing(null);
-      setFormError(null);
-      setError(null);
-      await refreshAll();
-      try {
-        const inspection = await invoke<ProfileInspection>(
-          "inspect_profile_by_id",
-          { id: editing.id }
-        );
-        const notes = [
-          ...inspection.analysis.warnings,
-          ...inspection.conflicts.map((c) => c.message),
-        ];
-        setSaveNotice(
-          notes.length > 0
-            ? { profileName: payload.name || editing.id, inspection }
-            : null
-        );
-      } catch (err) {
-        setError(`Profile was saved, but static analysis failed: ${String(err)}`);
-        setSaveNotice(null);
-      }
-    } catch (err) {
-      setFormError(String(err));
-    } finally {
-      setSaving(false);
+  const onImported = (result: BatchImportResult) => {
+    setProfiles(result.profiles);
+    setImportOpen(false);
+    void refreshAll();
+    if (result.errors.length > 0) {
+      setImportErrors(result.errors.map((e) => `${e.path}: ${e.error}`));
     }
   };
 
-  if (loading) return <p>Loading profiles...</p>;
+  if (loading) {
+    return (
+      <Page width="narrow">
+        <section>
+          <div className="profiles-toolbar">
+            <h2>Connections</h2>
+          </div>
+          <div className="connection-list">
+            <ConnectionCardSkeleton />
+            <ConnectionCardSkeleton />
+            <ConnectionCardSkeleton />
+          </div>
+        </section>
+      </Page>
+    );
+  }
 
-  const targetable = interfaces.filter((i) => i.category !== "filter");
-  const systemProxyAvailable = editing
-    ? editing.xraySocksPort !== null ||
-      (editing.isNew && editing.xraySource === "vless")
-    : false;
+  const runningProfiles = profiles.filter(
+    (p) => statusFor(p.id).state === "running",
+  );
+
+  const activeSnippet = snippets.find((s) => s.id === activeSnippetId) ?? null;
+  const isActiveSnippetDirty =
+    activeSnippet !== null &&
+    !sameIds(
+      activeSnippet.profileIds,
+      runningProfiles.map((p) => p.id),
+    );
+
+  const lowerSearch = search.trim().toLowerCase();
+  const filteredProfiles = lowerSearch
+    ? profiles.filter(
+        (p) =>
+          p.name.toLowerCase().includes(lowerSearch) ||
+          p.interfaceName.toLowerCase().includes(lowerSearch),
+      )
+    : profiles;
+
+  const groups: { backend: TunnelBackend; items: Profile[] }[] = (
+    ["wireGuard", "openVpn", "xray", "none"] as TunnelBackend[]
+  )
+    .map((backend) => ({
+      backend,
+      items: filteredProfiles.filter((p) => p.backend === backend),
+    }))
+    .filter((g) => g.items.length > 0);
 
   return (
+    <Page width="narrow">
     <section>
-      <BackendStatus />
       <div className="profiles-toolbar">
-        <h2>VPN Profiles</h2>
-        <span className="profiles-note">
-          WireGuard, OpenVPN, interface changes, and policy routes require administrator privileges.
-        </span>
-        <button className="profile-new-btn" onClick={openNew}>
-          New profile
+        <h2>Connections</h2>
+        <button className="profile-new-btn" onClick={() => setAddMenuOpen(true)}>
+          + Add connection
         </button>
         <button
           className="profile-import-btn"
-          onClick={onImportFiles}
-          disabled={importing}
+          onClick={() => setImportOpen(true)}
         >
-          {importing ? "Importing…" : "Import files…"}
+          Import…
         </button>
-        <button
-          className="profile-import-btn"
-          onClick={() => setSubOpen((v) => !v)}
-          disabled={subLoading}
-        >
-          {subLoading ? "Fetching…" : "Import subscription…"}
-        </button>
-        <button
-          className="profile-import-btn"
-          onClick={onImportWireGuardStandard}
-          disabled={importing}
-        >
-          Import WireGuard (standard)
-        </button>
-        {subOpen && (
-          <div className="subscription-form">
-            <input
-              type="text"
-              placeholder="Subscription URL"
-              value={subUrl}
-              onChange={(e) => setSubUrl(e.target.value)}
-            />
-            <input
-              type="text"
-              placeholder="HWID (X-HWID header)"
-              value={subHwid}
-              onChange={(e) => setSubHwid(e.target.value)}
-            />
+      </div>
+      <p className="profiles-note">
+        WireGuard, OpenVPN, interface changes, and policy routes require
+        administrator privileges. Several connections can run at once.
+      </p>
+
+      {profiles.length > 0 && (
+        <div className="snippets-bar">
+          <span className="snippets-label">Snippets</span>
+          <div className="snippets-chips">
+            {snippets.map((snippet) => {
+              const isActive = snippet.id === activeSnippetId;
+              const isDirty = isActive && isActiveSnippetDirty;
+              return (
+                <div
+                  key={snippet.id}
+                  className={`snippet-chip ${isDirty ? "dirty" : isActive ? "active" : ""}`}
+                >
+                  <button
+                    type="button"
+                    className="snippet-chip-apply"
+                    onClick={() => applySnippet(snippet)}
+                    title={
+                      isDirty
+                        ? "Connections have changed since this snippet was saved"
+                        : `Switch to exactly these ${snippet.profileIds.length} connection${
+                            snippet.profileIds.length === 1 ? "" : "s"
+                          }`
+                    }
+                  >
+                    {snippet.name}
+                  </button>
+                  <button
+                    type="button"
+                    className="snippet-chip-delete"
+                    onClick={() => deleteSnippet(snippet.id)}
+                    title="Delete snippet"
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
             <button
-              className="profile-import-btn"
-              onClick={onImportSubscription}
-              disabled={subLoading || !subUrl.trim()}
+              type="button"
+              className="snippet-chip-add"
+              onClick={openSaveModal}
+              disabled={runningProfiles.length === 0}
+              title={
+                runningProfiles.length === 0
+                  ? "Connect something first"
+                  : "Save the currently running connections as a snippet"
+              }
             >
-              Fetch
+              + Save current
             </button>
           </div>
-        )}
-      </div>
+        </div>
+      )}
+
+      {profiles.length > 0 && (
+        <input
+          className="filter-search connections-search"
+          type="text"
+          placeholder="Search connections…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+      )}
 
       {importErrors && (
         <div className="save-notice">
@@ -663,9 +676,7 @@ export default function ProfileManager() {
       {saveNotice && (
         <div className="save-notice">
           <div className="diagnostics-head">
-            <span>
-              Saved "{saveNotice.profileName}" — review notes
-            </span>
+            <span>Saved "{saveNotice.profileName}" — review notes</span>
             <button type="button" onClick={() => setSaveNotice(null)}>
               Dismiss
             </button>
@@ -681,506 +692,307 @@ export default function ProfileManager() {
         </div>
       )}
 
-      {diagnostics && (
-        <div className="diagnostics-panel">
-          <div className="diagnostics-head">
-            <span>
-              Diagnostics —{" "}
-              {profiles.find((p) => p.id === diagnostics.profileId)?.name ??
-                diagnostics.profileId}
-            </span>
-            <button type="button" onClick={() => setDiagnostics(null)}>
-              Close
+      {profiles.length === 0 ? (
+        <p className="empty-state">No profiles yet. Create one to get started.</p>
+      ) : filteredProfiles.length === 0 ? (
+        <p className="empty-state">No connections match "{search}".</p>
+      ) : (
+        groups.map((group) => {
+          const isCollapsed = collapsedGroups.has(group.backend);
+          return (
+          <div key={group.backend} className="profile-group">
+            <button
+              type="button"
+              className="profile-group-header"
+              onClick={() => toggleGroupCollapsed(group.backend)}
+              aria-expanded={!isCollapsed}
+            >
+              <ChevronIcon size={13} collapsed={isCollapsed} />
+              {backendIcon(group.backend, 18)}
+              <span className="profile-group-title">
+                {BACKEND_LABELS[group.backend]}
+              </span>
+              <span className="profile-group-count">
+                {group.items.length}
+              </span>
             </button>
+            {!isCollapsed && (
+            <div className="connection-list">
+              {group.items.map((profile) => {
+                const status = statusFor(profile.id);
+                const isBusy = busy.has(profile.id);
+                const inspection = inspections[profile.id];
+                const isExpanded = expanded.has(profile.id);
+                const detailCount =
+                  profile.routes.length + profile.domainPolicies.length;
+                const rate = status.state === "running" ? rateFor(profile) : null;
+                return (
+                  <div
+                    key={profile.id}
+                    className={`connection-card ${
+                      status.state === "running" ? "state-active" : ""
+                    } ${status.state === "failed" ? "state-failed" : ""}`}
+                  >
+                    <div className="connection-card-main">
+                      <span className={`backend-avatar backend-avatar-${profile.backend}`}>
+                        {backendIcon(profile.backend, 18)}
+                      </span>
+                      <div className="connection-card-info">
+                        <div className="connection-card-name-row">
+                          <span className="connection-card-name">{profile.name}</span>
+                          {inspection?.managedConfig === true && (
+                            <span className="badge badge-managed">Managed</span>
+                          )}
+                          {profile.useSystemProxy && (
+                            <span className="badge badge-managed">Proxy</span>
+                          )}
+                          {inspection?.managedConfig === false && (
+                            <span className="badge badge-external">External</span>
+                          )}
+                        </div>
+                        <span className="connection-card-meta">
+                          {status.state === "failed" && status.message
+                            ? status.message
+                            : rate
+                              ? `↓ ${formatRate(rate.rxRate)} · ↑ ${formatRate(rate.txRate)}`
+                              : profile.interfaceName || "No target interface"}
+                        </span>
+                      </div>
+                      <ToggleSwitch
+                        checked={status.state === "running"}
+                        onChange={() =>
+                          status.state === "running"
+                            ? onDisconnect(profile)
+                            : onConnect(profile)
+                        }
+                        disabled={isBusy}
+                        busy={isBusy}
+                        title={status.state === "running" ? "Disconnect" : "Connect"}
+                      />
+                      <OverflowMenu
+                        title="Profile actions"
+                        items={[
+                          { label: "Edit", onClick: () => openEdit(profile), disabled: isBusy },
+                          {
+                            label: diagBusy === profile.id ? "Running diagnostics…" : "Diagnostics",
+                            onClick: () => onDiagnose(profile),
+                            disabled: isBusy || diagBusy === profile.id,
+                          },
+                          {
+                            label: "Delete",
+                            onClick: () => onDelete(profile),
+                            disabled: isBusy,
+                            danger: true,
+                          },
+                        ]}
+                      />
+                    </div>
+
+                    {profile.backend === "xray" && profile.xraySocksPort !== null && (
+                      <div className="interface-row">
+                        <span className="row-label">SOCKS5</span>
+                        <span className="row-value mono">
+                          127.0.0.1:{profile.xraySocksPort}
+                        </span>
+                      </div>
+                    )}
+                    {profile.subscription && endpoints[profile.id] && (
+                      <div className="interface-row">
+                        <span className="row-label">Endpoint</span>
+                        <span className="row-value">
+                          <select
+                            value={
+                              endpoints[profile.id].findIndex(
+                                (e) => e.active,
+                              )
+                            }
+                            onChange={(e) =>
+                              onSwitchEndpoint(
+                                profile,
+                                Number(e.target.value),
+                              )
+                            }
+                            disabled={
+                              switching === profile.id ||
+                              isBusy ||
+                              status.state === "running"
+                            }
+                          >
+                            {endpoints[profile.id].map((ep, i) => (
+                              <option key={i} value={i}>
+                                {ep.name}
+                              </option>
+                            ))}
+                          </select>
+                          {switching === profile.id && " switching…"}
+                        </span>
+                      </div>
+                    )}
+                    {profile.useSystemProxy && (
+                      <div className="interface-row">
+                        <span className="row-label">Proxy bypass</span>
+                        <span className="row-value mono">
+                          {profile.proxyBypass.join("; ") || "none"}
+                        </span>
+                      </div>
+                    )}
+
+                    {detailCount > 0 && (
+                      <div className="connection-card-details">
+                        <button
+                          type="button"
+                          className="connection-detail-toggle"
+                          onClick={() => toggleExpanded(profile.id)}
+                        >
+                          <ChevronIcon size={13} collapsed={!isExpanded} />
+                          {profile.routes.length > 0 &&
+                            `${profile.routes.length} route${profile.routes.length === 1 ? "" : "s"}`}
+                          {profile.routes.length > 0 && profile.domainPolicies.length > 0 && " · "}
+                          {profile.domainPolicies.length > 0 &&
+                            `${profile.domainPolicies.length} domain rule${profile.domainPolicies.length === 1 ? "" : "s"}`}
+                        </button>
+                        {isExpanded && (
+                          <>
+                            {profile.domainPolicies.length > 0 && (
+                              <div className="interface-section">
+                                <span className="section-label">Domain rules</span>
+                                <ul className="profile-route-list">
+                                  {profile.domainPolicies.map((policy, i) => (
+                                    <li key={i}>
+                                      <span className="mono">
+                                        {policy.domains.join(", ")}
+                                      </span>
+                                      <span className="family-tag">
+                                        {DOMAIN_TARGET_LABELS[policy.target]}
+                                      </span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                            {profile.routes.length > 0 && (
+                              <div className="interface-section">
+                                <span className="section-label">Routes</span>
+                                <ul className="profile-route-list">
+                                  {profile.routes.map((route, i) => (
+                                    <li key={i}>
+                                      <span className="mono">
+                                        {route.destination}
+                                      </span>
+                                      <span className="family-tag">
+                                        metric {route.metric}
+                                      </span>
+                                    </li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            )}
           </div>
-          <ul className="diagnostics-list">
-            {diagnostics.checks.map((check, i) => (
-              <li key={i}>
-                <span className={`badge diag-${check.level}`}>
-                  {check.level}
-                </span>
-                <span className="diag-name">{check.name}</span>
-                <span className="diag-message">{check.message}</span>
-              </li>
+          );
+        })
+      )}
+
+      <ProfileFormModal
+        open={formOpen}
+        editing={editing}
+        interfaces={interfaces}
+        onClose={() => {
+          setFormOpen(false);
+          setEditing(null);
+        }}
+        onSaved={onFormSaved}
+        onError={(message) => setError(message)}
+      />
+
+      <ImportModal
+        open={importOpen}
+        onClose={() => setImportOpen(false)}
+        onImported={onImported}
+        onError={(message) => setError(message)}
+      />
+
+      <DiagnosticsModal
+        open={diagOpen}
+        diagnostics={diagnostics}
+        profiles={profiles}
+        onClose={() => {
+          setDiagOpen(false);
+          setDiagnostics(null);
+        }}
+      />
+
+      <AddConnectionMenu
+        open={addMenuOpen}
+        onClose={() => setAddMenuOpen(false)}
+        onChooseImport={handleChooseImport}
+        onChooseBackend={handleChooseBackend}
+      />
+
+      <Modal
+        open={saveModalOpen}
+        title="Save snippet"
+        onClose={() => setSaveModalOpen(false)}
+        maxWidth="420px"
+        footer={
+          <>
+            <button type="button" onClick={() => setSaveModalOpen(false)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="profile-save-btn"
+              onClick={createSnippet}
+              disabled={!newSnippetName.trim()}
+            >
+              Save as new
+            </button>
+          </>
+        }
+      >
+        <div className="interface-section">
+          <span className="section-label">
+            Will include {runningProfiles.length} connection
+            {runningProfiles.length === 1 ? "" : "s"}
+          </span>
+          <ul className="profile-route-list">
+            {runningProfiles.map((p) => (
+              <li key={p.id}>{p.name}</li>
             ))}
           </ul>
         </div>
-      )}
 
-      {editing && (
-        <div className="profile-form">
-          <h3>{editing.isNew ? "New profile" : "Edit profile"}</h3>
-          {formError && <p className="error">{formError}</p>}
-          <label>
-            Name
-            <input
-              type="text"
-              value={editing.name}
-              onChange={(e) => setEditing({ ...editing, name: e.target.value })}
-              placeholder="Work VPN"
-            />
-          </label>
-          <label>
-            Backend
-            <select
-              className="filter-select"
-              value={editing.backend}
-              onChange={(e) => {
-                const backend = e.target.value as TunnelBackend;
-                setEditing({
-                  ...editing,
-                  backend,
-                  configPath: "",
-                  domainPolicies: backend === "xray" ? editing.domainPolicies : [],
-                  xraySource: "json",
-                  xraySocksPort:
-                    backend === "xray"
-                      ? editing.isNew
-                        ? null
-                        : (editing.xraySocksPort ?? 10808)
-                      : null,
-                });
-              }}
-            >
-              <option value="none">Static routes (no tunnel)</option>
-              <option value="wireGuard">WireGuard</option>
-              <option value="openVpn">OpenVPN</option>
-              <option value="xray">Xray/VLESS</option>
-            </select>
-          </label>
-          {editing.backend !== "none" && editing.backend === "xray" && editing.isNew && (
-            <label>
-              Config source
-              <select
-                className="filter-select"
-                value={editing.xraySource}
-                onChange={(e) =>
-                  setEditing({
-                    ...editing,
-                    xraySource: e.target.value as "json" | "vless",
-                  })
-                }
-              >
-                <option value="json">Existing Xray JSON</option>
-                <option value="vless">Import vless:// URL</option>
-              </select>
-            </label>
-          )}
-          {editing.backend === "xray" &&
-          editing.isNew &&
-          editing.xraySource === "vless" ? (
-            <>
-              <label>
-                VLESS URL
-                <input
-                  type="password"
-                  value={editing.vlessUrl}
-                  onChange={(e) =>
-                    setEditing({ ...editing, vlessUrl: e.target.value })
-                  }
-                  placeholder="vless://uuid@host:port?…"
-                  autoComplete="off"
-                />
-              </label>
-              <span className="profile-help">
-                SOCKS5 port will be assigned automatically when the profile is
-                saved.
-              </span>
-            </>
-          ) : editing.backend !== "none" ? (
-            <label>
-              Config file
-              <div className="profile-config-row">
-                <input
-                  type="text"
-                  value={editing.configPath}
-                  onChange={(e) =>
-                    setEditing({ ...editing, configPath: e.target.value })
-                  }
-                  placeholder={
-                    editing.backend === "wireGuard"
-                      ? "C:\\path\\tunnel.conf"
-                      : editing.backend === "openVpn"
-                        ? "C:\\path\\client.ovpn"
-                        : "C:\\path\\config.json"
-                  }
-                />
-                <button type="button" onClick={browseConfig}>
-                  Browse…
-                </button>
-              </div>
-            </label>
-          ) : (
-            <span className="profile-help">
-              Static-routes profiles apply policy routes through an existing
-              interface (e.g. Ethernet) without starting a tunnel.
-            </span>
-          )}
-          {editing.backend === "xray" &&
-            !editing.isNew &&
-            editing.xraySocksPort !== null && (
-              <div className="interface-row">
-                <span className="row-label">SOCKS5</span>
-                <span className="row-value mono">
-                  127.0.0.1:{editing.xraySocksPort}
-                </span>
-              </div>
-            )}
-          {editing.backend === "xray" && (
-            <div className="profile-proxy">
-              <label className="profile-proxy-toggle">
-                <input
-                  type="checkbox"
-                  checked={editing.useSystemProxy}
-                  disabled={!systemProxyAvailable}
-                  onChange={(e) =>
-                    setEditing({ ...editing, useSystemProxy: e.target.checked })
-                  }
-                />
-                Use Windows system proxy
-              </label>
-              {!systemProxyAvailable ? (
-                <span className="profile-help">
-                  System proxy requires a generated Xray profile with a SOCKS5
-                  listener — this existing JSON config has none.
-                </span>
-              ) : (
-                <span className="profile-help">
-                  Applies only to apps that honor Windows proxy settings.
-                </span>
-              )}
-              {editing.useSystemProxy && systemProxyAvailable && (
-                <label>
-                  Proxy bypass (comma-separated)
-                  <input
-                    type="text"
-                    value={editing.proxyBypass}
-                    onChange={(e) =>
-                      setEditing({ ...editing, proxyBypass: e.target.value })
-                    }
-                    placeholder={DEFAULT_PROXY_BYPASS}
-                  />
-                </label>
-              )}
-            </div>
-          )}
-          <label>
-            Target interface (required for policy routes)
-            <input
-              type="text"
-              list="profile-target-interfaces"
-              value={editing.interfaceName}
-              onChange={(e) =>
-                setEditing({ ...editing, interfaceName: e.target.value })
-              }
-              placeholder="Interface friendly name"
-            />
-            <datalist id="profile-target-interfaces">
-              {targetable.map((i) => (
-                <option key={i.ifIndex} value={i.friendlyName} label={i.description || i.name} />
-              ))}
-            </datalist>
-          </label>
-          <div className="profile-routes">
-            <div className="profile-routes-head">
-              <span>Policy routes</span>
-              <button
-                type="button"
-                onClick={() =>
-                  setEditing({
-                    ...editing,
-                    routes: [...editing.routes, { destination: "10.0.0.0/24", metric: 5 }],
-                  })
-                }
-              >
-                Add route
-              </button>
-            </div>
-            {editing.routes.length === 0 && (
-              <span className="profile-routes-empty">
-                No routes — tunnel uses its own routing.
-              </span>
-            )}
-            {editing.routes.map((route, index) => (
-              <div className="profile-route-row" key={index}>
-                <input
-                  type="text"
-                  value={route.destination}
-                  onChange={(e) => updateRoute(index, { destination: e.target.value })}
-                  placeholder="10.0.0.0/24"
-                />
-                <input
-                  type="number"
-                  min={0}
-                  max={9999}
-                  value={route.metric}
-                  onChange={(e) =>
-                    updateRoute(index, { metric: clampMetric(e.target.valueAsNumber) })
-                  }
-                />
-                <button
-                  type="button"
-                  onClick={() =>
-                    setEditing({
-                      ...editing,
-                      routes: editing.routes.filter((_, i) => i !== index),
-                    })
-                  }
-                >
-                  Remove
-                </button>
-              </div>
-            ))}
-          </div>
-          {editing.backend === "xray" && (
-            <div className="profile-routes">
-              <div className="profile-routes-head">
-                <span>Domain routing</span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setEditing({
-                      ...editing,
-                      domainPolicies: [
-                        ...editing.domainPolicies,
-                        { domains: [""], target: "proxy" },
-                      ],
-                    })
-                  }
-                >
-                  Add domain rule
-                </button>
-              </div>
-              {editing.domainPolicies.length === 0 && (
-                <span className="profile-routes-empty">
-                  No domain rules — all traffic uses the proxy.
-                </span>
-              )}
-              {editing.domainPolicies.map((policy, index) => (
-                <div className="profile-route-row" key={index}>
-                  <input
-                    type="text"
-                    value={policy.domains.join(",")}
-                    onChange={(e) =>
-                      updateDomainRule(index, {
-                        domains: e.target.value.split(","),
-                      })
-                    }
-                    placeholder="domain:example.com, full:api.example.com"
-                  />
-                  <select
-                    className="filter-select"
-                    value={policy.target}
-                    onChange={(e) =>
-                      updateDomainRule(index, {
-                        target: e.target.value as DomainRouteTarget,
-                      })
-                    }
-                  >
-                    <option value="proxy">Through proxy</option>
-                    <option value="direct">Direct</option>
-                  </select>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setEditing({
-                        ...editing,
-                        domainPolicies: editing.domainPolicies.filter(
-                          (_, i) => i !== index
-                        ),
-                      })
-                    }
-                  >
-                    Remove
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-          <div className="profile-form-actions">
-            <button type="button" onClick={() => setEditing(null)} disabled={saving}>
-              Cancel
-            </button>
-            <button type="button" className="profile-save-btn" onClick={save} disabled={saving}>
-              Save
-            </button>
-          </div>
-        </div>
-      )}
+        {activeSnippet && isActiveSnippetDirty && (
+          <button
+            type="button"
+            className="snippet-overwrite-btn"
+            onClick={overwriteActiveSnippet}
+          >
+            Update "{activeSnippet.name}" with these connections
+          </button>
+        )}
 
-      {profiles.length === 0 ? (
-        <p className="empty-state">No profiles yet. Create one to get started.</p>
-      ) : (
-        <div className="profile-grid">
-          {profiles.map((profile) => {
-            const status = statusFor(profile.id);
-            const isBusy = busy.has(profile.id);
-            const inspection = inspections[profile.id];
-            return (
-              <div
-                key={profile.id}
-                className={`interface-card profile-card ${
-                  status.state === "running" ? "state-active" : ""
-                } ${status.state === "failed" ? "state-failed" : ""}`}
-              >
-                <div className="interface-header">
-                  <div className="interface-title">
-                    <span
-                      className={`status-dot ${status.state}`}
-                      title={status.state}
-                    />
-                    <span className="interface-name">{profile.name}</span>
-                  </div>
-                  <div className="badge-group">
-                    <span className="badge badge-physical">
-                      {BACKEND_LABELS[profile.backend]}
-                    </span>
-                    {inspection?.managedConfig === true && (
-                      <span className="badge badge-managed">Managed</span>
-                    )}
-                    {profile.useSystemProxy && (
-                      <span className="badge badge-managed">Proxy</span>
-                    )}
-                    {inspection?.managedConfig === false && (
-                      <span className="badge badge-external">External</span>
-                    )}
-                  </div>
-                </div>
-                {status.state === "failed" && status.message && (
-                  <p className="profile-status-msg">{status.message}</p>
-                )}
-                <div className="interface-row">
-                  <span className="row-label">Config</span>
-                  <span className="row-value mono">{profile.configPath}</span>
-                </div>
-                <div className="interface-row">
-                  <span className="row-label">Interface</span>
-                  <span className="row-value">{profile.interfaceName}</span>
-                </div>
-                {profile.backend === "xray" && profile.xraySocksPort !== null && (
-                  <div className="interface-row">
-                    <span className="row-label">SOCKS5</span>
-                    <span className="row-value mono">
-                      127.0.0.1:{profile.xraySocksPort}
-                    </span>
-                  </div>
-                )}
-                {profile.subscription && endpoints[profile.id] && (
-                  <div className="interface-row">
-                    <span className="row-label">Endpoint</span>
-                    <span className="row-value">
-                      <select
-                        value={
-                          endpoints[profile.id].findIndex((e) => e.active)
-                        }
-                        onChange={(e) =>
-                          onSwitchEndpoint(profile, Number(e.target.value))
-                        }
-                        disabled={
-                          switching === profile.id ||
-                          isBusy ||
-                          status.state === "running"
-                        }
-                      >
-                        {endpoints[profile.id].map((ep, i) => (
-                          <option key={i} value={i}>
-                            {ep.name}
-                          </option>
-                        ))}
-                      </select>
-                      {switching === profile.id && " switching…"}
-                    </span>
-                  </div>
-                )}
-                {profile.useSystemProxy && (
-                  <div className="interface-row">
-                    <span className="row-label">Proxy bypass</span>
-                    <span className="row-value mono">
-                      {profile.proxyBypass.join("; ") || "none"}
-                    </span>
-                  </div>
-                )}
-                {profile.backend === "xray" &&
-                  (profile.domainPolicies.length === 0 ? (
-                    <div className="interface-row">
-                      <span className="row-label">Domain rules</span>
-                      <span className="row-value">None</span>
-                    </div>
-                  ) : (
-                    <div className="interface-section">
-                      <span className="section-label">
-                        Domain rules ({profile.domainPolicies.length})
-                      </span>
-                      <ul className="profile-route-list">
-                        {profile.domainPolicies.map((policy, i) => (
-                          <li key={i}>
-                            <span className="mono">
-                              {policy.domains.join(", ")}
-                            </span>
-                            <span className="family-tag">
-                              {DOMAIN_TARGET_LABELS[policy.target]}
-                            </span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  ))}
-                {profile.routes.length === 0 ? (
-                  <div className="interface-row">
-                    <span className="row-label">Routes</span>
-                    <span className="row-value">None</span>
-                  </div>
-                ) : (
-                  <div className="interface-section">
-                    <span className="section-label">
-                      Routes ({profile.routes.length})
-                    </span>
-                    <ul className="profile-route-list">
-                      {profile.routes.map((route, i) => (
-                        <li key={i}>
-                          <span className="mono">{route.destination}</span>
-                          <span className="family-tag">metric {route.metric}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                <div className="profile-actions">
-                  <button onClick={() => openEdit(profile)} disabled={isBusy}>
-                    Edit
-                  </button>
-                  <button
-                    onClick={() => onDiagnose(profile)}
-                    disabled={isBusy || diagBusy === profile.id}
-                  >
-                    {diagBusy === profile.id ? "Diagnosing…" : "Diagnostics"}
-                  </button>
-                  <button onClick={() => onDelete(profile)} disabled={isBusy}>
-                    Delete
-                  </button>
-                  {status.state === "running" ? (
-                    <button
-                      className="profile-disconnect-btn"
-                      onClick={() => onDisconnect(profile)}
-                      disabled={isBusy}
-                    >
-                      Disconnect
-                    </button>
-                  ) : (
-                    <button
-                      className="profile-connect-btn"
-                      onClick={() => onConnect(profile)}
-                      disabled={isBusy}
-                    >
-                      Connect
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
+        <label>
+          {activeSnippet ? "Or save as a new snippet" : "Name"}
+          <input
+            type="text"
+            value={newSnippetName}
+            onChange={(e) => setNewSnippetName(e.target.value)}
+            placeholder="Work"
+            autoFocus
+          />
+        </label>
+      </Modal>
+
     </section>
+    </Page>
   );
 }

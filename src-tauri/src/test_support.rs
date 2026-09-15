@@ -56,13 +56,7 @@ pub(crate) fn profile(interface_name: &str) -> Profile {
         backend: TunnelBackend::WireGuard,
         config_path: PathBuf::from(r"C:\configs\p1.conf"),
         interface_name: interface_name.into(),
-        routes: vec![],
-        auto_connect: false,
-        domain_policies: vec![],
-        xray_socks_port: None,
-        use_system_proxy: false,
-        proxy_bypass: vec![],
-        subscription: None,
+        ..Default::default()
     }
 }
 

@@ -117,6 +117,83 @@ async fn wait_for_tcp_listener(port: u16, timeout: Duration, interval: Duration)
     }
 }
 
+/// Wait for OpenVPN to log `PUSH_REPLY` (or `Initialization Sequence Completed`)
+/// after connect, then return the server-pushed routes parsed from the log.
+/// Returns an empty vec if the deadline passes without a PUSH_REPLY.
+async fn wait_for_openvpn_pushed_routes(
+    tunnels: &mut TunnelManager,
+    profile: &Profile,
+    timeout: Duration,
+    interval: Duration,
+) -> Vec<AnalyzedRoute> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let routes = tunnels.openvpn_pushed_routes(&profile.id);
+        if !routes.is_empty() {
+            return routes;
+        }
+        if Instant::now() >= deadline {
+            return Vec::new();
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Derive the routes to install for a profile when `profile.routes` is empty.
+/// The app is the sole route installer, so when the user has not specified
+/// explicit policy routes, we derive them from the backend's own route
+/// information:
+/// - WireGuard: AllowedIPs (static, known pre-connect from analysis).
+/// - OpenVPN: server-pushed routes (dynamic, read from log post-connect).
+/// - Xray SOCKS: no OS routes (proxy-based, no interface routes).
+/// - None: no derivation (static-routes profiles require explicit routes).
+fn derive_installable_routes(
+    analysis: &ConfigAnalysis,
+    pushed: &[AnalyzedRoute],
+    backend: TunnelBackend,
+) -> Vec<PolicyRoute> {
+    match backend {
+        TunnelBackend::WireGuard => analysis
+            .os_routes
+            .iter()
+            .filter(|r| r.source.contains("WireGuard"))
+            .map(|r| PolicyRoute {
+                destination: r.destination,
+                metric: 5,
+            })
+            .collect(),
+        TunnelBackend::OpenVpn => pushed
+            .iter()
+            .chain(
+                analysis
+                    .os_routes
+                    .iter()
+                    .filter(|r| r.source.contains("OpenVPN") && !r.source.contains("pushed")),
+            )
+            .map(|r| PolicyRoute {
+                destination: r.destination,
+                metric: 5,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve the interface name for route installation. For WireGuard, if the
+/// profile has no explicit interface name, derive it from the config file name
+/// (the tunnel service creates an interface named after the config stem).
+fn resolve_install_interface(profile: &Profile) -> Option<String> {
+    if !profile.interface_name.trim().is_empty() {
+        return Some(profile.interface_name.clone());
+    }
+    match profile.backend {
+        TunnelBackend::WireGuard => {
+            net_manager_core::vpn::wireguard_tunnel_name(&profile.config_path).ok()
+        }
+        _ => None,
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn connect_profile(
     id: String,
@@ -128,6 +205,20 @@ pub(crate) async fn connect_profile(
         state
             .resolve_backend_executable(profile.backend)
             .map_err(|e| e.to_string())?;
+    }
+    // Xray TUN mode creates a Wintun interface, which requires elevation.
+    if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
+        let elevated = crate::elevation::is_elevated().map_err(|e| e.to_string())?;
+        if !elevated {
+            return Err(
+                "Xray TUN mode requires administrator privileges. Restart the app elevated.".into(),
+            );
+        }
+        // TUN mode captures traffic at the interface level — system proxy is
+        // not needed and must not be applied.
+        if profile.use_system_proxy {
+            profile.use_system_proxy = false;
+        }
     }
     let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let mut runtime = state.runtime.lock().await;
@@ -219,13 +310,56 @@ pub(crate) async fn connect_profile(
         proxy_applied = true;
     }
 
-    if !profile.routes.is_empty() {
+    // The app is the sole route installer. When the user has specified
+    // explicit policy routes (`profile.routes`), install those. When they have
+    // not, derive routes from the backend's own route information (WireGuard
+    // AllowedIPs, OpenVPN pushed routes) and install them through
+    // `PolicyManager`. This ensures consistent ownership, rollback, and
+    // conflict detection regardless of whether policy routes are set.
+    let install_routes = if !profile.routes.is_empty() {
+        profile.routes.clone()
+    } else {
+        let pushed = if profile.backend == TunnelBackend::OpenVpn {
+            wait_for_openvpn_pushed_routes(
+                &mut runtime.tunnels,
+                &profile,
+                Duration::from_secs(20),
+                Duration::from_millis(250),
+            )
+            .await
+        } else {
+            Vec::new()
+        };
+        derive_installable_routes(&candidate_analysis, &pushed, profile.backend)
+    };
+
+    if !install_routes.is_empty() {
+        let install_interface = match resolve_install_interface(&profile) {
+            Some(name) => name,
+            None => {
+                // No interface name available — skip route installation with a
+                // notice. This happens for OpenVPN profiles without an explicit
+                // interface name; the backend is up but routes are not installed.
+                status.message = Some(
+                    "tunnel is up but routes were not installed: \
+                     set a target interface in the profile to enable app-owned routing"
+                        .into(),
+                );
+                let _ = app.emit("route-changed", ());
+                return Ok(status);
+            }
+        };
+        let install_profile = Profile {
+            interface_name: install_interface,
+            routes: install_routes,
+            ..profile.clone()
+        };
         let mut matched_interfaces: Option<Vec<NetworkInterface>> = None;
         let mut list_error: Option<String> = None;
         for _ in 0..40 {
             match explorer::list_interfaces() {
                 Ok(interfaces) => {
-                    if has_target_interface(&profile, &interfaces) {
+                    if has_target_interface(&install_profile, &interfaces) {
                         matched_interfaces = Some(interfaces);
                         break;
                     }
@@ -252,7 +386,7 @@ pub(crate) async fn connect_profile(
         let Some(interfaces) = matched_interfaces else {
             let mut message = format!(
                 "timed out waiting for interface '{}' to come up",
-                profile.interface_name
+                install_profile.interface_name
             );
             if proxy_applied {
                 if let Err(cleanup) = runtime.proxy.restore(&id) {
@@ -264,7 +398,10 @@ pub(crate) async fn connect_profile(
             }
             return Err(message);
         };
-        if let Err(err) = runtime.policies.apply_profile(&profile, &interfaces) {
+        if let Err(err) = runtime
+            .policies
+            .apply_profile(&install_profile, &interfaces)
+        {
             let mut message = err.to_string();
             if proxy_applied {
                 if let Err(cleanup) = runtime.proxy.restore(&id) {
@@ -348,6 +485,115 @@ pub(crate) async fn get_tunnel_statuses(
         .iter()
         .map(|profile| runtime.tunnels.status(profile))
         .collect())
+}
+
+/// Probe server-pushed routes for an OpenVPN profile by performing a short-lived
+/// connection with `--route-nopull` and parsing `PUSH_REPLY` from the log.
+///
+/// The probe runs `openvpn.exe --config <path> --route-nopull` as a transient
+/// child process with stdout/stderr captured to a temp log file. It polls the
+/// log until either `PUSH_REPLY` or `Initialization Sequence Completed` appears
+/// (up to ~20s), then kills the process and returns the parsed routes.
+///
+/// This does NOT install any routes or modify the system — it is a read-only
+/// discovery step. The caller (UI) can then offer the user to copy the
+/// discovered destinations into `profile.routes`.
+#[tauri::command]
+pub(crate) async fn probe_openvpn_routes(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<AnalyzedRoute>, String> {
+    let profile = find_profile(&state.profiles, &id)?;
+    if profile.backend != TunnelBackend::OpenVpn {
+        return Err("route probe is only supported for OpenVPN profiles".into());
+    }
+    if !profile.config_path.is_file() {
+        return Err(format!(
+            "OpenVPN config '{}' does not exist",
+            profile.config_path.display()
+        ));
+    }
+    state
+        .resolve_backend_executable(TunnelBackend::OpenVpn)
+        .map_err(|e| e.to_string())?;
+    let exe = net_manager_core::vpn::resolve_openvpn_executable(None).map_err(|e| e.to_string())?;
+    let config_path = std::path::absolute(&profile.config_path).map_err(|e| e.to_string())?;
+
+    let log_dir = std::env::temp_dir();
+    let safe_id = net_manager_core::config_vault::sanitize_profile_id(&profile.id)
+        .map_err(|e| e.to_string())?;
+    let log_path = log_dir.join(format!("netmgr-probe-{}-{safe_id}.log", std::process::id()));
+    // Clean any stale log from a previous probe.
+    let _ = std::fs::remove_file(&log_path);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&log_path)
+        .map_err(|e| format!("failed to create probe log: {e}"))?;
+    let stderr = log_file
+        .try_clone()
+        .map_err(|e| format!("failed to dup probe log handle: {e}"))?;
+
+    let mut command = std::process::Command::new(&exe);
+    command
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--route-nopull")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("failed to start openvpn probe: {e}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut found_push = false;
+    while Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(&log_path) {
+            if text.contains("PUSH_REPLY") {
+                found_push = true;
+                break;
+            }
+            if text.contains("Initialization Sequence Completed") {
+                found_push = true;
+                break;
+            }
+            // Auth failure or fatal error — abort early.
+            if text.contains("AUTH_FAILED") || text.contains("FATAL") {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&log_path);
+                return Err("openvpn probe failed during handshake (check credentials or server reachability)".into());
+            }
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let routes = if found_push {
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        net_manager_core::vpn::parse_openvpn_pushed_reply(&text)
+    } else {
+        Vec::new()
+    };
+    let _ = std::fs::remove_file(&log_path);
+
+    if !found_push {
+        return Err("openvpn probe timed out waiting for PUSH_REPLY (server may be unreachable or credentials invalid)".into());
+    }
+    Ok(routes)
 }
 
 #[cfg(test)]

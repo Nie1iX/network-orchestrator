@@ -1,3 +1,4 @@
+use crate::elevation;
 use crate::state::{existing_profile_for_update, find_profile, AppState};
 use net_manager_core::analysis;
 use net_manager_core::config_security;
@@ -287,6 +288,93 @@ pub(crate) async fn save_vless_profile(
     Ok(doc.profiles)
 }
 
+/// Render WireGuard `[Interface]`/`[Peer]` config text from user-supplied
+/// fields. Values are written verbatim; the caller validates them.
+pub(crate) fn render_wireguard_config(fields: &WireGuardFields) -> String {
+    let mut out = String::new();
+    out.push_str("[Interface]\n");
+    out.push_str(&format!("PrivateKey = {}\n", fields.private_key.trim()));
+    out.push_str(&format!("Address = {}\n", fields.address.trim()));
+    if !fields.dns.trim().is_empty() {
+        out.push_str(&format!("DNS = {}\n", fields.dns.trim()));
+    }
+    out.push('\n');
+    out.push_str("[Peer]\n");
+    out.push_str(&format!("PublicKey = {}\n", fields.peer_public_key.trim()));
+    out.push_str(&format!("Endpoint = {}\n", fields.peer_endpoint.trim()));
+    out.push_str(&format!("AllowedIPs = {}\n", fields.allowed_ips.trim()));
+    if !fields.preshared_key.trim().is_empty() {
+        out.push_str(&format!("PresharedKey = {}\n", fields.preshared_key.trim()));
+    }
+    if let Some(keepalive) = fields.persistent_keepalive {
+        out.push_str(&format!("PersistentKeepalive = {keepalive}\n"));
+    }
+    out
+}
+
+#[tauri::command]
+pub(crate) async fn save_wireguard_profile(
+    mut profile: Profile,
+    fields: WireGuardFields,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    if profile.backend != TunnelBackend::WireGuard {
+        return Err("wireguard fields require a WireGuard profile".into());
+    }
+    if fields.private_key.trim().is_empty() {
+        return Err("WireGuard private key is required".into());
+    }
+    if fields.address.trim().is_empty() {
+        return Err("WireGuard interface address is required".into());
+    }
+    if fields.peer_public_key.trim().is_empty() {
+        return Err("WireGuard peer public key is required".into());
+    }
+    if fields.peer_endpoint.trim().is_empty() {
+        return Err("WireGuard peer endpoint is required".into());
+    }
+    if fields.allowed_ips.trim().is_empty() {
+        return Err("WireGuard allowed IPs are required".into());
+    }
+    let document = state.profiles.load().map_err(|e| e.to_string())?;
+    let stored = existing_profile_for_update(&document, &profile.id).cloned();
+    if let Some(existing) = &stored {
+        let mut runtime = state.runtime.lock().await;
+        if runtime.tunnels.status(existing).state == TunnelState::Running {
+            return Err(format!(
+                "profile '{}' is running; disconnect before editing",
+                profile.id
+            ));
+        }
+    }
+    let body = render_wireguard_config(&fields).into_bytes();
+    let import = state
+        .config_vault
+        .store_wireguard_config(&profile.id, &body)
+        .map_err(|e| e.to_string())?;
+    profile.config_path = import.config_path.clone();
+    let doc = match state.profiles.upsert(profile) {
+        Ok(doc) => doc,
+        Err(err) => {
+            let _ = state
+                .config_vault
+                .remove_revision_for_config(&import.config_path);
+            return Err(err.to_string());
+        }
+    };
+    if let Some(existing) = stored {
+        if existing.config_path != import.config_path {
+            remove_managed_revision(
+                &state.config_vault,
+                &existing.id,
+                &existing.config_path,
+                "profile saved",
+            )?;
+        }
+    }
+    Ok(doc.profiles)
+}
+
 /// Detect a tunnel backend for `path` by extension, with a small content sniff
 /// for the ambiguous `.conf` case (WireGuard and OpenVPN both use it).
 /// Returns `None` when the extension is unrecognized and no `default` hint is
@@ -390,14 +478,7 @@ pub(crate) fn import_configs_into(
             name,
             backend,
             config_path,
-            interface_name: String::new(),
-            routes: vec![],
-            auto_connect: false,
-            domain_policies: vec![],
-            xray_socks_port: None,
-            use_system_proxy: false,
-            proxy_bypass: vec![],
-            subscription: None,
+            ..Default::default()
         };
         if let Err(err) = store.upsert(profile) {
             let _ = vault.remove_revision_for_config(&import.config_path);
@@ -417,6 +498,10 @@ pub(crate) async fn import_configs_batch(
     default_backend: Option<TunnelBackend>,
     state: State<'_, AppState>,
 ) -> Result<BatchImportResult, String> {
+    // Enable SeBackupPrivilege so we can read ACL-protected files
+    // (e.g. WireGuard `.conf.dpapi` configs owned by SYSTEM) when the
+    // process is elevated. Ignored on non-Windows or when not elevated.
+    let _ = elevation::enable_backup_privilege();
     import_configs_into(
         &state.config_vault,
         &state.profiles,
@@ -570,19 +655,14 @@ pub(crate) async fn import_subscription_into(
         name: profile_name,
         backend: TunnelBackend::Xray,
         config_path: config_path.clone(),
-        interface_name: String::new(),
-        routes: vec![],
-        auto_connect: false,
-        domain_policies: vec![],
         xray_socks_port: Some(socks_port),
-        use_system_proxy: false,
-        proxy_bypass: vec![],
         subscription: Some(SubscriptionMeta {
             url: url.to_string(),
             hwid: hwid.to_string(),
             endpoint_count: endpoints.len(),
             active_index,
         }),
+        ..Default::default()
     };
     store.upsert(profile).map_err(|e| {
         let _ = vault.remove_revision_for_config(&config_path);
