@@ -220,6 +220,11 @@ pub(crate) async fn connect_profile(
             profile.use_system_proxy = false;
         }
     }
+    // The system proxy exists only on Windows; a profile imported from there
+    // must still connect elsewhere, just without touching proxy settings.
+    if !cfg!(windows) {
+        profile.use_system_proxy = false;
+    }
     let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let mut runtime = state.runtime.lock().await;
     cleanup_stale_routes_before_connect(&state, &mut runtime, &profile)?;
@@ -513,10 +518,10 @@ pub(crate) async fn probe_openvpn_routes(
             profile.config_path.display()
         ));
     }
-    state
+    let exe = state
         .resolve_backend_executable(TunnelBackend::OpenVpn)
-        .map_err(|e| e.to_string())?;
-    let exe = net_manager_core::vpn::resolve_openvpn_executable(None).map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .path;
     let config_path = std::path::absolute(&profile.config_path).map_err(|e| e.to_string())?;
 
     let log_dir = std::env::temp_dir();

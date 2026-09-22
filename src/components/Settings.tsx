@@ -3,9 +3,11 @@ import { getVersion } from "@tauri-apps/api/app";
 import BackendStatus from "./BackendStatus";
 import UpdateChecker from "./UpdateChecker";
 import Page from "./Page";
+import { usePlatformCapabilities } from "../platform";
 
 export default function Settings() {
   const [version, setVersion] = useState<string | null>(null);
+  const caps = usePlatformCapabilities();
 
   useEffect(() => {
     getVersion().then(setVersion).catch(() => setVersion(null));
@@ -22,20 +24,22 @@ export default function Settings() {
         </div>
       </div>
 
-      <div className="settings-group">
-        <div className="settings-group-title">Updates</div>
-        <div className="settings-group-body">
-          <div className="settings-row">
-            <div className="settings-row-main">
-              <span className="settings-row-label">App updates</span>
-              <span className="settings-row-sub">
-                Check for and install new versions
-              </span>
+      {caps?.appUpdates && (
+        <div className="settings-group">
+          <div className="settings-group-title">Updates</div>
+          <div className="settings-group-body">
+            <div className="settings-row">
+              <div className="settings-row-main">
+                <span className="settings-row-label">App updates</span>
+                <span className="settings-row-sub">
+                  Check for and install new versions
+                </span>
+              </div>
+              <UpdateChecker />
             </div>
-            <UpdateChecker />
           </div>
         </div>
-      </div>
+      )}
 
       <div className="settings-group">
         <div className="settings-group-title">About</div>

@@ -14,6 +14,7 @@ import {
   WireGuardFields,
   XrayMode,
 } from "../types";
+import { usePlatformCapabilities } from "../platform";
 
 const BACKEND_LABELS: Record<TunnelBackend, string> = {
   none: "Static routes",
@@ -153,6 +154,7 @@ export default function ProfileFormModal({
 }: ProfileFormModalProps) {
   const [form, setForm] = useState<ProfileFormState | null>(editing);
   const [formError, setFormError] = useState<string | null>(null);
+  const caps = usePlatformCapabilities();
   const [saving, setSaving] = useState(false);
   const [probing, setProbing] = useState(false);
   const [probeResults, setProbeResults] = useState<AnalyzedRoute[] | null>(null);
@@ -739,7 +741,7 @@ export default function ProfileFormModal({
               />
             </label>
             <span className="profile-help">
-              TUN mode captures all IP traffic via a Wintun interface. Domain
+              TUN mode captures all IP traffic via a TUN interface. Domain
               policies still apply inside Xray. System proxy is not used.
             </span>
           </div>
@@ -757,7 +759,9 @@ export default function ProfileFormModal({
         )}
       </div>
 
-      {current.backend === "xray" && current.xrayMode === "socks" && (
+      {current.backend === "xray" &&
+        current.xrayMode === "socks" &&
+        caps?.systemProxy && (
         <div className="profile-proxy">
           <label className="profile-proxy-toggle">
             <input

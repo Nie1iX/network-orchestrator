@@ -58,7 +58,8 @@ pub fn run() {
             install_managed_xray,
             cancel_managed_xray_install,
             remove_managed_xray,
-            get_managed_xray_offer
+            get_managed_xray_offer,
+            get_platform_capabilities
         ])
         .on_window_event(lifecycle::handle_window_event)
         .build(tauri::generate_context!())

@@ -9,6 +9,7 @@ import {
   ManagedXrayOffer,
   TunnelBackend,
 } from "../types";
+import { usePlatformCapabilities } from "../platform";
 
 const BACKEND_LABELS: Record<TunnelBackend, string> = {
   none: "Static routes",
@@ -36,6 +37,7 @@ function progressText(progress: BackendInstallProgress): string {
 
 export default function BackendStatus() {
   const [items, setItems] = useState<BackendAvailability[]>([]);
+  const caps = usePlatformCapabilities();
   const [offer, setOffer] = useState<ManagedXrayOffer | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -102,9 +104,9 @@ export default function BackendStatus() {
         filters: [
           {
             name: `${BACKEND_LABELS[item.backend]} executable`,
-            extensions: ["exe"],
+            extensions: caps?.executableExtensions ?? [],
           },
-        ],
+        ].filter((filter) => filter.extensions.length > 0),
       });
       if (typeof selected === "string") {
         await invoke("set_backend_executable", {
@@ -203,7 +205,10 @@ export default function BackendStatus() {
                 Reset to auto-detect
               </button>
             )}
-            {item.backend === "xray" && item.source !== "managed" && offer && (
+            {item.backend === "xray" &&
+              item.source !== "managed" &&
+              offer &&
+              caps?.managedXrayInstall && (
               <button
                 type="button"
                 disabled={busy !== null}

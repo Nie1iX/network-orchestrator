@@ -317,6 +317,16 @@ export interface BackendInstallProgress {
   total: number | null;
 }
 
+export interface PlatformCapabilities {
+  os: string;
+  systemProxy: boolean;
+  wireguardStandardImport: boolean;
+  managedXrayInstall: boolean;
+  elevationRelaunch: boolean;
+  appUpdates: boolean;
+  executableExtensions: string[];
+}
+
 export interface ManagedXrayOffer {
   version: string;
   sourceUrl: string;

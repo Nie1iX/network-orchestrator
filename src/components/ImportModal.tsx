@@ -4,6 +4,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import Modal from "./Modal";
 import { ensureElevation } from "../elevation";
 import { BatchImportResult } from "../types";
+import { usePlatformCapabilities } from "../platform";
 
 type ImportTab = "files" | "subscription" | "wireguard";
 
@@ -21,6 +22,7 @@ export default function ImportModal({
   onError,
 }: ImportModalProps) {
   const [tab, setTab] = useState<ImportTab>("files");
+  const caps = usePlatformCapabilities();
   const [busy, setBusy] = useState(false);
   const [subUrl, setSubUrl] = useState("");
   const [subHwid, setSubHwid] = useState("");
@@ -122,13 +124,15 @@ export default function ImportModal({
         >
           Subscription
         </button>
-        <button
-          type="button"
-          className={`modal-tab ${tab === "wireguard" ? "active" : ""}`}
-          onClick={() => setTab("wireguard")}
-        >
-          WireGuard (standard)
-        </button>
+        {caps?.wireguardStandardImport && (
+          <button
+            type="button"
+            className={`modal-tab ${tab === "wireguard" ? "active" : ""}`}
+            onClick={() => setTab("wireguard")}
+          >
+            WireGuard (standard)
+          </button>
+        )}
       </div>
 
       {tab === "files" && (
@@ -183,7 +187,7 @@ export default function ImportModal({
         </div>
       )}
 
-      {tab === "wireguard" && (
+      {tab === "wireguard" && caps?.wireguardStandardImport && (
         <div className="modal-tab-body">
           <p className="profile-help">
             Import all WireGuard configs from the standard Windows location

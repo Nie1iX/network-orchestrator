@@ -236,6 +236,43 @@ pub(crate) fn get_managed_xray_offer() -> ManagedXrayOffer {
     managed_xray_offer()
 }
 
+/// Which OS-specific features the frontend may offer on this platform.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlatformCapabilities {
+    os: &'static str,
+    system_proxy: bool,
+    wireguard_standard_import: bool,
+    managed_xray_install: bool,
+    elevation_relaunch: bool,
+    /// In-app updater; Linux installs update through the package manager.
+    app_updates: bool,
+    /// File-picker extensions for backend executables; empty means no filter.
+    executable_extensions: Vec<String>,
+}
+
+fn platform_capabilities() -> PlatformCapabilities {
+    let windows = cfg!(windows);
+    PlatformCapabilities {
+        os: std::env::consts::OS,
+        system_proxy: windows,
+        wireguard_standard_import: windows,
+        managed_xray_install: cfg!(all(target_os = "windows", target_arch = "x86_64")),
+        elevation_relaunch: windows,
+        app_updates: windows,
+        executable_extensions: if windows {
+            vec!["exe".to_string()]
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+#[tauri::command]
+pub(crate) fn get_platform_capabilities() -> PlatformCapabilities {
+    platform_capabilities()
+}
+
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -546,6 +583,55 @@ mod tests {
     use super::*;
     use crate::test_support::{app_state, unique_dir};
     use std::io;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_capabilities_hide_windows_only_features() {
+        let caps = platform_capabilities();
+        assert_eq!(caps.os, "linux");
+        assert!(!caps.system_proxy);
+        assert!(!caps.wireguard_standard_import);
+        assert!(!caps.managed_xray_install);
+        assert!(!caps.elevation_relaunch);
+        assert!(!caps.app_updates);
+        assert!(caps.executable_extensions.is_empty());
+    }
+
+    #[test]
+    fn capabilities_serialize_with_frontend_field_names() {
+        let value = serde_json::to_value(platform_capabilities()).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "appUpdates",
+                "elevationRelaunch",
+                "executableExtensions",
+                "managedXrayInstall",
+                "os",
+                "systemProxy",
+                "wireguardStandardImport",
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capabilities_expose_windows_features() {
+        let caps = platform_capabilities();
+        assert_eq!(caps.os, "windows");
+        assert!(caps.system_proxy);
+        assert!(caps.wireguard_standard_import);
+        assert!(caps.elevation_relaunch);
+        assert!(caps.app_updates);
+        assert_eq!(caps.executable_extensions, vec!["exe".to_string()]);
+    }
 
     #[test]
     fn backend_entry_maps_found_and_missing() {

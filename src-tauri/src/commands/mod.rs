@@ -17,8 +17,8 @@ pub(crate) use recovery::{cleanup_recovery, get_recovery_report};
 pub(crate) use route_map::get_route_map;
 pub(crate) use system::{
     cancel_managed_xray_install, discover_wireguard_configs, get_backend_availability,
-    get_managed_xray_offer, install_managed_xray, is_elevated, remove_managed_xray,
-    reset_backend_executable, restart_elevated, set_backend_executable,
+    get_managed_xray_offer, get_platform_capabilities, install_managed_xray, is_elevated,
+    remove_managed_xray, reset_backend_executable, restart_elevated, set_backend_executable,
 };
 pub(crate) use tunnels::{
     connect_profile, disconnect_profile, get_tunnel_statuses, probe_openvpn_routes,
