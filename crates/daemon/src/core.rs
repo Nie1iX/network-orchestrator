@@ -80,8 +80,19 @@ impl DaemonCore {
                 self.persist();
                 Ok(routes.len())
             }
-            Err(err) => {
-                self.journal.entries.remove(index);
+            Err((err, still_applied)) => {
+                if still_applied.is_empty() {
+                    self.journal.entries.remove(index);
+                } else {
+                    // Rollback left routes behind: keep them owned so a later
+                    // remove or startup recovery can clean them up.
+                    let entry = &mut self.journal.entries[index];
+                    entry.state = OwnedState::Stale;
+                    entry.resources = still_applied
+                        .into_iter()
+                        .map(OwnedResource::Route)
+                        .collect();
+                }
                 self.persist();
                 Err(err)
             }
@@ -379,6 +390,37 @@ mod tests {
 
         assert_eq!(*seen.lock().unwrap(), vec![Some(OwnedState::Applying)]);
         assert_eq!(journal_on_disk(&dir).entries[0].state, OwnedState::Applied);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_rollback_failure_keeps_stale_entry() {
+        let dir = unique_dir("rollback-stale");
+        let recorder = Recorder::default();
+        recorder.fail_add.lock().unwrap().push("10.2.0.0/16".into());
+        recorder
+            .fail_remove
+            .lock()
+            .unwrap()
+            .push("10.1.0.0/16".into());
+        let mut core = open_core(&dir, &recorder);
+
+        core.apply_routes(
+            1000,
+            "office",
+            vec![route("10.1.0.0/16"), route("10.2.0.0/16")],
+        )
+        .unwrap_err();
+
+        // 10.1.0.0/16 may still be in the kernel, so the journal must keep it.
+        let owned = core.owned(1000);
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].state, OwnedState::Stale);
+        assert_eq!(
+            owned[0].resources,
+            vec![OwnedResource::Route(route("10.1.0.0/16"))]
+        );
+        assert_eq!(journal_on_disk(&dir).entries.len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 

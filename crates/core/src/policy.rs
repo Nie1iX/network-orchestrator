@@ -23,23 +23,26 @@ pub trait RouteExecutor: Send {
 }
 
 /// Add `routes` in order; on the first failure remove the ones already
-/// added (in reverse) and return the original error kind.
+/// added (in reverse). The error keeps the original kind and comes with the
+/// routes whose rollback failed, i.e. those that may still be installed.
 pub fn apply_routes_transactional(
     executor: &mut dyn RouteExecutor,
     routes: &[AppliedRoute],
-) -> io::Result<()> {
+) -> Result<(), (io::Error, Vec<AppliedRoute>)> {
     for (added, route) in routes.iter().enumerate() {
         if let Err(err) = executor.add_route(route) {
             let mut message = err.to_string();
+            let mut still_applied = Vec::new();
             for rollback in routes[..added].iter().rev() {
                 if let Err(rb_err) = executor.remove_route(rollback) {
                     message.push_str(&format!(
                         "; rollback failed for {}: {}",
                         rollback.destination, rb_err
                     ));
+                    still_applied.push(rollback.clone());
                 }
             }
-            return Err(io::Error::new(err.kind(), message));
+            return Err((io::Error::new(err.kind(), message), still_applied));
         }
     }
     Ok(())
@@ -101,7 +104,7 @@ impl PolicyManager {
             ));
         }
         let routes = plan_profile_routes(profile, interfaces)?;
-        apply_routes_transactional(self.executor.as_mut(), &routes)?;
+        apply_routes_transactional(self.executor.as_mut(), &routes).map_err(|(err, _)| err)?;
         self.applied.insert(profile.id.clone(), routes.clone());
         Ok(routes)
     }
