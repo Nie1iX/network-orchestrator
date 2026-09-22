@@ -9,4 +9,5 @@ pub mod journal;
 pub mod netlink;
 #[cfg(target_os = "linux")]
 pub mod peer;
+pub mod server;
 pub mod validate;
