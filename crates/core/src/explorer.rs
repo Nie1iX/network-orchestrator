@@ -603,6 +603,7 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
             let rx_bytes = read_linux_stat(name, "statistics/rx_bytes");
             let tx_bytes = read_linux_stat(name, "statistics/tx_bytes");
             let link_speed_mbps = read_linux_speed(name);
+            let category = classify_category_linux(&kind, physical, name);
 
             result.push(NetworkInterface {
                 name: name.clone(),
@@ -620,7 +621,7 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
                 rx_bytes,
                 tx_bytes,
                 link_speed_mbps,
-                category: classify_category_linux(&kind, physical, name),
+                category,
                 description: read_linux_description(name),
                 if_type: read_linux_if_type(name),
                 tunnel_type: None,
@@ -684,8 +685,7 @@ fn read_linux_speed(name: &str) -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn read_linux_description(name: &str) -> String {
     // /sys/class/net/<name>/device/driver symlink gives the driver name
-    let driver_path = std::path::Path::new(&format!("/sys/class/net/{name}/device/driver"));
-    if let Ok(target) = std::fs::read_link(driver_path) {
+    if let Ok(target) = std::fs::read_link(format!("/sys/class/net/{name}/device/driver")) {
         if let Some(fname) = target.file_name() {
             return format!("{} driver", fname.to_string_lossy());
         }
@@ -767,7 +767,7 @@ fn classify_interface_linux(name: &str) -> InterfaceKind {
 }
 
 #[cfg(target_os = "linux")]
-fn classify_category_linux(kind: &InterfaceKind, physical: bool, name: &str) -> InterfaceCategory {
+fn classify_category_linux(kind: &InterfaceKind, physical: bool, _name: &str) -> InterfaceCategory {
     match kind {
         InterfaceKind::Loopback => InterfaceCategory::System,
         InterfaceKind::WireGuard | InterfaceKind::OpenVpn | InterfaceKind::Xray => {

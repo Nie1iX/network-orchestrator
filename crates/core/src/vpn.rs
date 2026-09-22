@@ -303,17 +303,27 @@ pub fn resolve_wireguard_executable(configured: Option<&Path>) -> io::Result<Pat
     )
 }
 
+#[cfg(windows)]
+const OPENVPN_EXE_NAME: &str = "openvpn.exe";
+#[cfg(not(windows))]
+const OPENVPN_EXE_NAME: &str = "openvpn";
+
+#[cfg(windows)]
+const XRAY_EXE_NAME: &str = "xray.exe";
+#[cfg(not(windows))]
+const XRAY_EXE_NAME: &str = "xray";
+
 pub fn resolve_openvpn_executable(configured: Option<&Path>) -> io::Result<PathBuf> {
     resolve_executable(
         configured,
-        "openvpn.exe",
+        OPENVPN_EXE_NAME,
         "OpenVPN",
         &openvpn_standard_paths(),
     )
 }
 
 pub fn resolve_xray_executable(configured: Option<&Path>) -> io::Result<PathBuf> {
-    resolve_executable(configured, "xray.exe", "Xray", &xray_standard_paths())
+    resolve_executable(configured, XRAY_EXE_NAME, "Xray", &xray_standard_paths())
 }
 
 fn resolve_executable(
@@ -379,7 +389,19 @@ fn openvpn_standard_paths() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn openvpn_standard_paths() -> Vec<PathBuf> {
+    [
+        "/usr/bin/openvpn",
+        "/usr/sbin/openvpn",
+        "/usr/local/bin/openvpn",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn openvpn_standard_paths() -> Vec<PathBuf> {
     Vec::new()
 }
@@ -391,7 +413,15 @@ fn xray_standard_paths() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn xray_standard_paths() -> Vec<PathBuf> {
+    ["/usr/bin/xray", "/usr/local/bin/xray", "/opt/xray/xray"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn xray_standard_paths() -> Vec<PathBuf> {
     Vec::new()
 }
@@ -1430,12 +1460,27 @@ mod tests {
         fs::remove_dir_all(manager.log_dir.clone().unwrap()).unwrap();
     }
 
+    // Windows treats `/` as a valid separator alongside `\`, so a forward-
+    // slash literal like "C:/configs/work.conf" parses identically on
+    // Windows and portably (as a plain absolute-looking path) elsewhere,
+    // letting these fixtures run cross-platform. `\`-only literals used to
+    // break `file_name()`/`std::path::absolute()` derived assertions on
+    // non-Windows, where `\` is just an ordinary filename character.
+    #[cfg(windows)]
+    fn sample_absolute_path(file: &str) -> PathBuf {
+        PathBuf::from(format!("C:/configs/{file}"))
+    }
+    #[cfg(not(windows))]
+    fn sample_absolute_path(file: &str) -> PathBuf {
+        PathBuf::from(format!("/configs/{file}"))
+    }
+
     fn wg_profile() -> Profile {
         Profile {
             id: "work-wg".into(),
             name: "Work WireGuard".into(),
             backend: TunnelBackend::WireGuard,
-            config_path: PathBuf::from(r"C:\configs\work.conf"),
+            config_path: sample_absolute_path("work.conf"),
             interface_name: "wg-work".into(),
             ..Default::default()
         }
@@ -1446,7 +1491,7 @@ mod tests {
             id: "work-xray".into(),
             name: "Work Xray".into(),
             backend: TunnelBackend::Xray,
-            config_path: PathBuf::from(r"C:\configs\node.json"),
+            config_path: sample_absolute_path("node.json"),
             interface_name: String::new(),
             xray_socks_port: Some(10808),
             ..Default::default()
@@ -1458,7 +1503,7 @@ mod tests {
             id: "home-ovpn".into(),
             name: "Home OpenVPN".into(),
             backend: TunnelBackend::OpenVpn,
-            config_path: PathBuf::from(r"C:\configs\home.ovpn"),
+            config_path: sample_absolute_path("home.ovpn"),
             interface_name: "ovpn-home".into(),
             ..Default::default()
         }
@@ -1467,15 +1512,15 @@ mod tests {
     #[test]
     fn tunnel_name_strips_conf_and_conf_dpapi_case_insensitively() {
         assert_eq!(
-            wireguard_tunnel_name(Path::new(r"C:\c\work.conf")).unwrap(),
+            wireguard_tunnel_name(Path::new("C:/c/work.conf")).unwrap(),
             "work"
         );
         assert_eq!(
-            wireguard_tunnel_name(Path::new(r"C:\c\work.conf.dpapi")).unwrap(),
+            wireguard_tunnel_name(Path::new("C:/c/work.conf.dpapi")).unwrap(),
             "work"
         );
         assert_eq!(
-            wireguard_tunnel_name(Path::new(r"C:\c\WORK.CONF.DPAPI")).unwrap(),
+            wireguard_tunnel_name(Path::new("C:/c/WORK.CONF.DPAPI")).unwrap(),
             "WORK"
         );
     }
@@ -1532,7 +1577,7 @@ mod tests {
             spec.args,
             vec![
                 OsString::from("--config"),
-                OsString::from(r"C:\configs\home.ovpn"),
+                sample_absolute_path("home.ovpn").into_os_string(),
                 OsString::from("--route-nopull"),
             ]
         );
@@ -1550,7 +1595,7 @@ mod tests {
             spec.args,
             vec![
                 OsString::from("--config"),
-                OsString::from(r"C:\configs\home.ovpn"),
+                sample_absolute_path("home.ovpn").into_os_string(),
                 OsString::from("--route-nopull"),
             ]
         );
@@ -1621,7 +1666,7 @@ mod tests {
             "WireGuardTunnel$work"
         );
         let mut dpapi = wg_profile();
-        dpapi.config_path = PathBuf::from(r"C:\configs\site.conf.dpapi");
+        dpapi.config_path = sample_absolute_path("site.conf.dpapi");
         assert_eq!(
             wireguard_service_name(&dpapi).unwrap(),
             "WireGuardTunnel$site"
@@ -1776,6 +1821,17 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(doc["outbounds"][0]["protocol"], "vless");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_standard_paths_use_unsuffixed_binary_names() {
+        for path in xray_standard_paths() {
+            assert_eq!(path.file_name().unwrap(), "xray");
+        }
+        for path in openvpn_standard_paths() {
+            assert_eq!(path.file_name().unwrap(), "openvpn");
+        }
     }
 
     #[test]

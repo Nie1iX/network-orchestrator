@@ -82,6 +82,7 @@ pub use imp::ChildJob;
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+    #[cfg(windows)]
     use std::time::{Duration, Instant};
 
     #[cfg(windows)]

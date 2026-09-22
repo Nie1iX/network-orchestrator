@@ -1,0 +1,15 @@
+[package]
+name = "network-orchestrator-linux-helper"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "linux-helper"
+path = "src/main.rs"
+
+[lib]
+name = "linux_helper"
+path = "src/lib.rs"
+
+[dependencies]
+ipnet = "2"

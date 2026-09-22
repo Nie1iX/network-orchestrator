@@ -1,7 +1,9 @@
 use crate::elevation;
 use crate::state::{resolve_backend_path, AppState, ResolvedBackendExecutable, RuntimeState};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+use net_manager_core::managed_xray::ManagedXrayInstallation;
 use net_manager_core::managed_xray::{
-    self, ManagedXrayInstallation, MANAGED_XRAY_URL, MANAGED_XRAY_VERSION, MAX_XRAY_ARCHIVE_BYTES,
+    self, MANAGED_XRAY_URL, MANAGED_XRAY_VERSION, MAX_XRAY_ARCHIVE_BYTES,
 };
 use net_manager_core::models::{
     BackendAvailability, BackendExecutableSetting, BackendExecutableSource, Profile, TunnelBackend,
@@ -12,7 +14,9 @@ use serde::Serialize;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use tauri::{Emitter, State};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+use tauri::Emitter;
+use tauri::State;
 
 #[tauri::command]
 pub(crate) async fn is_elevated() -> Result<bool, String> {
@@ -232,6 +236,7 @@ pub(crate) fn get_managed_xray_offer() -> ManagedXrayOffer {
     managed_xray_offer()
 }
 
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BackendInstallProgress {
@@ -241,6 +246,10 @@ struct BackendInstallProgress {
     total: Option<u64>,
 }
 
+// Used by `install_managed_xray_inner` on 64-bit Windows and directly by
+// unit tests on every platform; never used by the plain (non-test,
+// non-Windows) lib build, hence `any(test, ...)`.
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 fn checked_download_len(current: usize, chunk_len: usize) -> io::Result<usize> {
     match current.checked_add(chunk_len) {
         Some(total) if total <= MAX_XRAY_ARCHIVE_BYTES => Ok(total),
@@ -251,6 +260,7 @@ fn checked_download_len(current: usize, chunk_len: usize) -> io::Result<usize> {
     }
 }
 
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 fn append_download_chunk(buffer: &mut Vec<u8>, chunk: &[u8], cancelled: bool) -> io::Result<()> {
     if cancelled {
         return Err(io::Error::new(
@@ -263,6 +273,7 @@ fn append_download_chunk(buffer: &mut Vec<u8>, chunk: &[u8], cancelled: bool) ->
     Ok(())
 }
 
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 fn validate_download_length(actual: usize, declared: Option<u64>) -> io::Result<()> {
     if let Some(declared) = declared {
         if declared != actual as u64 {
@@ -290,6 +301,7 @@ fn require_managed_xray_setting(
     }
 }
 
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn cleanup_created_installation(installation: &ManagedXrayInstallation) -> io::Result<()> {
     if installation.created {
         std::fs::remove_dir_all(&installation.version_dir)?;
@@ -297,6 +309,7 @@ fn cleanup_created_installation(installation: &ManagedXrayInstallation) -> io::R
     Ok(())
 }
 
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 fn install_failure_message(primary: String, cleanup: io::Result<()>) -> String {
     match cleanup {
         Ok(()) => primary,

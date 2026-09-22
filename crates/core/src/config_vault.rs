@@ -1304,6 +1304,7 @@ mod tests {
 
     #[test]
     fn import_and_store_protect_managed_paths() {
+        #[cfg(windows)]
         use crate::config_security::inspect_path_protection;
         let (vault, dir) = vault("protected");
         let cfg_dir = dir.join("cfg");
@@ -1315,11 +1316,19 @@ mod tests {
         #[cfg(windows)]
         let source_acl_before = inspect_path_protection(&source).unwrap();
 
+        #[cfg(windows)]
         let import = vault
             .import("home", TunnelBackend::OpenVpn, &source)
             .unwrap();
+        #[cfg(not(windows))]
+        vault
+            .import("home", TunnelBackend::OpenVpn, &source)
+            .unwrap();
+        #[cfg(windows)]
         let revision = import.config_path.parent().unwrap();
+        #[cfg(windows)]
         let profile_dir = revision.parent().unwrap();
+        #[cfg(windows)]
         let asset = revision.join("assets").join("0-ca.crt");
 
         #[cfg(windows)]
@@ -1349,6 +1358,7 @@ mod tests {
         let stored = vault
             .store_xray_config("node", br#"{"outbounds":[]}"#)
             .unwrap();
+        #[cfg(windows)]
         let stored_revision = stored.config_path.parent().unwrap();
         #[cfg(windows)]
         for path in [stored_revision.to_path_buf(), stored.config_path.clone()] {

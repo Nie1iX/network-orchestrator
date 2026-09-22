@@ -29,7 +29,9 @@ impl PolicyManager {
     pub fn new() -> Self {
         #[cfg(windows)]
         let executor: Box<dyn RouteExecutor> = Box::new(WindowsRouteExecutor);
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        let executor: Box<dyn RouteExecutor> = Box::new(LinuxRouteExecutor::new());
+        #[cfg(not(any(windows, target_os = "linux")))]
         let executor: Box<dyn RouteExecutor> = Box::new(UnsupportedRouteExecutor);
         Self::with_executor(executor)
     }
@@ -277,22 +279,129 @@ impl RouteExecutor for WindowsRouteExecutor {
     }
 }
 
-#[cfg(not(windows))]
+/// Resolves and invokes the privileged `linux-helper` binary via `pkexec`
+/// to add/remove routes through `ip route`. The app itself never runs
+/// elevated: each mutation is a separate `pkexec` call, authorized by
+/// `com.netmanager.app.run-linux-helper` (see `crates/linux-helper/
+/// resources/`), cached for ~5 minutes by polkit's `auth_admin_keep` so a
+/// connect/disconnect cycle in the same session only prompts once.
+#[cfg(target_os = "linux")]
+pub struct LinuxRouteExecutor {
+    helper_path: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxRouteExecutor {
+    pub fn new() -> Self {
+        Self::with_helper_path(resolve_linux_helper_path())
+    }
+
+    pub fn with_helper_path(helper_path: std::path::PathBuf) -> Self {
+        Self { helper_path }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Default for LinuxRouteExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `scripts/install-linux-helper-dev.sh` installs the helper here for local
+/// development; the eventual Linux package installs it to the same path.
+/// `NETWORK_ORCHESTRATOR_LINUX_HELPER` overrides it, for tests and for
+/// running the app from a build directory without installing anything
+/// system-wide.
+#[cfg(target_os = "linux")]
+fn resolve_linux_helper_path() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("NETWORK_ORCHESTRATOR_LINUX_HELPER") {
+        return std::path::PathBuf::from(path);
+    }
+    std::path::PathBuf::from("/usr/local/libexec/network-orchestrator/linux-helper")
+}
+
+#[cfg(target_os = "linux")]
+fn interface_name_for_index(index: u32) -> io::Result<String> {
+    let mut buf = [0u8; libc::IF_NAMESIZE];
+    let ptr = unsafe { libc::if_indextoname(index, buf.as_mut_ptr() as *mut libc::c_char) };
+    if ptr.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "interface name is not valid UTF-8",
+            )
+        })?;
+    Ok(name.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn helper_args(verb: &str, route: &AppliedRoute, iface: &str) -> Vec<String> {
+    vec![
+        verb.to_string(),
+        route.destination.to_string(),
+        iface.to_string(),
+        route.metric.to_string(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_helper(helper_path: &std::path::Path, args: &[String]) -> io::Result<()> {
+    let output = std::process::Command::new("pkexec")
+        .arg(helper_path)
+        .args(args)
+        .output()
+        .map_err(|e| {
+            io::Error::other(format!(
+                "failed to run linux-helper via pkexec (helper path: {}): {e}",
+                helper_path.display()
+            ))
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(io::Error::other(format!(
+            "linux-helper {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        )))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl RouteExecutor for LinuxRouteExecutor {
+    fn add_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+        let iface = interface_name_for_index(route.interface_index)?;
+        run_linux_helper(&self.helper_path, &helper_args("route-add", route, &iface))
+    }
+
+    fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+        let iface = interface_name_for_index(route.interface_index)?;
+        run_linux_helper(&self.helper_path, &helper_args("route-del", route, &iface))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 struct UnsupportedRouteExecutor;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 impl RouteExecutor for UnsupportedRouteExecutor {
     fn add_route(&mut self, _route: &AppliedRoute) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "policy routes are only supported on Windows",
+            "policy routes are only supported on Windows and Linux",
         ))
     }
 
     fn remove_route(&mut self, _route: &AppliedRoute) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "policy routes are only supported on Windows",
+            "policy routes are only supported on Windows and Linux",
         ))
     }
 }
@@ -303,6 +412,7 @@ mod tests {
     use crate::models::{
         InterfaceCategory, InterfaceKind, InterfaceState, PolicyRoute, TunnelBackend,
     };
+    #[cfg(windows)]
     use std::net::IpAddr;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -729,5 +839,66 @@ mod tests {
         assert!(win32_remove_result(ERROR_NOT_FOUND).is_ok());
         let err = win32_remove_result(WIN32_ERROR(5)).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_args_builds_verb_destination_iface_metric() {
+        let route = AppliedRoute {
+            destination: "10.8.0.0/24".parse().unwrap(),
+            interface_index: 3,
+            metric: 10,
+        };
+        assert_eq!(
+            helper_args("route-add", &route, "wg0"),
+            vec!["route-add", "10.8.0.0/24", "wg0", "10"]
+        );
+        assert_eq!(
+            helper_args("route-del", &route, "wg0"),
+            vec!["route-del", "10.8.0.0/24", "wg0", "10"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interface_name_for_index_resolves_loopback() {
+        // Interface index 1 is loopback ("lo") on every Linux system; this
+        // is a read-only libc call, not a mutation, so it is safe to run
+        // for real in ordinary tests.
+        assert_eq!(interface_name_for_index(1).unwrap(), "lo");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interface_name_for_index_rejects_unknown_index() {
+        // errno for a nonexistent index (ENXIO) has no dedicated ErrorKind,
+        // so just assert it fails rather than pin an exact kind.
+        assert!(interface_name_for_index(u32::MAX).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_linux_helper_path_honors_env_override() {
+        let dir = std::env::temp_dir().join(format!(
+            "netmgr-linux-helper-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // SAFETY: no other thread in this test binary reads or writes
+        // NETWORK_ORCHESTRATOR_LINUX_HELPER concurrently.
+        unsafe {
+            std::env::set_var("NETWORK_ORCHESTRATOR_LINUX_HELPER", &dir);
+        }
+        assert_eq!(resolve_linux_helper_path(), dir);
+        unsafe {
+            std::env::remove_var("NETWORK_ORCHESTRATOR_LINUX_HELPER");
+        }
+        assert_eq!(
+            resolve_linux_helper_path(),
+            std::path::PathBuf::from("/usr/local/libexec/network-orchestrator/linux-helper")
+        );
     }
 }

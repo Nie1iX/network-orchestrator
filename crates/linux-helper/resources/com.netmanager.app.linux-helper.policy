@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  PolicyKit action for the Network Orchestrator Linux privileged helper.
+
+  Authorises exactly one binary, at exactly the path scripts/install-linux-
+  helper-dev.sh installs it to (or that the eventual Linux package installs
+  it to). The helper itself whitelists its subcommands (route-add/route-del
+  today; tunnel setup subcommands later) and validates every argument before
+  shelling out to `ip`, so this single action covers all of them.
+
+  `auth_admin_keep` prompts once per session (~5 min cache per polkit's
+  default InhibitDelayMaxUSec) and lets subsequent invocations through
+  unchallenged, matching NetworkManager/wireguard-tools behavior.
+
+  IMPORTANT: the exec.path annotation below MUST be the literal, real path
+  the app invokes pkexec with — not a symlink target resolved some other
+  way, and not the official-installer path copied from a different OS
+  packaging. A path that doesn't match exactly what's actually exec'd makes
+  polkit fall back to the generic org.freedesktop.policykit.exec action,
+  which uses auth_admin (no caching) instead of auth_admin_keep and
+  reprompts on every single call. Keep both in lockstep.
+-->
+<policyconfig>
+
+  <vendor>Network Orchestrator</vendor>
+  <vendor_url>https://github.com/Nie1iX/network-orchestrator</vendor_url>
+  <icon_name>network-workgroup</icon_name>
+
+  <action id="com.netmanager.app.run-linux-helper">
+    <description>Run the Network Orchestrator privileged helper</description>
+    <description xml:lang="ru">Запустить системный модуль Network Orchestrator</description>
+    <message>Network Orchestrator needs administrative privileges to manage routes.</message>
+    <message xml:lang="ru">Network Orchestrator требует права администратора для управления маршрутами.</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/network-orchestrator/linux-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+</policyconfig>
