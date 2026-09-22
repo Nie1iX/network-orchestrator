@@ -32,6 +32,9 @@ pub(crate) fn applied_route_present(applied: &AppliedRoute, entry: &RouteEntry) 
     applied.interface_index == entry.interface_index
         && entry.destination == applied.destination.network()
         && entry.prefix_len == applied.destination.prefix_len()
+        && applied
+            .gateway
+            .is_none_or(|gateway| entry.gateway == Some(gateway))
 }
 
 fn resolve_backend_executable(state: &AppState, profile: &Profile) -> Result<PathBuf, String> {
@@ -738,6 +741,22 @@ mod tests {
             check_named(&checks, "Applied routes").level,
             DiagnosticLevel::Error
         );
+    }
+
+    #[test]
+    fn applied_route_present_compares_gateway() {
+        let mut applied = AppliedRoute::on_link("10.9.0.0/24".parse().unwrap(), 7, 5);
+        applied.gateway = Some("192.168.1.1".parse().unwrap());
+        let mut entry = route_entry("10.9.0.0", 24, 7, 5);
+
+        assert!(!applied_route_present(&applied, &entry));
+        entry.gateway = Some("192.168.1.2".parse().unwrap());
+        assert!(!applied_route_present(&applied, &entry));
+        entry.gateway = Some("192.168.1.1".parse().unwrap());
+        assert!(applied_route_present(&applied, &entry));
+
+        let on_link = AppliedRoute::on_link("10.9.0.0/24".parse().unwrap(), 7, 5);
+        assert!(applied_route_present(&on_link, &entry));
     }
 
     #[test]

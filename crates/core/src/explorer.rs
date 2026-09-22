@@ -710,23 +710,35 @@ fn read_linux_if_type(name: &str) -> u32 {
 }
 
 #[cfg(target_os = "linux")]
-fn read_linux_gateway(_name: &str) -> Option<IpAddr> {
+fn read_linux_gateway(name: &str) -> Option<IpAddr> {
     // Gateway resolution via netlink is async; for the synchronous list_interfaces
     // we read /proc/net/route for the default route on this interface.
     // This is a best-effort heuristic.
     let routes = std::fs::read_to_string("/proc/net/route").ok()?;
-    for line in routes.lines().skip(1) {
+    parse_proc_net_route_default_gateway(&routes, name).map(IpAddr::V4)
+}
+
+/// Gateway of the first IPv4 default route on `iface` in `/proc/net/route`
+/// text. The kernel prints addresses as the raw in-memory `u32` in hex, so
+/// `to_ne_bytes` yields the address octets on any endianness.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_net_route_default_gateway(text: &str, iface: &str) -> Option<std::net::Ipv4Addr> {
+    for line in text.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 4 {
             continue;
         }
-        // Field 1 = Destination (0.0.0.0 for default), Field 2 = Gateway
-        if fields[1] == "00000000" {
+        // Field 0 = Iface, 1 = Destination (0.0.0.0 for default), 2 = Gateway
+        if fields[0] == iface && fields[1] == "00000000" {
             let gw_hex = fields[2];
             if gw_hex.len() == 8 {
                 let gw_u32 = u32::from_str_radix(gw_hex, 16).ok()?;
+                // `default dev X` has no next hop; 0.0.0.0 is not a gateway.
+                if gw_u32 == 0 {
+                    continue;
+                }
                 let bytes = gw_u32.to_ne_bytes();
-                return Some(IpAddr::V4(std::net::Ipv4Addr::from(bytes)));
+                return Some(std::net::Ipv4Addr::from(bytes));
             }
         }
     }
@@ -868,6 +880,22 @@ mod tests {
     use super::*;
     use std::cmp::Reverse;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn proc_net_route_gateway_is_per_interface() {
+        let text =
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+                    wlp2s0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+                    wlp2s0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n\
+                    enp0s3\t0002000A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n\
+                    wg0\t00000000\t00000000\t0001\t0\t0\t50\t00000000\t0\t0\t0\n";
+        assert_eq!(parse_proc_net_route_default_gateway(text, "enp0s3"), None);
+        assert_eq!(parse_proc_net_route_default_gateway(text, "wg0"), None);
+        assert_eq!(
+            parse_proc_net_route_default_gateway(text, "wlp2s0"),
+            Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+    }
 
     #[test]
     fn longest_prefix_match_logic() {
