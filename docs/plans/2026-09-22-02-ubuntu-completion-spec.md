@@ -85,6 +85,7 @@ systemd-resolved, NetworkManager — на VM). **Ubuntu-first:** Windows не
 | B13 | AppImage не может установить daemon, systemd unit и polkit policy | tunnel-функции в AppImage невозможны | inferred |
 | B14 | Название продукта: «Network Orchestrator» / «Network Manager» / «Network Explorer» | путаница в UI, пакете, polkit | inspected |
 | B15 | `csp: null` | нет CSP | inspected |
+| B16 | `explorer::list_routes` отбрасывает IPv6 (`IPv4 only in MVP-0`) на всех ОС; Linux не читает IPv6-шлюзы (`/proc/net/ipv6_route`) | route map/lookup/diagnostics не видят IPv6-маршрутов, в том числе установленных приложением | inspected (найдено в S1 Task 2) |
 
 ## 3. Архитектурные решения
 
@@ -278,6 +279,8 @@ Xray запускается через daemon от root. IP-адрес, MTU, м�
 - E2. Bulk-ввод CIDR (вставка/файл), дедупликация и агрегация, IPv6.
 - E3. Применение при старте (`auto_connect`) и повторное применение, когда
   интерфейс снова поднялся (через route watcher).
+- E5. IPv6 в Explorer/route map (B16): `list_routes` с IPv6, IPv6-шлюзы на
+  Linux (netlink вместо `/proc/net/route`).
 - E4. Route map/lookup показывают, какой профиль владеет маршрутом и какое
   правило/таблица выиграли (с учётом D2).
 
