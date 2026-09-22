@@ -178,6 +178,51 @@ Xray запускается через daemon от root. IP-адрес, MTU, м�
   (для SOCKS — можно, это не root).
 - Конфиги копируются в `/run/network-orchestrator/<uid>/…` (0600, root), удаляются при disconnect.
 
+### D6. Поправки по результатам проверки фактов (2026-09-22)
+
+Подробности, доказательства и точные JSON/CLI —
+`2026-09-22-05-backend-facts.md`. Эти поправки имеют приоритет над текстом
+выше:
+
+- **Xray TUN (D4):**
+  - pinned 26.3.27 понимает `name`/`mtu`, не назначает IP и маршруты; имя
+    задавать явно;
+  - `-test` с tun inbound создаёт реальное устройство (и `EBUSY` при
+    коллизии), поэтому валидируем конфиг **без** tun inbound — root не нужен;
+  - `gateway`/`autoSystemRoutingTable` из новых версий не используем:
+    маршрутами владеет daemon.
+- **Loop prevention (D2):** `sockopt.mark` ставится на все outbound'ы,
+  **включая `freedom`**; без метки остаётся только `blackhole`.
+- **Hysteria2 (§5.D1):**
+  - в Xray это `protocol: "hysteria"`, `network: "hysteria"`, обязательно
+    `security: "tls"`;
+  - `insecure=1` / VLESS `allowInsecure` не поддерживаются ядром: такие
+    ссылки отклоняем с подсказкой про `pinSHA256`/`pcs`;
+  - `obfs=gecko` в 26.3.27 нет.
+- **OpenVPN (D5/C1/C4):**
+  - поддерживаем 2.6 (Debian 13) и 2.7 (Ubuntu 26.04, Arch);
+  - наши флаги ставятся **после** `--config`: `--dev ovpn-<id> --dev-type tun
+    --route-nopull --script-security 1 --ignore-unknown-option dns-updown
+    --dns-updown disable --mark <M> --management <sock> unix
+    --management-client-user root`;
+  - из конфига вырезаются все исполняющие и файловые директивы из
+    facts §5, включая `plugin`, `config`, `log`, `status`, `writepid`;
+  - pushed routes и DNS берутся из `PUSH_REPLY` в management log, потому
+    что `--route-nopull` отбрасывает и `dhcp-option`.
+- **Пакеты (G1/G2):**
+  - daemon ставится в `/usr/lib/network-orchestrator/network-orchestrator-daemon`
+    (Arch запрещает `/usr/libexec`);
+  - `systemd-resolved` — в `Recommends`, не `Depends` (иначе на Debian
+    перепишется `/etc/resolv.conf`);
+  - maintainer-скрипты `.deb` пишем вручную (Tauri не даёт debhelper);
+  - Arch `.install` только печатает подсказку `systemctl enable --now`.
+- **Updater (G3):** `tauri-plugin-updater` умеет `.deb` (`pkexec dpkg -i`).
+  Для `.deb` его **оставляем** (иначе нет обновлений до появления
+  APT-репозитория). Для Arch-сборки выключаем: без маркера бандла она
+  попадёт в ветку AppImage.
+- **DNS (D3):** root вызывает resolved без polkit. Per-link настройки
+  теряются при рестарте resolved, поэтому daemon применяет их заново.
+
 ## 4. Нефункциональные требования
 
 - Никаких секретов в логах/ошибках (текущие redaction-хелперы

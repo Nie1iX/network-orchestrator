@@ -19,7 +19,9 @@ After=dbus.service polkit.service
 
 [Service]
 Type=simple
-ExecStart=/usr/libexec/network-orchestrator/daemon
+# /usr/lib/<pkg>/ rather than /usr/libexec: Arch forbids libexec, and the
+# .deb and PKGBUILD install the same paths.
+ExecStart=/usr/lib/network-orchestrator/network-orchestrator-daemon
 Restart=on-failure
 RestartSec=1
 KillMode=mixed
