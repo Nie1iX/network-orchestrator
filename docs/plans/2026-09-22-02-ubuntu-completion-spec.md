@@ -356,6 +356,23 @@ Xray запускается через daemon от root. IP-адрес, MTU, м�
   `ip rule` и TUN; маршруты и интерфейсы хоста не меняются. Стенд покрывает
   split, full tunnel (нет петли), DNS, crash cleanup и рестарт daemon'а.
   Приёмка §6 — отдельно, на чистой Ubuntu (VM или железо).
+
+  Рецепт `client` с systemd (executed 2026-09-22, Ubuntu 26.04 image,
+  systemd 259, polkit 127):
+
+  ```
+  docker run -d -e container=docker --cap-add NET_ADMIN --cap-add SYS_ADMIN \
+    --security-opt apparmor=unconfined --device /dev/net/tun \
+    --tmpfs /run --tmpfs /run/lock --cgroupns=private \
+    --entrypoint sh <image> -c 'mount -o remount,rw /sys/fs/cgroup && exec /sbin/init'
+  ```
+
+  Без remount cgroup2 остаётся read-only, и PID 1 завершается
+  («Failed to create /init.scope control group»). С этим рецептом
+  `is-system-running` = `running`, resolved принимает per-link
+  `dns`/`domain ~.`/`revert`, polkit стартует. `SYS_ADMIN` + unconfined
+  apparmor — ослабление изоляции: стенд только для dev-машины и CI, не для
+  чужого кода.
 - UI smoke: ручной чек-лист §6, опционально `tauri-driver` + WebKitWebDriver.
 - `AGENTS.md`: добавить Linux gate и правила безопасности для `linux_e2e`.
 
