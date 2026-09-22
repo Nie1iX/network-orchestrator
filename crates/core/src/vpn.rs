@@ -1589,6 +1589,7 @@ mod tests {
         profile.routes = vec![PolicyRoute {
             destination: "10.8.0.0/24".parse().unwrap(),
             metric: 10,
+            via: None,
         }];
         let spec = openvpn_connect_spec(Path::new(r"C:\ovpn\openvpn.exe"), &profile).unwrap();
         assert_eq!(
@@ -2408,6 +2409,7 @@ mod table_off_tests {
         let mut profile = wg_profile_with_routes(vec![PolicyRoute {
             destination: "10.20.0.0/16".parse().unwrap(),
             metric: 5,
+            via: None,
         }]);
         profile.config_path = config_path.clone();
 
@@ -2543,6 +2545,7 @@ mod table_off_tests {
             vec![PolicyRoute {
                 destination: "10.0.0.0/24".parse().unwrap(),
                 metric: 10,
+                via: None,
             }],
         );
         let status = manager.connect(&profile).unwrap();
@@ -2568,6 +2571,7 @@ mod table_off_tests {
             vec![PolicyRoute {
                 destination: "10.0.0.0/24".parse().unwrap(),
                 metric: 10,
+                via: None,
             }],
         );
         let health = manager.protocol_health(&profile);

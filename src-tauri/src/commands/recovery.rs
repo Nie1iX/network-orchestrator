@@ -152,6 +152,8 @@ mod tests {
                 destination: dest.parse().unwrap(),
                 interface_index: if_index,
                 metric: 10,
+                gateway: None,
+                table: None,
             }],
         }
     }

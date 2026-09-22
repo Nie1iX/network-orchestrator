@@ -689,12 +689,15 @@ mod tests {
         p.routes = vec![PolicyRoute {
             destination: "10.9.0.0/24".parse().unwrap(),
             metric: 5,
+            via: None,
         }];
         let mut input = diag_input(&p);
         input.owned_routes = Some(vec![AppliedRoute {
             destination: "10.9.0.0/24".parse().unwrap(),
             interface_index: 7,
             metric: 5,
+            gateway: None,
+            table: None,
         }]);
         let checks = build_diagnostics(&input);
         let applied = check_named(&checks, "Applied routes");
@@ -713,12 +716,15 @@ mod tests {
         p.routes = vec![PolicyRoute {
             destination: "10.9.0.0/24".parse().unwrap(),
             metric: 5,
+            via: None,
         }];
         let mut input = diag_input(&p);
         input.owned_routes = Some(vec![AppliedRoute {
             destination: "10.9.0.0/24".parse().unwrap(),
             interface_index: 7,
             metric: 99,
+            gateway: None,
+            table: None,
         }]);
         input.os_routes = Ok(vec![route_entry("10.9.0.0", 24, 7, 1)]);
         let checks = build_diagnostics(&input);

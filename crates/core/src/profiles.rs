@@ -110,6 +110,20 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
                 route.metric
             )));
         }
+        if let Some(via) = route.via {
+            if via.is_unspecified() {
+                return Err(invalid_data(format!(
+                    "route {} gateway must not be unspecified",
+                    route.destination
+                )));
+            }
+            if via.is_ipv4() != matches!(route.destination, ipnet::IpNet::V4(_)) {
+                return Err(invalid_data(format!(
+                    "route {} gateway {via} is from a different address family",
+                    route.destination
+                )));
+            }
+        }
     }
     if profile.backend != TunnelBackend::Xray && !profile.domain_policies.is_empty() {
         return Err(invalid_data(
@@ -209,6 +223,7 @@ mod tests {
             routes: vec![PolicyRoute {
                 destination: "10.7.0.0/24".parse().unwrap(),
                 metric: 5,
+                via: None,
             }],
             auto_connect: true,
             ..Default::default()
@@ -281,6 +296,38 @@ mod tests {
         profile.routes = vec![PolicyRoute {
             destination: "10.7.0.0/24".parse().unwrap(),
             metric: 5,
+            via: None,
+        }];
+        let err = validate_profile(&profile).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn policy_route_without_via_deserializes() {
+        let route: PolicyRoute =
+            serde_json::from_str(r#"{"destination":"10.7.0.0/24","metric":5}"#).unwrap();
+        assert_eq!(route.via, None);
+    }
+
+    #[test]
+    fn profile_validation_rejects_via_family_mismatch() {
+        let mut profile = wg_profile();
+        profile.routes = vec![PolicyRoute {
+            destination: "10.7.0.0/24".parse().unwrap(),
+            metric: 5,
+            via: Some("fe80::1".parse().unwrap()),
+        }];
+        let err = validate_profile(&profile).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn profile_validation_rejects_unspecified_via() {
+        let mut profile = wg_profile();
+        profile.routes = vec![PolicyRoute {
+            destination: "10.7.0.0/24".parse().unwrap(),
+            metric: 5,
+            via: Some("0.0.0.0".parse().unwrap()),
         }];
         let err = validate_profile(&profile).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

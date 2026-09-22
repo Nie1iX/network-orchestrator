@@ -20,6 +20,50 @@ pub trait RouteExecutor: Send {
     fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()>;
 }
 
+/// Add `routes` in order; on the first failure remove the ones already
+/// added (in reverse) and return the original error kind.
+pub fn apply_routes_transactional(
+    executor: &mut dyn RouteExecutor,
+    routes: &[AppliedRoute],
+) -> io::Result<()> {
+    for (added, route) in routes.iter().enumerate() {
+        if let Err(err) = executor.add_route(route) {
+            let mut message = err.to_string();
+            for rollback in routes[..added].iter().rev() {
+                if let Err(rb_err) = executor.remove_route(rollback) {
+                    message.push_str(&format!(
+                        "; rollback failed for {}: {}",
+                        rollback.destination, rb_err
+                    ));
+                }
+            }
+            return Err(io::Error::new(err.kind(), message));
+        }
+    }
+    Ok(())
+}
+
+/// Remove `routes` in reverse order, continuing past failures. On error
+/// returns the routes that could not be removed and a joined message.
+pub fn remove_routes_best_effort(
+    executor: &mut dyn RouteExecutor,
+    routes: &[AppliedRoute],
+) -> Result<(), (Vec<AppliedRoute>, String)> {
+    let mut failed: Vec<AppliedRoute> = Vec::new();
+    let mut messages: Vec<String> = Vec::new();
+    for route in routes.iter().rev() {
+        if let Err(err) = executor.remove_route(route) {
+            messages.push(format!("{}: {}", route.destination, err));
+            failed.push(route.clone());
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err((failed, messages.join("; ")))
+    }
+}
+
 pub struct PolicyManager {
     executor: Box<dyn RouteExecutor>,
     applied: HashMap<String, Vec<AppliedRoute>>,
@@ -55,22 +99,7 @@ impl PolicyManager {
             ));
         }
         let routes = plan_profile_routes(profile, interfaces)?;
-        let mut added: Vec<AppliedRoute> = Vec::with_capacity(routes.len());
-        for route in &routes {
-            if let Err(err) = self.executor.add_route(route) {
-                let mut message = err.to_string();
-                for rollback in added.iter().rev() {
-                    if let Err(rb_err) = self.executor.remove_route(rollback) {
-                        message.push_str(&format!(
-                            "; rollback failed for {}: {}",
-                            rollback.destination, rb_err
-                        ));
-                    }
-                }
-                return Err(io::Error::new(err.kind(), message));
-            }
-            added.push(route.clone());
-        }
+        apply_routes_transactional(self.executor.as_mut(), &routes)?;
         self.applied.insert(profile.id.clone(), routes.clone());
         Ok(routes)
     }
@@ -82,19 +111,13 @@ impl PolicyManager {
                 format!("profile '{profile_id}' has no applied routes"),
             ));
         };
-        let mut failed: Vec<AppliedRoute> = Vec::new();
-        let mut messages: Vec<String> = Vec::new();
-        for route in routes.iter().rev() {
-            if let Err(err) = self.executor.remove_route(route) {
-                messages.push(format!("{}: {}", route.destination, err));
-                failed.push(route.clone());
+        match remove_routes_best_effort(self.executor.as_mut(), &routes) {
+            Ok(()) => Ok(()),
+            Err((failed, message)) => {
+                self.applied.insert(profile_id.to_string(), failed);
+                Err(io::Error::other(message))
             }
         }
-        if failed.is_empty() {
-            return Ok(());
-        }
-        self.applied.insert(profile_id.to_string(), failed);
-        Err(io::Error::other(messages.join("; ")))
     }
 
     pub fn applied_for(&self, profile_id: &str) -> &[AppliedRoute] {
@@ -172,6 +195,8 @@ pub fn plan_profile_routes(
             destination: route.destination,
             interface_index: interface.if_index,
             metric: route.metric,
+            gateway: None,
+            table: None,
         })
         .collect())
 }
@@ -457,6 +482,7 @@ mod tests {
         PolicyRoute {
             destination: dest.parse().unwrap(),
             metric,
+            via: None,
         }
     }
 
@@ -530,6 +556,8 @@ mod tests {
                 destination: "10.7.0.0/24".parse().unwrap(),
                 interface_index: 7,
                 metric: 5,
+                gateway: None,
+                table: None,
             }]
         );
     }
@@ -662,6 +690,8 @@ mod tests {
             destination: "10.7.0.99/24".parse().unwrap(),
             interface_index: 42,
             metric: 5,
+            gateway: None,
+            table: None,
         };
         let mut row = unsafe { std::mem::zeroed::<MIB_IPFORWARD_ROW2>() };
         populate_forward_row(&mut row, &applied);
@@ -693,6 +723,8 @@ mod tests {
             destination: "fd00::1/64".parse().unwrap(),
             interface_index: 13,
             metric: 7,
+            gateway: None,
+            table: None,
         };
         let mut row = unsafe { std::mem::zeroed::<MIB_IPFORWARD_ROW2>() };
         populate_forward_row(&mut row, &applied);
@@ -771,6 +803,8 @@ mod tests {
                     destination: "10.1.0.0/24".parse().unwrap(),
                     interface_index: 3,
                     metric: 9,
+                    gateway: None,
+                    table: None,
                 }],
             },
         ];
@@ -825,6 +859,8 @@ mod tests {
                     destination: "10.1.0.0/24".parse().unwrap(),
                     interface_index: 3,
                     metric: 9,
+                    gateway: None,
+                    table: None,
                 }],
             },
         ])
@@ -848,6 +884,8 @@ mod tests {
             destination: "10.8.0.0/24".parse().unwrap(),
             interface_index: 3,
             metric: 10,
+            gateway: None,
+            table: None,
         };
         assert_eq!(
             helper_args("route-add", &route, "wg0"),

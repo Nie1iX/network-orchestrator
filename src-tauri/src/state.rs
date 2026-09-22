@@ -290,6 +290,7 @@ mod tests {
         p.routes.push(PolicyRoute {
             destination: "10.5.0.0/24".parse().unwrap(),
             metric: 3,
+            via: None,
         });
         policies
             .apply_profile(&p, &[iface("if0", "wg-work", InterfaceState::Up)])

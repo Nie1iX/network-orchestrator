@@ -119,6 +119,8 @@ mod tests {
                             destination: "10.3.0.0/24".parse().unwrap(),
                             interface_index: 4,
                             metric: 10,
+                            gateway: None,
+                            table: None,
                         }],
                     },
                 ])

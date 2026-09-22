@@ -159,6 +159,9 @@ pub struct DomainPolicy {
 pub struct PolicyRoute {
     pub destination: IpNet,
     pub metric: u32,
+    /// Explicit next hop; `None` means the interface gateway or on-link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<IpAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -361,6 +364,24 @@ pub struct AppliedRoute {
     pub destination: IpNet,
     pub interface_index: u32,
     pub metric: u32,
+    /// Next hop; `None` installs the route on-link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<IpAddr>,
+    /// Routing table chosen by the Linux daemon; `None` means the main table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<u32>,
+}
+
+impl AppliedRoute {
+    pub fn on_link(destination: IpNet, interface_index: u32, metric: u32) -> Self {
+        Self {
+            destination,
+            interface_index,
+            metric,
+            gateway: None,
+            table: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

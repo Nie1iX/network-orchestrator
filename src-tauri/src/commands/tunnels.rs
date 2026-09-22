@@ -160,6 +160,7 @@ fn derive_installable_routes(
             .map(|r| PolicyRoute {
                 destination: r.destination,
                 metric: 5,
+                via: None,
             })
             .collect(),
         TunnelBackend::OpenVpn => pushed
@@ -173,6 +174,7 @@ fn derive_installable_routes(
             .map(|r| PolicyRoute {
                 destination: r.destination,
                 metric: 5,
+                via: None,
             })
             .collect(),
         _ => Vec::new(),
@@ -678,6 +680,8 @@ mod tests {
                     destination: "10.4.0.0/24".parse().unwrap(),
                     interface_index: 5,
                     metric: 11,
+                    gateway: None,
+                    table: None,
                 }],
             }])
             .unwrap();

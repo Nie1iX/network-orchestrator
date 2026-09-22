@@ -25,7 +25,7 @@ systemd-resolved, NetworkManager — на VM). **Ubuntu-first:** Windows не
 - все юзеркейсы из §6 проходят на чистой Ubuntu 26.04 VM с приложением,
   установленным из `.deb`; smoke-набор (Q6) проходит на Debian stable и Arch;
 - quality gate из `AGENTS.md` зелёный на Linux;
-- Linux E2E harness (§5.I) в network namespaces на disposable VM зелёный;
+- Linux E2E harness (§5.I) на Docker-стенде зелёный;
 - README/`docs/security.md`/`docs/testing.md`/`AGENTS.md` описывают Linux.
 
 ## 1. Текущее состояние (снимок 2026-09-22)
@@ -343,11 +343,19 @@ Xray запускается через daemon от root. IP-адрес, MTU, м�
 ### I. Тестирование
 
 - Unit: TDD с fake daemon/executor (RED/GREEN, как сейчас).
-- **Linux E2E harness** (`crates/core/tests/linux_e2e.rs`, `--ignored` + env
-  ack, только disposable VM, например multipass/LXD): network namespaces
-  `ns-client`/`ns-server`, в server — WG peer, OpenVPN server (PKI
-  генерирует тест), Xray VLESS/Reality server. Покрывает split, full tunnel
-  (нет петли), DNS, crash cleanup. Хост не трогается.
+- **Linux E2E harness** (`--ignored` + env ack): Docker-стенд. На машине
+  разработки нет KVM, а LXD не установлен (executed). Два контейнера на
+  отдельной docker network:
+  - `client` — Ubuntu 26.04 с systemd, daemon, polkit и resolved;
+  - `server` — WG peer, OpenVPN server (PKI генерирует тест), Xray
+    VLESS/Reality и Hysteria2 server.
+
+  Контейнеры запускаются с `--cap-add NET_ADMIN --device /dev/net/tun`, без
+  `--privileged`. Проверено (executed 2026-09-22): внутри такого контейнера
+  работают WireGuard link с `fwmark`, отдельная таблица маршрутов с
+  `ip rule` и TUN; маршруты и интерфейсы хоста не меняются. Стенд покрывает
+  split, full tunnel (нет петли), DNS, crash cleanup и рестарт daemon'а.
+  Приёмка §6 — отдельно, на чистой Ubuntu (VM или железо).
 - UI smoke: ручной чек-лист §6, опционально `tauri-driver` + WebKitWebDriver.
 - `AGENTS.md`: добавить Linux gate и правила безопасности для `linux_e2e`.
 
@@ -389,7 +397,7 @@ Xray запускается через daemon от root. IP-адрес, MTU, м�
 |---|---|---|---|
 | S0 | Linux baseline | Закоммитить текущий Linux-порт; `npm run tauri dev` на Ubuntu; `get_platform_capabilities` + UI gating; фикс B1 | B1, F6 |
 | S1 | Daemon | Crate, systemd unit, socket + `SO_PEERCRED` + polkit, протокол и события, журнал/recovery, runtime-абстракция в `src-tauri`; миграция маршрутов (batch, `via`, tables); interface up/down; dev-install скрипт | B4, B8, B9, A*, E1 |
-| S2 | Linux E2E harness | netns-стенд на VM; сначала только маршруты | I |
+| S2 | Linux E2E harness | Docker-стенд client/server; сначала daemon + маршруты | I |
 | S3 | WireGuard Linux + D2 + D3 | Кернельный WG, fwmark/tables, resolvectl | B6, B7, B* WG, UC 03–05 |
 | S4 | OpenVPN Linux | Запуск в daemon'е, script-security, credentials, mark, DNS, management | B5, B10, B12, UC 06–08 |
 | S5 | Xray | TUN fix, парсеры, подписки/refresh, latency, mixed inbound, presets, managed Xray linux | B2, B3, UC 09–12 |

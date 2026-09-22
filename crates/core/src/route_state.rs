@@ -94,6 +94,8 @@ mod tests {
                     destination: "10.0.0.0/24".parse().unwrap(),
                     interface_index: 7,
                     metric: 5,
+                    gateway: None,
+                    table: None,
                 }],
             }],
         }
@@ -127,6 +129,31 @@ mod tests {
         let err = AppliedRouteStore::new(&path).load().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_applied_route_document_without_gateway_loads() {
+        let dir = unique_dir("legacy");
+        let path = dir.join("applied-routes.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"profiles":[{"profileId":"p1","routes":[
+                {"destination":"10.0.0.0/24","interfaceIndex":7,"metric":5}]}]}"#,
+        )
+        .unwrap();
+        let doc = AppliedRouteStore::new(&path).load().unwrap();
+        let route = &doc.profiles[0].routes[0];
+        assert_eq!(route.gateway, None);
+        assert_eq!(route.table, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn applied_route_none_fields_are_not_serialized() {
+        let route = AppliedRoute::on_link("10.0.0.0/24".parse().unwrap(), 7, 5);
+        let value = serde_json::to_value(&route).unwrap();
+        assert!(value.get("gateway").is_none());
+        assert!(value.get("table").is_none());
     }
 
     #[test]

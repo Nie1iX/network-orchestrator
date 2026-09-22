@@ -312,6 +312,7 @@ mod tests {
                 vec![PolicyRoute {
                     destination: cidr.parse().unwrap(),
                     metric,
+                    via: None,
                 }],
             )
         };
