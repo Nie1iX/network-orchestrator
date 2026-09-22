@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  PolicyKit actions for the Network Orchestrator daemon.
+
+  The daemon checks these itself over D-Bus (CheckAuthorization) for the
+  client process on the other end of its Unix socket; nothing is run via
+  pkexec, so there is no exec.path annotation.
+
+  connect-profile: removing the caller's own routes and recovery cleanup.
+    An active local session is allowed without a prompt.
+  system-network: applying routes and changing link state. Prompts for an
+    administrator once and caches the result (auth_admin_keep).
+-->
+<policyconfig>
+
+  <vendor>Network Orchestrator</vendor>
+  <vendor_url>https://github.com/Nie1iX/network-orchestrator</vendor_url>
+  <icon_name>network-workgroup</icon_name>
+
+  <action id="com.netmanager.app.connect-profile">
+    <description>Remove network changes made by Network Orchestrator</description>
+    <description xml:lang="ru">Отменить сетевые изменения Network Orchestrator</description>
+    <message>Network Orchestrator needs authorization to remove its network changes.</message>
+    <message xml:lang="ru">Network Orchestrator требует авторизацию для отмены своих сетевых изменений.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.netmanager.app.system-network">
+    <description>Change system network configuration</description>
+    <description xml:lang="ru">Изменить системную конфигурацию сети</description>
+    <message>Network Orchestrator needs administrative privileges to manage routes and network interfaces.</message>
+    <message xml:lang="ru">Network Orchestrator требует права администратора для управления маршрутами и сетевыми интерфейсами.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+</policyconfig>
