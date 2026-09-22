@@ -2603,10 +2603,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "network-orchestrator-linux-helper"
+name = "network-orchestrator-daemon"
 version = "0.1.1"
 dependencies = [
+ "futures",
  "ipnet",
+ "libc",
+ "net-manager-core",
+ "netlink-packet-route",
+ "rtnetlink",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zbus",
 ]
 
 [[package]]

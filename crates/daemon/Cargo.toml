@@ -1,0 +1,26 @@
+[package]
+name = "network-orchestrator-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "network-orchestrator-daemon"
+path = "src/main.rs"
+
+[lib]
+name = "network_orchestrator_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+net-manager-core = { path = "../core" }
+ipnet = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+futures = "0.3"
+libc = "0.2"
+netlink-packet-route = "=0.19.0"
+rtnetlink = "=0.14.1"
+zbus = "5"
