@@ -4,12 +4,16 @@
 
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::net::IpAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const RESOLVECTL: &str = "/usr/bin/resolvectl";
+/// resolvectl runs under the daemon's core lock; a hung resolved must not
+/// block every other RPC.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DNS_SERVERS: usize = 8;
 const MAX_DNS_DOMAINS: usize = 16;
 
@@ -102,23 +106,55 @@ impl DnsCommandRunner for SystemCommandRunner {
 
     fn run(&mut self, args: &[String]) -> io::Result<CommandOutput> {
         let mut command = Command::new(RESOLVECTL);
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null());
-        if args == ["--help"] {
-            let output = command.stdout(Stdio::piped()).output()?;
-            Ok(CommandOutput {
-                success: output.status.success(),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            })
-        } else {
-            Ok(CommandOutput {
-                success: command.stdout(Stdio::null()).status()?.success(),
-                stdout: String::new(),
-            })
-        }
+        command.args(args);
+        run_bounded(command, args == ["--help"], COMMAND_TIMEOUT)
     }
+}
+
+/// Run `command`, killing it once `timeout` expires.
+fn run_bounded(
+    mut command: Command,
+    capture: bool,
+    timeout: Duration,
+) -> io::Result<CommandOutput> {
+    command
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let mut child = command.spawn()?;
+    let reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "resolvectl timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    Ok(CommandOutput {
+        success: status.success(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+    })
 }
 
 pub struct ResolvectlDnsExecutor<R = SystemCommandRunner> {
@@ -263,6 +299,22 @@ fn validate_link(link: &str) -> Result<(), DnsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hung_command_is_killed_after_timeout() {
+        let started = std::time::Instant::now();
+        let mut sleep = Command::new("sleep");
+        sleep.arg("5");
+        let Err(error) = run_bounded(sleep, false, Duration::from_millis(100)) else {
+            panic!("hung command was not killed");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let mut echo = Command::new("echo");
+        echo.arg("default-route");
+        let output = run_bounded(echo, true, COMMAND_TIMEOUT).unwrap();
+        assert!(output.success && output.stdout.contains("default-route"));
+    }
 
     #[test]
     fn xray_tun_link_is_accepted_for_per_link_dns() {
