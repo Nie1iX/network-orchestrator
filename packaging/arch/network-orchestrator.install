@@ -1,0 +1,5 @@
+post_install() {
+    printf '%s\n' 'Enable the Network Orchestrator daemon with:' \
+        '  sudo systemctl enable --now network-orchestrator.service' \
+        'Use pacman to update Network Orchestrator.'
+}

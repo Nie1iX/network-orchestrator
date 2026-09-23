@@ -6,6 +6,14 @@ use net_manager_core::models::*;
 use net_manager_core::system_proxy::ProxyOwnership;
 use tauri::{Emitter, State};
 
+#[cfg(target_os = "linux")]
+fn daemon_owned_profile(profile: &Profile) -> bool {
+    matches!(
+        profile.backend,
+        TunnelBackend::WireGuard | TunnelBackend::OpenVpn
+    ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun)
+}
+
 pub(crate) fn build_recovery_report(
     profiles: &[Profile],
     statuses: &[(String, TunnelStatus)],
@@ -28,18 +36,26 @@ pub(crate) fn build_recovery_report(
         let Some(profile) = profiles.iter().find(|p| &p.id == profile_id) else {
             continue;
         };
+        #[cfg(target_os = "linux")]
+        if !daemon_owned_profile(profile) {
+            continue;
+        }
+        #[cfg(not(target_os = "linux"))]
         if profile.backend != TunnelBackend::WireGuard {
             continue;
         }
         match status.state {
-            TunnelState::Running => issues.push(RecoveryIssue {
-                kind: RecoveryIssueKind::SurvivingWireGuardService,
-                profile_id: Some(profile_id.clone()),
-                message: format!(
-                    "WireGuard tunnel service for profile '{}' ('{}') may still be installed",
-                    profile.id, profile.name
-                ),
-            }),
+            TunnelState::Running => {
+                #[cfg(not(target_os = "linux"))]
+                issues.push(RecoveryIssue {
+                    kind: RecoveryIssueKind::SurvivingWireGuardService,
+                    profile_id: Some(profile_id.clone()),
+                    message: format!(
+                        "WireGuard tunnel service for profile '{}' ('{}') may still be installed",
+                        profile.id, profile.name
+                    ),
+                });
+            }
             TunnelState::Failed => issues.push(RecoveryIssue {
                 kind: RecoveryIssueKind::StatusCheckFailed,
                 profile_id: Some(profile_id.clone()),
@@ -106,12 +122,42 @@ pub(crate) fn build_recovery_report(
 async fn collect_report(state: &AppState) -> Result<RecoveryReport, String> {
     let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let os_routes = explorer::list_routes().await.map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    let mut statuses = Vec::with_capacity(profiles.len());
+    #[cfg(target_os = "linux")]
+    let client = crate::daemon_client::DaemonClient::system();
+    #[cfg(target_os = "linux")]
+    for profile in &profiles {
+        if daemon_owned_profile(profile) {
+            let result = if profile.backend == TunnelBackend::WireGuard {
+                crate::commands::tunnels::linux_wireguard_status(&client, profile).await
+            } else if profile.backend == TunnelBackend::OpenVpn {
+                crate::commands::tunnels::linux_openvpn_status(&client, profile).await
+            } else {
+                crate::commands::tunnels::linux_xray_status(&client, profile).await
+            };
+            let status = result.unwrap_or_else(|err| TunnelStatus {
+                profile_id: profile.id.clone(),
+                state: TunnelState::Failed,
+                message: Some(err),
+            });
+            statuses.push((profile.id.clone(), status));
+        }
+    }
     let mut runtime = state.runtime.lock().await;
+    #[cfg(not(target_os = "linux"))]
     let statuses: Vec<(String, TunnelStatus)> = profiles
         .iter()
         .map(|p| (p.id.clone(), runtime.tunnels.status(p)))
         .collect();
-    let ownership = runtime.policies.snapshot();
+    #[cfg(target_os = "linux")]
+    statuses.extend(
+        profiles
+            .iter()
+            .filter(|p| !daemon_owned_profile(p))
+            .map(|p| (p.id.clone(), runtime.tunnels.status(p))),
+    );
+    let ownership = runtime.routes.snapshot().await?;
     let proxy_ownership = runtime.proxy.ownership().cloned();
     drop(runtime);
     Ok(build_recovery_report(
@@ -135,6 +181,8 @@ pub(crate) async fn cleanup_recovery(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<RecoveryReport, String> {
+    #[cfg(target_os = "linux")]
+    crate::lifecycle::disconnect_all(&state, &crate::daemon_client::DaemonClient::system()).await?;
     cleanup_all(&state).await?;
     let _ = app.emit("route-changed", ());
     collect_report(&state).await
@@ -169,6 +217,44 @@ mod tests {
         )
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_linux_wireguard_reports_active_link() {
+        let profiles = vec![profile("wg-work")];
+        let report = build_recovery_report(
+            &profiles,
+            &[status("p1", TunnelState::Running)],
+            &[],
+            &[],
+            None,
+        );
+        assert!(report.issues.is_empty());
+        assert!(!report.requires_elevation);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_linux_openvpn_is_not_a_recovery_issue() {
+        let mut p = profile("ovpn-work");
+        p.backend = TunnelBackend::OpenVpn;
+        let report =
+            build_recovery_report(&[p], &[status("p1", TunnelState::Running)], &[], &[], None);
+        assert!(report.issues.is_empty());
+        assert!(!report.requires_elevation);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_linux_openvpn_status_is_recovery_issue() {
+        let mut p = profile("ovpn-work");
+        p.backend = TunnelBackend::OpenVpn;
+        let mut failed = status("p1", TunnelState::Failed);
+        failed.1.message = Some("daemon unavailable".into());
+        let report = build_recovery_report(&[p], &[failed], &[], &[], None);
+        assert_eq!(report.issues[0].kind, RecoveryIssueKind::StatusCheckFailed);
+        assert!(report.issues[0].message.contains("daemon unavailable"));
+    }
+
     #[test]
     fn running_wireguard_and_owned_routes_produce_two_issues() {
         let profiles = vec![profile("wg-work")];
@@ -179,13 +265,24 @@ mod tests {
         let report = build_recovery_report(&profiles, &statuses, &ownership, &os_routes, None);
 
         assert!(report.requires_elevation);
-        assert_eq!(report.issues.len(), 2);
+        #[cfg(target_os = "linux")]
+        assert_eq!(report.issues.len(), 1);
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(report.issues.len(), 2);
+            assert_eq!(
+                report.issues[0].kind,
+                RecoveryIssueKind::SurvivingWireGuardService
+            );
+        }
         assert_eq!(
-            report.issues[0].kind,
-            RecoveryIssueKind::SurvivingWireGuardService
+            report.issues.last().unwrap().kind,
+            RecoveryIssueKind::OwnedRoutes
         );
-        assert_eq!(report.issues[1].kind, RecoveryIssueKind::OwnedRoutes);
-        assert_eq!(report.issues[1].profile_id.as_deref(), Some("p1"));
+        assert_eq!(
+            report.issues.last().unwrap().profile_id.as_deref(),
+            Some("p1")
+        );
     }
 
     #[test]
@@ -242,6 +339,21 @@ mod tests {
         assert_eq!(report.issues.len(), 1);
         assert_eq!(report.issues[0].kind, RecoveryIssueKind::StatusCheckFailed);
         assert!(report.issues[0].message.contains("service query failed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_xray_tun_daemon_status_is_a_recovery_issue() {
+        let mut p = profile("xray");
+        p.backend = TunnelBackend::Xray;
+        p.xray_mode = XrayMode::Tun;
+        let mut failed = status(&p.id, TunnelState::Failed);
+        failed.1.message = Some("daemon status unavailable".into());
+        let report = build_recovery_report(&[p], &[failed], &[], &[], None);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.kind == RecoveryIssueKind::StatusCheckFailed));
     }
 
     #[test]

@@ -58,6 +58,7 @@ export interface RouteLookupResult {
   destination: string;
   matchedRoute: RouteEntry;
   interfaceName: string;
+  table?: string | null;
 }
 
 export function formatKind(kind: InterfaceKind): string {
@@ -96,8 +97,8 @@ export const CATEGORY_LABELS: Record<InterfaceCategory, string> = {
 export const CATEGORY_DESCRIPTIONS: Record<InterfaceCategory, string> = {
   physical: "Real network adapters: Ethernet, Wi-Fi, Bluetooth",
   vpn: "VPN tunnels: WireGuard, OpenVPN, Xray, Tailscale",
-  virtual: "Virtual switches and bridges: Hyper-V, WSL, Wi-Fi Direct",
-  system: "OS-internal: Loopback, Kernel Debug",
+  virtual: "Virtual links, switches and bridges",
+  system: "OS-internal: loopback and kernel interfaces",
   tunnel: "OS tunnel pseudo-interfaces: Teredo, 6to4, WAN Miniports",
   filter: "Filter drivers: WFP, Npcap, QoS — sub-interfaces of real adapters",
 };
@@ -126,9 +127,28 @@ export type TunnelBackend = "none" | "wireGuard" | "openVpn" | "xray";
 export interface PolicyRoute {
   destination: string;
   metric: number;
+  via?: string | null;
 }
 
-export type DomainRouteTarget = "proxy" | "direct";
+export interface DaemonStatus {
+  state: "notRequired" | "notInstalled" | "notRunning" | "incompatible" | "ready" | "error";
+  message: string;
+}
+
+export type AlwaysOnKind = "wireGuard" | "staticRoutes";
+
+export interface AlwaysOnListResult {
+  profiles: { kind: AlwaysOnKind; profileId: string; enabled: boolean }[];
+  paused: boolean;
+  supportedKinds: AlwaysOnKind[];
+}
+
+export interface AlwaysOnSetResult {
+  stored: boolean;
+  active: boolean;
+}
+
+export type DomainRouteTarget = "proxy" | "direct" | "block";
 
 export interface DomainPolicy {
   domains: string[];
@@ -140,11 +160,35 @@ export interface SubscriptionMeta {
   hwid: string;
   endpointCount: number;
   activeIndex: number;
+  refreshIntervalMinutes: number | null;
+  lastRefreshAtUnix: number | null;
+  lastRefreshError: string | null;
+  userInfo: SubscriptionUserInfo | null;
+}
+
+export interface SubscriptionUserInfo {
+  uploadBytes: number;
+  downloadBytes: number;
+  totalBytes: number | null;
+  expiresAtUnix: number | null;
 }
 
 export interface SubscriptionEndpointInfo {
   name: string;
   active: boolean;
+}
+
+export interface SubscriptionRefreshResult {
+  endpointCount: number;
+  activeIndex: number;
+  skippedCount: number;
+  fallbackUsed: boolean;
+  cleanupFailed: boolean;
+}
+
+export interface SubscriptionDelayResult {
+  delayMs: number | null;
+  error: string | null;
 }
 
 export interface WireGuardFields {
@@ -169,7 +213,9 @@ export interface Profile {
   routes: PolicyRoute[];
   autoConnect: boolean;
   domainPolicies: DomainPolicy[];
+  privateLanDirect: boolean;
   xraySocksPort: number | null;
+  xrayHttpPort: number | null;
   useSystemProxy: boolean;
   proxyBypass: string[];
   subscription: SubscriptionMeta | null;

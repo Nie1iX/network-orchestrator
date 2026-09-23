@@ -1,4 +1,5 @@
 use crate::models::*;
+#[cfg(not(target_os = "linux"))]
 use ipnet::IpNet;
 use net_route::Handle as RouteHandle;
 use std::collections::HashMap;
@@ -57,9 +58,10 @@ fn route_metric(r: &net_route::Route) -> u32 {
     }
 }
 
-// ── Route lookup (cross-platform, pure logic) ──────────────────────────
+// ── Route lookup ────────────────────────────────────────────────────────
 
 /// Given a destination IP, find which route and interface the OS would use.
+#[cfg(not(target_os = "linux"))]
 pub async fn lookup_route(dest: IpAddr) -> std::io::Result<RouteLookupResult> {
     let routes = list_routes().await?;
 
@@ -93,7 +95,154 @@ pub async fn lookup_route(dest: IpAddr) -> std::io::Result<RouteLookupResult> {
         destination: dest,
         matched_route: matched.clone(),
         interface_name: matched.interface_name.clone(),
+        table: None,
     })
+}
+
+#[cfg(target_os = "linux")]
+const MAX_ROUTE_GET_BYTES: usize = 16 * 1024;
+
+#[cfg(target_os = "linux")]
+fn parse_linux_route_get(
+    dest: IpAddr,
+    bytes: &[u8],
+    interfaces: &[NetworkInterface],
+) -> std::io::Result<RouteLookupResult> {
+    use serde::Deserialize;
+    use std::io::{Error, ErrorKind};
+
+    #[derive(Deserialize)]
+    struct RouteGetRow {
+        dst: String,
+        dev: String,
+        gateway: Option<String>,
+        metric: Option<u32>,
+        table: Option<serde_json::Value>,
+    }
+
+    let invalid = || Error::new(ErrorKind::InvalidData, "invalid route lookup response");
+    if bytes.len() > MAX_ROUTE_GET_BYTES {
+        return Err(invalid());
+    }
+    let mut rows: Vec<RouteGetRow> = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    if rows.len() != 1 {
+        return Err(invalid());
+    }
+    let row = rows.pop().ok_or_else(invalid)?;
+    if row.dev.is_empty() {
+        return Err(invalid());
+    }
+    let (destination, prefix_len) = if row.dst == "default" {
+        (
+            if dest.is_ipv4() { "0.0.0.0" } else { "::" }
+                .parse()
+                .unwrap(),
+            0,
+        )
+    } else if let Ok(net) = row.dst.parse::<ipnet::IpNet>() {
+        (net.addr(), net.prefix_len())
+    } else {
+        let address: IpAddr = row.dst.parse().map_err(|_| invalid())?;
+        (address, if address.is_ipv4() { 32 } else { 128 })
+    };
+    if destination.is_ipv4() != dest.is_ipv4()
+        || !ipnet::IpNet::new(destination, prefix_len)
+            .map_err(|_| invalid())?
+            .contains(&dest)
+    {
+        return Err(invalid());
+    }
+    let table = match row.table {
+        None => "main".to_string(),
+        Some(serde_json::Value::String(table)) if !table.is_empty() && table.len() <= 32 => table,
+        Some(serde_json::Value::Number(table)) => {
+            let id = table
+                .as_u64()
+                .filter(|id| *id <= u32::MAX as u64)
+                .ok_or_else(invalid)?;
+            id.to_string()
+        }
+        _ => return Err(invalid()),
+    };
+    let gateway = row
+        .gateway
+        .map(|value| value.parse().map_err(|_| invalid()))
+        .transpose()?;
+    let (interface_index, interface_name) = interfaces
+        .iter()
+        .find(|interface| interface.name == row.dev)
+        .map(|interface| (interface.if_index, interface.friendly_name.clone()))
+        .unwrap_or((0, row.dev));
+    Ok(RouteLookupResult {
+        destination: dest,
+        matched_route: RouteEntry {
+            destination,
+            prefix_len,
+            gateway,
+            interface_index,
+            interface_name: interface_name.clone(),
+            metric: row.metric.unwrap_or(0),
+        },
+        interface_name,
+        table: Some(table),
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub async fn lookup_route(dest: IpAddr) -> std::io::Result<RouteLookupResult> {
+    use std::io::{Error, ErrorKind};
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    let mut child = tokio::process::Command::new("/usr/sbin/ip")
+        .args([
+            "-j",
+            if dest.is_ipv4() { "-4" } else { "-6" },
+            "route",
+            "get",
+            "fibmatch",
+        ])
+        .arg(dest.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| Error::new(ErrorKind::NotFound, "iproute2 is unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::other("route lookup failed"))?;
+    let mut bytes = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        stdout
+            .take((MAX_ROUTE_GET_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() > MAX_ROUTE_GET_BYTES {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "route lookup response too large",
+            ));
+        }
+        if !child.wait().await?.success() {
+            return Err(Error::new(ErrorKind::NotFound, "no matching route"));
+        }
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => parse_linux_route_get(dest, &bytes, &list_interfaces().unwrap_or_default()),
+        Ok(Err(err)) => {
+            let _ = child.kill().await;
+            Err(err)
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(Error::new(ErrorKind::TimedOut, "route lookup timed out"))
+        }
+    }
 }
 
 // ── Route change watcher (cross-platform via net-route) ─────────────────
@@ -985,5 +1134,75 @@ mod tests {
             routes.iter().any(|r| r.destination.is_unspecified()),
             "should have a default route"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn route_get_parser_preserves_policy_table_and_matched_prefix() {
+        let dest = "198.51.100.9".parse().unwrap();
+        let json =
+            br#"[{"dst":"198.51.100.0/24","dev":"wg-test","table":51820,"metric":5,"flags":[]}]"#;
+
+        let result = parse_linux_route_get(dest, json, &[]).unwrap();
+
+        assert_eq!(result.matched_route.destination.to_string(), "198.51.100.0");
+        assert_eq!(result.matched_route.prefix_len, 24);
+        assert_eq!(result.matched_route.interface_name, "wg-test");
+        assert_eq!(result.matched_route.metric, 5);
+        assert_eq!(result.table.as_deref(), Some("51820"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn route_get_parser_defaults_omitted_table_to_main() {
+        let dest = "1.1.1.1".parse().unwrap();
+        let json = br#"[{"dst":"default","gateway":"192.0.2.1","dev":"eth0","flags":[]}]"#;
+
+        let result = parse_linux_route_get(dest, json, &[]).unwrap();
+
+        assert_eq!(result.matched_route.destination.to_string(), "0.0.0.0");
+        assert_eq!(result.matched_route.prefix_len, 0);
+        assert_eq!(
+            result.matched_route.gateway.unwrap().to_string(),
+            "192.0.2.1"
+        );
+        assert_eq!(result.table.as_deref(), Some("main"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn route_get_parser_supports_ipv6_local_and_rejects_bad_shapes() {
+        let dest = "::1".parse().unwrap();
+        let json = br#"[{"type":"local","dst":"::1","dev":"lo","table":"local"}]"#;
+        let result = parse_linux_route_get(dest, json, &[]).unwrap();
+        assert_eq!(result.matched_route.prefix_len, 128);
+        assert_eq!(result.table.as_deref(), Some("local"));
+
+        for bad in [
+            &b"[]"[..],
+            &b"[{\"dst\":\"::1\",\"dev\":\"lo\"},{\"dst\":\"::1\",\"dev\":\"lo\"}]"[..],
+            &b"[{\"dst\":\"1.1.1.1\",\"dev\":\"lo\"}]"[..],
+            &b"[{\"dst\":\"2001:db8::/32\",\"dev\":\"lo\"}]"[..],
+            &b"[{\"dst\":\"::1\",\"table\":\"local\"}]"[..],
+        ] {
+            assert!(parse_linux_route_get(dest, bad, &[]).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn route_get_parser_bounds_json_and_table_value() {
+        let dest = "1.1.1.1".parse().unwrap();
+        let oversized = format!(
+            r#"[{{"dst":"default","dev":"eth0","padding":"{}"}}]"#,
+            "x".repeat(MAX_ROUTE_GET_BYTES)
+        );
+        assert!(parse_linux_route_get(dest, oversized.as_bytes(), &[]).is_err());
+        assert!(parse_linux_route_get(
+            dest,
+            br#"[{"dst":"default","dev":"eth0","table":true}]"#,
+            &[]
+        )
+        .is_err());
     }
 }

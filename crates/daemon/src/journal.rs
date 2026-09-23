@@ -6,9 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const JOURNAL_VERSION: u32 = 1;
+pub const JOURNAL_VERSION: u32 = 5;
 pub const JOURNAL_FILE: &str = "state.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,9 +45,8 @@ impl JournalStore {
         Self { path: path.into() }
     }
 
-    /// Missing file → empty journal. A malformed or unknown-version file is
-    /// renamed to `state.json.corrupt-<ts>` and the daemon starts empty:
-    /// refusing to start would leave the user with no daemon at all.
+    /// Missing file → empty journal. A malformed or unknown-version file
+    /// prevents startup so previously owned network resources are not lost.
     pub fn load(&self) -> io::Result<JournalDocument> {
         let raw = match fs::read(&self.path) {
             Ok(raw) => raw,
@@ -58,16 +56,14 @@ impl JournalStore {
             Err(err) => return Err(err),
         };
         match serde_json::from_slice::<JournalDocument>(&raw) {
-            Ok(doc) if doc.version == JOURNAL_VERSION => Ok(doc),
-            _ => {
-                let quarantine = self.quarantine_path();
-                fs::rename(&self.path, &quarantine)?;
-                eprintln!(
-                    "network-orchestrator-daemon: unreadable journal moved to {}",
-                    quarantine.display()
-                );
-                Ok(JournalDocument::default())
+            Ok(mut doc) if (1..=JOURNAL_VERSION).contains(&doc.version) => {
+                doc.version = JOURNAL_VERSION;
+                Ok(doc)
             }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ownership journal is unreadable or has an unsupported version",
+            )),
         }
     }
 
@@ -90,16 +86,6 @@ impl JournalStore {
             return Err(err);
         }
         sync_dir(parent)
-    }
-
-    fn quarantine_path(&self) -> PathBuf {
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let mut name = self.path.clone().into_os_string();
-        name.push(format!(".corrupt-{millis}"));
-        PathBuf::from(name)
     }
 }
 
@@ -214,28 +200,72 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_version_is_quarantined() {
+    fn unsupported_version_blocks_start_and_preserves_journal() {
         let dir = unique_dir("version");
         let path = dir.join(JOURNAL_FILE);
-        fs::write(&path, r#"{"version":99,"entries":[]}"#).unwrap();
-        let doc = JournalStore::new(&path).load().unwrap();
-        assert_eq!(doc, JournalDocument::default());
-        let names = file_names(&dir);
-        assert_eq!(names.len(), 1, "{names:?}");
-        assert!(names[0].starts_with("state.json.corrupt-"), "{names:?}");
+        let original = r#"{"version":99,"entries":[]}"#;
+        fs::write(&path, original).unwrap();
+        let store = JournalStore::new(&path);
+        assert_eq!(store.load().unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(store.load().unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn malformed_is_quarantined() {
+    fn malformed_blocks_start_and_preserves_journal() {
         let dir = unique_dir("malformed");
         let path = dir.join(JOURNAL_FILE);
         fs::write(&path, "{not json").unwrap();
-        let doc = JournalStore::new(&path).load().unwrap();
-        assert!(doc.entries.is_empty());
-        let names = file_names(&dir);
-        assert_eq!(names.len(), 1, "{names:?}");
-        assert!(names[0].starts_with("state.json.corrupt-"), "{names:?}");
+        let store = JournalStore::new(&path);
+        assert_eq!(store.load().unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(store.load().unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{not json");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn version_one_route_journal_remains_readable_for_recovery() {
+        let dir = unique_dir("v1-route");
+        let path = dir.join(JOURNAL_FILE);
+        fs::write(&path, r#"{"version":1,"entries":[{"uid":1000,"owner":"static-office","state":"applied","resources":[{"kind":"route","destination":"203.0.113.0/24","interfaceIndex":2,"metric":5}]}]}"#).unwrap();
+        let loaded = JournalStore::new(&path).load().unwrap();
+        assert_eq!(loaded.version, JOURNAL_VERSION);
+        assert_eq!(loaded.entries.len(), 1);
+        assert!(matches!(
+            loaded.entries[0].resources[0],
+            OwnedResource::Route(_)
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn version_two_wireguard_link_remains_readable_for_recovery() {
+        let dir = unique_dir("v2-wireguard");
+        let path = dir.join(JOURNAL_FILE);
+        fs::write(&path, r#"{"version":2,"entries":[{"uid":1000,"owner":"wg:home","state":"applied","resources":[{"kind":"wireGuardLink","name":"wg-ab12","index":42,"ownerMarker":"network-orchestrator:1000:wg:home"}]}]}"#).unwrap();
+        let loaded = JournalStore::new(&path).load().unwrap();
+        assert_eq!(loaded.version, JOURNAL_VERSION);
+        assert!(matches!(
+            loaded.entries[0].resources[0],
+            OwnedResource::WireGuardLink(_)
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn version_three_openvpn_process_upgrades_without_inventing_full_ownership() {
+        let dir = unique_dir("v3-openvpn");
+        let path = dir.join(JOURNAL_FILE);
+        fs::write(&path, r#"{"version":3,"entries":[{"uid":1000,"owner":"ovpn:home","state":"applied","resources":[{"kind":"openVpnProcess","name":"ovpn-ab12","ownerMarker":"network-orchestrator:1000:ovpn:home"}]}]}"#).unwrap();
+        let store = JournalStore::new(&path);
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.version, JOURNAL_VERSION);
+        assert!(
+            matches!(&loaded.entries[0].resources[0], OwnedResource::OpenVpnProcess(process) if process.transport_mark.is_none() && process.full.is_none())
+        );
+        store.save(&loaded).unwrap();
+        assert_eq!(store.load().unwrap(), loaded);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

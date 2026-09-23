@@ -1455,6 +1455,17 @@ button:disabled {
   font-size: 0.78rem;
 }
 
+.profile-bulk-cidrs textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.profile-bulk-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
 .profile-routes-empty {
   color: var(--text-muted);
 }

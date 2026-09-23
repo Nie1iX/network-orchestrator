@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import Modal from "./Modal";
@@ -20,7 +20,7 @@ const BACKEND_LABELS: Record<TunnelBackend, string> = {
   none: "Static routes",
   wireGuard: "WireGuard",
   openVpn: "OpenVPN",
-  xray: "Xray/VLESS",
+  xray: "Xray",
 };
 
 const BACKEND_EXTENSIONS: Record<TunnelBackend, string[]> = {
@@ -69,12 +69,15 @@ export interface ProfileFormState {
   configPath: string;
   interfaceName: string;
   routes: PolicyRoute[];
+  autoConnect: boolean;
   xraySource: "json" | "vless";
   vlessUrl: string;
   wgSource: "file" | "fields";
   wgFields: WireGuardFields;
   xraySocksPort: number | null;
+  xrayHttpPort: number | null;
   domainPolicies: DomainPolicy[];
+  privateLanDirect: boolean;
   useSystemProxy: boolean;
   proxyBypass: string;
   isNew: boolean;
@@ -92,12 +95,15 @@ export function newFormState(backend: TunnelBackend = "wireGuard"): ProfileFormS
     configPath: "",
     interfaceName: "",
     routes: [],
+    autoConnect: false,
     xraySource: "json",
     vlessUrl: "",
     wgSource: "fields",
     wgFields: { ...EMPTY_WG_FIELDS },
     xraySocksPort: null,
+    xrayHttpPort: null,
     domainPolicies: [],
+    privateLanDirect: false,
     useSystemProxy: false,
     proxyBypass: DEFAULT_PROXY_BYPASS,
     isNew: true,
@@ -116,15 +122,18 @@ export function editFormState(profile: Profile): ProfileFormState {
     configPath: profile.configPath,
     interfaceName: profile.interfaceName,
     routes: profile.routes.map((r) => ({ ...r })),
+    autoConnect: profile.autoConnect,
     xraySource: "json",
     vlessUrl: "",
     wgSource: "file",
     wgFields: { ...EMPTY_WG_FIELDS },
     xraySocksPort: profile.xraySocksPort,
+    xrayHttpPort: profile.xrayHttpPort,
     domainPolicies: profile.domainPolicies.map((p) => ({
       domains: [...p.domains],
       target: p.target,
     })),
+    privateLanDirect: profile.privateLanDirect,
     useSystemProxy: profile.useSystemProxy,
     proxyBypass: profile.proxyBypass.join(", "),
     isNew: false,
@@ -159,12 +168,16 @@ export default function ProfileFormModal({
   const [probing, setProbing] = useState(false);
   const [probeResults, setProbeResults] = useState<AnalyzedRoute[] | null>(null);
   const [probeNotice, setProbeNotice] = useState<string | null>(null);
+  const [bulkCidrs, setBulkCidrs] = useState("");
+  const [bulkBusy, setBulkBusy] = useState(false);
 
-  // Sync incoming editing state when modal opens.
-  if (editing && form !== editing && open) {
-    setForm(editing);
-    setFormError(null);
-  }
+  useEffect(() => {
+    if (open) {
+      setForm(editing);
+      setFormError(null);
+      setBulkCidrs("");
+    }
+  }, [open, editing?.id]);
 
   const current = form ?? editing;
   if (!current) return null;
@@ -174,6 +187,11 @@ export default function ProfileFormModal({
     current.xrayMode === "socks" &&
     (current.xraySocksPort !== null ||
       (current.isNew && current.xraySource === "vless"));
+  const daemonManagedInterface = caps?.os === "linux" && (
+    current.backend === "wireGuard" ||
+    current.backend === "openVpn" ||
+    (current.backend === "xray" && current.xrayMode === "tun")
+  );
 
   const update = (patch: Partial<ProfileFormState>) =>
     setForm({ ...current, ...patch });
@@ -254,6 +272,31 @@ export default function ProfileFormModal({
       ),
     });
 
+  const addBulkCidrs = async () => {
+    if (!bulkCidrs.trim()) return;
+    setBulkBusy(true);
+    setFormError(null);
+    try {
+      const cidrs = await invoke<string[]>("parse_bulk_cidrs", { input: bulkCidrs });
+      if (cidrs.length === 0) {
+        setFormError("No CIDRs found in the pasted list.");
+        return;
+      }
+      const existing = new Set(current.routes.map((route) => route.destination.trim()));
+      update({
+        routes: [
+          ...current.routes,
+          ...cidrs.filter((cidr) => !existing.has(cidr)).map((destination) => ({ destination, metric: 5 })),
+        ],
+      });
+      setBulkCidrs("");
+    } catch (err) {
+      setFormError(String(err));
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
   const save = async () => {
     for (const route of current.routes) {
       if (!route.destination.trim()) {
@@ -261,7 +304,8 @@ export default function ProfileFormModal({
         return;
       }
     }
-    if (current.routes.length > 0 && !current.interfaceName.trim()) {
+    if (current.routes.length > 0 && !current.interfaceName.trim()
+      && !daemonManagedInterface) {
       setFormError("Target interface is required when policy routes are set.");
       return;
     }
@@ -292,14 +336,14 @@ export default function ProfileFormModal({
     if (isXray) {
       for (const policy of domainPolicies) {
         if (policy.domains.length === 0) {
-          setFormError("Each domain rule must list at least one domain.");
+          setFormError("Each routing rule must list at least one selector.");
           return;
         }
       }
     }
     if (isVlessImport) {
       if (!current.vlessUrl.trim()) {
-        setFormError("VLESS URL is required.");
+         setFormError("Share link is required.");
         return;
       }
       if (
@@ -344,9 +388,11 @@ export default function ProfileFormModal({
       routes: current.routes.map((r) => ({
         destination: r.destination.trim(),
         metric: clampMetric(r.metric),
+        via: r.via?.trim() || null,
       })),
-      autoConnect: false,
+      autoConnect: current.autoConnect,
       domainPolicies: isXray ? domainPolicies : [],
+      privateLanDirect: isXray && current.privateLanDirect,
       xraySocksPort: !isXray
         ? null
         : isVlessImport
@@ -354,12 +400,13 @@ export default function ProfileFormModal({
           : current.isNew
             ? null
             : current.xraySocksPort,
+      xrayHttpPort: isXray && !current.isNew ? current.xrayHttpPort : null,
       useSystemProxy: isXray && current.useSystemProxy && current.xrayMode === "socks",
       proxyBypass: isXray ? proxyBypass : [],
       subscription: current.isNew ? null : current.subscription ?? null,
       xrayMode: isXray ? current.xrayMode : "socks",
-      xrayTunInterface: isXray && current.xrayMode === "tun" ? current.xrayTunInterface.trim() : null,
-      xrayTunIp: isXray && current.xrayMode === "tun" ? current.xrayTunIp.trim() : null,
+      xrayTunInterface: isXray && current.xrayMode === "tun" && caps?.os === "windows" ? current.xrayTunInterface.trim() : null,
+      xrayTunIp: isXray && current.xrayMode === "tun" && caps?.os === "windows" ? current.xrayTunIp.trim() : null,
     };
     setSaving(true);
     try {
@@ -441,6 +488,7 @@ export default function ProfileFormModal({
               configPath: "",
               domainPolicies:
                 backend === "xray" ? current.domainPolicies : [],
+              privateLanDirect: backend === "xray" && current.privateLanDirect,
               xraySource: "json",
               xraySocksPort:
                 backend === "xray"
@@ -448,15 +496,26 @@ export default function ProfileFormModal({
                     ? null
                     : (current.xraySocksPort ?? 10808)
                   : null,
+              xrayHttpPort: backend === "xray" ? current.xrayHttpPort : null,
             });
           }}
         >
           <option value="none">Static routes (no tunnel)</option>
           <option value="wireGuard">WireGuard</option>
           <option value="openVpn">OpenVPN</option>
-          <option value="xray">Xray/VLESS</option>
+          <option value="xray">Xray</option>
         </select>
       </label>
+      {caps?.os === "linux" && (
+        <label className="profile-proxy-toggle">
+          <input
+            type="checkbox"
+            checked={current.autoConnect}
+            onChange={(e) => update({ autoConnect: e.target.checked })}
+          />
+          Connect when the app starts
+        </label>
+      )}
       </div>
 
       <div className="form-section">
@@ -472,7 +531,7 @@ export default function ProfileFormModal({
             }
           >
             <option value="json">Existing Xray JSON</option>
-            <option value="vless">Import vless:// URL</option>
+            <option value="vless">Import share link</option>
           </select>
         </label>
       )}
@@ -496,12 +555,12 @@ export default function ProfileFormModal({
       current.xraySource === "vless" ? (
         <>
           <label>
-            VLESS URL
+            Share link
             <input
               type="password"
               value={current.vlessUrl}
               onChange={(e) => update({ vlessUrl: e.target.value })}
-              placeholder="vless://uuid@host:port?…"
+              placeholder="vless:// or hysteria2://…"
               autoComplete="off"
             />
           </label>
@@ -663,7 +722,7 @@ export default function ProfileFormModal({
           interface (e.g. Ethernet) without starting a tunnel.
         </span>
       )}
-      {current.backend === "openVpn" && !current.isNew && current.configPath.trim() && (
+      {current.backend === "openVpn" && caps?.os !== "linux" && !current.isNew && current.configPath.trim() && (
         <div className="profile-probe">
           <button
             type="button"
@@ -713,13 +772,23 @@ export default function ProfileFormModal({
             }
           >
             <option value="socks">SOCKS5 (system proxy)</option>
-            <option value="tun">TUN (full tunnel, requires admin)</option>
+            <option value="tun" disabled={caps?.os === "linux" && current.xraySource !== "vless" && current.xraySocksPort === null}>
+              {caps?.os === "linux" ? "TUN (network daemon, generated links)" : "TUN (full tunnel, requires admin)"}
+            </option>
           </select>
         </label>
       )}
       {current.backend === "xray" &&
         current.xrayMode === "tun" && (
           <div className="profile-tun-fields">
+            {caps?.os === "linux" ? (
+              <span className="profile-help">
+                The network daemon assigns the TUN interface and IP. With no
+                policy routes, IPv4 uses a default route and 1.1.1.1 DNS;
+                explicit split routes do not set DNS automatically.
+              </span>
+            ) : (
+            <>
             <label>
               TUN interface name
               <input
@@ -744,6 +813,8 @@ export default function ProfileFormModal({
               TUN mode captures all IP traffic via a TUN interface. Domain
               policies still apply inside Xray. System proxy is not used.
             </span>
+            </>
+            )}
           </div>
         )}
       {current.backend === "xray" &&
@@ -754,6 +825,17 @@ export default function ProfileFormModal({
             <span className="row-label">SOCKS5</span>
             <span className="row-value mono">
               127.0.0.1:{current.xraySocksPort}
+            </span>
+          </div>
+        )}
+      {current.backend === "xray" &&
+        !current.isNew &&
+        current.xrayMode === "socks" &&
+        current.xrayHttpPort !== null && (
+          <div className="interface-row">
+            <span className="row-label">HTTP CONNECT</span>
+            <span className="row-value mono">
+              127.0.0.1:{current.xrayHttpPort}
             </span>
           </div>
         )}
@@ -799,7 +881,7 @@ export default function ProfileFormModal({
       )}
       <div className="form-section">
       <span className="form-section-title">Routing</span>
-      <label>
+      {!daemonManagedInterface && <label>
         Target interface (required for policy routes)
         <input
           type="text"
@@ -817,7 +899,7 @@ export default function ProfileFormModal({
             />
           ))}
         </datalist>
-      </label>
+      </label>}
       <div className="profile-routes">
         <div className="profile-routes-head">
           <span>Policy routes</span>
@@ -835,6 +917,41 @@ export default function ProfileFormModal({
             Add route
           </button>
         </div>
+        <div className="profile-bulk-cidrs">
+          <label>
+            Paste CIDRs (one per line or comma-separated)
+            <textarea
+              value={bulkCidrs}
+              onChange={(event) => setBulkCidrs(event.target.value)}
+              rows={3}
+              placeholder={"10.0.0.0/24\n2001:db8::/32"}
+            />
+          </label>
+          <div className="profile-bulk-actions">
+            <input
+              type="file"
+              accept=".txt,.csv,text/plain,text/csv"
+              aria-label="Load CIDRs from file"
+              onChange={async (event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                if (!file) return;
+                if (file.size > 1024 * 1024) {
+                  setFormError("CIDR file exceeds 1 MiB.");
+                  return;
+                }
+                try {
+                  setBulkCidrs(await file.text());
+                } catch {
+                  setFormError("Could not read CIDR file.");
+                }
+              }}
+            />
+            <button type="button" onClick={addBulkCidrs} disabled={bulkBusy || !bulkCidrs.trim()}>
+              {bulkBusy ? "Adding…" : "Add CIDRs"}
+            </button>
+          </div>
+        </div>
         {current.routes.length === 0 && (
           <span className="profile-routes-empty">
             No routes — tunnel uses its own routing.
@@ -849,6 +966,13 @@ export default function ProfileFormModal({
                 updateRoute(index, { destination: e.target.value })
               }
               placeholder="10.0.0.0/24"
+            />
+            <input
+              type="text"
+              value={route.via ?? ""}
+              onChange={(e) => updateRoute(index, { via: e.target.value })}
+              placeholder="Gateway (optional)"
+              aria-label="Gateway (optional)"
             />
             <input
               type="number"
@@ -877,7 +1001,7 @@ export default function ProfileFormModal({
       {current.backend === "xray" && (
         <div className="profile-routes">
           <div className="profile-routes-head">
-            <span>Domain routing</span>
+            <span>Domain/IP routing</span>
             <button
               type="button"
               onClick={() =>
@@ -889,12 +1013,12 @@ export default function ProfileFormModal({
                 })
               }
             >
-              Add domain rule
+              Add routing rule
             </button>
           </div>
           {current.domainPolicies.length === 0 && (
             <span className="profile-routes-empty">
-              No domain rules — all traffic uses the proxy.
+              No custom rules — all traffic uses the proxy.
             </span>
           )}
           {current.domainPolicies.map((policy, index) => (
@@ -907,7 +1031,7 @@ export default function ProfileFormModal({
                     domains: e.target.value.split(","),
                   })
                 }
-                placeholder="domain:example.com, full:api.example.com"
+                placeholder="domain:example.com, geosite:cn, geoip:us"
               />
               <select
                 className="filter-select"
@@ -920,6 +1044,7 @@ export default function ProfileFormModal({
               >
                 <option value="proxy">Through proxy</option>
                 <option value="direct">Direct</option>
+                <option value="block">Block</option>
               </select>
               <button
                 type="button"
@@ -935,6 +1060,14 @@ export default function ProfileFormModal({
               </button>
             </div>
           ))}
+          <label className="profile-proxy-toggle">
+            <input
+              type="checkbox"
+              checked={current.privateLanDirect}
+              onChange={(e) => update({ privateLanDirect: e.target.checked })}
+            />
+            Direct for private/LAN IPs (after custom rules)
+          </label>
         </div>
       )}
       </div>

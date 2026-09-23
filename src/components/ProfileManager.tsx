@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation } from "../elevation";
+import { usePlatformCapabilities } from "../platform";
 import { backendIcon, ChevronIcon } from "../icons";
 import AddConnectionMenu from "./AddConnectionMenu";
 import DiagnosticsModal from "./DiagnosticsModal";
@@ -17,6 +19,9 @@ import ProfileFormModal, {
   type ProfileFormState,
 } from "./ProfileFormModal";
 import {
+  AlwaysOnKind,
+  AlwaysOnListResult,
+  AlwaysOnSetResult,
   BatchImportResult,
   DomainRouteTarget,
   NetworkInterface,
@@ -24,6 +29,8 @@ import {
   ProfileDiagnostics,
   ProfileInspection,
   SubscriptionEndpointInfo,
+  SubscriptionDelayResult,
+  SubscriptionRefreshResult,
   TunnelBackend,
   TunnelStatus,
 } from "../types";
@@ -32,12 +39,18 @@ const BACKEND_LABELS: Record<TunnelBackend, string> = {
   none: "Static routes",
   wireGuard: "WireGuard",
   openVpn: "OpenVPN",
-  xray: "Xray/VLESS",
+  xray: "Xray",
 };
+
+interface AutoConnectResult {
+  failedCount: number;
+  startupFailed: boolean;
+}
 
 const DOMAIN_TARGET_LABELS: Record<DomainRouteTarget, string> = {
   proxy: "Through proxy",
   direct: "Direct",
+  block: "Block",
 };
 
 function requiresElevation(profile: Profile): boolean {
@@ -52,6 +65,13 @@ function formatRate(bytesPerSec: number): string {
   if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`;
   if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
   return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
 }
 
 const COLLAPSED_GROUPS_KEY = "netmanager.connections.collapsedGroups";
@@ -114,8 +134,11 @@ function ConnectionCardSkeleton() {
 }
 
 export default function ProfileManager() {
+  const caps = usePlatformCapabilities();
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [statuses, setStatuses] = useState<TunnelStatus[]>([]);
+  const [alwaysOn, setAlwaysOn] = useState<AlwaysOnListResult | null>(null);
+  const [resumingAlwaysOn, setResumingAlwaysOn] = useState(false);
   const [interfaces, setInterfaces] = useState<NetworkInterface[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -141,6 +164,19 @@ export default function ProfileManager() {
     Record<string, SubscriptionEndpointInfo[]>
   >({});
   const [switching, setSwitching] = useState<string | null>(null);
+  const [refreshingSubscription, setRefreshingSubscription] = useState<string | null>(null);
+  const [settingRefreshInterval, setSettingRefreshInterval] = useState<string | null>(null);
+  const [openVpnCredentialProfile, setOpenVpnCredentialProfile] = useState<Profile | null>(null);
+  const [openVpnUsername, setOpenVpnUsername] = useState("");
+  const [openVpnPassword, setOpenVpnPassword] = useState("");
+  const [openVpnKeyPassphrase, setOpenVpnKeyPassphrase] = useState("");
+  const [rememberOpenVpnCredentials, setRememberOpenVpnCredentials] = useState(false);
+  const [openVpnCredentialError, setOpenVpnCredentialError] = useState<string | null>(null);
+  const [openVpnCredentialBusy, setOpenVpnCredentialBusy] = useState(false);
+  const [measuringDelay, setMeasuringDelay] = useState<string | null>(null);
+  const [delayResults, setDelayResults] = useState<
+    Record<string, { index: number; result: SubscriptionDelayResult }>
+  >({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [collapsedGroups, setCollapsedGroups] = useState<Set<TunnelBackend>>(
     loadCollapsedGroups,
@@ -155,6 +191,43 @@ export default function ProfileManager() {
     Record<number, { rxRate: number; txRate: number }>
   >({});
   const prevStats = useRef<Record<number, { rx: number; tx: number; time: number }>>({});
+
+  useEffect(() => {
+    let active = true;
+    let stopListening: (() => void) | null = null;
+    const showResult = (result: AutoConnectResult | null) => {
+      if (!active || !result) return;
+      if (result.startupFailed) {
+        setRuntimeNotice(
+          "Auto-connect could not start. Check Network daemon in Settings and profile Diagnostics.",
+        );
+      } else if (result.failedCount > 0) {
+        setRuntimeNotice(
+          `${result.failedCount} profile(s) could not connect automatically. Check Diagnostics and retry Connect manually.`,
+        );
+      }
+    };
+    void (async () => {
+      try {
+        const stop = await listen<AutoConnectResult>(
+          "auto-connect-result",
+          (event) => showResult(event.payload),
+        );
+        if (!active) {
+          stop();
+          return;
+        }
+        stopListening = stop;
+        showResult(await invoke<AutoConnectResult | null>("get_auto_connect_result"));
+      } catch {
+        // The profile list remains usable if the startup result is unavailable.
+      }
+    })();
+    return () => {
+      active = false;
+      stopListening?.();
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -250,6 +323,11 @@ export default function ProfileManager() {
     } catch {
       // keep last known statuses on poll failure
     }
+    try {
+      setAlwaysOn(await invoke<AlwaysOnListResult>("get_always_on_profiles"));
+    } catch {
+      // Keep the last known enrollment and pause state until the daemon returns.
+    }
   }, []);
 
   const refreshAll = useCallback(async () => {
@@ -264,6 +342,11 @@ export default function ProfileManager() {
       setStatuses(statusData);
       setInterfaces(interfaceData);
       try {
+        setAlwaysOn(await invoke<AlwaysOnListResult>("get_always_on_profiles"));
+      } catch {
+        setAlwaysOn(null);
+      }
+      try {
         const inspectionData =
           await invoke<ProfileInspection[]>("inspect_profiles");
         setInspections(
@@ -274,6 +357,7 @@ export default function ProfileManager() {
       } catch (err) {
         setError(String(err));
       }
+      return profileData;
     } catch (err) {
       setError(String(err));
     } finally {
@@ -283,6 +367,29 @@ export default function ProfileManager() {
 
   useEffect(() => {
     refreshAll();
+  }, [refreshAll]);
+
+  useEffect(() => {
+    const onRouteChanged = () => {
+      void (async () => {
+        const updated = await refreshAll();
+        if (!updated) return;
+        const next: Record<string, SubscriptionEndpointInfo[]> = {};
+        for (const profile of updated.filter((profile) => profile.subscription !== null)) {
+          try {
+            next[profile.id] = await invoke<SubscriptionEndpointInfo[]>(
+              "get_subscription_endpoints",
+              { profileId: profile.id },
+            );
+          } catch {
+            // Keep the profile visible if its sidecar is temporarily unavailable.
+          }
+        }
+        setEndpoints(next);
+      })();
+    };
+    window.addEventListener("route-changed", onRouteChanged);
+    return () => window.removeEventListener("route-changed", onRouteChanged);
   }, [refreshAll]);
 
   useEffect(() => {
@@ -319,13 +426,18 @@ export default function ProfileManager() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profiles]);
 
-  const withBusy = async (id: string, action: () => Promise<unknown>) => {
+  const withBusy = async (
+    id: string,
+    action: () => Promise<unknown>,
+    onError?: (err: unknown) => void,
+  ) => {
     setBusy((prev) => new Set(prev).add(id));
     try {
       await action();
       await refreshAll();
     } catch (err) {
-      setError(String(err));
+      if (onError) onError(err);
+      else setError(String(err));
     } finally {
       setBusy((prev) => {
         const next = new Set(prev);
@@ -349,7 +461,60 @@ export default function ProfileManager() {
         id: profile.id,
       });
       if (status.message) setRuntimeNotice(status.message);
+    }, (err) => {
+      if (caps?.os === "linux" && profile.backend === "openVpn" && String(err) === "OpenVPN credentials required") {
+        setOpenVpnCredentialProfile(profile);
+        setOpenVpnCredentialError(null);
+        setError(null);
+      } else {
+        setError(String(err));
+      }
     });
+  };
+
+  const closeOpenVpnCredentials = () => {
+    if (openVpnCredentialBusy) return;
+    setOpenVpnCredentialProfile(null);
+    setOpenVpnUsername("");
+    setOpenVpnPassword("");
+    setOpenVpnKeyPassphrase("");
+    setRememberOpenVpnCredentials(false);
+    setOpenVpnCredentialError(null);
+  };
+
+  const submitOpenVpnCredentials = async () => {
+    if (!openVpnCredentialProfile) return;
+    if (openVpnPassword && !openVpnUsername) {
+      setOpenVpnCredentialError("Enter a username with the password.");
+      return;
+    }
+    if (!openVpnUsername && !openVpnKeyPassphrase) {
+      setOpenVpnCredentialError("Enter the credentials required by this profile.");
+      return;
+    }
+    setOpenVpnCredentialBusy(true);
+    setOpenVpnCredentialError(null);
+    try {
+      const status = await invoke<TunnelStatus>("connect_openvpn_with_credentials", {
+        id: openVpnCredentialProfile.id,
+        credentials: {
+          ...(openVpnUsername ? { authUserPass: { username: openVpnUsername, password: openVpnPassword } } : {}),
+          ...(openVpnKeyPassphrase ? { privateKeyPassphrase: openVpnKeyPassphrase } : {}),
+        },
+        remember: rememberOpenVpnCredentials,
+      });
+      if (status.message) setRuntimeNotice(status.message);
+      setOpenVpnCredentialProfile(null);
+      setOpenVpnUsername("");
+      setOpenVpnPassword("");
+      setOpenVpnKeyPassphrase("");
+      setRememberOpenVpnCredentials(false);
+      await refreshAll();
+    } catch {
+      setOpenVpnCredentialError("OpenVPN connection failed. Check credentials and profile settings.");
+    } finally {
+      setOpenVpnCredentialBusy(false);
+    }
   };
 
   const onDisconnect = async (profile: Profile) => {
@@ -382,6 +547,10 @@ export default function ProfileManager() {
   };
 
   const onDelete = async (profile: Profile) => {
+    if (alwaysOn?.profiles.some((item) => item.profileId === profile.id)) {
+      setError("Disable always-on before deleting this profile.");
+      return;
+    }
     const ok = await confirm(`Delete profile "${profile.name}"?`, {
       title: "Delete profile",
       kind: "warning",
@@ -412,10 +581,88 @@ export default function ProfileManager() {
         }
       }
       setEndpoints(next);
+      setDelayResults((current) => {
+        const updated = { ...current };
+        delete updated[profile.id];
+        return updated;
+      });
     } catch (err) {
       setError(String(err));
     } finally {
       setSwitching(null);
+    }
+  };
+
+  const onRefreshSubscription = async (profile: Profile) => {
+    setRefreshingSubscription(profile.id);
+    try {
+      const result = await invoke<SubscriptionRefreshResult>("refresh_subscription", {
+        id: profile.id,
+      });
+      await refreshAll();
+      const updated = await invoke<SubscriptionEndpointInfo[]>(
+        "get_subscription_endpoints",
+        { profileId: profile.id },
+      );
+      setEndpoints((current) => ({ ...current, [profile.id]: updated }));
+      setDelayResults((current) => {
+        const next = { ...current };
+        delete next[profile.id];
+        return next;
+      });
+      const details = [
+        `Subscription refreshed: ${result.endpointCount} endpoint${result.endpointCount === 1 ? "" : "s"}.`,
+      ];
+      if (result.skippedCount > 0) details.push(`${result.skippedCount} skipped.`);
+      if (result.fallbackUsed) details.push("Selected endpoint disappeared; first endpoint selected.");
+      if (result.cleanupFailed) details.push("Previous config cleanup failed.");
+      setRuntimeNotice(details.join(" "));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setRefreshingSubscription(null);
+    }
+  };
+
+  const onSetRefreshInterval = async (profile: Profile, minutes: number | null) => {
+    setSettingRefreshInterval(profile.id);
+    try {
+      const updated = await invoke<Profile[]>("set_subscription_refresh_interval", {
+        profileId: profile.id,
+        refreshIntervalMinutes: minutes,
+      });
+      setProfiles(updated);
+    } catch {
+      setError("Cannot update subscription refresh interval.");
+    } finally {
+      setSettingRefreshInterval(null);
+    }
+  };
+
+  const onMeasureDelay = async (profile: Profile) => {
+    const index =
+      endpoints[profile.id]?.findIndex((endpoint) => endpoint.active) ?? -1;
+    if (index < 0) return;
+    setMeasuringDelay(profile.id);
+    try {
+      const result = await invoke<SubscriptionDelayResult>(
+        "measure_subscription_endpoint_delay",
+        { profileId: profile.id, endpointIndex: index },
+      );
+      setDelayResults((current) => ({
+        ...current,
+        [profile.id]: { index, result },
+      }));
+    } catch {
+      setDelayResults((current) => ({
+        ...current,
+        [profile.id]: {
+          index,
+          result: { delayMs: null, error: "Delay check failed" },
+        },
+      }));
+    } finally {
+      setMeasuringDelay(null);
     }
   };
 
@@ -477,8 +724,42 @@ export default function ProfileManager() {
   };
 
   const openEdit = (profile: Profile) => {
+    if (alwaysOn?.profiles.some((item) => item.profileId === profile.id)) {
+      setError("Disable always-on before editing this profile.");
+      return;
+    }
     setEditing(editFormState(profile));
     setFormOpen(true);
+  };
+
+  const onToggleAlwaysOn = async (profile: Profile, kind: AlwaysOnKind, enrolled: boolean) => {
+    if (!enrolled && kind === "wireGuard") {
+      const approved = await confirm(
+        "Always-on stores a copy of this WireGuard config, including its private key, in root-only system state. It can connect before you sign in. Enable it?",
+        { title: "Enable always-on WireGuard", kind: "warning" },
+      );
+      if (!approved) return;
+    }
+    await withBusy(profile.id, async () => {
+      if (enrolled) {
+        await invoke("remove_always_on_profile", { kind, profileId: profile.id });
+      } else {
+        const result = await invoke<AlwaysOnSetResult>("set_always_on_profile", { id: profile.id });
+        if (!result.active) setRuntimeNotice("Always-on saved. Resume always-on to activate it.");
+      }
+    });
+  };
+
+  const onResumeAlwaysOn = async () => {
+    setResumingAlwaysOn(true);
+    try {
+      await invoke("resume_always_on");
+      await refreshAll();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setResumingAlwaysOn(false);
+    }
   };
 
   const onFormSaved = (
@@ -581,6 +862,22 @@ export default function ProfileManager() {
         WireGuard, OpenVPN, interface changes, and policy routes require
         administrator privileges. Several connections can run at once.
       </p>
+
+      {caps?.os === "linux" && (
+        <p className="profiles-note">
+          Always-on before sign-in is available for WireGuard and static routes.
+          OpenVPN and Xray are not supported.
+        </p>
+      )}
+
+      {caps?.os === "linux" && alwaysOn?.paused && (
+        <div className="runtime-notice" role="status">
+          <span>Always-on is paused after Disconnect all.</span>
+          <button type="button" onClick={onResumeAlwaysOn} disabled={resumingAlwaysOn}>
+            {resumingAlwaysOn ? "Resuming…" : "Resume always-on"}
+          </button>
+        </div>
+      )}
 
       {profiles.length > 0 && (
         <div className="snippets-bar">
@@ -721,6 +1018,16 @@ export default function ProfileManager() {
               {group.items.map((profile) => {
                 const status = statusFor(profile.id);
                 const isBusy = busy.has(profile.id);
+                const alwaysOnKind: AlwaysOnKind | null =
+                  profile.backend === "wireGuard" ? "wireGuard" :
+                  profile.backend === "none" ? "staticRoutes" : null;
+                const alwaysOnEntry = alwaysOn?.profiles.find(
+                  (item) => item.profileId === profile.id && item.kind === alwaysOnKind,
+                );
+                const canEnableAlwaysOn = alwaysOnKind !== null &&
+                  alwaysOn?.supportedKinds.includes(alwaysOnKind) &&
+                  (alwaysOnKind === "wireGuard" ||
+                    (profile.interfaceName.length > 0 && profile.routes.length > 0));
                 const inspection = inspections[profile.id];
                 const isExpanded = expanded.has(profile.id);
                 const detailCount =
@@ -745,6 +1052,13 @@ export default function ProfileManager() {
                           )}
                           {profile.useSystemProxy && (
                             <span className="badge badge-managed">Proxy</span>
+                          )}
+                          {alwaysOnEntry && (
+                            <span className="badge badge-managed">
+                              {alwaysOnEntry.enabled
+                                ? alwaysOn?.paused ? "Always-on paused" : "Always-on"
+                                : "Always-on cleanup pending"}
+                            </span>
                           )}
                           {inspection?.managedConfig === false && (
                             <span className="badge badge-external">External</span>
@@ -773,6 +1087,19 @@ export default function ProfileManager() {
                         title="Profile actions"
                         items={[
                           { label: "Edit", onClick: () => openEdit(profile), disabled: isBusy },
+                          ...(caps?.os === "linux" && alwaysOnKind && (alwaysOnEntry || canEnableAlwaysOn) ? [{
+                            label: alwaysOnEntry ? "Disable always-on" : "Enable always-on before sign-in",
+                            onClick: () => onToggleAlwaysOn(profile, alwaysOnKind, Boolean(alwaysOnEntry)),
+                            disabled: isBusy,
+                          }] : []),
+                          ...(caps?.os === "linux" && profile.backend === "openVpn" ? [{
+                            label: "Credentials…",
+                            onClick: () => {
+                              setOpenVpnCredentialProfile(profile);
+                              setOpenVpnCredentialError(null);
+                            },
+                            disabled: isBusy,
+                          }] : []),
                           {
                             label: diagBusy === profile.id ? "Running diagnostics…" : "Diagnostics",
                             onClick: () => onDiagnose(profile),
@@ -788,14 +1115,26 @@ export default function ProfileManager() {
                       />
                     </div>
 
-                    {profile.backend === "xray" && profile.xraySocksPort !== null && (
-                      <div className="interface-row">
-                        <span className="row-label">SOCKS5</span>
-                        <span className="row-value mono">
-                          127.0.0.1:{profile.xraySocksPort}
-                        </span>
-                      </div>
-                    )}
+                    {profile.backend === "xray" &&
+                      profile.xrayMode === "socks" &&
+                      profile.xraySocksPort !== null && (
+                        <div className="interface-row">
+                          <span className="row-label">SOCKS5</span>
+                          <span className="row-value mono">
+                            127.0.0.1:{profile.xraySocksPort}
+                          </span>
+                        </div>
+                      )}
+                    {profile.backend === "xray" &&
+                      profile.xrayMode === "socks" &&
+                      profile.xrayHttpPort !== null && (
+                        <div className="interface-row">
+                          <span className="row-label">HTTP CONNECT</span>
+                          <span className="row-value mono">
+                            127.0.0.1:{profile.xrayHttpPort}
+                          </span>
+                        </div>
+                      )}
                     {profile.subscription && endpoints[profile.id] && (
                       <div className="interface-row">
                         <span className="row-label">Endpoint</span>
@@ -814,6 +1153,7 @@ export default function ProfileManager() {
                             }
                             disabled={
                               switching === profile.id ||
+                              refreshingSubscription === profile.id ||
                               isBusy ||
                               status.state === "running"
                             }
@@ -824,8 +1164,100 @@ export default function ProfileManager() {
                               </option>
                             ))}
                           </select>
-                          {switching === profile.id && " switching…"}
+                            {switching === profile.id && " switching…"}
+                            <button
+                              type="button"
+                              className="connection-detail-toggle"
+                              onClick={() => onRefreshSubscription(profile)}
+                              disabled={
+                                refreshingSubscription === profile.id ||
+                                switching === profile.id ||
+                                isBusy ||
+                                status.state === "running"
+                              }
+                            >
+                              {refreshingSubscription === profile.id ? "Refreshing…" : "Refresh"}
+                            </button>
+                            <button
+                              type="button"
+                              className="connection-detail-toggle"
+                              onClick={() => onMeasureDelay(profile)}
+                              disabled={
+                                measuringDelay === profile.id ||
+                                switching === profile.id ||
+                                refreshingSubscription === profile.id ||
+                                isBusy
+                              }
+                            >
+                              {measuringDelay === profile.id ? "Testing…" : "Test delay"}
+                            </button>
+                            {delayResults[profile.id]?.index ===
+                              endpoints[profile.id].findIndex((e) => e.active) && (
+                                <span>
+                                  {delayResults[profile.id].result.delayMs !== null
+                                    ? `${delayResults[profile.id].result.delayMs} ms`
+                                    : delayResults[profile.id].result.error}
+                                </span>
+                              )}
                         </span>
+                      </div>
+                    )}
+                    {profile.subscription && (
+                      <>
+                        <div className="interface-row">
+                          <span className="row-label">Auto-refresh</span>
+                          <span className="row-value">
+                            <select
+                              value={profile.subscription.refreshIntervalMinutes ?? ""}
+                              onChange={(event) => onSetRefreshInterval(profile, event.target.value ? Number(event.target.value) : null)}
+                              disabled={settingRefreshInterval === profile.id || isBusy}
+                            >
+                              <option value="">Off</option>
+                              <option value="15">Every 15 minutes</option>
+                              <option value="60">Every hour</option>
+                              <option value="360">Every 6 hours</option>
+                            </select>
+                          </span>
+                        </div>
+                        {profile.subscription.userInfo && (
+                          <div className="interface-row">
+                            <span className="row-label">Traffic</span>
+                            <span className="row-value">
+                              {formatBytes(profile.subscription.userInfo.uploadBytes + profile.subscription.userInfo.downloadBytes)} used
+                              {profile.subscription.userInfo.totalBytes !== null
+                                ? ` / ${formatBytes(profile.subscription.userInfo.totalBytes)}`
+                                : " / unlimited"}
+                            </span>
+                          </div>
+                        )}
+                        {profile.subscription.userInfo?.expiresAtUnix != null && (
+                          <div className="interface-row">
+                            <span className="row-label">Expires</span>
+                            <span className="row-value">
+                              {new Date(profile.subscription.userInfo.expiresAtUnix * 1000).toLocaleDateString()}
+                            </span>
+                          </div>
+                        )}
+                        {profile.subscription.lastRefreshAtUnix !== null && (
+                          <div className="interface-row">
+                            <span className="row-label">Last checked</span>
+                            <span className="row-value">
+                              {new Date(profile.subscription.lastRefreshAtUnix * 1000).toLocaleString()}
+                            </span>
+                          </div>
+                        )}
+                        {profile.subscription.lastRefreshError && (
+                          <div className="interface-row">
+                            <span className="row-label">Refresh</span>
+                            <span className="row-value">{profile.subscription.lastRefreshError}</span>
+                          </div>
+                        )}
+                      </>
+                    )}
+                    {profile.backend === "xray" && profile.privateLanDirect && (
+                      <div className="interface-row">
+                        <span className="row-label">Private/LAN IPs</span>
+                        <span className="row-value">Direct after custom rules</span>
                       </div>
                     )}
                     {profile.useSystemProxy && (
@@ -848,14 +1280,14 @@ export default function ProfileManager() {
                           {profile.routes.length > 0 &&
                             `${profile.routes.length} route${profile.routes.length === 1 ? "" : "s"}`}
                           {profile.routes.length > 0 && profile.domainPolicies.length > 0 && " · "}
-                          {profile.domainPolicies.length > 0 &&
-                            `${profile.domainPolicies.length} domain rule${profile.domainPolicies.length === 1 ? "" : "s"}`}
+                            {profile.domainPolicies.length > 0 &&
+                              `${profile.domainPolicies.length} routing rule${profile.domainPolicies.length === 1 ? "" : "s"}`}
                         </button>
                         {isExpanded && (
                           <>
                             {profile.domainPolicies.length > 0 && (
                               <div className="interface-section">
-                                <span className="section-label">Domain rules</span>
+                                  <span className="section-label">Domain/IP rules</span>
                                 <ul className="profile-route-list">
                                   {profile.domainPolicies.map((policy, i) => (
                                     <li key={i}>
@@ -936,6 +1368,44 @@ export default function ProfileManager() {
         onChooseImport={handleChooseImport}
         onChooseBackend={handleChooseBackend}
       />
+
+      <Modal
+        open={openVpnCredentialProfile !== null}
+        title="OpenVPN credentials"
+        onClose={closeOpenVpnCredentials}
+        maxWidth="420px"
+        footer={
+          <>
+            <button type="button" onClick={closeOpenVpnCredentials} disabled={openVpnCredentialBusy}>
+              Cancel
+            </button>
+            <button type="button" className="profile-save-btn" onClick={submitOpenVpnCredentials} disabled={openVpnCredentialBusy}>
+              {openVpnCredentialBusy ? "Connecting…" : "Connect"}
+            </button>
+          </>
+        }
+      >
+        <form className="profile-form" onSubmit={(event) => { event.preventDefault(); void submitOpenVpnCredentials(); }}>
+          <label>
+            Username
+            <input type="text" autoComplete="username" value={openVpnUsername} onChange={(event) => setOpenVpnUsername(event.target.value)} />
+          </label>
+          <label>
+            Password
+            <input type="password" autoComplete="current-password" value={openVpnPassword} onChange={(event) => setOpenVpnPassword(event.target.value)} />
+          </label>
+          <label>
+            Private key passphrase (if required)
+            <input type="password" autoComplete="off" value={openVpnKeyPassphrase} onChange={(event) => setOpenVpnKeyPassphrase(event.target.value)} />
+          </label>
+          <label className="profile-proxy-toggle">
+            <input type="checkbox" checked={rememberOpenVpnCredentials} onChange={(event) => setRememberOpenVpnCredentials(event.target.checked)} />
+            Remember on this device
+          </label>
+          <span className="profile-help">Stored in private app data on this device for automatic connections.</span>
+          {openVpnCredentialError && <p className="error" role="alert">{openVpnCredentialError}</p>}
+        </form>
+      </Modal>
 
       <Modal
         open={saveModalOpen}

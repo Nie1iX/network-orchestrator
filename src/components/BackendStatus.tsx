@@ -189,13 +189,15 @@ export default function BackendStatus() {
             {!item.available && item.path ? ` — ${item.message}` : ""}
           </span>
           <span className="backend-actions">
-            <button
-              type="button"
-              disabled={busy !== null || item.source === "managed"}
-              onClick={() => chooseExecutable(item)}
-            >
-              Choose existing…
-            </button>
+            {!(caps?.os === "linux" && (item.backend === "wireGuard" || item.backend === "openVpn")) && (
+              <button
+                type="button"
+                disabled={busy !== null || item.source === "managed"}
+                onClick={() => chooseExecutable(item)}
+              >
+                Choose existing…
+              </button>
+            )}
             {item.source === "configured" && (
               <button
                 type="button"

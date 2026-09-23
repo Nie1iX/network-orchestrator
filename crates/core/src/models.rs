@@ -89,6 +89,8 @@ pub struct RouteLookupResult {
     pub destination: IpAddr,
     pub matched_route: RouteEntry,
     pub interface_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,6 +107,7 @@ pub enum TunnelBackend {
 pub enum DomainRouteTarget {
     Proxy,
     Direct,
+    Block,
 }
 
 /// Xray operating mode. `Socks` (default) creates a SOCKS5 inbound on
@@ -177,7 +180,11 @@ pub struct Profile {
     #[serde(default)]
     pub domain_policies: Vec<DomainPolicy>,
     #[serde(default)]
+    pub private_lan_direct: bool,
+    #[serde(default)]
     pub xray_socks_port: Option<u16>,
+    #[serde(default)]
+    pub xray_http_port: Option<u16>,
     #[serde(default)]
     pub use_system_proxy: bool,
     #[serde(default)]
@@ -207,7 +214,9 @@ impl Default for Profile {
             routes: Vec::new(),
             auto_connect: false,
             domain_policies: Vec::new(),
+            private_lan_direct: false,
             xray_socks_port: None,
+            xray_http_port: None,
             use_system_proxy: false,
             proxy_bypass: Vec::new(),
             subscription: None,
@@ -218,13 +227,46 @@ impl Default for Profile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionMeta {
     pub url: String,
     pub hwid: String,
     pub endpoint_count: usize,
     pub active_index: usize,
+    #[serde(default)]
+    pub refresh_interval_minutes: Option<u32>,
+    #[serde(default)]
+    pub last_refresh_at_unix: Option<u64>,
+    #[serde(default)]
+    pub last_refresh_error: Option<String>,
+    #[serde(default)]
+    pub user_info: Option<SubscriptionUserInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionUserInfo {
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub expires_at_unix: Option<u64>,
+}
+
+impl std::fmt::Debug for SubscriptionMeta {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubscriptionMeta")
+            .field("url", &"<redacted>")
+            .field("hwid", &"<redacted>")
+            .field("endpoint_count", &self.endpoint_count)
+            .field("active_index", &self.active_index)
+            .field("refresh_interval_minutes", &self.refresh_interval_minutes)
+            .field("last_refresh_at_unix", &self.last_refresh_at_unix)
+            .field("last_refresh_error", &self.last_refresh_error)
+            .field("user_info", &self.user_info)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -529,5 +571,60 @@ mod tests {
         assert!(json.contains("\"friendlyName\""));
         assert!(json.contains("\"ifIndex\""));
         assert!(json.contains("\"linkSpeedMbps\""));
+    }
+
+    #[test]
+    fn subscription_debug_hides_url_and_hwid() {
+        let subscription = SubscriptionMeta {
+            url: "https://example.test/private-token".into(),
+            hwid: "private-hwid".into(),
+            endpoint_count: 2,
+            active_index: 1,
+            refresh_interval_minutes: None,
+            last_refresh_at_unix: None,
+            last_refresh_error: None,
+            user_info: None,
+        };
+        let debug = format!("{subscription:?}");
+        assert!(!debug.contains("private-token"));
+        assert!(!debug.contains("private-hwid"));
+        assert!(debug.contains("endpoint_count"));
+    }
+
+    #[test]
+    fn old_profile_json_defaults_http_port_to_none() {
+        let mut json = serde_json::to_value(Profile::default()).unwrap();
+        json.as_object_mut().unwrap().remove("xrayHttpPort");
+        let restored: Profile = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.xray_http_port, None);
+        let mut upgraded = restored;
+        upgraded.xray_http_port = Some(10809);
+        assert_eq!(
+            serde_json::to_value(upgraded).unwrap()["xrayHttpPort"],
+            10809
+        );
+    }
+
+    #[test]
+    fn old_profile_json_defaults_private_lan_preset_to_off() {
+        let mut json = serde_json::to_value(Profile::default()).unwrap();
+        json.as_object_mut().unwrap().remove("privateLanDirect");
+        let restored: Profile = serde_json::from_value(json).unwrap();
+        assert!(!restored.private_lan_direct);
+    }
+
+    #[test]
+    fn old_subscription_metadata_defaults_refresh_and_usage_fields() {
+        let old = serde_json::json!({
+            "url": "https://example.test/private-token",
+            "hwid": "private-hwid",
+            "endpointCount": 2,
+            "activeIndex": 1
+        });
+        let restored: SubscriptionMeta = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.refresh_interval_minutes, None);
+        assert_eq!(restored.last_refresh_at_unix, None);
+        assert!(restored.last_refresh_error.is_none());
+        assert!(restored.user_info.is_none());
     }
 }

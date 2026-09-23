@@ -27,6 +27,10 @@ wait_socket
 expect_eq "$(stat -c %a "$SOCK")" 666 "socket mode 0666 despite UMask=0077"
 expect_eq "$(stat -c %a /var/lib/network-orchestrator)" 700 "state dir mode 0700"
 
+step "isolated peer container"
+peer=$(python3 -c 'from urllib.request import urlopen; print(urlopen("http://wg-server:8765/server-health.txt", timeout=3).read().decode().strip())' 2>/dev/null) || fail "peer container unreachable"
+expect_eq "$peer" "netorch-e2e-server" "peer reachable over private Docker network"
+
 step "test interfaces"
 ip link add dum0 type dummy
 ip addr add 192.0.2.1/24 dev dum0
@@ -34,6 +38,15 @@ ip -6 addr add 2001:db8:1::1/64 dev dum0 nodad
 ip link set dum0 up
 IDX=$(cat /sys/class/net/dum0/ifindex)
 ok "dum0 index $IDX"
+
+step "policy rule selects a non-main table for fibmatch lookup"
+ip -4 route add 198.18.77.0/24 dev dum0 table 22379 proto 79
+ip -4 rule add pref 21000 to 198.18.77.0/24 lookup 22379
+lookup=$(ip -j -4 route get fibmatch 198.18.77.7)
+python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); assert len(rows)==1; route=rows[0]; assert route["dst"]=="198.18.77.0/24"; assert route["dev"]=="dum0"; assert str(route["table"])=="22379"' "$lookup" \
+    && ok "fibmatch follows policy rule into table 22379" || fail "policy lookup: $lookup"
+ip -4 rule del pref 21000 to 198.18.77.0/24 lookup 22379
+ip -4 route del 198.18.77.0/24 dev dum0 table 22379
 
 step "hello reports peer uid"
 expect_eq "$(python3 "$CLIENT" owned.list)" '{"owners": []}' "root owned.list empty"
@@ -130,5 +143,19 @@ expect_eq "$(ours -4 | grep -c '^100\.')" 1000 "1000 routes installed"
 [ "$elapsed_ms" -le 2000 ] && ok "bulk apply in ${elapsed_ms} ms (<= 2000)" || fail "bulk apply too slow: ${elapsed_ms} ms"
 python3 "$CLIENT" routes.remove '{"owner":"bulk"}' >/dev/null
 expect_eq "$(ours -4 | grep -c '^100\.' || true)" 0 "bulk removed"
+
+step "corrupt journal blocks startup without losing ownership data"
+systemctl stop "$UNIT"
+printf '%s' '{broken journal' >"$STATE"
+systemctl start "$UNIT" >/dev/null 2>&1 || true
+sleep 2
+systemctl is-active --quiet "$UNIT" && fail "daemon started with corrupt journal" || ok "daemon refused corrupt journal"
+expect_eq "$(cat "$STATE")" '{broken journal' "corrupt journal preserved"
+systemctl stop "$UNIT" >/dev/null 2>&1 || true
+printf '%s\n' '{"version":1,"entries":[]}' >"$STATE"
+systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+systemctl start "$UNIT"
+wait_socket
+ok "daemon starts after journal recovery"
 
 printf '\nALL %d CHECKS PASSED\n' "$PASS"

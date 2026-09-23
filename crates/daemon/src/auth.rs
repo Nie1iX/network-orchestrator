@@ -43,8 +43,20 @@ impl Action {
 /// and need no polkit action.
 pub fn required_action(method_name: &str) -> Option<Action> {
     match method_name {
-        method::ROUTES_APPLY | method::LINK_SET_STATE => Some(Action::SystemNetwork),
-        method::ROUTES_REMOVE | method::RECOVERY_CLEANUP => Some(Action::ConnectProfile),
+        method::ROUTES_APPLY
+        | method::LINK_SET_STATE
+        | method::ALWAYS_ON_SET
+        | method::ALWAYS_ON_REMOVE
+        | method::ALWAYS_ON_RESUME => Some(Action::SystemNetwork),
+        method::ROUTES_REMOVE
+        | method::RECOVERY_CLEANUP
+        | method::WIREGUARD_CONNECT
+        | method::WIREGUARD_DISCONNECT
+        | method::OPENVPN_CONNECT
+        | method::OPENVPN_PROBE
+        | method::OPENVPN_DISCONNECT
+        | method::XRAY_CONNECT
+        | method::XRAY_DISCONNECT => Some(Action::ConnectProfile),
         _ => None,
     }
 }
@@ -215,12 +227,31 @@ mod tests {
             required_action(method::LINK_SET_STATE),
             Some(Action::SystemNetwork)
         );
+        for method in [
+            method::ALWAYS_ON_SET,
+            method::ALWAYS_ON_REMOVE,
+            method::ALWAYS_ON_RESUME,
+        ] {
+            assert_eq!(required_action(method), Some(Action::SystemNetwork));
+        }
         assert_eq!(
             required_action(method::ROUTES_REMOVE),
             Some(Action::ConnectProfile)
         );
         assert_eq!(
             required_action(method::RECOVERY_CLEANUP),
+            Some(Action::ConnectProfile)
+        );
+        assert_eq!(
+            required_action(method::OPENVPN_CONNECT),
+            Some(Action::ConnectProfile)
+        );
+        assert_eq!(
+            required_action(method::OPENVPN_PROBE),
+            Some(Action::ConnectProfile)
+        );
+        assert_eq!(
+            required_action(method::OPENVPN_DISCONNECT),
             Some(Action::ConnectProfile)
         );
         assert_eq!(
@@ -239,6 +270,7 @@ mod tests {
             method::HELLO,
             method::OWNED_LIST,
             method::SUBSCRIBE,
+            method::ALWAYS_ON_LIST,
             "frobnicate",
         ] {
             assert_eq!(required_action(name), None, "{name}");

@@ -36,6 +36,60 @@ const REQUIRED_SHA256: [(&str, &str); 3] = [
     ),
 ];
 
+#[derive(Clone, Copy)]
+struct ArchiveLayout {
+    version: &'static str,
+    executable_name: &'static str,
+    allowlist: &'static [&'static str],
+    required_names: &'static [&'static str],
+}
+
+const WINDOWS_LAYOUT: ArchiveLayout = ArchiveLayout {
+    version: MANAGED_XRAY_VERSION,
+    executable_name: "xray.exe",
+    allowlist: &ALLOWLIST,
+    required_names: &REQUIRED,
+};
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const LINUX_XRAY_VERSION: &str = "v26.3.27";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const LINUX_XRAY_PACKAGE_ROOT: &str = "/usr/lib/network-orchestrator/xray";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const LINUX_XRAY_URL: &str =
+    "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip";
+// Official XTLS release asset Xray-linux-64.zip.dgst, SHA2-256.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const LINUX_XRAY_SHA256: &str =
+    "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const LINUX_ALLOWLIST: [&str; 5] = ["xray", "geoip.dat", "geosite.dat", "LICENSE", "README.md"];
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const LINUX_REQUIRED: [&str; 3] = ["xray", "geoip.dat", "geosite.dat"];
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const LINUX_LAYOUT: ArchiveLayout = ArchiveLayout {
+    version: LINUX_XRAY_VERSION,
+    executable_name: "xray",
+    allowlist: &LINUX_ALLOWLIST,
+    required_names: &LINUX_REQUIRED,
+};
+// SHA-256 of required files extracted from the archive above.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const LINUX_REQUIRED_SHA256: [(&str, &str); 3] = [
+    (
+        "xray",
+        "8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed",
+    ),
+    (
+        "geoip.dat",
+        "744c97b74c52bae2ac8664fef6ac481d7765cb8432a0df54f0368a88b9b4a354",
+    ),
+    (
+        "geosite.dat",
+        "adf92de0cfc70e458b399f04c5f912bf42d115ed7e37281b30e2f1c68605e4e9",
+    ),
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedXrayInstallation {
     pub executable: PathBuf,
@@ -45,6 +99,86 @@ pub struct ManagedXrayInstallation {
 
 pub fn managed_version_dir(root: &Path) -> PathBuf {
     root.join(MANAGED_XRAY_VERSION)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn linux_managed_version_dir(root: &Path) -> PathBuf {
+    root.join(LINUX_XRAY_VERSION)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn verify_managed_linux_executable(root: &Path, executable: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if fs::symlink_metadata(root)?.file_type().is_symlink() {
+        return Err(invalid_data("managed xray installation contains a symlink"));
+    }
+    let root = root.canonicalize()?;
+    let expected_dir = linux_managed_version_dir(&root);
+    if executable.canonicalize()? != expected_dir.join("xray") {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "executable is outside the managed xray installation",
+        ));
+    }
+    for name in LINUX_REQUIRED {
+        if fs::symlink_metadata(expected_dir.join(name))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(invalid_data("managed xray installation contains a symlink"));
+        }
+    }
+    verify_required_hashes(&expected_dir, &LINUX_REQUIRED_SHA256)?;
+    let executable_metadata = fs::symlink_metadata(expected_dir.join("xray"))?;
+    let mode = executable_metadata.permissions().mode() & 0o777;
+    if mode == 0o700 {
+        return Ok(());
+    }
+    if !package_executable_mode_allowed(mode, executable_metadata.uid()) {
+        return Err(invalid_data(
+            "managed xray executable has unsafe permissions",
+        ));
+    }
+    for name in LINUX_REQUIRED {
+        verify_root_owned_readonly_path(&expected_dir.join(name))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn package_executable_mode_allowed(mode: u32, uid: u32) -> bool {
+    mode == 0o755 && uid == 0
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn verify_root_owned_readonly_path(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for component in path.ancestors() {
+        let metadata = fs::symlink_metadata(component)?;
+        if metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(invalid_data(
+                "managed xray package path is not root-owned and read-only",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn install_verified_linux_archive(
+    root: &Path,
+    archive: &[u8],
+) -> io::Result<ManagedXrayInstallation> {
+    install_archive_for_platform(
+        root,
+        archive,
+        LINUX_XRAY_SHA256,
+        &LINUX_REQUIRED_SHA256,
+        LINUX_LAYOUT,
+    )
 }
 
 pub fn is_managed_executable(root: &Path, executable: &Path) -> io::Result<bool> {
@@ -91,6 +225,28 @@ fn install_archive_with_expected_hash(
     expected_hash: &str,
     expected_required: &[(&str, &str)],
 ) -> io::Result<ManagedXrayInstallation> {
+    install_archive_for_platform(
+        root,
+        archive,
+        expected_hash,
+        expected_required,
+        WINDOWS_LAYOUT,
+    )
+}
+
+fn install_archive_for_platform(
+    root: &Path,
+    archive: &[u8],
+    expected_hash: &str,
+    expected_required: &[(&str, &str)],
+    layout: ArchiveLayout,
+) -> io::Result<ManagedXrayInstallation> {
+    let ArchiveLayout {
+        version,
+        executable_name,
+        allowlist,
+        required_names,
+    } = layout;
     if archive.len() > MAX_XRAY_ARCHIVE_BYTES {
         return Err(invalid_input(format!(
             "archive exceeds the {} byte download limit",
@@ -103,11 +259,11 @@ fn install_archive_with_expected_hash(
             "archive sha-256 does not match the pinned digest",
         ));
     }
-    let final_dir = managed_version_dir(root);
-    let executable = final_dir.join("xray.exe");
+    let final_dir = root.join(version);
+    let executable = final_dir.join(executable_name);
     if final_dir.is_dir() {
         if version_verified(&final_dir, expected_required) {
-            protect_version_tree(root, &final_dir)?;
+            protect_version_tree(root, &final_dir, required_names, executable_name)?;
             return Ok(ManagedXrayInstallation {
                 executable,
                 version_dir: final_dir,
@@ -118,13 +274,13 @@ fn install_archive_with_expected_hash(
             io::ErrorKind::AlreadyExists,
             format!(
                 "managed xray directory '{}' exists but is incomplete; remove it explicitly before reinstalling",
-                MANAGED_XRAY_VERSION
+                version
             ),
         ));
     }
 
     let mut seen_names = std::collections::HashSet::new();
-    for name in allowlisted_central_names(archive)? {
+    for name in allowlisted_central_names(archive, allowlist)? {
         if !seen_names.insert(name.clone()) {
             return Err(invalid_data(format!(
                 "archive contains a duplicate entry '{name}'"
@@ -138,8 +294,14 @@ fn install_archive_with_expected_hash(
     let mut total: u64 = 0;
     for index in 0..archive_reader.len() {
         let entry = archive_reader.by_index(index).map_err(invalid_data)?;
-        if !entry.is_file() || !ALLOWLIST.contains(&entry.name()) {
+        if !entry.is_file() || !allowlist.contains(&entry.name()) {
             continue;
+        }
+        if entry
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err(invalid_data("archive contains a symlink"));
         }
         if selected.insert(entry.name().to_string(), index).is_some() {
             return Err(invalid_data(format!(
@@ -162,8 +324,8 @@ fn install_archive_with_expected_hash(
             )));
         }
     }
-    for required in REQUIRED {
-        if !selected.contains_key(required) {
+    for required in required_names {
+        if !selected.contains_key(*required) {
             return Err(invalid_data(format!(
                 "archive is missing required entry '{required}'"
             )));
@@ -176,10 +338,7 @@ fn install_archive_with_expected_hash(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let staging = root.join(format!(
-        "{MANAGED_XRAY_VERSION}.tmp-{}-{nanos}",
-        std::process::id()
-    ));
+    let staging = root.join(format!("{version}.tmp-{}-{nanos}", std::process::id()));
     let outcome = (|| {
         fs::create_dir(&staging)?;
         crate::config_security::protect_path(&staging)?;
@@ -201,18 +360,17 @@ fn install_archive_with_expected_hash(
             }
             crate::config_security::protect_path(&target)?;
         }
+        verify_required_hashes(&staging, expected_required)?;
+        protect_version_tree(root, &staging, required_names, executable_name)?;
         match fs::rename(&staging, &final_dir) {
-            Ok(()) => {
-                protect_version_tree(root, &final_dir)?;
-                Ok(ManagedXrayInstallation {
-                    executable,
-                    version_dir: final_dir,
-                    created: true,
-                })
-            }
+            Ok(()) => Ok(ManagedXrayInstallation {
+                executable,
+                version_dir: final_dir,
+                created: true,
+            }),
             Err(err) => {
                 if version_verified(&final_dir, expected_required) {
-                    protect_version_tree(root, &final_dir)?;
+                    protect_version_tree(root, &final_dir, required_names, executable_name)?;
                     Ok(ManagedXrayInstallation {
                         executable,
                         version_dir: final_dir,
@@ -230,7 +388,7 @@ fn install_archive_with_expected_hash(
     outcome
 }
 
-fn allowlisted_central_names(archive: &[u8]) -> io::Result<Vec<String>> {
+fn allowlisted_central_names(archive: &[u8], allowlist: &[&str]) -> io::Result<Vec<String>> {
     let scan_from = archive.len().saturating_sub(22 + 65_535);
     let mut eocd = None;
     for pos in (scan_from..archive.len().saturating_sub(21)).rev() {
@@ -262,7 +420,7 @@ fn allowlisted_central_names(archive: &[u8]) -> io::Result<Vec<String>> {
         }
         let name = std::str::from_utf8(&archive[pos + 46..name_end])
             .map_err(|_| invalid_data("archive entry name is not UTF-8"))?;
-        if ALLOWLIST.contains(&name) {
+        if allowlist.contains(&name) {
             names.push(name.to_string());
         }
         pos = name_end + extra_len + comment_len;
@@ -273,7 +431,8 @@ fn allowlisted_central_names(archive: &[u8]) -> io::Result<Vec<String>> {
 fn version_verified(version_dir: &Path, expected_required: &[(&str, &str)]) -> bool {
     expected_required.iter().all(|(name, expected_hash)| {
         let path = version_dir.join(name);
-        path.is_file()
+        fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
             && fs::read(&path)
                 .map(|data| sha256_hex(&data) == *expected_hash)
                 .unwrap_or(false)
@@ -300,12 +459,27 @@ fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 
-fn protect_version_tree(root: &Path, version_dir: &Path) -> io::Result<()> {
+fn protect_version_tree(
+    root: &Path,
+    version_dir: &Path,
+    required_names: &[&str],
+    executable_name: &str,
+) -> io::Result<()> {
     crate::config_security::protect_path(root)?;
     crate::config_security::protect_path(version_dir)?;
-    for name in REQUIRED {
+    for name in required_names {
         crate::config_security::protect_path(&version_dir.join(name))?;
     }
+    #[cfg(unix)]
+    if executable_name == "xray" {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            version_dir.join(executable_name),
+            fs::Permissions::from_mode(0o700),
+        )?;
+    }
+    #[cfg(not(unix))]
+    let _ = executable_name;
     Ok(())
 }
 
@@ -355,6 +529,174 @@ mod tests {
             ("geoip.dat", b"geoip".to_vec()),
             ("geosite.dat", b"geosite".to_vec()),
         ]
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn linux_required_entries() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("xray", b"ELF fake xray".to_vec()),
+            ("geoip.dat", b"geoip".to_vec()),
+            ("geosite.dat", b"geosite".to_vec()),
+        ]
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn install_linux_synthetic(root: &Path, archive: &[u8]) -> io::Result<ManagedXrayInstallation> {
+        let file_hashes: Vec<(String, String)> = linux_required_entries()
+            .iter()
+            .map(|(name, data)| (name.to_string(), sha256_hex(data)))
+            .collect();
+        let refs: Vec<(&str, &str)> = file_hashes
+            .iter()
+            .map(|(n, h)| (n.as_str(), h.as_str()))
+            .collect();
+        install_archive_for_platform(root, archive, &sha256_hex(archive), &refs, LINUX_LAYOUT)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_manifest_installs_executable_and_assets_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_dir("linux-valid");
+        let root = dir.join("xray");
+        let owned = linux_required_entries();
+        let archive = build_archive(&slices(&owned));
+        let installed = install_linux_synthetic(&root, &archive).unwrap();
+        assert!(installed.created);
+        assert_eq!(installed.version_dir, root.join("v26.3.27"));
+        assert_eq!(installed.executable, installed.version_dir.join("xray"));
+        assert_eq!(
+            fs::metadata(&installed.executable)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(installed.version_dir.join("geoip.dat"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(!install_linux_synthetic(&root, &archive).unwrap().created);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_manifest_rejects_wrong_archive_and_tampered_assets() {
+        let dir = unique_dir("linux-integrity");
+        let root = dir.join("xray");
+        let owned = linux_required_entries();
+        let archive = build_archive(&slices(&owned));
+        assert_eq!(
+            install_verified_linux_archive(&root, &archive)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!root.join(LINUX_XRAY_VERSION).exists());
+        let installed = install_linux_synthetic(&root, &archive).unwrap();
+        fs::write(installed.version_dir.join("geoip.dat"), b"tampered").unwrap();
+        assert!(install_linux_synthetic(&root, &archive).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_manifest_rejects_missing_binary_without_publishing_version() {
+        let dir = unique_dir("linux-missing");
+        let root = dir.join("xray");
+        let archive = build_archive(&[("geoip.dat", b"geoip"), ("geosite.dat", b"geosite")]);
+        assert_eq!(
+            install_linux_synthetic(&root, &archive).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!linux_managed_version_dir(&root).exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_manifest_rejects_wrong_file_hash_before_atomic_publish() {
+        let dir = unique_dir("linux-wrong-file-hash");
+        let root = dir.join("xray");
+        let archive = build_archive(&[
+            ("xray", b"ELF fake xray"),
+            ("geoip.dat", b"tampered"),
+            ("geosite.dat", b"geosite"),
+        ]);
+        assert_eq!(
+            install_linux_synthetic(&root, &archive).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!linux_managed_version_dir(&root).exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn package_mode_policy_requires_root_owner_and_no_group_write() {
+        assert!(package_executable_mode_allowed(0o755, 0));
+        assert!(!package_executable_mode_allowed(0o775, 0));
+        assert!(!package_executable_mode_allowed(0o757, 0));
+        assert!(!package_executable_mode_allowed(0o755, 1000));
+        assert!(!package_executable_mode_allowed(0o644, 0));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn linux_manifest_rejects_symlinked_existing_asset() {
+        let dir = unique_dir("linux-symlink");
+        let root = dir.join("xray");
+        let owned = linux_required_entries();
+        let archive = build_archive(&slices(&owned));
+        let installed = install_linux_synthetic(&root, &archive).unwrap();
+        let external = dir.join("external-geoip.dat");
+        fs::write(&external, b"geoip").unwrap();
+        fs::remove_file(installed.version_dir.join("geoip.dat")).unwrap();
+        std::os::unix::fs::symlink(&external, installed.version_dir.join("geoip.dat")).unwrap();
+        assert_eq!(
+            install_linux_synthetic(&root, &archive).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn official_linux_archive_verifies_when_supplied_outside_normal_tests() {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(path) = std::env::var("XRAY_LINUX_ARCHIVE") else {
+            return;
+        };
+        let archive = fs::read(path).unwrap();
+        assert_eq!(sha256_hex(&archive), LINUX_XRAY_SHA256);
+        let dir = unique_dir("linux-official");
+        let root = dir.join("xray");
+        let installed = install_verified_linux_archive(&root, &archive).unwrap();
+        verify_managed_linux_executable(&root, &installed.executable).unwrap();
+        let version = std::process::Command::new(&installed.executable)
+            .arg("version")
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        assert!(String::from_utf8_lossy(&version.stdout).contains("26.3.27"));
+        fs::set_permissions(&installed.executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify_managed_linux_executable(&root, &installed.executable).is_err());
+        fs::set_permissions(&installed.executable, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(installed.version_dir.join("geosite.dat"), b"tampered").unwrap();
+        assert_eq!(
+            verify_managed_linux_executable(&root, &installed.executable)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn slices<'a>(entries: &'a [(&'a str, Vec<u8>)]) -> Vec<(&'a str, &'a [u8])> {

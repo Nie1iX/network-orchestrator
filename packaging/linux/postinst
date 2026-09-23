@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure|abort-upgrade|abort-remove|abort-deconfigure)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+            systemctl enable network-orchestrator.service
+            if [ -d /run/systemd/system ]; then
+                systemctl start network-orchestrator.service
+            fi
+        fi
+        ;;
+esac
+
+exit 0

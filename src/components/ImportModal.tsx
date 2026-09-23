@@ -26,6 +26,7 @@ export default function ImportModal({
   const [busy, setBusy] = useState(false);
   const [subUrl, setSubUrl] = useState("");
   const [subHwid, setSubHwid] = useState("");
+  const [subRefreshMinutes, setSubRefreshMinutes] = useState<number | null>(null);
 
   const onImportFiles = async () => {
     setBusy(true);
@@ -66,10 +67,12 @@ export default function ImportModal({
       const result = await invoke<BatchImportResult>("import_subscription", {
         url: subUrl.trim(),
         hwid: subHwid.trim(),
+        refreshIntervalMinutes: subRefreshMinutes,
       });
       onImported(result);
       setSubUrl("");
       setSubHwid("");
+      setSubRefreshMinutes(null);
       onClose();
     } catch (err) {
       onError(String(err));
@@ -155,8 +158,8 @@ export default function ImportModal({
       {tab === "subscription" && (
         <div className="modal-tab-body">
           <p className="profile-help">
-            Import a v2ray-style subscription URL. All vless:// endpoints are
-            grouped into a single profile with an endpoint selector.
+            Import a subscription URL. Supported vless:// and hysteria2://
+            endpoints are grouped into a profile with an endpoint selector.
           </p>
           <label>
             Subscription URL
@@ -170,11 +173,23 @@ export default function ImportModal({
           <label>
             HWID (X-HWID header, optional)
             <input
-              type="text"
+              type="password"
               value={subHwid}
               onChange={(e) => setSubHwid(e.target.value)}
               placeholder="device-hwid"
             />
+          </label>
+          <label>
+            Automatic refresh
+            <select
+              value={subRefreshMinutes ?? ""}
+              onChange={(event) => setSubRefreshMinutes(event.target.value ? Number(event.target.value) : null)}
+            >
+              <option value="">Off</option>
+              <option value="15">Every 15 minutes</option>
+              <option value="60">Every hour</option>
+              <option value="360">Every 6 hours</option>
+            </select>
           </label>
           <button
             type="button"

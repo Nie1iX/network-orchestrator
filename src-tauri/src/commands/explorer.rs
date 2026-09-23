@@ -22,5 +22,18 @@ pub(crate) async fn lookup_destination(dest: String) -> Result<RouteLookupResult
 
 #[tauri::command]
 pub(crate) async fn set_interface_state(name: String, up: bool) -> Result<(), String> {
-    explorer::set_interface_state(&name, up).map_err(|e| e.to_string())
+    #[cfg(target_os = "linux")]
+    {
+        use net_manager_core::daemon_protocol::{method, LinkSetStateParams};
+        let client = crate::daemon_client::DaemonClient::system();
+        let _: serde_json::Value = client
+            .request(method::LINK_SET_STATE, LinkSetStateParams { name, up })
+            .await
+            .map_err(|e| crate::daemon_client::user_message(&e))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        explorer::set_interface_state(&name, up).map_err(|e| e.to_string())
+    }
 }

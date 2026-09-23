@@ -28,3 +28,6 @@ target/
 
 .serena/
 .worktrees/
+
+# Python
+__pycache__/

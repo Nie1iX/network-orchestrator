@@ -12,6 +12,7 @@ name = "network_orchestrator_daemon"
 path = "src/lib.rs"
 
 [dependencies]
+base64 = "0.22"
 net-manager-core = { path = "../core" }
 ipnet = "2"
 serde = { version = "1", features = ["derive"] }

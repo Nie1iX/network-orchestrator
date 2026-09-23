@@ -7,6 +7,8 @@ use ipnet::{IpNet, Ipv4Net};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::fs;
 use std::io;
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -323,7 +325,57 @@ pub fn resolve_openvpn_executable(configured: Option<&Path>) -> io::Result<PathB
 }
 
 pub fn resolve_xray_executable(configured: Option<&Path>) -> io::Result<PathBuf> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        resolve_xray_executable_with_package_root(
+            configured,
+            Path::new(crate::managed_xray::LINUX_XRAY_PACKAGE_ROOT),
+            crate::managed_xray::verify_managed_linux_executable,
+        )
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        resolve_executable(configured, XRAY_EXE_NAME, "Xray", &xray_standard_paths())
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn resolve_xray_executable_with_package_root(
+    configured: Option<&Path>,
+    root: &Path,
+    verify: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    if configured.is_none() {
+        if let Some(package) = verified_package_xray_at(root, verify)? {
+            return Ok(package);
+        }
+    }
     resolve_executable(configured, XRAY_EXE_NAME, "Xray", &xray_standard_paths())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn verified_package_xray_at(
+    root: &Path,
+    verify: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<Option<PathBuf>> {
+    let executable = crate::managed_xray::linux_managed_version_dir(root).join("xray");
+    match fs::symlink_metadata(&executable) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packaged Xray is unavailable",
+            ))
+        }
+        Ok(_) => {}
+    }
+    verify(root, &executable).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "packaged Xray failed integrity verification",
+        )
+    })?;
+    Ok(Some(executable))
 }
 
 fn resolve_executable(
@@ -447,13 +499,12 @@ fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
             profile.config_path.display()
         ))
     })?;
-    let with_policies = crate::xray::apply_domain_policies(&base, &profile.domain_policies)
-        .map_err(|err| {
-            invalid_data(format!(
-                "failed to apply domain policies to '{}': {err}",
-                profile.config_path.display()
-            ))
-        })?;
+    let with_policies = crate::xray::apply_profile_routing(
+        &base,
+        &profile.domain_policies,
+        profile.private_lan_direct,
+    )
+    .map_err(|_| invalid_data("failed to apply Xray routing policies"))?;
     let merged = if profile.xray_mode == crate::models::XrayMode::Tun {
         crate::xray::apply_tun_inbound(
             &with_policies,
@@ -1788,6 +1839,28 @@ mod tests {
     }
 
     #[test]
+    fn prepare_xray_config_applies_private_lan_preset_after_user_rules() {
+        let dir = unique_dir("xray-private-lan");
+        let path = dir.join("node.json");
+        fs::write(&path, r#"{"outbounds":[{"tag":"proxy","protocol":"vless"},{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[]}}"#).unwrap();
+        let mut profile = xray_profile();
+        profile.config_path = path;
+        profile.private_lan_direct = true;
+        profile.domain_policies = vec![DomainPolicy {
+            domains: vec!["geoip:us".into()],
+            target: DomainRouteTarget::Block,
+        }];
+        let config: serde_json::Value =
+            serde_json::from_slice(&prepare_xray_config(&profile).unwrap()).unwrap();
+        assert_eq!(
+            config["routing"]["rules"][0]["ip"],
+            serde_json::json!(["geoip:us"])
+        );
+        assert_eq!(config["routing"]["rules"][1]["ip"][0], "10.0.0.0/8");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn prepare_xray_config_rejects_malformed_json_without_echoing_content() {
         let dir = unique_dir("xray-badjson");
         let path = dir.join("node.json");
@@ -1840,6 +1913,60 @@ mod tests {
         let dir = unique_dir("xray-exe");
         let err = resolve_xray_executable(Some(&dir.join("missing-xray.exe"))).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn package_xray_candidate_is_used_only_after_verification() {
+        let dir = unique_dir("xray-package-candidate");
+        let root = dir.join("xray");
+        let candidate = root
+            .join(crate::managed_xray::LINUX_XRAY_VERSION)
+            .join("xray");
+        fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        fs::write(&candidate, b"synthetic binary").unwrap();
+        let verified = verified_package_xray_at(&root, |_, path| {
+            assert_eq!(path, candidate);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(verified, Some(candidate.clone()));
+        let err = verified_package_xray_at(&root, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tampered secret",
+            ))
+        })
+        .unwrap_err();
+        assert!(!err.to_string().contains("tampered secret"));
+        assert!(!err.to_string().contains(&dir.display().to_string()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn xray_auto_detect_prefers_verified_package_but_respects_explicit_path() {
+        let dir = unique_dir("xray-package-priority");
+        let root = dir.join("xray");
+        let package = root
+            .join(crate::managed_xray::LINUX_XRAY_VERSION)
+            .join("xray");
+        fs::create_dir_all(package.parent().unwrap()).unwrap();
+        fs::write(&package, b"package").unwrap();
+        let explicit = dir.join("configured-xray");
+        fs::write(&explicit, b"configured").unwrap();
+        assert_eq!(
+            resolve_xray_executable_with_package_root(None, &root, |_, _| Ok(())).unwrap(),
+            package
+        );
+        assert_eq!(
+            resolve_xray_executable_with_package_root(Some(&explicit), &root, |_, _| panic!(
+                "package verifier must not run for configured path"
+            ))
+            .unwrap(),
+            explicit
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

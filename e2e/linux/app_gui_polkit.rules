@@ -1,0 +1,8 @@
+// Headless disposable-container fixture: no active logind/polkit agent exists.
+polkit.addRule(function(action, subject) {
+    if (subject.user == "alice" &&
+        (action.id == "com.netmanager.app.system-network" ||
+         action.id == "com.netmanager.app.connect-profile")) {
+        return polkit.Result.YES;
+    }
+});

@@ -1,17 +1,1152 @@
 //! `DaemonCore`: owner bookkeeping on top of the journal and the executors.
 //! Synchronous by design; the server calls it from `spawn_blocking`.
 
+#[cfg(target_os = "linux")]
+use crate::dns::{DnsApply, DnsExecutor};
 use crate::journal::{JournalDocument, JournalEntry, JournalStore};
+use crate::openvpn::OpenVpnPlan;
+use crate::openvpn_process::OpenVpnProcessRunner;
 use crate::validate::{validate_apply, validate_iface_name, validate_owner};
-use net_manager_core::daemon_protocol::{CleanupResult, OwnedEntry, OwnedResource, OwnedState};
-use net_manager_core::models::AppliedRoute;
+use crate::wireguard::{WireGuardPlan, WireGuardPlanWarning};
+use crate::xray::prepare_xray;
+use crate::xray_process::XrayProcessRunner;
+use ipnet::IpNet;
+use net_manager_core::daemon_protocol::{
+    CleanupResult, IpFamily, OpenVpnConnectionState, OpenVpnProbeResult, OpenVpnProcessResource,
+    OpenVpnStatusResult, OpenVpnWarning, OwnedEntry, OwnedResource, OwnedRuleResource, OwnedState,
+    WireGuardAddressResource, WireGuardFullResource, WireGuardLinkResource, WireGuardStatusResult,
+    WireGuardWarning, XrayConnectParams, XrayProcessResource, XrayStatusResult,
+};
+use net_manager_core::models::TunnelState;
+use net_manager_core::models::{AnalyzedRoute, AppliedRoute};
+use net_manager_core::openvpn_management::{ManagementEvent, ManagementSnapshot, OpenVpnState};
 use net_manager_core::policy::{
     apply_routes_transactional, remove_routes_best_effort, RouteExecutor,
 };
+use std::collections::{HashMap, HashSet};
 use std::io;
 
 pub trait LinkExecutor: Send {
     fn set_link_state(&mut self, name: &str, up: bool) -> io::Result<()>;
+}
+
+#[cfg(test)]
+mod openvpn_tests {
+    use super::testing::{FakeLinks, FakeRoutes, Op, Recorder};
+    use super::*;
+    use crate::openvpn::prepare_openvpn;
+    use net_manager_core::daemon_protocol::{
+        OpenVpnConnectParams, OpenVpnConnectRequest, OpenVpnConnectionState, OpenVpnCredentials,
+        OpenVpnUserPass,
+    };
+    use net_manager_core::openvpn_management::{parse_push_reply, ManagementEvent, OpenVpnState};
+    use std::collections::{BTreeMap, VecDeque};
+    use std::fs;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct FakeProcess {
+        calls: Arc<Mutex<Vec<String>>>,
+        pending: Arc<Mutex<VecDeque<Vec<ManagementEvent>>>>,
+        journal_path: Arc<Mutex<Option<std::path::PathBuf>>>,
+        link_missing: Arc<Mutex<bool>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakePolicy {
+        events: Arc<Mutex<Vec<String>>>,
+        existing: Arc<Mutex<Vec<OwnedRuleResource>>>,
+        fail_add: Arc<Mutex<bool>>,
+    }
+
+    impl PolicyRuleExecutor for FakePolicy {
+        fn rules_snapshot(&mut self) -> io::Result<Vec<OwnedRuleResource>> {
+            Ok(self.existing.lock().unwrap().clone())
+        }
+        fn table_in_use(&mut self, _table: u32) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn add_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("rule-add:{}:{}", rule.table, rule.priority));
+            if *self.fail_add.lock().unwrap() {
+                Err(io::Error::other("synthetic rule add failure"))
+            } else {
+                Ok(())
+            }
+        }
+        fn remove_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("rule-remove:{}:{}", rule.table, rule.priority));
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeDns {
+        events: Arc<Mutex<Vec<String>>>,
+        unavailable: Arc<Mutex<bool>>,
+    }
+
+    impl crate::dns::DnsExecutor for FakeDns {
+        fn apply(
+            &mut self,
+            name: &str,
+            servers: &[std::net::IpAddr],
+            _domains: &[String],
+            full: bool,
+        ) -> Result<crate::dns::DnsApply, crate::dns::DnsError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("dns-apply:{name}:{}:{full}", servers.len()));
+            Ok(if *self.unavailable.lock().unwrap() {
+                crate::dns::DnsApply::Unavailable
+            } else {
+                crate::dns::DnsApply::Applied
+            })
+        }
+        fn revert(&mut self, name: &str) -> Result<(), crate::dns::DnsError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("dns-revert:{name}"));
+            Ok(())
+        }
+    }
+
+    impl OpenVpnProcessRunner for FakeProcess {
+        fn verify_binary(&self) -> io::Result<()> {
+            self.calls.lock().unwrap().push("verify".into());
+            Ok(())
+        }
+        fn link_index(&self, name: &str) -> io::Result<Option<u32>> {
+            let mut calls = self.calls.lock().unwrap();
+            let started = calls.iter().any(|call| call == &format!("start:{name}"));
+            let stopped = calls.iter().any(|call| call == &format!("stop:{name}"));
+            calls.push(format!("lookup:{name}"));
+            Ok((started && !stopped && !*self.link_missing.lock().unwrap()).then_some(42))
+        }
+        fn start(
+            &mut self,
+            _uid: u32,
+            name: &str,
+            _: &net_manager_core::openvpn_config::SanitizedOpenVpnConfig,
+            _: Option<net_manager_core::daemon_protocol::OpenVpnCredentials>,
+            mark: u32,
+        ) -> io::Result<()> {
+            if let Some(path) = self.journal_path.lock().unwrap().as_ref() {
+                let journal = JournalStore::new(path).load().unwrap();
+                assert!(journal.entries.iter().any(|entry| entry
+                    .resources
+                    .iter()
+                    .any(|resource| matches!(resource, OwnedResource::OpenVpnProcess(_)))));
+            }
+            self.calls.lock().unwrap().push(format!("start:{name}"));
+            self.calls.lock().unwrap().push(format!("mark:{mark}"));
+            Ok(())
+        }
+        fn poll(&mut self, _: &str) -> io::Result<Vec<ManagementEvent>> {
+            Ok(self.pending.lock().unwrap().pop_front().unwrap_or_default())
+        }
+        fn stop(&mut self, name: &str) -> io::Result<()> {
+            self.calls.lock().unwrap().push(format!("stop:{name}"));
+            Ok(())
+        }
+        fn cleanup(&mut self, _: u32, name: &str) -> io::Result<()> {
+            self.calls.lock().unwrap().push(format!("cleanup:{name}"));
+            Ok(())
+        }
+    }
+
+    fn unique_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("openvpn-core-{}-{label}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn core(dir: &Path, process: &FakeProcess, routes: &Recorder) -> DaemonCore {
+        *process.journal_path.lock().unwrap() = Some(dir.join("state.json"));
+        DaemonCore::open_with_openvpn(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(FakeRoutes::new(routes)),
+            Box::new(FakeLinks(routes.clone())),
+            Box::new(process.clone()),
+        )
+        .unwrap()
+    }
+
+    fn plan() -> OpenVpnPlan {
+        prepare_openvpn(
+            1000,
+            OpenVpnConnectParams {
+                profile_id: "home".into(),
+                config: "client\nremote vpn.example 1194\n".into(),
+                assets: BTreeMap::new(),
+                routes: vec![],
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn probe_journals_process_then_returns_pushed_routes_without_network_apply() {
+        let dir = unique_dir("probe-success");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.start_openvpn_probe(1000, plan()).unwrap();
+        assert_eq!(core.journal.entries[0].owner, "ovpn-probe:home");
+        assert_eq!(core.journal.entries[0].resources.len(), 1);
+        assert!(matches!(
+            core.journal.entries[0].resources[0],
+            OwnedResource::OpenVpnProcess(_)
+        ));
+        assert!(core.connect_openvpn(1000, plan()).is_err());
+        assert!(routes.ops().is_empty());
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,route 10.89.0.0 255.255.255.0").unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        let result = core.poll_openvpn_probe(1000, "home").unwrap().unwrap();
+        assert_eq!(
+            result.routes[0].destination,
+            "10.89.0.0/24".parse().unwrap()
+        );
+        assert_eq!(result.routes[0].source, "OpenVPN pushed");
+        core.finish_openvpn_probe(1000, "home").unwrap();
+        assert!(core.journal.entries.is_empty());
+        assert!(routes.ops().is_empty());
+        assert!(process
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("cleanup:")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_probe_is_cleaned_and_crashed_probe_is_recovered_from_journal() {
+        let dir = unique_dir("probe-failure");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut daemon = core(&dir, &process, &routes);
+        daemon.start_openvpn_probe(1000, plan()).unwrap();
+        process
+            .pending
+            .lock()
+            .unwrap()
+            .push_back(vec![ManagementEvent::AuthenticationFailed]);
+        assert!(daemon.poll_openvpn_probe(1000, "home").is_err());
+        daemon.finish_openvpn_probe(1000, "home").unwrap();
+        assert!(daemon.journal.entries.is_empty());
+
+        daemon.start_openvpn_probe(1000, plan()).unwrap();
+        drop(daemon);
+        let recovered_process = FakeProcess::default();
+        let recovered = core(&dir, &recovered_process, &routes);
+        assert!(recovered.journal.entries.is_empty());
+        assert!(routes.ops().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn credentials_never_enter_the_ownership_journal() {
+        let dir = unique_dir("credentials-journal");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        let mut request = OpenVpnConnectRequest::from(OpenVpnConnectParams {
+            profile_id: "home".into(),
+            config: "client\nremote vpn.example\nauth-user-pass\n".into(),
+            assets: BTreeMap::new(),
+            routes: vec![],
+        });
+        request.credentials = Some(OpenVpnCredentials {
+            auth_user_pass: Some(OpenVpnUserPass {
+                username: "SECRET-USER".into(),
+                password: "SECRET-PASSWORD".into(),
+            }),
+            private_key_passphrase: None,
+        });
+        let plan = prepare_openvpn(1000, request).unwrap();
+        core.connect_openvpn(1000, plan).unwrap();
+        let journal = fs::read_to_string(dir.join("state.json")).unwrap();
+        for secret in ["SECRET-USER", "SECRET-PASSWORD"] {
+            assert!(!journal.contains(secret));
+        }
+        core.disconnect_openvpn(1000, "home").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_management_auth_failure_sets_a_clearable_warning() {
+        let dir = unique_dir("auth-failure-warning");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        process
+            .pending
+            .lock()
+            .unwrap()
+            .push_back(vec![ManagementEvent::AuthenticationFailed]);
+        assert!(core.reconcile_openvpn().is_err());
+        let status = core.openvpn_status(1000, "home");
+        assert_eq!(status.state, OpenVpnConnectionState::Failed);
+        assert_eq!(
+            serde_json::to_value(&status.warnings).unwrap(),
+            serde_json::json!(["authenticationFailed"])
+        );
+        core.disconnect_openvpn(1000, "home").unwrap();
+        assert_eq!(
+            core.openvpn_status(1000, "home").state,
+            OpenVpnConnectionState::Stopped
+        );
+        assert!(core.openvpn_status(1000, "home").warnings.is_empty());
+
+        core.connect_openvpn(1000, plan()).unwrap();
+        process
+            .pending
+            .lock()
+            .unwrap()
+            .push_back(vec![ManagementEvent::State(OpenVpnState::Exiting)]);
+        core.reconcile_openvpn().unwrap();
+        assert!(core.openvpn_status(1000, "home").warnings.is_empty());
+        core.disconnect_openvpn(1000, "home").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn successful_reconnect_clears_previous_authentication_warning() {
+        let dir = unique_dir("auth-warning-reconnect");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        process
+            .pending
+            .lock()
+            .unwrap()
+            .push_back(vec![ManagementEvent::AuthenticationFailed]);
+        assert!(core.reconcile_openvpn().is_err());
+        assert!(core
+            .openvpn_status(1000, "home")
+            .warnings
+            .contains(&OpenVpnWarning::AuthenticationFailed));
+        core.connect_openvpn(1000, plan()).unwrap();
+        assert!(core.openvpn_status(1000, "home").warnings.is_empty());
+        core.disconnect_openvpn(1000, "home").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn journals_before_spawn_and_applies_pushed_split_routes_after_connected() {
+        let dir = unique_dir("split");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        let status = core.connect_openvpn(1000, plan()).unwrap();
+        assert_eq!(status.state, OpenVpnConnectionState::Connecting);
+        assert_eq!(
+            core.openvpn_status(1001, "home").state,
+            OpenVpnConnectionState::Stopped
+        );
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,route 10.89.0.0 255.255.0.0").unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        core.reconcile_openvpn().unwrap();
+        assert_eq!(
+            core.openvpn_status(1000, "home").state,
+            OpenVpnConnectionState::Connected
+        );
+        assert_eq!(
+            core.openvpn_status(1000, "home").applied_routes,
+            ["10.89.0.0/16".parse().unwrap()]
+        );
+        assert_eq!(routes.ops(), vec![Op::Add("10.89.0.0/16".into())]);
+        assert!(core.disconnect_openvpn(1001, "home").is_err());
+        core.disconnect_openvpn(1000, "home").unwrap();
+        assert_eq!(
+            routes.ops(),
+            vec![
+                Op::Add("10.89.0.0/16".into()),
+                Op::Remove("10.89.0.0/16".into())
+            ]
+        );
+        assert!(process
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("stop:")));
+        assert!(JournalStore::new(dir.join("state.json"))
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pushed_full_or_dns_causes_teardown_without_route_mutation() {
+        for (label, push) in [
+            ("full", "PUSH_REPLY,redirect-gateway def1"),
+            (
+                "def1-routes",
+                "PUSH_REPLY,route 0.0.0.0 128.0.0.0,route 128.0.0.0 128.0.0.0",
+            ),
+            ("dns", "PUSH_REPLY,dhcp-option DNS 10.8.0.1"),
+        ] {
+            let dir = unique_dir(label);
+            let process = FakeProcess::default();
+            let routes = Recorder::default();
+            let mut core = core(&dir, &process, &routes);
+            core.connect_openvpn(1000, plan()).unwrap();
+            process.pending.lock().unwrap().push_back(vec![
+                ManagementEvent::PushReply(parse_push_reply(push).unwrap()),
+                ManagementEvent::State(OpenVpnState::Connected),
+            ]);
+            assert!(core.reconcile_openvpn().is_err());
+            assert!(routes.ops().is_empty());
+            assert!(process
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.starts_with("stop:")));
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn connected_without_owned_tun_rolls_back_process() {
+        let dir = unique_dir("missing-tun");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        *process.link_missing.lock().unwrap() = true;
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,route 10.89.0.0 255.255.0.0").unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        assert!(core.reconcile_openvpn().is_err());
+        assert!(process
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("stop:")));
+        assert_eq!(
+            core.openvpn_status(1000, "home").state,
+            OpenVpnConnectionState::Failed
+        );
+        assert!(JournalStore::new(dir.join("state.json"))
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn route_collision_rolls_back_child_without_removing_foreign_route() {
+        let dir = unique_dir("route-collision");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        routes.fail_add.lock().unwrap().push("10.89.0.0/16".into());
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,route 10.89.0.0 255.255.0.0").unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        assert!(core.reconcile_openvpn().is_err());
+        assert_eq!(routes.ops(), vec![Op::Add("10.89.0.0/16".into())]);
+        assert!(process
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("stop:")));
+        assert!(JournalStore::new(dir.join("state.json"))
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reconnect_replaces_owned_split_route_set() {
+        let dir = unique_dir("reconnect-replace");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,route 10.89.0.0 255.255.0.0").unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+            ManagementEvent::ByteCount {
+                received: 17,
+                sent: 23,
+            },
+        ]);
+        core.reconcile_openvpn().unwrap();
+        assert_eq!(core.openvpn_status(1000, "home").rx_bytes, 17);
+        process
+            .pending
+            .lock()
+            .unwrap()
+            .push_back(vec![ManagementEvent::State(OpenVpnState::Reconnecting)]);
+        core.reconcile_openvpn().unwrap();
+        assert!(core.openvpn_status(1000, "home").applied_routes.is_empty());
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,route 10.90.0.0 255.255.0.0").unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        core.reconcile_openvpn().unwrap();
+        assert_eq!(
+            core.openvpn_status(1000, "home").applied_routes,
+            ["10.90.0.0/16".parse().unwrap()]
+        );
+        assert_eq!(
+            routes.ops(),
+            vec![
+                Op::Add("10.89.0.0/16".into()),
+                Op::Remove("10.89.0.0/16".into()),
+                Op::Add("10.90.0.0/16".into()),
+            ]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn simultaneous_split_profiles_use_distinct_transport_marks() {
+        let dir = unique_dir("split-marks");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        let second = prepare_openvpn(
+            1000,
+            OpenVpnConnectParams {
+                profile_id: "office".into(),
+                config: "client\nremote vpn.example\n".into(),
+                assets: BTreeMap::new(),
+                routes: vec![],
+            },
+        )
+        .unwrap();
+        core.connect_openvpn(1000, second).unwrap();
+        let marks: Vec<_> = process
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.starts_with("mark:"))
+            .cloned()
+            .collect();
+        assert_eq!(marks, ["mark:51820", "mark:51821"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pushed_def1_and_dns_use_owned_table_rules_and_resolved() {
+        let dir = unique_dir("full-dns");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let policy = FakePolicy::default();
+        let dns = FakeDns::default();
+        let mut core = core(&dir, &process, &routes);
+        core.policy = Some(Box::new(policy.clone()));
+        core.dns = Some(Box::new(dns.clone()));
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.79.0.1")
+                    .unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        core.reconcile_openvpn().unwrap();
+        let status = core.openvpn_status(1000, "home");
+        assert_eq!(status.state, OpenVpnConnectionState::Connected);
+        assert_eq!(status.applied_routes.len(), 2);
+        assert!(status.warnings.contains(&OpenVpnWarning::Ipv6NotCovered));
+        assert!(!status.warnings.contains(&OpenVpnWarning::DnsNotApplied));
+        let owned = core.owned(1000);
+        let process = owned[0]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::OpenVpnProcess(process) => Some(process),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(process.transport_mark, Some(51820));
+        assert!(process.full.is_some());
+        assert!(
+            owned[0]
+                .resources
+                .iter()
+                .filter(|resource| matches!(resource, OwnedResource::Rule(_)))
+                .count()
+                == 2
+        );
+        assert!(owned[0]
+            .resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) => Some(route),
+                _ => None,
+            })
+            .all(|route| route.table == Some(51820)));
+        assert!(dns
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.contains(":1:true")));
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let wg_config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
+        let wg_plan = crate::wireguard::parse_wireguard_config(&wg_config, &[]).unwrap();
+        assert_eq!(
+            core.allocate_full(&wg_plan).err().unwrap().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        core.disconnect_openvpn(1000, "home").unwrap();
+        assert!(policy
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("rule-remove:")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unavailable_dns_is_warned_and_reapplied_when_resolved_returns() {
+        let dir = unique_dir("full-dns-unavailable");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let policy = FakePolicy::default();
+        let dns = FakeDns::default();
+        *dns.unavailable.lock().unwrap() = true;
+        let mut core = core(&dir, &process, &routes);
+        core.policy = Some(Box::new(policy.clone()));
+        core.dns = Some(Box::new(dns.clone()));
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.79.0.1")
+                    .unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        core.reconcile_openvpn().unwrap();
+        let warnings = core.openvpn_status(1000, "home").warnings;
+        assert!(
+            warnings.contains(&net_manager_core::daemon_protocol::OpenVpnWarning::DnsNotApplied)
+        );
+        assert!(
+            warnings.contains(&net_manager_core::daemon_protocol::OpenVpnWarning::Ipv6NotCovered)
+        );
+        *dns.unavailable.lock().unwrap() = false;
+        core.reapply_dns().unwrap();
+        assert!(!core
+            .openvpn_status(1000, "home")
+            .warnings
+            .contains(&net_manager_core::daemon_protocol::OpenVpnWarning::DnsNotApplied));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pushed_dns_domain_without_server_fails_closed_before_network_mutation() {
+        let dir = unique_dir("dns-domain-only");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.dns = Some(Box::new(FakeDns::default()));
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(parse_push_reply("PUSH_REPLY,route 10.89.0.0 255.255.0.0,dns server 0 resolve-domains corp.example").unwrap()),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        assert!(core.reconcile_openvpn().is_err());
+        assert!(routes.ops().is_empty());
+        assert_eq!(
+            core.openvpn_status(1000, "home").state,
+            OpenVpnConnectionState::Failed
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn second_full_owner_is_rejected_before_new_routes_or_rules() {
+        let dir = unique_dir("full-collision");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let policy = FakePolicy::default();
+        let mut core = core(&dir, &process, &routes);
+        core.policy = Some(Box::new(policy.clone()));
+        core.dns = Some(Box::new(FakeDns::default()));
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,redirect-gateway def1").unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        core.reconcile_openvpn().unwrap();
+        let before_routes = routes.ops();
+        let before_rules = policy.events.lock().unwrap().clone();
+        let second = prepare_openvpn(
+            1001,
+            OpenVpnConnectParams {
+                profile_id: "office".into(),
+                config: "client\nremote vpn.example\n".into(),
+                assets: BTreeMap::new(),
+                routes: vec![],
+            },
+        )
+        .unwrap();
+        core.connect_openvpn(1001, second).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,redirect-gateway def1").unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        assert!(core.reconcile_openvpn_owner(1001, "ovpn:office").is_err());
+        assert_eq!(
+            core.openvpn_status(1000, "home").state,
+            OpenVpnConnectionState::Connected
+        );
+        assert_eq!(
+            core.openvpn_status(1001, "office").state,
+            OpenVpnConnectionState::Failed
+        );
+        assert_eq!(routes.ops(), before_routes);
+        assert_eq!(*policy.events.lock().unwrap(), before_rules);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_full_rule_add_rolls_back_routes_and_child() {
+        let dir = unique_dir("full-rule-rollback");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let policy = FakePolicy::default();
+        *policy.fail_add.lock().unwrap() = true;
+        let mut core = core(&dir, &process, &routes);
+        core.policy = Some(Box::new(policy.clone()));
+        core.dns = Some(Box::new(FakeDns::default()));
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,redirect-gateway def1").unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        assert!(core.reconcile_openvpn().is_err());
+        assert_eq!(
+            core.openvpn_status(1000, "home").state,
+            OpenVpnConnectionState::Failed
+        );
+        assert!(process
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("stop:")));
+        assert!(JournalStore::new(dir.join("state.json"))
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        assert!(routes.ops().iter().any(|op| matches!(op, Op::Remove(_))));
+        assert!(policy
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("rule-remove:")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn full_reconnect_replaces_routes_rules_and_dns() {
+        let dir = unique_dir("full-reconnect");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let policy = FakePolicy::default();
+        let dns = FakeDns::default();
+        let mut core = core(&dir, &process, &routes);
+        core.policy = Some(Box::new(policy.clone()));
+        core.dns = Some(Box::new(dns.clone()));
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.79.0.1")
+                    .unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        core.reconcile_openvpn().unwrap();
+        process
+            .pending
+            .lock()
+            .unwrap()
+            .push_back(vec![ManagementEvent::State(OpenVpnState::Reconnecting)]);
+        core.reconcile_openvpn().unwrap();
+        assert!(core.openvpn_status(1000, "home").applied_routes.is_empty());
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(parse_push_reply("PUSH_REPLY,redirect-gateway def1,route 10.90.0.0 255.255.0.0,dhcp-option DNS 10.79.0.2").unwrap()),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        core.reconcile_openvpn().unwrap();
+        let owned = core.owned(1000);
+        let dns_resource = owned[0]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::Dns(dns) => Some(dns),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            dns_resource.servers,
+            ["10.79.0.2".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(core.openvpn_status(1000, "home").applied_routes.len(), 3);
+        assert!(dns
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("dns-revert:")));
+        assert!(policy
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("rule-remove:")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn foreign_rule_appearing_after_connect_blocks_full_before_route_mutation() {
+        let dir = unique_dir("full-rule-collision");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let policy = FakePolicy::default();
+        let mut core = core(&dir, &process, &routes);
+        core.policy = Some(Box::new(policy.clone()));
+        core.dns = Some(Box::new(FakeDns::default()));
+        core.connect_openvpn(1000, plan()).unwrap();
+        policy.existing.lock().unwrap().push(OwnedRuleResource {
+            family: IpFamily::Ipv4,
+            priority: 10000,
+            table: 254,
+            fwmark: None,
+            invert: false,
+            suppress_prefix_length: Some(0),
+        });
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,redirect-gateway def1").unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        assert!(core.reconcile_openvpn().is_err());
+        assert!(routes.ops().is_empty());
+        assert!(policy.events.lock().unwrap().is_empty());
+        assert_eq!(
+            core.openvpn_status(1000, "home").state,
+            OpenVpnConnectionState::Failed
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ipv6_full_push_installs_only_ipv6_policy_rules() {
+        let dir = unique_dir("full-ipv6");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let policy = FakePolicy::default();
+        let mut core = core(&dir, &process, &routes);
+        core.policy = Some(Box::new(policy));
+        core.dns = Some(Box::new(FakeDns::default()));
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(parse_push_reply("PUSH_REPLY,route-ipv6 ::/0").unwrap()),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        core.reconcile_openvpn().unwrap();
+        let owned = core.owned(1000);
+        let rules: Vec<_> = owned[0]
+            .resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Rule(rule) => Some(rule),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rules.len(), 2);
+        assert!(rules.iter().all(|rule| rule.family == IpFamily::Ipv6));
+        assert!(!core
+            .openvpn_status(1000, "home")
+            .warnings
+            .contains(&OpenVpnWarning::Ipv6NotCovered));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_recovery_cleans_full_rules_routes_and_dns_without_child_pid() {
+        let dir = unique_dir("full-recovery");
+        let full = WireGuardFullResource {
+            table: 51820,
+            fwmark: 51820,
+            priority_main: 10000,
+            priority_tunnel: 10001,
+            ipv4: true,
+            ipv6: false,
+        };
+        let mut first = AppliedRoute::on_link("0.0.0.0/1".parse().unwrap(), 42, 5);
+        first.table = Some(51820);
+        let mut second = AppliedRoute::on_link("128.0.0.0/1".parse().unwrap(), 42, 5);
+        second.table = Some(51820);
+        let mut resources = vec![
+            OwnedResource::OpenVpnProcess(OpenVpnProcessResource {
+                name: "ovpn-a123456789".into(),
+                owner_marker: "network-orchestrator:1000:ovpn:home".into(),
+                transport_mark: Some(51820),
+                full: Some(full.clone()),
+            }),
+            OwnedResource::Route(first),
+            OwnedResource::Route(second),
+        ];
+        resources.extend(
+            full_policy_rules(&full)
+                .into_iter()
+                .map(OwnedResource::Rule),
+        );
+        resources.push(OwnedResource::Dns(
+            net_manager_core::daemon_protocol::WireGuardDnsResource {
+                interface_index: 42,
+                name: "ovpn-a123456789".into(),
+                servers: vec!["10.79.0.1".parse().unwrap()],
+                domains: vec![],
+                full: true,
+                applied: true,
+            },
+        ));
+        let journal = JournalDocument {
+            version: crate::journal::JOURNAL_VERSION,
+            entries: vec![JournalEntry {
+                uid: 1000,
+                owner: "ovpn:home".into(),
+                state: OwnedState::Applied,
+                resources,
+            }],
+        };
+        let store = JournalStore::new(dir.join("state.json"));
+        store.save(&journal).unwrap();
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let policy = FakePolicy::default();
+        let dns = FakeDns::default();
+        let mut core = DaemonCore {
+            journal: store.load().unwrap(),
+            store,
+            routes: Box::new(FakeRoutes::new(&routes)),
+            links: Box::new(FakeLinks(routes.clone())),
+            wg: None,
+            wg_config: None,
+            openvpn: Some(Box::new(process.clone())),
+            xray: None,
+            openvpn_runtime: HashMap::new(),
+            openvpn_failed: HashSet::new(),
+            openvpn_auth_failed: HashSet::new(),
+            policy: Some(Box::new(policy.clone())),
+            dns: Some(Box::new(dns.clone())),
+        };
+        let result = core.teardown(|_| true).unwrap();
+        assert_eq!(result.removed_owners, ["ovpn:home"]);
+        assert!(core.owned(1000).is_empty());
+        assert_eq!(
+            policy
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.starts_with("rule-remove:"))
+                .count(),
+            2
+        );
+        assert!(dns
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.starts_with("dns-revert:")));
+        assert_eq!(
+            routes
+                .ops()
+                .iter()
+                .filter(|op| matches!(op, Op::Remove(_)))
+                .count(),
+            2
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_recovery_removes_only_journaled_openvpn_route() {
+        let dir = unique_dir("recovery");
+        let journal = JournalDocument {
+            version: crate::journal::JOURNAL_VERSION,
+            entries: vec![JournalEntry {
+                uid: 1000,
+                owner: "ovpn:home".into(),
+                state: OwnedState::Applied,
+                resources: vec![
+                    OwnedResource::OpenVpnProcess(OpenVpnProcessResource {
+                        name: "ovpn-a123456789".into(),
+                        owner_marker: "network-orchestrator:1000:ovpn:home".into(),
+                        transport_mark: None,
+                        full: None,
+                    }),
+                    OwnedResource::Route(AppliedRoute::on_link(
+                        "10.89.0.0/16".parse().unwrap(),
+                        42,
+                        5,
+                    )),
+                ],
+            }],
+        };
+        JournalStore::new(dir.join("state.json"))
+            .save(&journal)
+            .unwrap();
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let core = core(&dir, &process, &routes);
+        assert!(core.owned(1000).is_empty());
+        assert_eq!(routes.ops(), vec![Op::Remove("10.89.0.0/16".into())]);
+        assert_eq!(
+            core.openvpn_status(1001, "home").state,
+            OpenVpnConnectionState::Stopped
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reconnect_route_removal_failure_stops_owned_child_and_marks_stale() {
+        let dir = unique_dir("reconnect-removal");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,route 10.89.0.0 255.255.0.0").unwrap(),
+            ),
+            ManagementEvent::State(OpenVpnState::Connected),
+        ]);
+        core.reconcile_openvpn().unwrap();
+        routes
+            .fail_remove
+            .lock()
+            .unwrap()
+            .push("10.89.0.0/16".into());
+        process
+            .pending
+            .lock()
+            .unwrap()
+            .push_back(vec![ManagementEvent::State(OpenVpnState::Reconnecting)]);
+        assert!(core.reconcile_openvpn().is_err());
+        assert!(process
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call.starts_with("stop:")));
+        assert_eq!(core.owned(1000)[0].state, OwnedState::Stale);
+        let calls = process.calls.lock().unwrap().len();
+        assert!(core.reconcile_openvpn().is_ok());
+        assert_eq!(process.calls.lock().unwrap().len(), calls);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+pub trait WgSystem: Send {
+    fn create_link(&mut self, name: &str, owner_marker: &str) -> io::Result<u32>;
+    fn link_owned(&mut self, name: &str, index: u32, owner_marker: &str) -> io::Result<bool>;
+    fn link_present(&mut self, _name: &str, _index: u32) -> io::Result<bool> {
+        Ok(false)
+    }
+    fn delete_link(&mut self, name: &str, index: u32, owner_marker: &str) -> io::Result<()>;
+    fn add_address(&mut self, index: u32, address: IpNet) -> io::Result<()>;
+    fn remove_address(&mut self, index: u32, address: IpNet) -> io::Result<()>;
+    fn set_mtu(&mut self, index: u32, mtu: u32) -> io::Result<()>;
+    fn set_state(&mut self, index: u32, up: bool) -> io::Result<()>;
+}
+
+pub trait PolicyRuleExecutor: Send {
+    fn rules_snapshot(&mut self) -> io::Result<Vec<OwnedRuleResource>>;
+    fn table_in_use(&mut self, table: u32) -> io::Result<bool>;
+    fn add_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()>;
+    fn remove_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()>;
+}
+
+pub trait WgConfigExecutor: Send {
+    fn configure(&mut self, name: &str, config: &str) -> io::Result<()>;
+    fn set_fwmark(&mut self, _name: &str, _mark: u32) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "WireGuard mark executor is unavailable",
+        ))
+    }
+    fn marks_in_use(&self) -> io::Result<Vec<u32>> {
+        Ok(Vec::new())
+    }
+    fn endpoint_ips(&self, _name: &str) -> io::Result<Vec<std::net::IpAddr>> {
+        Ok(Vec::new())
+    }
+    fn verify_transport(
+        &self,
+        _name: &str,
+        _mark: u32,
+        _ipv4: bool,
+        _ipv6: bool,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+    fn health(&self, _name: &str) -> io::Result<(Option<u64>, u64, u64)> {
+        Ok((None, 0, 0))
+    }
 }
 
 pub struct DaemonCore {
@@ -19,6 +1154,115 @@ pub struct DaemonCore {
     journal: JournalDocument,
     routes: Box<dyn RouteExecutor>,
     links: Box<dyn LinkExecutor>,
+    wg: Option<Box<dyn WgSystem>>,
+    wg_config: Option<Box<dyn WgConfigExecutor>>,
+    openvpn: Option<Box<dyn OpenVpnProcessRunner>>,
+    xray: Option<Box<dyn XrayProcessRunner>>,
+    openvpn_runtime: HashMap<(u32, String), OpenVpnRuntime>,
+    openvpn_failed: HashSet<(u32, String)>,
+    openvpn_auth_failed: HashSet<(u32, String)>,
+    #[cfg(target_os = "linux")]
+    policy: Option<Box<dyn PolicyRuleExecutor>>,
+    #[cfg(target_os = "linux")]
+    dns: Option<Box<dyn DnsExecutor>>,
+}
+
+struct OpenVpnRuntime {
+    explicit_routes: Vec<net_manager_core::models::PolicyRoute>,
+    snapshot: ManagementSnapshot,
+}
+
+struct OpenVpnNetworkPlan {
+    routes: Vec<net_manager_core::models::PolicyRoute>,
+    full_ipv4: bool,
+    full_ipv6: bool,
+    dns_servers: Vec<std::net::IpAddr>,
+    dns_domains: Vec<String>,
+}
+
+impl OpenVpnNetworkPlan {
+    fn from_runtime(runtime: &OpenVpnRuntime) -> io::Result<Self> {
+        let mut routes = runtime.explicit_routes.clone();
+        let mut dns_servers = Vec::new();
+        let mut dns_domains = Vec::new();
+        let mut redirect_def1 = false;
+        if let Some(push) = &runtime.snapshot.active_push {
+            redirect_def1 = push.redirect_gateway_def1;
+            for destination in &push.routes {
+                if !routes.iter().any(|route| route.destination == *destination) {
+                    routes.push(net_manager_core::models::PolicyRoute {
+                        destination: *destination,
+                        metric: 5,
+                        via: None,
+                    });
+                }
+            }
+            for server in push.legacy_dns_servers.iter().chain(
+                push.dns_servers
+                    .iter()
+                    .flat_map(|server| server.addresses.iter()),
+            ) {
+                if !dns_servers.contains(server) {
+                    dns_servers.push(*server);
+                }
+            }
+            for domain in push.search_domains.iter().chain(
+                push.dns_servers
+                    .iter()
+                    .flat_map(|server| server.resolve_domains.iter()),
+            ) {
+                if !dns_domains.contains(domain) {
+                    dns_domains.push(domain.clone());
+                }
+            }
+        }
+        if dns_servers.len() > 8 || dns_domains.len() > 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "OpenVPN pushed too many DNS settings",
+            ));
+        }
+        if !dns_domains.is_empty() && dns_servers.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "OpenVPN pushed DNS domains without a server",
+            ));
+        }
+        let has = |network: &str| {
+            routes
+                .iter()
+                .any(|route| route.destination == network.parse::<IpNet>().unwrap())
+        };
+        let full_ipv4 =
+            redirect_def1 || has("0.0.0.0/0") || (has("0.0.0.0/1") && has("128.0.0.0/1"));
+        let full_ipv6 = has("::/0") || (has("::/1") && has("8000::/1"));
+        Ok(Self {
+            routes,
+            full_ipv4,
+            full_ipv6,
+            dns_servers,
+            dns_domains,
+        })
+    }
+
+    fn is_full_route(&self, destination: IpNet) -> bool {
+        match destination {
+            IpNet::V4(_) => {
+                self.full_ipv4
+                    && matches!(
+                        destination.to_string().as_str(),
+                        "0.0.0.0/0" | "0.0.0.0/1" | "128.0.0.0/1"
+                    )
+            }
+            IpNet::V6(_) => {
+                self.full_ipv6
+                    && matches!(
+                        destination.to_string().as_str(),
+                        "::/0" | "::/1" | "8000::/1"
+                    )
+            }
+        }
+    }
 }
 
 impl DaemonCore {
@@ -35,6 +1279,17 @@ impl DaemonCore {
             journal,
             routes,
             links,
+            wg: None,
+            wg_config: None,
+            openvpn: None,
+            xray: None,
+            openvpn_runtime: HashMap::new(),
+            openvpn_failed: HashSet::new(),
+            openvpn_auth_failed: HashSet::new(),
+            #[cfg(target_os = "linux")]
+            policy: None,
+            #[cfg(target_os = "linux")]
+            dns: None,
         };
         if !core.journal.entries.is_empty() {
             let result = core.teardown(|_| true)?;
@@ -47,6 +1302,1671 @@ impl DaemonCore {
         Ok(core)
     }
 
+    pub fn open_with_wireguard(
+        store: JournalStore,
+        routes: Box<dyn RouteExecutor>,
+        links: Box<dyn LinkExecutor>,
+        wg: Box<dyn WgSystem>,
+        wg_config: Box<dyn WgConfigExecutor>,
+    ) -> io::Result<Self> {
+        let journal = store.load()?;
+        let mut core = Self {
+            store,
+            journal,
+            routes,
+            links,
+            wg: Some(wg),
+            wg_config: Some(wg_config),
+            openvpn: None,
+            xray: None,
+            openvpn_runtime: HashMap::new(),
+            openvpn_failed: HashSet::new(),
+            openvpn_auth_failed: HashSet::new(),
+            #[cfg(target_os = "linux")]
+            policy: None,
+            #[cfg(target_os = "linux")]
+            dns: None,
+        };
+        if !core.journal.entries.is_empty() {
+            core.teardown(|_| true)?;
+        }
+        Ok(core)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn open_with_wireguard_full(
+        store: JournalStore,
+        routes: Box<dyn RouteExecutor>,
+        links: Box<dyn LinkExecutor>,
+        wg: Box<dyn WgSystem>,
+        wg_config: Box<dyn WgConfigExecutor>,
+        policy: Box<dyn PolicyRuleExecutor>,
+        dns: Box<dyn DnsExecutor>,
+    ) -> io::Result<Self> {
+        let journal = store.load()?;
+        let mut core = Self {
+            store,
+            journal,
+            routes,
+            links,
+            wg: Some(wg),
+            wg_config: Some(wg_config),
+            openvpn: None,
+            xray: None,
+            openvpn_runtime: HashMap::new(),
+            openvpn_failed: HashSet::new(),
+            openvpn_auth_failed: HashSet::new(),
+            policy: Some(policy),
+            dns: Some(dns),
+        };
+        if !core.journal.entries.is_empty() {
+            core.teardown(|_| true)?;
+        }
+        Ok(core)
+    }
+
+    pub fn open_with_openvpn(
+        store: JournalStore,
+        routes: Box<dyn RouteExecutor>,
+        links: Box<dyn LinkExecutor>,
+        openvpn: Box<dyn OpenVpnProcessRunner>,
+    ) -> io::Result<Self> {
+        let journal = store.load()?;
+        let mut core = Self {
+            store,
+            journal,
+            routes,
+            links,
+            wg: None,
+            wg_config: None,
+            openvpn: Some(openvpn),
+            xray: None,
+            openvpn_runtime: HashMap::new(),
+            openvpn_failed: HashSet::new(),
+            openvpn_auth_failed: HashSet::new(),
+            #[cfg(target_os = "linux")]
+            policy: None,
+            #[cfg(target_os = "linux")]
+            dns: None,
+        };
+        if !core.journal.entries.is_empty() {
+            core.teardown(|_| true)?;
+        }
+        Ok(core)
+    }
+
+    #[cfg(test)]
+    pub fn open_with_xray(
+        store: JournalStore,
+        routes: Box<dyn RouteExecutor>,
+        links: Box<dyn LinkExecutor>,
+        tun: Box<dyn WgSystem>,
+        xray: Box<dyn XrayProcessRunner>,
+    ) -> io::Result<Self> {
+        let journal = store.load()?;
+        let mut core = Self {
+            store,
+            journal,
+            routes,
+            links,
+            wg: Some(tun),
+            wg_config: None,
+            openvpn: None,
+            xray: Some(xray),
+            openvpn_runtime: HashMap::new(),
+            openvpn_failed: HashSet::new(),
+            openvpn_auth_failed: HashSet::new(),
+            #[cfg(target_os = "linux")]
+            policy: None,
+            #[cfg(target_os = "linux")]
+            dns: None,
+        };
+        if !core.journal.entries.is_empty() {
+            core.teardown(|_| true)?;
+        }
+        Ok(core)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_all(
+        store: JournalStore,
+        routes: Box<dyn RouteExecutor>,
+        links: Box<dyn LinkExecutor>,
+        wg: Box<dyn WgSystem>,
+        wg_config: Box<dyn WgConfigExecutor>,
+        policy: Box<dyn PolicyRuleExecutor>,
+        dns: Box<dyn DnsExecutor>,
+        openvpn: Box<dyn OpenVpnProcessRunner>,
+        xray: Box<dyn XrayProcessRunner>,
+    ) -> io::Result<Self> {
+        let journal = store.load()?;
+        let mut core = Self {
+            store,
+            journal,
+            routes,
+            links,
+            wg: Some(wg),
+            wg_config: Some(wg_config),
+            openvpn: Some(openvpn),
+            xray: Some(xray),
+            openvpn_runtime: HashMap::new(),
+            openvpn_failed: HashSet::new(),
+            openvpn_auth_failed: HashSet::new(),
+            policy: Some(policy),
+            dns: Some(dns),
+        };
+        if !core.journal.entries.is_empty() {
+            core.teardown(|_| true)?;
+        }
+        Ok(core)
+    }
+
+    pub fn connect_xray(
+        &mut self,
+        uid: u32,
+        params: XrayConnectParams,
+    ) -> io::Result<XrayStatusResult> {
+        let owner = format!("xray:{}", params.profile_id);
+        validate_owner(&owner).map_err(invalid_input)?;
+        if self.position(uid, &owner).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Xray profile is already connected",
+            ));
+        }
+        let mark = self.allocate_openvpn_mark()?;
+        let plan = prepare_xray(uid, params, mark)?;
+        let runner = self.xray.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
+        })?;
+        runner
+            .verify_binary()
+            .map_err(|err| xray_stage("binary_verify", err))?;
+        if runner
+            .link_index(&plan.name)
+            .map_err(|err| xray_stage("link_lookup", err))?
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Xray link name is occupied",
+            ));
+        }
+        let full = if plan.full_ipv4 || plan.full_ipv6 {
+            if self.journal.entries.iter().any(|entry| {
+                entry.resources.iter().any(|resource| match resource {
+                    OwnedResource::WireGuardLink(link) => link.full.is_some(),
+                    OwnedResource::OpenVpnProcess(process) => process.full.is_some(),
+                    OwnedResource::XrayProcess(process) => process.full.is_some(),
+                    _ => false,
+                })
+            }) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "another full tunnel owns policy routing",
+                ));
+            }
+            #[cfg(target_os = "linux")]
+            if self.policy.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "policy executor is unavailable",
+                ));
+            }
+            let slot = mark - 51820;
+            Some(WireGuardFullResource {
+                table: mark,
+                fwmark: mark,
+                priority_main: 10000 + slot * 2,
+                priority_tunnel: 10001 + slot * 2,
+                ipv4: plan.full_ipv4,
+                ipv6: plan.full_ipv6,
+            })
+        } else {
+            None
+        };
+        if !plan.dns_servers.is_empty() {
+            #[cfg(target_os = "linux")]
+            if self.dns.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "DNS executor is unavailable",
+                ));
+            }
+        }
+        self.journal.entries.push(JournalEntry {
+            uid,
+            owner: owner.clone(),
+            state: OwnedState::Applying,
+            resources: vec![OwnedResource::XrayProcess(XrayProcessResource {
+                name: plan.name.clone(),
+                index: 0,
+                owner_marker: format!("network-orchestrator:{uid}:{owner}"),
+                transport_mark: mark,
+                full: full.clone(),
+            })],
+        });
+        if let Err(err) = self.store.save(&self.journal) {
+            self.journal.entries.pop();
+            return Err(xray_stage("journal_prepare", err));
+        }
+        let index = self.journal.entries.len() - 1;
+        let result = self.apply_xray_plan(index, uid, &plan, full.as_ref());
+        if let Err(err) = result {
+            let _ = self.teardown_xray_entry(index);
+            self.persist();
+            return Err(err);
+        }
+        self.journal.entries[index].state = OwnedState::Applied;
+        if let Err(err) = self.store.save(&self.journal) {
+            let _ = self.teardown_xray_entry(index);
+            self.persist();
+            return Err(xray_stage("journal_commit", err));
+        }
+        Ok(self.xray_status(uid, &plan.profile_id))
+    }
+
+    fn apply_xray_plan(
+        &mut self,
+        index: usize,
+        uid: u32,
+        plan: &crate::xray::XrayPlan,
+        full: Option<&WireGuardFullResource>,
+    ) -> io::Result<()> {
+        self.xray
+            .as_mut()
+            .unwrap()
+            .start(uid, &plan.name, &plan.config)
+            .map_err(|err| {
+                let stage = if matches!(
+                    err.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::NotConnected
+                ) {
+                    "tun_wait"
+                } else {
+                    "spawn"
+                };
+                xray_stage(stage, err)
+            })?;
+        let link_index = self
+            .xray
+            .as_ref()
+            .unwrap()
+            .link_index(&plan.name)
+            .map_err(|err| xray_stage("tun_lookup", err))?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "Xray TUN link is unavailable")
+            })?;
+        if let OwnedResource::XrayProcess(process) = &mut self.journal.entries[index].resources[0] {
+            process.index = link_index;
+        }
+        self.store
+            .save(&self.journal)
+            .map_err(|err| xray_stage("journal_link", err))?;
+        let address = WireGuardAddressResource {
+            interface_index: link_index,
+            address: plan.address,
+        };
+        self.journal.entries[index]
+            .resources
+            .push(OwnedResource::Address(address.clone()));
+        self.store
+            .save(&self.journal)
+            .map_err(|err| xray_stage("journal_address", err))?;
+        if let Err(err) = self
+            .wg
+            .as_mut()
+            .unwrap()
+            .add_address(link_index, plan.address)
+        {
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                self.journal.entries[index].resources.pop();
+            }
+            return Err(xray_stage("address_add", err));
+        }
+        self.wg
+            .as_mut()
+            .unwrap()
+            .set_mtu(link_index, plan.mtu)
+            .map_err(|err| xray_stage("mtu_set", err))?;
+        self.wg
+            .as_mut()
+            .unwrap()
+            .set_state(link_index, true)
+            .map_err(|err| xray_stage("link_up", err))?;
+        for route in &plan.routes {
+            let mut applied = AppliedRoute::on_link(route.destination, link_index, route.metric);
+            if route.destination.prefix_len() == 0 {
+                applied.table = full.map(|full| full.table);
+            }
+            self.journal.entries[index]
+                .resources
+                .push(OwnedResource::Route(applied.clone()));
+            self.store
+                .save(&self.journal)
+                .map_err(|err| xray_stage("journal_route", err))?;
+            if let Err(err) = self.routes.add_route(&applied) {
+                if err.kind() == io::ErrorKind::AlreadyExists {
+                    self.journal.entries[index].resources.pop();
+                }
+                return Err(xray_stage("route_add", err));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(full) = full {
+            for rule in full_policy_rules(full) {
+                self.journal.entries[index]
+                    .resources
+                    .push(OwnedResource::Rule(rule.clone()));
+                self.store
+                    .save(&self.journal)
+                    .map_err(|err| xray_stage("journal_rule", err))?;
+                if let Err(err) = self.policy.as_mut().unwrap().add_rule(&rule) {
+                    if err.kind() == io::ErrorKind::AlreadyExists {
+                        self.journal.entries[index].resources.pop();
+                    }
+                    return Err(xray_stage("rule_add", err));
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if !plan.dns_servers.is_empty() {
+            self.journal.entries[index]
+                .resources
+                .push(OwnedResource::Dns(
+                    net_manager_core::daemon_protocol::WireGuardDnsResource {
+                        interface_index: link_index,
+                        name: plan.name.clone(),
+                        servers: plan.dns_servers.clone(),
+                        domains: plan.dns_domains.clone(),
+                        full: full.is_some(),
+                        applied: false,
+                    },
+                ));
+            self.store
+                .save(&self.journal)
+                .map_err(|err| xray_stage("journal_dns", err))?;
+            match self.dns.as_mut().unwrap().apply(
+                &plan.name,
+                &plan.dns_servers,
+                &plan.dns_domains,
+                full.is_some(),
+            ) {
+                Ok(DnsApply::Applied) => {
+                    if let Some(OwnedResource::Dns(dns)) =
+                        self.journal.entries[index].resources.last_mut()
+                    {
+                        dns.applied = true;
+                    }
+                    self.store
+                        .save(&self.journal)
+                        .map_err(|err| xray_stage("journal_dns_applied", err))?;
+                }
+                Ok(DnsApply::Unavailable | DnsApply::Skipped) => {}
+                Err(_) => return Err(io::Error::other("Xray dns_apply failed")),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn disconnect_xray(&mut self, uid: u32, profile_id: &str) -> io::Result<()> {
+        let owner = format!("xray:{profile_id}");
+        let index = self.position(uid, &owner).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Xray profile is not connected")
+        })?;
+        let result = self.teardown_entry(index);
+        self.store.save(&self.journal)?;
+        result
+    }
+
+    pub fn xray_status(&mut self, uid: u32, profile_id: &str) -> XrayStatusResult {
+        let owner = format!("xray:{profile_id}");
+        let entry = self
+            .journal
+            .entries
+            .iter()
+            .find(|entry| entry.uid == uid && entry.owner == owner);
+        let process = entry.and_then(|entry| {
+            entry.resources.iter().find_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) => Some(process),
+                _ => None,
+            })
+        });
+        let state = match (entry, process) {
+            (None, _) => TunnelState::Stopped,
+            (Some(entry), Some(process)) if entry.state == OwnedState::Applied => {
+                if self
+                    .xray
+                    .as_mut()
+                    .is_some_and(|runner| runner.health(&process.name).unwrap_or(false))
+                {
+                    TunnelState::Running
+                } else {
+                    TunnelState::Failed
+                }
+            }
+            _ => TunnelState::Failed,
+        };
+        XrayStatusResult {
+            profile_id: profile_id.to_owned(),
+            state,
+            interface_name: process.map(|process| process.name.clone()),
+            dns_applied: entry.is_some_and(|entry| {
+                entry
+                    .resources
+                    .iter()
+                    .any(|resource| matches!(resource, OwnedResource::Dns(dns) if dns.applied))
+            }),
+            ipv4_covered: process
+                .is_some_and(|process| process.full.as_ref().is_some_and(|full| full.ipv4)),
+            ipv6_covered: process
+                .is_some_and(|process| process.full.as_ref().is_some_and(|full| full.ipv6)),
+        }
+    }
+
+    pub fn connect_openvpn(
+        &mut self,
+        uid: u32,
+        plan: OpenVpnPlan,
+    ) -> io::Result<OpenVpnStatusResult> {
+        let owner = format!("ovpn:{}", plan.profile_id);
+        validate_owner(&owner).map_err(invalid_input)?;
+        if self.position(uid, &owner).is_some()
+            || self
+                .position(uid, &format!("ovpn-probe:{}", plan.profile_id))
+                .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "OpenVPN profile is already connected",
+            ));
+        }
+        let mark = self.allocate_openvpn_mark()?;
+        let runner = self.openvpn.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "OpenVPN executor is unavailable",
+            )
+        })?;
+        runner.verify_binary()?;
+        if runner.link_index(&plan.name)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "OpenVPN link name is occupied",
+            ));
+        }
+        self.journal.entries.push(JournalEntry {
+            uid,
+            owner: owner.clone(),
+            state: OwnedState::Applying,
+            resources: vec![OwnedResource::OpenVpnProcess(OpenVpnProcessResource {
+                name: plan.name.clone(),
+                owner_marker: format!("network-orchestrator:{uid}:{owner}"),
+                transport_mark: Some(mark),
+                full: None,
+            })],
+        });
+        if let Err(err) = self.store.save(&self.journal) {
+            self.journal.entries.pop();
+            return Err(err);
+        }
+        let index = self.journal.entries.len() - 1;
+        if let Err(err) = self.openvpn.as_mut().unwrap().start(
+            uid,
+            &plan.name,
+            &plan.config,
+            plan.credentials,
+            mark,
+        ) {
+            let _ = self.teardown_openvpn_entry(index);
+            self.persist();
+            return Err(err);
+        }
+        self.journal.entries[index].state = OwnedState::Applied;
+        self.persist();
+        self.openvpn_runtime.insert(
+            (uid, owner.clone()),
+            OpenVpnRuntime {
+                explicit_routes: plan.routes,
+                snapshot: ManagementSnapshot::default(),
+            },
+        );
+        self.openvpn_failed.remove(&(uid, owner));
+        self.openvpn_auth_failed
+            .remove(&(uid, format!("ovpn:{}", plan.profile_id)));
+        Ok(self.openvpn_status(uid, &plan.profile_id))
+    }
+
+    /// A probe owns only its transient process and link. It never applies routes or DNS.
+    pub fn start_openvpn_probe(&mut self, uid: u32, plan: OpenVpnPlan) -> io::Result<()> {
+        let owner = format!("ovpn-probe:{}", plan.profile_id);
+        validate_owner(&owner).map_err(invalid_input)?;
+        if self.position(uid, &owner).is_some()
+            || self
+                .position(uid, &format!("ovpn:{}", plan.profile_id))
+                .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "OpenVPN profile is already active",
+            ));
+        }
+        let mark = self.allocate_openvpn_mark()?;
+        let runner = self.openvpn.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "OpenVPN executor is unavailable",
+            )
+        })?;
+        runner.verify_binary()?;
+        if runner.link_index(&plan.name)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "OpenVPN link name is occupied",
+            ));
+        }
+        self.journal.entries.push(JournalEntry {
+            uid,
+            owner: owner.clone(),
+            state: OwnedState::Applying,
+            resources: vec![OwnedResource::OpenVpnProcess(OpenVpnProcessResource {
+                name: plan.name.clone(),
+                owner_marker: format!("network-orchestrator:{uid}:{owner}"),
+                transport_mark: Some(mark),
+                full: None,
+            })],
+        });
+        if let Err(error) = self.store.save(&self.journal) {
+            self.journal.entries.pop();
+            return Err(error);
+        }
+        let index = self.journal.entries.len() - 1;
+        if let Err(error) = self.openvpn.as_mut().unwrap().start(
+            uid,
+            &plan.name,
+            &plan.config,
+            plan.credentials,
+            mark,
+        ) {
+            let _ = self.teardown_openvpn_entry(index);
+            self.persist();
+            return Err(error);
+        }
+        self.journal.entries[index].state = OwnedState::Applied;
+        self.persist();
+        Ok(())
+    }
+
+    pub fn poll_openvpn_probe(
+        &mut self,
+        uid: u32,
+        profile_id: &str,
+    ) -> io::Result<Option<OpenVpnProbeResult>> {
+        let owner = format!("ovpn-probe:{profile_id}");
+        let index = self.position(uid, &owner).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "OpenVPN probe is not active")
+        })?;
+        let name = self.journal.entries[index]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::OpenVpnProcess(process) => Some(&process.name),
+                _ => None,
+            })
+            .ok_or_else(|| io::Error::other("OpenVPN probe has no process marker"))?
+            .clone();
+        let events = self
+            .openvpn
+            .as_mut()
+            .ok_or_else(|| io::Error::other("OpenVPN executor is unavailable"))?
+            .poll(&name)?;
+        if events.iter().any(|event| {
+            matches!(
+                event,
+                ManagementEvent::AuthenticationFailed
+                    | ManagementEvent::PasswordPrompt(_)
+                    | ManagementEvent::State(OpenVpnState::Exiting)
+            )
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "OpenVPN probe authentication or handshake failed",
+            ));
+        }
+        let connected = events
+            .iter()
+            .any(|event| matches!(event, ManagementEvent::State(OpenVpnState::Connected)));
+        if let Some(push) = events.into_iter().find_map(|event| match event {
+            ManagementEvent::PushReply(push) => Some(push),
+            _ => None,
+        }) {
+            return Ok(Some(OpenVpnProbeResult {
+                routes: push
+                    .routes
+                    .into_iter()
+                    .map(|destination| AnalyzedRoute {
+                        destination,
+                        source: "OpenVPN pushed".into(),
+                        metric: None,
+                    })
+                    .collect(),
+            }));
+        }
+        Ok(connected.then_some(OpenVpnProbeResult { routes: Vec::new() }))
+    }
+
+    pub fn finish_openvpn_probe(&mut self, uid: u32, profile_id: &str) -> io::Result<()> {
+        let owner = format!("ovpn-probe:{profile_id}");
+        let index = self.position(uid, &owner).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "OpenVPN probe is not active")
+        })?;
+        let result = self.teardown_openvpn_entry(index);
+        self.persist();
+        result
+    }
+
+    pub fn disconnect_openvpn(&mut self, uid: u32, profile_id: &str) -> io::Result<()> {
+        let owner = format!("ovpn:{profile_id}");
+        let key = (uid, owner.clone());
+        let Some(index) = self.position(uid, &owner) else {
+            if self.openvpn_failed.remove(&key) {
+                self.openvpn_auth_failed.remove(&key);
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "OpenVPN profile is not connected",
+            ));
+        };
+        let result = self.teardown_entry(index);
+        self.persist();
+        if result.is_ok() {
+            self.openvpn_failed.remove(&key);
+            self.openvpn_auth_failed.remove(&key);
+        }
+        result
+    }
+
+    fn allocate_openvpn_mark(&mut self) -> io::Result<u32> {
+        #[cfg(target_os = "linux")]
+        let existing_rules = match self.policy.as_mut() {
+            Some(policy) => policy.rules_snapshot()?,
+            None => Vec::new(),
+        };
+        for slot in 0..128_u32 {
+            let mark = 51820 + slot;
+            let priority_main = 10000 + slot * 2;
+            let priority_tunnel = priority_main + 1;
+            let used_by_owner = self.journal.entries.iter().any(|entry| {
+                entry.resources.iter().any(|resource| match resource {
+                    OwnedResource::OpenVpnProcess(process) => process.transport_mark == Some(mark),
+                    OwnedResource::XrayProcess(process) => process.transport_mark == mark,
+                    OwnedResource::WireGuardLink(link) => {
+                        link.full.as_ref().is_some_and(|full| full.fwmark == mark)
+                    }
+                    _ => false,
+                })
+            });
+            if used_by_owner {
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            if existing_rules.iter().any(|rule| {
+                rule.fwmark == Some(mark)
+                    || rule.priority == priority_main
+                    || rule.priority == priority_tunnel
+            }) {
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            if self
+                .policy
+                .as_mut()
+                .is_some_and(|policy| policy.table_in_use(mark).unwrap_or(true))
+            {
+                continue;
+            }
+            return Ok(mark);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no OpenVPN transport mark is available",
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn openvpn_full_plan(
+        &mut self,
+        index: usize,
+        ipv4: bool,
+        ipv6: bool,
+    ) -> io::Result<Option<WireGuardFullResource>> {
+        if !ipv4 && !ipv6 {
+            return Ok(None);
+        }
+        if self
+            .journal
+            .entries
+            .iter()
+            .enumerate()
+            .any(|(other_index, entry)| {
+                other_index != index
+                    && entry.resources.iter().any(|resource| match resource {
+                        OwnedResource::WireGuardLink(link) => link.full.is_some(),
+                        OwnedResource::OpenVpnProcess(process) => process.full.is_some(),
+                        OwnedResource::XrayProcess(process) => process.full.is_some(),
+                        _ => false,
+                    })
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "another full tunnel owns policy routing",
+            ));
+        }
+        let process = self.journal.entries[index]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::OpenVpnProcess(process) => Some(process),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "OpenVPN process journal is malformed",
+                )
+            })?;
+        let mark = process.transport_mark.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "OpenVPN transport mark is missing",
+            )
+        })?;
+        let slot = mark
+            .checked_sub(51820)
+            .filter(|slot| *slot < 128)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "OpenVPN transport mark is invalid",
+                )
+            })?;
+        let priority_main = 10000 + slot * 2;
+        let priority_tunnel = priority_main + 1;
+        if process.full.is_none() {
+            let policy = self.policy.as_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "policy executor is unavailable",
+                )
+            })?;
+            let rules = policy.rules_snapshot()?;
+            if rules.iter().any(|rule| {
+                rule.fwmark == Some(mark)
+                    || rule.priority == priority_main
+                    || rule.priority == priority_tunnel
+            }) || policy.table_in_use(mark)?
+                || self.wg_config.as_ref().is_some_and(|wg| {
+                    wg.marks_in_use()
+                        .map_or(true, |marks| marks.contains(&mark))
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "OpenVPN policy slot is occupied",
+                ));
+            }
+        }
+        Ok(Some(WireGuardFullResource {
+            table: mark,
+            fwmark: mark,
+            priority_main,
+            priority_tunnel,
+            ipv4,
+            ipv6,
+        }))
+    }
+
+    pub fn openvpn_status(&self, uid: u32, profile_id: &str) -> OpenVpnStatusResult {
+        let owner = format!("ovpn:{profile_id}");
+        let key = (uid, owner.clone());
+        let entry = self
+            .journal
+            .entries
+            .iter()
+            .find(|entry| entry.uid == uid && entry.owner == owner);
+        let interface_name = entry.and_then(|entry| {
+            entry.resources.iter().find_map(|resource| match resource {
+                OwnedResource::OpenVpnProcess(process) => Some(process.name.clone()),
+                _ => None,
+            })
+        });
+        let runtime = self.openvpn_runtime.get(&key);
+        let state = match (entry, runtime) {
+            (Some(entry), _) if entry.state == OwnedState::Stale => OpenVpnConnectionState::Failed,
+            (Some(_), Some(runtime)) => match runtime.snapshot.state {
+                Some(OpenVpnState::Connected) => OpenVpnConnectionState::Connected,
+                Some(OpenVpnState::Reconnecting) => OpenVpnConnectionState::Reconnecting,
+                Some(OpenVpnState::Exiting) => OpenVpnConnectionState::Failed,
+                _ => OpenVpnConnectionState::Connecting,
+            },
+            (Some(_), None) => OpenVpnConnectionState::Failed,
+            (None, _) if self.openvpn_failed.contains(&key) => OpenVpnConnectionState::Failed,
+            (None, _) => OpenVpnConnectionState::Stopped,
+        };
+        let applied_routes = entry
+            .map(|entry| {
+                entry
+                    .resources
+                    .iter()
+                    .filter_map(|resource| match resource {
+                        OwnedResource::Route(route) => Some(route.destination),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut warnings = Vec::new();
+        if let Some(entry) = entry {
+            if entry
+                .resources
+                .iter()
+                .any(|resource| matches!(resource, OwnedResource::Dns(dns) if !dns.applied))
+            {
+                warnings.push(OpenVpnWarning::DnsNotApplied);
+            }
+            if entry.resources.iter().any(|resource| matches!(resource, OwnedResource::OpenVpnProcess(process) if process.full.as_ref().is_some_and(|full| full.ipv4 && !full.ipv6))) {
+                warnings.push(OpenVpnWarning::Ipv6NotCovered);
+            }
+        }
+        if state == OpenVpnConnectionState::Failed && self.openvpn_auth_failed.contains(&key) {
+            warnings.push(OpenVpnWarning::AuthenticationFailed);
+        }
+        OpenVpnStatusResult {
+            profile_id: profile_id.to_owned(),
+            state,
+            interface_name,
+            rx_bytes: runtime.map_or(0, |runtime| runtime.snapshot.received),
+            tx_bytes: runtime.map_or(0, |runtime| runtime.snapshot.sent),
+            applied_routes,
+            warnings,
+        }
+    }
+
+    pub fn reconcile_openvpn(&mut self) -> io::Result<()> {
+        let owners: Vec<_> = self
+            .openvpn_runtime
+            .keys()
+            .filter(|(uid, owner)| {
+                self.position(*uid, owner)
+                    .is_some_and(|index| self.journal.entries[index].state == OwnedState::Applied)
+            })
+            .cloned()
+            .collect();
+        for (uid, owner) in owners {
+            self.reconcile_openvpn_owner(uid, &owner)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_openvpn_owner(&mut self, uid: u32, owner: &str) -> io::Result<()> {
+        let index = self
+            .position(uid, owner)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "OpenVPN owner is missing"))?;
+        let name = self.journal.entries[index]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::OpenVpnProcess(process) => Some(process.name.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "OpenVPN process journal is malformed",
+                )
+            })?;
+        let events = match self.openvpn.as_mut().unwrap().poll(&name) {
+            Ok(events) => events,
+            Err(_) => return self.fail_openvpn(uid, owner),
+        };
+        for event in events {
+            match &event {
+                ManagementEvent::AuthenticationFailed => {
+                    self.openvpn_auth_failed.insert((uid, owner.to_owned()));
+                    return self.fail_openvpn(uid, owner);
+                }
+                ManagementEvent::PasswordPrompt(_) => return self.fail_openvpn(uid, owner),
+                _ => {}
+            }
+            if let Some(runtime) = self.openvpn_runtime.get_mut(&(uid, owner.to_owned())) {
+                runtime.snapshot.apply(event);
+            }
+        }
+        let runtime = self.openvpn_runtime.get(&(uid, owner.to_owned())).unwrap();
+        let network = if runtime.snapshot.state == Some(OpenVpnState::Connected) {
+            match OpenVpnNetworkPlan::from_runtime(runtime) {
+                Ok(plan) => plan,
+                Err(_) => return self.fail_openvpn(uid, owner),
+            }
+        } else if runtime.snapshot.state == Some(OpenVpnState::Reconnecting) {
+            OpenVpnNetworkPlan {
+                routes: Vec::new(),
+                full_ipv4: false,
+                full_ipv6: false,
+                dns_servers: Vec::new(),
+                dns_domains: Vec::new(),
+            }
+        } else {
+            return Ok(());
+        };
+        #[cfg(target_os = "linux")]
+        let full = match self.openvpn_full_plan(index, network.full_ipv4, network.full_ipv6) {
+            Ok(full) => full,
+            Err(_) => return self.fail_openvpn(uid, owner),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let full: Option<WireGuardFullResource> = None;
+        #[cfg(target_os = "linux")]
+        if !network.dns_servers.is_empty() && self.dns.is_none() {
+            return self.fail_openvpn(uid, owner);
+        }
+        let current: Vec<_> = self.journal.entries[index]
+            .resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) => Some(route.clone()),
+                _ => None,
+            })
+            .collect();
+        let desired_routes: Vec<_> = network
+            .routes
+            .iter()
+            .map(|route| {
+                (
+                    route.destination,
+                    route.metric,
+                    network
+                        .is_full_route(route.destination)
+                        .then(|| full.as_ref().map(|full| full.table))
+                        .flatten(),
+                )
+            })
+            .collect();
+        let current_full = self.journal.entries[index]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::OpenVpnProcess(process) => process.full.clone(),
+                _ => None,
+            });
+        let current_dns = self.journal.entries[index]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::Dns(dns) => Some((&dns.servers, &dns.domains, dns.full)),
+                _ => None,
+            });
+        if current
+            .iter()
+            .map(|route| (route.destination, route.metric, route.table))
+            .collect::<Vec<_>>()
+            == desired_routes
+            && current_full == full
+            && current_dns.is_none_or(|(servers, domains, is_full)| {
+                servers == &network.dns_servers
+                    && domains == &network.dns_domains
+                    && is_full == full.is_some()
+            })
+            && (current_dns.is_some() == !network.dns_servers.is_empty())
+        {
+            return Ok(());
+        }
+        if self.clear_openvpn_network(index).is_err() {
+            return self.fail_openvpn(uid, owner);
+        }
+        if network.routes.is_empty() && network.dns_servers.is_empty() {
+            return Ok(());
+        }
+        let link_index = match self.openvpn.as_ref().unwrap().link_index(&name) {
+            Ok(Some(index)) => index,
+            _ => return self.fail_openvpn(uid, owner),
+        };
+        if let Some(OwnedResource::OpenVpnProcess(process)) =
+            self.journal.entries[index].resources.first_mut()
+        {
+            process.full = full.clone();
+        }
+        if self.store.save(&self.journal).is_err() {
+            return self.fail_openvpn(uid, owner);
+        }
+        for route in &network.routes {
+            let mut applied = AppliedRoute::on_link(route.destination, link_index, route.metric);
+            if network.is_full_route(route.destination) {
+                applied.table = full.as_ref().map(|full| full.table);
+            }
+            self.journal.entries[index]
+                .resources
+                .push(OwnedResource::Route(applied.clone()));
+            if let Err(err) = self.store.save(&self.journal) {
+                self.journal.entries[index].resources.pop();
+                let _ = self.fail_openvpn(uid, owner);
+                return Err(err);
+            }
+            if let Err(err) = self.routes.add_route(&applied) {
+                if err.kind() == io::ErrorKind::AlreadyExists {
+                    self.journal.entries[index].resources.pop();
+                }
+                return self.fail_openvpn(uid, owner);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(full) = &full {
+            for rule in full_policy_rules(full) {
+                self.journal.entries[index]
+                    .resources
+                    .push(OwnedResource::Rule(rule.clone()));
+                if self.store.save(&self.journal).is_err() {
+                    self.journal.entries[index].resources.pop();
+                    return self.fail_openvpn(uid, owner);
+                }
+                if let Err(err) = self.policy.as_mut().unwrap().add_rule(&rule) {
+                    if err.kind() == io::ErrorKind::AlreadyExists {
+                        self.journal.entries[index].resources.pop();
+                    }
+                    return self.fail_openvpn(uid, owner);
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if !network.dns_servers.is_empty() {
+            self.journal.entries[index]
+                .resources
+                .push(OwnedResource::Dns(
+                    net_manager_core::daemon_protocol::WireGuardDnsResource {
+                        interface_index: link_index,
+                        name: name.clone(),
+                        servers: network.dns_servers.clone(),
+                        domains: network.dns_domains.clone(),
+                        full: full.is_some(),
+                        applied: false,
+                    },
+                ));
+            if self.store.save(&self.journal).is_err() {
+                self.journal.entries[index].resources.pop();
+                return self.fail_openvpn(uid, owner);
+            }
+            let result = self.dns.as_mut().unwrap().apply(
+                &name,
+                &network.dns_servers,
+                &network.dns_domains,
+                full.is_some(),
+            );
+            match result {
+                Ok(DnsApply::Applied) => {
+                    if let Some(OwnedResource::Dns(resource)) =
+                        self.journal.entries[index].resources.last_mut()
+                    {
+                        resource.applied = true;
+                    }
+                    self.persist();
+                }
+                Ok(DnsApply::Unavailable | DnsApply::Skipped) => {}
+                Err(_) => return self.fail_openvpn(uid, owner),
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_openvpn_network(&mut self, index: usize) -> io::Result<()> {
+        let resources = self.journal.entries[index].resources.clone();
+        let name = resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::OpenVpnProcess(process) => Some(process.name.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "OpenVPN process journal is malformed",
+                )
+            })?;
+        let link_present = self
+            .openvpn
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "OpenVPN executor is unavailable",
+                )
+            })?
+            .link_index(name)?
+            .is_some();
+        for resource in resources.iter().rev() {
+            let result = match resource {
+                OwnedResource::Dns(dns) if dns.applied => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        match self.dns.as_mut() {
+                            Some(executor) => match executor.revert(&dns.name) {
+                                Ok(()) | Err(crate::dns::DnsError::Unavailable) => Ok(()),
+                                Err(_) if !link_present => Ok(()),
+                                Err(_) => Err(io::Error::other("OpenVPN DNS cleanup failed")),
+                            },
+                            None if !link_present => Ok(()),
+                            None => Err(io::Error::other("OpenVPN DNS executor is unavailable")),
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Ok(())
+                    }
+                }
+                OwnedResource::Rule(rule) => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.policy
+                            .as_mut()
+                            .ok_or_else(|| {
+                                io::Error::other("OpenVPN policy executor is unavailable")
+                            })?
+                            .remove_rule(rule)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Ok(())
+                    }
+                }
+                OwnedResource::Route(route) => self.routes.remove_route(route),
+                _ => Ok(()),
+            };
+            if let Err(err) = result {
+                if err.kind() != io::ErrorKind::NotFound {
+                    self.journal.entries[index].state = OwnedState::Stale;
+                    self.persist();
+                    return Err(io::Error::other("OpenVPN network cleanup failed"));
+                }
+            }
+        }
+        self.journal.entries[index]
+            .resources
+            .retain(|resource| matches!(resource, OwnedResource::OpenVpnProcess(_)));
+        if let Some(OwnedResource::OpenVpnProcess(process)) =
+            self.journal.entries[index].resources.first_mut()
+        {
+            process.full = None;
+        }
+        self.store.save(&self.journal)
+    }
+
+    fn fail_openvpn(&mut self, uid: u32, owner: &str) -> io::Result<()> {
+        if let Some(index) = self.position(uid, owner) {
+            let _ = self.teardown_openvpn_entry(index);
+            self.persist();
+        }
+        self.openvpn_failed.insert((uid, owner.to_owned()));
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "OpenVPN connection failed or requested unsupported network options",
+        ))
+    }
+
+    pub fn connect_wireguard(
+        &mut self,
+        uid: u32,
+        profile_id: &str,
+        plan: WireGuardPlan,
+    ) -> io::Result<WireGuardStatusResult> {
+        let owner = wireguard_owner(profile_id)?;
+        #[cfg(target_os = "linux")]
+        if !plan.dns_servers.is_empty() && self.dns.is_none() {
+            return Err(invalid_input("DNS executor is unavailable".into()));
+        }
+        if self.position(uid, &owner).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "WireGuard profile is already connected",
+            ));
+        }
+        if self.wg.is_none() || self.wg_config.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "WireGuard executor is unavailable",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        let full = self.allocate_full(&plan)?;
+        #[cfg(not(target_os = "linux"))]
+        let full: Option<WireGuardFullResource> = None;
+        let name = wireguard_name(uid, profile_id);
+        let marker = format!("network-orchestrator:{uid}:{owner}");
+        let mut warnings: Vec<_> = plan
+            .warnings
+            .iter()
+            .map(|warning| match warning {
+                WireGuardPlanWarning::IgnoredHook => WireGuardWarning::IgnoredHook,
+                WireGuardPlanWarning::IgnoredSaveConfig => WireGuardWarning::IgnoredSaveConfig,
+            })
+            .collect();
+        if plan.full_ipv4 && !plan.full_ipv6 {
+            warnings.push(WireGuardWarning::Ipv6NotCovered);
+        }
+        let link = WireGuardLinkResource {
+            name: name.clone(),
+            index: 0,
+            owner_marker: marker.clone(),
+            full: full.clone(),
+            warnings,
+        };
+        self.journal.entries.push(JournalEntry {
+            uid,
+            owner: owner.clone(),
+            state: OwnedState::Applying,
+            resources: vec![OwnedResource::WireGuardLink(link)],
+        });
+        let index = self.journal.entries.len() - 1;
+        if let Err(err) = self.store.save(&self.journal) {
+            self.journal.entries.pop();
+            return Err(err);
+        }
+        let result = (|| -> io::Result<()> {
+            let ifindex = self.wg.as_mut().unwrap().create_link(&name, &marker)?;
+            if let OwnedResource::WireGuardLink(link) =
+                &mut self.journal.entries[index].resources[0]
+            {
+                link.index = ifindex;
+            }
+            self.store.save(&self.journal)?;
+            self.wg_config
+                .as_mut()
+                .unwrap()
+                .configure(&name, &plan.setconf)?;
+            if let Some(full) = &full {
+                self.wg_config
+                    .as_mut()
+                    .unwrap()
+                    .set_fwmark(&name, full.fwmark)?;
+            }
+            for address in &plan.addresses {
+                self.journal.entries[index]
+                    .resources
+                    .push(OwnedResource::Address(WireGuardAddressResource {
+                        interface_index: ifindex,
+                        address: *address,
+                    }));
+                self.store.save(&self.journal)?;
+                self.wg.as_mut().unwrap().add_address(ifindex, *address)?;
+            }
+            if let Some(mtu) = plan.mtu {
+                self.wg.as_mut().unwrap().set_mtu(ifindex, mtu)?;
+            }
+            self.wg.as_mut().unwrap().set_state(ifindex, true)?;
+            for route in &plan.routes {
+                if plan
+                    .addresses
+                    .iter()
+                    .any(|address| address.trunc() == route.destination)
+                {
+                    continue;
+                }
+                let mut applied = AppliedRoute::on_link(route.destination, ifindex, route.metric);
+                if route.destination.prefix_len() == 0 {
+                    if let Some(full) = &full {
+                        applied.table = Some(full.table);
+                    }
+                }
+                self.journal.entries[index]
+                    .resources
+                    .push(OwnedResource::Route(applied.clone()));
+                self.store.save(&self.journal)?;
+                self.routes.add_route(&applied)?;
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(full) = &full {
+                for rule in full_policy_rules(full) {
+                    self.journal.entries[index]
+                        .resources
+                        .push(OwnedResource::Rule(rule.clone()));
+                    self.store.save(&self.journal)?;
+                    self.policy.as_mut().unwrap().add_rule(&rule)?;
+                }
+                self.wg_config.as_ref().unwrap().verify_transport(
+                    &name,
+                    full.fwmark,
+                    full.ipv4,
+                    full.ipv6,
+                )?;
+            }
+            #[cfg(target_os = "linux")]
+            if !plan.dns_servers.is_empty() {
+                self.journal.entries[index]
+                    .resources
+                    .push(OwnedResource::Dns(
+                        net_manager_core::daemon_protocol::WireGuardDnsResource {
+                            interface_index: ifindex,
+                            name: name.clone(),
+                            servers: plan.dns_servers.clone(),
+                            domains: plan.dns_domains.clone(),
+                            full: full.is_some(),
+                            applied: false,
+                        },
+                    ));
+                self.store.save(&self.journal)?;
+                let outcome = self
+                    .dns
+                    .as_mut()
+                    .unwrap()
+                    .apply(&name, &plan.dns_servers, &plan.dns_domains, full.is_some())
+                    .map_err(|err| io::Error::other(err.to_string()))?;
+                match outcome {
+                    DnsApply::Applied => {
+                        if let Some(OwnedResource::Dns(dns)) =
+                            self.journal.entries[index].resources.last_mut()
+                        {
+                            dns.applied = true;
+                        }
+                    }
+                    DnsApply::Unavailable => {
+                        if let OwnedResource::WireGuardLink(link) =
+                            &mut self.journal.entries[index].resources[0]
+                        {
+                            link.warnings.push(WireGuardWarning::DnsNotApplied);
+                        }
+                    }
+                    DnsApply::Skipped => {
+                        self.journal.entries[index].resources.pop();
+                        if let OwnedResource::WireGuardLink(link) =
+                            &mut self.journal.entries[index].resources[0]
+                        {
+                            link.warnings.push(WireGuardWarning::DnsNotApplied);
+                        }
+                    }
+                }
+                self.store.save(&self.journal)?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            // RTM_NEWLINK with EEXIST did not create anything; the existing
+            // interface must never be claimed or removed by our WAL intent.
+            if err.kind() == io::ErrorKind::AlreadyExists
+                && self.journal.entries[index].resources.len() == 1
+                && matches!(&self.journal.entries[index].resources[0], OwnedResource::WireGuardLink(link) if link.index == 0)
+            {
+                self.journal.entries.remove(index);
+                self.persist();
+                return Err(err);
+            }
+            let _ = self.teardown_entry(index);
+            self.persist();
+            return Err(err);
+        }
+        self.journal.entries[index].state = OwnedState::Applied;
+        if let Err(err) = self.store.save(&self.journal) {
+            let _ = self.teardown_entry(index);
+            self.persist();
+            return Err(err);
+        }
+        Ok(self.wireguard_status(uid, profile_id))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn allocate_full(&mut self, plan: &WireGuardPlan) -> io::Result<Option<WireGuardFullResource>> {
+        if !plan.full_ipv4 && !plan.full_ipv6 {
+            return Ok(None);
+        }
+        if self.journal.entries.iter().any(|entry| {
+            entry.resources.iter().any(|resource| match resource {
+                OwnedResource::WireGuardLink(link) => link.full.is_some(),
+                OwnedResource::OpenVpnProcess(process) => process.full.is_some(),
+                OwnedResource::XrayProcess(process) => process.full.is_some(),
+                _ => false,
+            })
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "another full tunnel owns policy routing",
+            ));
+        }
+        let policy = self.policy.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "policy executor is unavailable",
+            )
+        })?;
+        let existing = policy.rules_snapshot()?;
+        let wg_marks = self.wg_config.as_ref().unwrap().marks_in_use()?;
+        for slot in 0..128_u32 {
+            let table = 51820 + slot;
+            let priority_main = 10000 + slot * 2;
+            let priority_tunnel = priority_main + 1;
+            if wg_marks.contains(&table)
+                || self.journal.entries.iter().any(|entry| entry.resources.iter().any(|resource| matches!(resource, OwnedResource::OpenVpnProcess(process) if process.transport_mark == Some(table)) || matches!(resource, OwnedResource::XrayProcess(process) if process.transport_mark == table)))
+                || existing.iter().any(|rule| {
+                    rule.fwmark == Some(table)
+                        || rule.priority == priority_main
+                        || rule.priority == priority_tunnel
+                })
+                || policy.table_in_use(table)?
+            {
+                continue;
+            }
+            return Ok(Some(WireGuardFullResource {
+                table,
+                fwmark: table,
+                priority_main,
+                priority_tunnel,
+                ipv4: plan.full_ipv4,
+                ipv6: plan.full_ipv6,
+            }));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "no safe policy routing slot is available",
+        ))
+    }
+
+    pub fn disconnect_wireguard(&mut self, uid: u32, profile_id: &str) -> io::Result<()> {
+        let owner = wireguard_owner(profile_id)?;
+        let index = self.position(uid, &owner).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "WireGuard profile is not connected",
+            )
+        })?;
+        let result = self.teardown_entry(index);
+        self.store.save(&self.journal)?;
+        result
+    }
+
+    pub fn wireguard_status(&self, uid: u32, profile_id: &str) -> WireGuardStatusResult {
+        let owner = format!("wg:{profile_id}");
+        let entry = self
+            .journal
+            .entries
+            .iter()
+            .find(|entry| entry.uid == uid && entry.owner == owner);
+        let interface_name = entry.and_then(|entry| {
+            entry.resources.iter().find_map(|resource| match resource {
+                OwnedResource::WireGuardLink(link) => Some(link.name.clone()),
+                _ => None,
+            })
+        });
+        let warnings = entry
+            .and_then(|entry| {
+                entry.resources.iter().find_map(|resource| match resource {
+                    OwnedResource::WireGuardLink(link) => Some(link.warnings.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_default();
+        let dns_applied = entry.is_some_and(|entry| {
+            entry
+                .resources
+                .iter()
+                .any(|resource| matches!(resource, OwnedResource::Dns(dns) if dns.applied))
+        });
+        let (state, latest_handshake, rx_bytes, tx_bytes) = match (entry, interface_name.as_deref())
+        {
+            (Some(entry), Some(name)) if entry.state == OwnedState::Applied => {
+                match self.wg_config.as_ref().and_then(|wg| wg.health(name).ok()) {
+                    Some((handshake, rx, tx)) => (TunnelState::Running, handshake, rx, tx),
+                    None => (TunnelState::Failed, None, 0, 0),
+                }
+            }
+            (Some(_), _) => (TunnelState::Failed, None, 0, 0),
+            (None, _) => (TunnelState::Stopped, None, 0, 0),
+        };
+        WireGuardStatusResult {
+            profile_id: profile_id.into(),
+            state,
+            interface_name,
+            latest_handshake,
+            rx_bytes,
+            tx_bytes,
+            dns_applied,
+            warnings,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn reapply_dns(&mut self) -> io::Result<()> {
+        let Some(dns_executor) = self.dns.as_mut() else {
+            return Ok(());
+        };
+        let mut changed_any = false;
+        for entry in &mut self.journal.entries {
+            if entry.state != OwnedState::Applied {
+                continue;
+            }
+            if entry.owner.starts_with("ovpn:") {
+                let Some(dns) = entry.resources.iter().find_map(|resource| match resource {
+                    OwnedResource::Dns(dns) => Some(dns.clone()),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let active = self
+                    .openvpn_runtime
+                    .get(&(entry.uid, entry.owner.clone()))
+                    .is_some_and(|runtime| runtime.snapshot.state == Some(OpenVpnState::Connected));
+                let same_link = self
+                    .openvpn
+                    .as_ref()
+                    .and_then(|runner| runner.link_index(&dns.name).ok().flatten())
+                    == Some(dns.interface_index);
+                if !active || !same_link {
+                    continue;
+                }
+                let applied = matches!(
+                    dns_executor.apply(&dns.name, &dns.servers, &dns.domains, dns.full),
+                    Ok(DnsApply::Applied)
+                );
+                if let Some(OwnedResource::Dns(resource)) = entry
+                    .resources
+                    .iter_mut()
+                    .find(|resource| matches!(resource, OwnedResource::Dns(_)))
+                {
+                    if resource.applied != applied {
+                        resource.applied = applied;
+                        changed_any = true;
+                    }
+                }
+                continue;
+            }
+            if entry.owner.starts_with("xray:") {
+                let Some(dns) = entry.resources.iter().find_map(|resource| match resource {
+                    OwnedResource::Dns(dns) => Some(dns.clone()),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let same_link = self
+                    .xray
+                    .as_ref()
+                    .and_then(|runner| runner.link_index(&dns.name).ok().flatten())
+                    == Some(dns.interface_index);
+                if !same_link {
+                    continue;
+                }
+                let applied = matches!(
+                    dns_executor.apply(&dns.name, &dns.servers, &dns.domains, dns.full),
+                    Ok(DnsApply::Applied)
+                );
+                if let Some(OwnedResource::Dns(resource)) = entry
+                    .resources
+                    .iter_mut()
+                    .find(|resource| matches!(resource, OwnedResource::Dns(_)))
+                {
+                    if resource.applied != applied {
+                        resource.applied = applied;
+                        changed_any = true;
+                    }
+                }
+                continue;
+            }
+            if !entry.owner.starts_with("wg:") {
+                continue;
+            }
+            let Some(wg) = self.wg.as_mut() else {
+                continue;
+            };
+            let link = entry.resources.iter().find_map(|resource| match resource {
+                OwnedResource::WireGuardLink(link) => Some(link.clone()),
+                _ => None,
+            });
+            let dns = entry.resources.iter().find_map(|resource| match resource {
+                OwnedResource::Dns(dns) => Some(dns.clone()),
+                _ => None,
+            });
+            let (Some(link), Some(dns)) = (link, dns) else {
+                continue;
+            };
+            if !wg.link_owned(&link.name, link.index, &link.owner_marker)? {
+                continue;
+            }
+            let applied = matches!(
+                dns_executor.apply(&dns.name, &dns.servers, &dns.domains, dns.full),
+                Ok(DnsApply::Applied)
+            );
+            let mut changed = false;
+            if let Some(OwnedResource::Dns(resource)) = entry
+                .resources
+                .iter_mut()
+                .find(|resource| matches!(resource, OwnedResource::Dns(_)))
+            {
+                if resource.applied != applied {
+                    resource.applied = applied;
+                    changed = true;
+                }
+            }
+            if let Some(OwnedResource::WireGuardLink(resource)) = entry
+                .resources
+                .iter_mut()
+                .find(|resource| matches!(resource, OwnedResource::WireGuardLink(_)))
+            {
+                if applied {
+                    let before = resource.warnings.len();
+                    resource
+                        .warnings
+                        .retain(|warning| *warning != WireGuardWarning::DnsNotApplied);
+                    changed |= resource.warnings.len() != before;
+                } else if !resource.warnings.contains(&WireGuardWarning::DnsNotApplied) {
+                    resource.warnings.push(WireGuardWarning::DnsNotApplied);
+                    changed = true;
+                }
+            }
+            changed_any |= changed;
+        }
+        if changed_any {
+            self.store.save(&self.journal)?;
+        }
+        Ok(())
+    }
+
     /// Apply `routes` for `(uid, owner)` all-or-nothing. The journal entry is
     /// persisted as `applying` before the first kernel change.
     pub fn apply_routes(
@@ -56,6 +2976,9 @@ impl DaemonCore {
         routes: Vec<AppliedRoute>,
     ) -> io::Result<usize> {
         validate_owner(owner).map_err(invalid_input)?;
+        if owner.starts_with("wg:") || owner.starts_with("ovpn:") || owner.starts_with("xray:") {
+            return Err(invalid_input("reserved owner prefix".into()));
+        }
         validate_apply(&routes).map_err(invalid_input)?;
         if self.position(uid, owner).is_some() {
             return Err(io::Error::new(
@@ -106,6 +3029,11 @@ impl DaemonCore {
         let index = self
             .position(uid, owner)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "owner has nothing applied"))?;
+        if owner.starts_with("wg:") || owner.starts_with("ovpn:") {
+            return Err(invalid_input(
+                "use the tunnel disconnect method for tunnel owners".into(),
+            ));
+        }
         let count = self.journal.entries[index].resources.len();
         let result = self.teardown_entry(index);
         self.persist();
@@ -123,6 +3051,48 @@ impl DaemonCore {
                 resources: entry.resources.clone(),
             })
             .collect()
+    }
+
+    /// Forget only static owners whose daemon-protocol routes disappeared from
+    /// the kernel (for example after a physical link flap). A later always-on
+    /// replay resolves the current ifindex before installing them again.
+    pub fn reconcile_static_routes(&mut self, observed: &[AppliedRoute]) -> io::Result<usize> {
+        let mut removed = 0;
+        let mut failed = false;
+        for index in (0..self.journal.entries.len()).rev() {
+            let entry = &self.journal.entries[index];
+            if entry.state != OwnedState::Applied
+                || entry.owner.starts_with("wg:")
+                || entry.owner.starts_with("ovpn:")
+                || entry.owner.starts_with("xray:")
+                || entry.resources.is_empty()
+                || !entry
+                    .resources
+                    .iter()
+                    .all(|resource| matches!(resource, OwnedResource::Route(_)))
+            {
+                continue;
+            }
+            let missing = entry.resources.iter().any(|resource| match resource {
+                OwnedResource::Route(route) => !observed.contains(route),
+                _ => false,
+            });
+            if missing {
+                if self.teardown_entry(index).is_ok() {
+                    removed += 1;
+                } else {
+                    failed = true;
+                }
+            }
+        }
+        self.store.save(&self.journal)?;
+        if failed {
+            Err(io::Error::other(
+                "static route reconciliation left stale resources",
+            ))
+        } else {
+            Ok(removed)
+        }
     }
 
     pub fn cleanup_uid(&mut self, uid: u32) -> io::Result<CleanupResult> {
@@ -166,11 +3136,21 @@ impl DaemonCore {
     /// failure it keeps only what could not be removed and becomes `stale`.
     /// The caller persists the journal.
     fn teardown_entry(&mut self, index: usize) -> io::Result<()> {
+        if self.journal.entries[index].owner.starts_with("xray:") {
+            return self.teardown_xray_entry(index);
+        }
+        if self.journal.entries[index].owner.starts_with("ovpn:") {
+            return self.teardown_openvpn_entry(index);
+        }
+        if self.journal.entries[index].owner.starts_with("wg:") {
+            return self.teardown_wireguard_entry(index);
+        }
         let routes: Vec<AppliedRoute> = self.journal.entries[index]
             .resources
             .iter()
-            .map(|resource| match resource {
-                OwnedResource::Route(route) => route.clone(),
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) => Some(route.clone()),
+                _ => None,
             })
             .collect();
         match remove_routes_best_effort(&mut IgnoreMissing(self.routes.as_mut()), &routes) {
@@ -188,6 +3168,314 @@ impl DaemonCore {
         }
     }
 
+    fn teardown_xray_entry(&mut self, index: usize) -> io::Result<()> {
+        let entry = self.journal.entries[index].clone();
+        let process = entry
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) => Some(process),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Xray owner has no process marker",
+                )
+            })?;
+        let Some(runner) = self.xray.as_mut() else {
+            self.journal.entries[index].state = OwnedState::Stale;
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Xray executor is unavailable",
+            ));
+        };
+        let current_index = runner.link_index(&process.name)?;
+        if current_index.is_some_and(|current| process.index == 0 || current != process.index) {
+            self.journal.entries[index].state = OwnedState::Stale;
+            return Err(io::Error::other("Xray TUN link identity is unverified"));
+        }
+        let mut failed = Vec::new();
+        for resource in entry.resources.iter().rev() {
+            let result = match resource {
+                OwnedResource::Dns(_) if current_index.is_none() => Ok(()),
+                OwnedResource::Dns(dns) => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        match self.dns.as_mut() {
+                            Some(executor) => match executor.revert(&dns.name) {
+                                Ok(()) | Err(crate::dns::DnsError::Unavailable) => Ok(()),
+                                Err(_) => Err(io::Error::other("Xray DNS cleanup failed")),
+                            },
+                            None => Err(io::Error::new(
+                                io::ErrorKind::NotConnected,
+                                "DNS executor is unavailable",
+                            )),
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "DNS executor is unavailable",
+                        ))
+                    }
+                }
+                OwnedResource::Rule(rule) => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.policy
+                            .as_mut()
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::NotConnected,
+                                    "policy executor is unavailable",
+                                )
+                            })?
+                            .remove_rule(rule)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "policy executor is unavailable",
+                        ))
+                    }
+                }
+                OwnedResource::Route(route) => self.routes.remove_route(route),
+                OwnedResource::Address(address) if current_index.is_some() => self
+                    .wg
+                    .as_mut()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotConnected, "TUN executor is unavailable")
+                    })?
+                    .remove_address(address.interface_index, address.address),
+                OwnedResource::Address(_) => Ok(()),
+                OwnedResource::XrayProcess(_) => {
+                    match self.xray.as_mut().unwrap().stop(&process.name) {
+                        Ok(()) => self
+                            .xray
+                            .as_mut()
+                            .unwrap()
+                            .cleanup(entry.uid, &process.name),
+                        Err(ref e) if e.kind() == io::ErrorKind::NotFound => self
+                            .xray
+                            .as_mut()
+                            .unwrap()
+                            .cleanup(entry.uid, &process.name),
+                        Err(err) => Err(err),
+                    }
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected Xray journal resource",
+                )),
+            };
+            let removed = match result {
+                Ok(()) => true,
+                Err(ref e) if e.kind() == io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            };
+            if !removed || matches!(resource, OwnedResource::XrayProcess(_)) && !failed.is_empty() {
+                failed.push(resource.clone());
+            }
+        }
+        if failed.is_empty() {
+            self.journal.entries.remove(index);
+            Ok(())
+        } else {
+            self.journal.entries[index].state = OwnedState::Stale;
+            self.journal.entries[index].resources = failed.into_iter().rev().collect();
+            Err(io::Error::other("Xray cleanup left owned resources"))
+        }
+    }
+
+    fn teardown_openvpn_entry(&mut self, index: usize) -> io::Result<()> {
+        let entry = self.journal.entries[index].clone();
+        let process = entry
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::OpenVpnProcess(process) => Some(process),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "OpenVPN owner has no process marker",
+                )
+            })?;
+        let Some(runner) = self.openvpn.as_mut() else {
+            self.journal.entries[index].state = OwnedState::Stale;
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "OpenVPN executor is unavailable",
+            ));
+        };
+        if let Err(err) = runner.stop(&process.name) {
+            if err.kind() != io::ErrorKind::NotFound {
+                self.journal.entries[index].state = OwnedState::Stale;
+                return Err(io::Error::other("OpenVPN child termination failed"));
+            }
+        }
+        if runner.link_index(&process.name)?.is_some() {
+            self.journal.entries[index].state = OwnedState::Stale;
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "OpenVPN link identity is unverified",
+            ));
+        }
+        if self.clear_openvpn_network(index).is_err() {
+            self.journal.entries[index].state = OwnedState::Stale;
+            return Err(io::Error::other("OpenVPN network cleanup failed"));
+        }
+        if let Err(err) = self
+            .openvpn
+            .as_mut()
+            .unwrap()
+            .cleanup(entry.uid, &process.name)
+        {
+            if err.kind() != io::ErrorKind::NotFound {
+                self.journal.entries[index].state = OwnedState::Stale;
+                return Err(io::Error::other("OpenVPN staging cleanup failed"));
+            }
+        }
+        self.journal.entries.remove(index);
+        self.openvpn_runtime.remove(&(entry.uid, entry.owner));
+        Ok(())
+    }
+
+    fn teardown_wireguard_entry(&mut self, index: usize) -> io::Result<()> {
+        let resources = self.journal.entries[index].resources.clone();
+        let link = resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::WireGuardLink(link) => Some(link),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "WireGuard owner has no link")
+            })?;
+        let Some(wg) = self.wg.as_mut() else {
+            self.journal.entries[index].state = OwnedState::Stale;
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "WireGuard executor is unavailable",
+            ));
+        };
+        let owned = match wg.link_owned(&link.name, link.index, &link.owner_marker) {
+            Ok(owned) => owned,
+            Err(err) => {
+                self.journal.entries[index].state = OwnedState::Stale;
+                return Err(err);
+            }
+        };
+        if !owned {
+            let present = match wg.link_present(&link.name, link.index) {
+                Ok(present) => present,
+                Err(err) => {
+                    self.journal.entries[index].state = OwnedState::Stale;
+                    return Err(err);
+                }
+            };
+            if present {
+                self.journal.entries[index].state = OwnedState::Stale;
+                return Err(io::Error::other("WireGuard link identity is unverified"));
+            }
+        }
+        let mut failed = Vec::new();
+        for resource in resources.iter().rev() {
+            let result = match resource {
+                OwnedResource::Route(route) if owned => self.routes.remove_route(route),
+                OwnedResource::Route(_) => Ok(()),
+                OwnedResource::Address(address) if owned => {
+                    wg.remove_address(address.interface_index, address.address)
+                }
+                OwnedResource::Address(_) => Ok(()),
+                OwnedResource::WireGuardLink(link) if failed.is_empty() => {
+                    if owned {
+                        wg.delete_link(&link.name, link.index, &link.owner_marker)
+                    } else {
+                        Ok(())
+                    }
+                }
+                OwnedResource::WireGuardLink(_) => {
+                    failed.push(resource.clone());
+                    continue;
+                }
+                OwnedResource::Rule(rule) => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.policy
+                            .as_mut()
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::NotConnected,
+                                    "policy executor is unavailable",
+                                )
+                            })?
+                            .remove_rule(rule)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "policy executor is unavailable",
+                        ))
+                    }
+                }
+                OwnedResource::Dns(dns) if owned => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        match self.dns.as_mut() {
+                            Some(executor) => match executor.revert(&dns.name) {
+                                Ok(()) | Err(crate::dns::DnsError::Unavailable) => Ok(()),
+                                Err(err) => Err(io::Error::other(err.to_string())),
+                            },
+                            None => Err(io::Error::new(
+                                io::ErrorKind::NotConnected,
+                                "DNS executor is unavailable",
+                            )),
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "DNS executor is unavailable",
+                        ))
+                    }
+                }
+                OwnedResource::Dns(_) => Ok(()),
+                OwnedResource::OpenVpnProcess(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "OpenVPN resource in WireGuard journal entry",
+                )),
+                OwnedResource::XrayProcess(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Xray resource in WireGuard journal entry",
+                )),
+            };
+            let removed = match result {
+                Ok(()) => true,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            };
+            if !removed {
+                failed.push(resource.clone());
+            }
+        }
+        if failed.is_empty() {
+            self.journal.entries.remove(index);
+            Ok(())
+        } else {
+            let entry = &mut self.journal.entries[index];
+            entry.state = OwnedState::Stale;
+            entry.resources = failed.into_iter().rev().collect();
+            Err(io::Error::other("WireGuard cleanup left owned resources"))
+        }
+    }
+
     /// Save after a kernel change already happened. The in-memory journal
     /// stays authoritative; a stale file only causes harmless `NotFound`
     /// removals on the next start, so the failure is logged, not returned.
@@ -200,6 +3488,32 @@ impl DaemonCore {
 
 /// Removing a route that is already gone is success: the goal state holds.
 struct IgnoreMissing<'a>(&'a mut dyn RouteExecutor);
+
+fn full_policy_rules(full: &WireGuardFullResource) -> Vec<OwnedRuleResource> {
+    let mut rules = Vec::new();
+    for family in [IpFamily::Ipv4, IpFamily::Ipv6] {
+        if (family == IpFamily::Ipv4 && !full.ipv4) || (family == IpFamily::Ipv6 && !full.ipv6) {
+            continue;
+        }
+        rules.push(OwnedRuleResource {
+            family,
+            priority: full.priority_main,
+            table: 254,
+            fwmark: None,
+            invert: false,
+            suppress_prefix_length: Some(0),
+        });
+        rules.push(OwnedRuleResource {
+            family,
+            priority: full.priority_tunnel,
+            table: full.table,
+            fwmark: Some(full.fwmark),
+            invert: true,
+            suppress_prefix_length: None,
+        });
+    }
+    rules
+}
 
 impl RouteExecutor for IgnoreMissing<'_> {
     fn add_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
@@ -214,8 +3528,662 @@ impl RouteExecutor for IgnoreMissing<'_> {
     }
 }
 
+#[cfg(test)]
+mod xray_core_tests {
+    use super::*;
+    use crate::xray_process::XrayProcessRunner;
+    use net_manager_core::daemon_protocol::XrayConnectParams;
+    use net_manager_core::models::PolicyRoute;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Events(Arc<Mutex<Vec<String>>>);
+    impl Events {
+        fn push(&self, event: impl Into<String>) {
+            self.0.lock().unwrap().push(event.into());
+        }
+        fn list(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+    struct Routes(Events);
+    impl RouteExecutor for Routes {
+        fn add_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+            self.0.push(format!("route-add:{}", route.destination));
+            Ok(())
+        }
+        fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+            self.0.push(format!("route-del:{}", route.destination));
+            Ok(())
+        }
+    }
+    struct RejectRoutes(Events);
+    impl RouteExecutor for RejectRoutes {
+        fn add_route(&mut self, _: &AppliedRoute) -> io::Result<()> {
+            self.0.push("route-reject");
+            Err(io::Error::other("fake route failure"))
+        }
+        fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+            self.0.push(format!("route-del:{}", route.destination));
+            Ok(())
+        }
+    }
+    struct Links;
+    impl LinkExecutor for Links {
+        fn set_link_state(&mut self, _: &str, _: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    struct Tun(Events);
+    impl WgSystem for Tun {
+        fn create_link(&mut self, _: &str, _: &str) -> io::Result<u32> {
+            unreachable!()
+        }
+        fn link_owned(&mut self, _: &str, _: u32, _: &str) -> io::Result<bool> {
+            unreachable!()
+        }
+        fn delete_link(&mut self, _: &str, _: u32, _: &str) -> io::Result<()> {
+            unreachable!()
+        }
+        fn add_address(&mut self, _: u32, address: IpNet) -> io::Result<()> {
+            self.0.push(format!("address-add:{address}"));
+            Ok(())
+        }
+        fn remove_address(&mut self, _: u32, address: IpNet) -> io::Result<()> {
+            self.0.push(format!("address-del:{address}"));
+            Ok(())
+        }
+        fn set_mtu(&mut self, _: u32, _: u32) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_state(&mut self, _: u32, _: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    struct Process(Events);
+    impl XrayProcessRunner for Process {
+        fn verify_binary(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn link_index(&self, _: &str) -> io::Result<Option<u32>> {
+            Ok(self.0.list().contains(&"spawn".to_owned()).then_some(42))
+        }
+        fn start(&mut self, _: u32, _: &str, _: &str) -> io::Result<()> {
+            self.0.push("spawn");
+            Ok(())
+        }
+        fn health(&mut self, _: &str) -> io::Result<bool> {
+            Ok(true)
+        }
+        fn stop(&mut self, _: &str) -> io::Result<()> {
+            self.0.push("stop");
+            Ok(())
+        }
+        fn cleanup(&mut self, _: u32, _: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn params() -> XrayConnectParams {
+        XrayConnectParams {
+            profile_id: "home".into(),
+            config: json!({
+                "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
+                "outbounds":[
+                    {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"proxy.test","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                    {"tag":"direct","protocol":"freedom"}
+                ],
+                "routing":{"domainStrategy":"AsIs","rules":[]}
+            }).to_string(),
+            routes: vec![PolicyRoute { destination: "10.20.0.0/16".parse().unwrap(), metric: 5, via: None }],
+            dns_servers: vec![], dns_domains: vec![],
+        }
+    }
+
+    struct Policy(Events);
+    impl PolicyRuleExecutor for Policy {
+        fn rules_snapshot(&mut self) -> io::Result<Vec<OwnedRuleResource>> {
+            Ok(vec![])
+        }
+        fn table_in_use(&mut self, _: u32) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn add_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()> {
+            self.0.push(format!("rule-add:{}", rule.priority));
+            Ok(())
+        }
+        fn remove_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()> {
+            self.0.push(format!("rule-del:{}", rule.priority));
+            Ok(())
+        }
+    }
+    struct Dns(Events);
+    impl DnsExecutor for Dns {
+        fn apply(
+            &mut self,
+            name: &str,
+            _: &[std::net::IpAddr],
+            _: &[String],
+            _: bool,
+        ) -> Result<DnsApply, crate::dns::DnsError> {
+            self.0.push(format!("dns-apply:{name}"));
+            Ok(DnsApply::Applied)
+        }
+        fn revert(&mut self, name: &str) -> Result<(), crate::dns::DnsError> {
+            self.0.push(format!("dns-revert:{name}"));
+            Ok(())
+        }
+    }
+    #[test]
+    fn split_xray_is_journaled_before_spawn_and_cleans_up_in_reverse_order() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-core-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Process(events.clone())),
+        )
+        .unwrap();
+        let status = core.connect_xray(1000, params()).unwrap();
+        assert_eq!(status.state, TunnelState::Running);
+        assert!(!status.ipv4_covered);
+        assert!(core.disconnect_xray(1001, "home").is_err());
+        core.disconnect_xray(1000, "home").unwrap();
+        let events = events.list();
+        assert_eq!(events[0], "spawn");
+        assert!(events[1].starts_with("address-add:"));
+        assert_eq!(events[2], "route-add:10.20.0.0/16");
+        assert_eq!(events[3], "route-del:10.20.0.0/16");
+        assert!(events[4].starts_with("address-del:"));
+        assert_eq!(events[5], "stop");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn full_xray_marks_transport_before_rules_and_reverts_dns_rules_routes() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-full-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Process(events.clone())),
+        )
+        .unwrap();
+        core.policy = Some(Box::new(Policy(events.clone())));
+        core.dns = Some(Box::new(Dns(events.clone())));
+        let mut input = params();
+        input.routes = vec![PolicyRoute {
+            destination: "0.0.0.0/0".parse().unwrap(),
+            metric: 5,
+            via: None,
+        }];
+        input.dns_servers = vec!["1.1.1.1".parse().unwrap()];
+        let status = core.connect_xray(1000, input).unwrap();
+        assert!(status.ipv4_covered && !status.ipv6_covered && status.dns_applied);
+        let owned = core.owned(1000);
+        assert!(owned[0]
+            .resources
+            .iter()
+            .any(|r| matches!(r, OwnedResource::Route(route) if route.table == Some(51820))));
+        assert_eq!(
+            owned[0]
+                .resources
+                .iter()
+                .filter(|r| matches!(r, OwnedResource::Rule(_)))
+                .count(),
+            2
+        );
+        let events_before = events.list();
+        assert_eq!(
+            events_before
+                .iter()
+                .filter(|e| e.starts_with("rule-add:"))
+                .count(),
+            2
+        );
+        assert!(
+            events_before
+                .iter()
+                .position(|e| e.starts_with("route-add:"))
+                .unwrap()
+                < events_before
+                    .iter()
+                    .position(|e| e.starts_with("rule-add:"))
+                    .unwrap()
+        );
+        core.disconnect_xray(1000, "home").unwrap();
+        let all = events.list();
+        assert!(
+            all.iter()
+                .position(|e| e.starts_with("dns-revert:"))
+                .unwrap()
+                < all.iter().position(|e| e.starts_with("rule-del:")).unwrap()
+        );
+        assert!(
+            all.iter().position(|e| e.starts_with("rule-del:")).unwrap()
+                < all
+                    .iter()
+                    .position(|e| e.starts_with("route-del:"))
+                    .unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_xray_route_rolls_back_owned_address_and_process() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-rollback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(RejectRoutes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Process(events.clone())),
+        )
+        .unwrap();
+        let error = core.connect_xray(1000, params()).unwrap_err();
+        assert_eq!(error.to_string(), "Xray route_add failed");
+        assert!(!error.to_string().contains("SECRET-ID"));
+        assert!(core.owned(1000).is_empty());
+        let events = events.list();
+        assert!(events.iter().any(|e| e == "route-reject"));
+        assert!(events.iter().any(|e| e.starts_with("address-del:")));
+        assert!(events.iter().any(|e| e == "stop"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_recovery_removes_xray_routes_after_process_exit() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-recover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = JournalStore::new(dir.join("state.json"));
+        store
+            .save(&JournalDocument {
+                version: crate::journal::JOURNAL_VERSION,
+                entries: vec![JournalEntry {
+                    uid: 1000,
+                    owner: "xray:home".into(),
+                    state: OwnedState::Applying,
+                    resources: vec![
+                        OwnedResource::XrayProcess(XrayProcessResource {
+                            name: "xray-123abc".into(),
+                            index: 42,
+                            owner_marker: "network-orchestrator:1000:xray:home".into(),
+                            transport_mark: 51820,
+                            full: None,
+                        }),
+                        OwnedResource::Address(WireGuardAddressResource {
+                            interface_index: 42,
+                            address: "198.18.0.1/32".parse().unwrap(),
+                        }),
+                        OwnedResource::Route(AppliedRoute::on_link(
+                            "10.20.0.0/16".parse().unwrap(),
+                            42,
+                            5,
+                        )),
+                        OwnedResource::Dns(
+                            net_manager_core::daemon_protocol::WireGuardDnsResource {
+                                interface_index: 42,
+                                name: "xray-123abc".into(),
+                                servers: vec!["10.20.0.53".parse().unwrap()],
+                                domains: vec![],
+                                full: false,
+                                applied: true,
+                            },
+                        ),
+                    ],
+                }],
+            })
+            .unwrap();
+        let core = DaemonCore::open_with_xray(
+            store,
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Process(events.clone())),
+        )
+        .unwrap();
+        assert!(core.owned(1000).is_empty());
+        assert_eq!(events.list(), vec!["route-del:10.20.0.0/16", "stop"]);
+        assert!(JournalStore::new(dir.join("state.json"))
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 fn invalid_input(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn xray_stage(stage: &'static str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("Xray {stage} failed"))
+}
+
+fn wireguard_owner(profile_id: &str) -> io::Result<String> {
+    validate_owner(profile_id).map_err(invalid_input)?;
+    Ok(format!("wg:{profile_id}"))
+}
+
+fn wireguard_name(uid: u32, profile_id: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in uid.to_le_bytes().iter().chain(profile_id.as_bytes()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("wg-{:012x}", hash & 0xffffffffffff)
+}
+
+#[cfg(target_os = "linux")]
+pub struct TrustedWgCommand;
+
+fn parse_wg_dump(dump: &str) -> io::Result<(Option<u64>, u64, u64)> {
+    let mut lines = dump.lines();
+    if lines.next().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WireGuard status is malformed",
+        ));
+    }
+    let mut latest = None;
+    let mut rx = 0_u64;
+    let mut tx = 0_u64;
+    for line in lines {
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WireGuard status is malformed",
+            ));
+        }
+        let numbers = (
+            fields[4].parse::<u64>(),
+            fields[5].parse::<u64>(),
+            fields[6].parse::<u64>(),
+        );
+        let (handshake, peer_rx, peer_tx) = match numbers {
+            (Ok(handshake), Ok(peer_rx), Ok(peer_tx)) => (handshake, peer_rx, peer_tx),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WireGuard status is malformed",
+                ))
+            }
+        };
+        if handshake != 0 {
+            latest = Some(latest.map_or(handshake, |prior: u64| prior.max(handshake)));
+        }
+        rx = rx.saturating_add(peer_rx);
+        tx = tx.saturating_add(peer_tx);
+    }
+    Ok((latest, rx, tx))
+}
+
+fn parse_wg_endpoint_ips(dump: &str) -> io::Result<Vec<std::net::IpAddr>> {
+    let mut lines = dump.lines();
+    if lines.next().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WireGuard status is malformed",
+        ));
+    }
+    let mut endpoints = Vec::new();
+    for line in lines {
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WireGuard status is malformed",
+            ));
+        }
+        if fields[2] == "(none)" {
+            continue;
+        }
+        let socket = fields[2].parse::<std::net::SocketAddr>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WireGuard endpoint is malformed",
+            )
+        })?;
+        endpoints.push(socket.ip());
+    }
+    Ok(endpoints)
+}
+
+fn parse_ip_route_device(output: &[u8]) -> io::Result<String> {
+    let rows: serde_json::Value = serde_json::from_slice(output)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "route lookup is malformed"))?;
+    rows.as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("dev"))
+        .and_then(|dev| dev.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "route lookup has no interface"))
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_wg_binary() -> io::Result<&'static str> {
+    use std::os::unix::fs::MetadataExt;
+    const PATH: &str = "/usr/bin/wg";
+    let metadata = std::fs::symlink_metadata(PATH).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "trusted WireGuard binary is unavailable",
+        )
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "trusted WireGuard binary is unsafe",
+        ));
+    }
+    Ok(PATH)
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_ip_binary() -> io::Result<&'static str> {
+    use std::os::unix::fs::MetadataExt;
+    const PATH: &str = "/usr/bin/ip";
+    let metadata = std::fs::symlink_metadata(PATH).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "trusted ip binary is unavailable",
+        )
+    })?;
+    if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "trusted ip binary is unsafe",
+        ));
+    }
+    Ok(PATH)
+}
+
+#[cfg(target_os = "linux")]
+fn wg_dump(name: &str) -> io::Result<String> {
+    use std::process::{Command, Stdio};
+    let output = Command::new(trusted_wg_binary()?)
+        .args(["show", name, "dump"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| io::Error::other("WireGuard status is unavailable"))?;
+    if !output.status.success() || output.stdout.len() > 64 * 1024 {
+        return Err(io::Error::other("WireGuard status is unavailable"));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "WireGuard status is malformed"))
+}
+
+#[cfg(target_os = "linux")]
+fn ip_route_device(destination: std::net::IpAddr, mark: Option<u32>) -> io::Result<String> {
+    use std::process::{Command, Stdio};
+    let mut args = vec![
+        "-j".to_string(),
+        "route".into(),
+        "get".into(),
+        destination.to_string(),
+    ];
+    if let Some(mark) = mark {
+        args.push("mark".into());
+        args.push(mark.to_string());
+    }
+    let output = Command::new(trusted_ip_binary()?)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| io::Error::other("route lookup failed"))?;
+    if !output.status.success() || output.stdout.len() > 64 * 1024 {
+        return Err(io::Error::other("route lookup failed"));
+    }
+    parse_ip_route_device(&output.stdout)
+}
+
+#[cfg(target_os = "linux")]
+impl WgConfigExecutor for TrustedWgCommand {
+    fn configure(&mut self, name: &str, config: &str) -> io::Result<()> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(trusted_wg_binary()?)
+            .arg("setconf")
+            .arg(name)
+            .arg("/dev/stdin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "trusted WireGuard binary is unavailable",
+                )
+            })?;
+        let write_result = child.stdin.take().unwrap().write_all(config.as_bytes());
+        let status = child
+            .wait()
+            .map_err(|_| io::Error::other("WireGuard configuration failed"))?;
+        if write_result.is_err() {
+            return Err(io::Error::other("WireGuard config transfer failed"));
+        }
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other("WireGuard configuration failed"))
+        }
+    }
+
+    fn health(&self, name: &str) -> io::Result<(Option<u64>, u64, u64)> {
+        parse_wg_dump(&wg_dump(name)?)
+    }
+
+    fn set_fwmark(&mut self, name: &str, mark: u32) -> io::Result<()> {
+        use std::process::{Command, Stdio};
+        let status = Command::new(trusted_wg_binary()?)
+            .args(["set", name, "fwmark", &mark.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| io::Error::other("WireGuard fwmark configuration failed"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other("WireGuard fwmark configuration failed"))
+        }
+    }
+
+    fn marks_in_use(&self) -> io::Result<Vec<u32>> {
+        use std::process::{Command, Stdio};
+        let output = Command::new(trusted_wg_binary()?)
+            .args(["show", "all", "fwmark"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|_| io::Error::other("WireGuard mark inspection failed"))?;
+        if !output.status.success() || output.stdout.len() > 64 * 1024 {
+            return Err(io::Error::other("WireGuard mark inspection failed"));
+        }
+        let output = std::str::from_utf8(&output.stdout).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WireGuard mark inspection failed",
+            )
+        })?;
+        let mut marks = Vec::new();
+        for line in output.lines() {
+            let mut fields = line.split_whitespace();
+            let _name = fields.next();
+            let Some(mark) = fields.next() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WireGuard mark inspection failed",
+                ));
+            };
+            if mark == "off" {
+                continue;
+            }
+            let parsed = match mark.strip_prefix("0x") {
+                Some(hex) => u32::from_str_radix(hex, 16),
+                None => mark.parse(),
+            }
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WireGuard mark inspection failed",
+                )
+            })?;
+            marks.push(parsed);
+        }
+        Ok(marks)
+    }
+
+    fn endpoint_ips(&self, name: &str) -> io::Result<Vec<std::net::IpAddr>> {
+        parse_wg_endpoint_ips(&wg_dump(name)?)
+    }
+
+    fn verify_transport(&self, name: &str, mark: u32, ipv4: bool, ipv6: bool) -> io::Result<()> {
+        let endpoints = self.endpoint_ips(name)?;
+        if endpoints.is_empty() {
+            return Err(io::Error::other("WireGuard endpoint is unavailable"));
+        }
+        for endpoint in endpoints {
+            if ip_route_device(endpoint, Some(mark))? == name {
+                return Err(io::Error::other(
+                    "WireGuard transport route loops into the tunnel",
+                ));
+            }
+        }
+        for probe in [
+            ipv4.then(|| "198.19.255.253".parse::<std::net::IpAddr>().unwrap()),
+            ipv6.then(|| "2001:db8:ffff::7".parse::<std::net::IpAddr>().unwrap()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if ip_route_device(probe, None)? != name {
+                return Err(io::Error::other(
+                    "WireGuard policy route does not select the tunnel",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -362,6 +4330,967 @@ mod tests {
 
     fn remove(dest: &str) -> Op {
         Op::Remove(dest.into())
+    }
+
+    struct FakeWg {
+        events: Arc<Mutex<Vec<String>>>,
+        fail_remove_address: bool,
+        before_create: Option<PathBuf>,
+    }
+
+    impl WgSystem for FakeWg {
+        fn create_link(&mut self, name: &str, _marker: &str) -> io::Result<u32> {
+            if let Some(path) = &self.before_create {
+                let journal = JournalStore::new(path).load().unwrap();
+                assert_eq!(journal.entries[0].state, OwnedState::Applying);
+                assert!(
+                    matches!(&journal.entries[0].resources[0], OwnedResource::WireGuardLink(link) if link.name == name && link.index == 0)
+                );
+            }
+            self.events.lock().unwrap().push(format!("create:{name}"));
+            Ok(42)
+        }
+        fn link_owned(&mut self, _name: &str, _index: u32, _marker: &str) -> io::Result<bool> {
+            Ok(true)
+        }
+        fn delete_link(&mut self, name: &str, _index: u32, _marker: &str) -> io::Result<()> {
+            self.events.lock().unwrap().push(format!("delete:{name}"));
+            Ok(())
+        }
+        fn add_address(&mut self, _index: u32, address: ipnet::IpNet) -> io::Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("address+:{address}"));
+            Ok(())
+        }
+        fn remove_address(&mut self, _index: u32, address: ipnet::IpNet) -> io::Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("address-:{address}"));
+            if self.fail_remove_address {
+                return Err(io::Error::other("remove failed"));
+            }
+            Ok(())
+        }
+        fn set_mtu(&mut self, _index: u32, _mtu: u32) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_state(&mut self, _index: u32, up: bool) -> io::Result<()> {
+            self.events.lock().unwrap().push(format!("state:{up}"));
+            Ok(())
+        }
+    }
+
+    struct FakeWgConfig {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WgConfigExecutor for FakeWgConfig {
+        fn configure(&mut self, _name: &str, _config: &str) -> io::Result<()> {
+            self.events.lock().unwrap().push("configure".into());
+            Ok(())
+        }
+        fn health(&self, _name: &str) -> io::Result<(Option<u64>, u64, u64)> {
+            Ok((Some(42), 7, 8))
+        }
+        fn set_fwmark(&mut self, _name: &str, mark: u32) -> io::Result<()> {
+            self.events.lock().unwrap().push(format!("fwmark:{mark}"));
+            Ok(())
+        }
+        fn verify_transport(
+            &self,
+            _name: &str,
+            mark: u32,
+            _ipv4: bool,
+            _ipv6: bool,
+        ) -> io::Result<()> {
+            self.events.lock().unwrap().push(format!("verify:{mark}"));
+            Ok(())
+        }
+    }
+
+    struct FakePolicyRules {
+        events: Arc<Mutex<Vec<String>>>,
+        rules: Arc<Mutex<Vec<OwnedRuleResource>>>,
+        journal_path: PathBuf,
+    }
+
+    impl PolicyRuleExecutor for FakePolicyRules {
+        fn rules_snapshot(&mut self) -> io::Result<Vec<OwnedRuleResource>> {
+            Ok(self.rules.lock().unwrap().clone())
+        }
+        fn table_in_use(&mut self, _table: u32) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn add_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()> {
+            let journal = JournalStore::new(&self.journal_path).load().unwrap();
+            assert!(
+                matches!(journal.entries[0].resources.last(), Some(OwnedResource::Rule(intent)) if intent == rule)
+            );
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("rule+:{:?}:{}", rule.family, rule.priority));
+            self.rules.lock().unwrap().push(rule.clone());
+            Ok(())
+        }
+        fn remove_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("rule-:{:?}:{}", rule.family, rule.priority));
+            self.rules
+                .lock()
+                .unwrap()
+                .retain(|existing| existing != rule);
+            Ok(())
+        }
+    }
+
+    struct FakeDns {
+        result: crate::dns::DnsApply,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl crate::dns::DnsExecutor for FakeDns {
+        fn apply(
+            &mut self,
+            _link: &str,
+            _servers: &[std::net::IpAddr],
+            _domains: &[String],
+            _full: bool,
+        ) -> Result<crate::dns::DnsApply, crate::dns::DnsError> {
+            self.events.lock().unwrap().push("dns-apply".into());
+            Ok(self.result)
+        }
+        fn revert(&mut self, _link: &str) -> Result<(), crate::dns::DnsError> {
+            self.events.lock().unwrap().push("dns-revert".into());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn full_ipv4_uses_marked_transport_and_ordered_policy_rules() {
+        let dir = unique_dir("wireguard-full-v4");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let rules = Arc::new(Mutex::new(Vec::new()));
+        let mut core = DaemonCore::open_with_wireguard_full(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: Some(journal_path.clone()),
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+            Box::new(FakePolicyRules {
+                events: events.clone(),
+                rules: rules.clone(),
+                journal_path: journal_path.clone(),
+            }),
+            Box::new(FakeDns {
+                result: crate::dns::DnsApply::Skipped,
+                events: events.clone(),
+            }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let status = core.connect_wireguard(1000, "home", plan).unwrap();
+        assert_eq!(status.state, TunnelState::Running);
+        assert_eq!(status.warnings, vec![WireGuardWarning::Ipv6NotCovered]);
+        let owned = core.owned(1000);
+        let full = owned[0]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::WireGuardLink(link) => link.full.as_ref(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(full.table, 51820);
+        assert_eq!(full.fwmark, 51820);
+        assert_eq!((full.priority_main, full.priority_tunnel), (10000, 10001));
+        assert!(owned[0].resources.iter().any(|resource| matches!(resource, OwnedResource::Route(route) if route.destination.to_string() == "0.0.0.0/0" && route.table == Some(51820))));
+        assert_eq!(rules.lock().unwrap().len(), 2);
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "fwmark:51820"));
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "verify:51820"));
+        let before_second_connect = events.lock().unwrap().len();
+        let second_plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        assert_eq!(
+            core.connect_wireguard(1001, "other", second_plan)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(events.lock().unwrap().len(), before_second_connect);
+        core.disconnect_wireguard(1000, "home").unwrap();
+        assert!(rules.lock().unwrap().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dual_stack_full_installs_rules_for_both_families() {
+        let dir = unique_dir("wireguard-full-dual");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let rules = Arc::new(Mutex::new(Vec::new()));
+        let mut core = DaemonCore::open_with_wireguard_full(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder)),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: None,
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+            Box::new(FakePolicyRules {
+                events: events.clone(),
+                rules: rules.clone(),
+                journal_path,
+            }),
+            Box::new(FakeDns {
+                result: crate::dns::DnsApply::Skipped,
+                events,
+            }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32, fd77::2/128\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0, ::/0\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let status = core.connect_wireguard(1000, "home", plan).unwrap();
+        assert!(!status.warnings.contains(&WireGuardWarning::Ipv6NotCovered));
+        let rules = rules.lock().unwrap();
+        assert_eq!(rules.len(), 4);
+        assert_eq!(
+            rules
+                .iter()
+                .filter(|rule| rule.family == IpFamily::Ipv4)
+                .count(),
+            2
+        );
+        assert_eq!(
+            rules
+                .iter()
+                .filter(|rule| rule.family == IpFamily::Ipv6)
+                .count(),
+            2
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn full_allocator_skips_foreign_rule_priority_without_deleting_it() {
+        let dir = unique_dir("wireguard-full-priority-conflict");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let foreign = OwnedRuleResource {
+            family: IpFamily::Ipv4,
+            priority: 10000,
+            table: 254,
+            fwmark: None,
+            invert: false,
+            suppress_prefix_length: None,
+        };
+        let rules = Arc::new(Mutex::new(vec![foreign.clone()]));
+        let mut core = DaemonCore::open_with_wireguard_full(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder)),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: None,
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+            Box::new(FakePolicyRules {
+                events: events.clone(),
+                rules: rules.clone(),
+                journal_path,
+            }),
+            Box::new(FakeDns {
+                result: crate::dns::DnsApply::Skipped,
+                events,
+            }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        core.connect_wireguard(1000, "home", plan).unwrap();
+        let full = core.owned(1000)[0]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::WireGuardLink(link) => link.full.clone(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                full.table,
+                full.fwmark,
+                full.priority_main,
+                full.priority_tunnel
+            ),
+            (51821, 51821, 10002, 10003)
+        );
+        core.disconnect_wireguard(1000, "home").unwrap();
+        assert_eq!(*rules.lock().unwrap(), vec![foreign]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    struct MissingWgLink;
+
+    impl WgSystem for MissingWgLink {
+        fn create_link(&mut self, _name: &str, _marker: &str) -> io::Result<u32> {
+            unreachable!()
+        }
+        fn link_owned(&mut self, _name: &str, _index: u32, _marker: &str) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn link_present(&mut self, _name: &str, _index: u32) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn delete_link(&mut self, _name: &str, _index: u32, _marker: &str) -> io::Result<()> {
+            unreachable!()
+        }
+        fn add_address(&mut self, _index: u32, _address: ipnet::IpNet) -> io::Result<()> {
+            unreachable!()
+        }
+        fn remove_address(&mut self, _index: u32, _address: ipnet::IpNet) -> io::Result<()> {
+            unreachable!()
+        }
+        fn set_mtu(&mut self, _index: u32, _mtu: u32) -> io::Result<()> {
+            unreachable!()
+        }
+        fn set_state(&mut self, _index: u32, _up: bool) -> io::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn missing_wireguard_link_still_cleans_independent_full_policy_rules() {
+        let dir = unique_dir("wireguard-missing-full-link");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let rule = OwnedRuleResource {
+            family: IpFamily::Ipv4,
+            priority: 10000,
+            table: 254,
+            fwmark: None,
+            invert: false,
+            suppress_prefix_length: Some(0),
+        };
+        let store = JournalStore::new(&journal_path);
+        store
+            .save(&JournalDocument {
+                version: crate::journal::JOURNAL_VERSION,
+                entries: vec![JournalEntry {
+                    uid: 1000,
+                    owner: "wg:home".into(),
+                    state: OwnedState::Applied,
+                    resources: vec![
+                        OwnedResource::WireGuardLink(WireGuardLinkResource {
+                            name: "wg-ab12".into(),
+                            index: 42,
+                            owner_marker: "network-orchestrator:1000:wg:home".into(),
+                            full: None,
+                            warnings: vec![],
+                        }),
+                        OwnedResource::Rule(rule.clone()),
+                    ],
+                }],
+            })
+            .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let rules = Arc::new(Mutex::new(vec![rule]));
+        let recorder = Recorder::default();
+        let core = DaemonCore::open_with_wireguard_full(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder)),
+            Box::new(MissingWgLink),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+            Box::new(FakePolicyRules {
+                events: events.clone(),
+                rules: rules.clone(),
+                journal_path: journal_path.clone(),
+            }),
+            Box::new(FakeDns {
+                result: crate::dns::DnsApply::Skipped,
+                events,
+            }),
+        )
+        .unwrap();
+        assert!(core.owned(1000).is_empty());
+        assert!(rules.lock().unwrap().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn full_dns_is_journaled_and_reverted_before_link_teardown() {
+        let dir = unique_dir("wireguard-full-dns");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let rules = Arc::new(Mutex::new(Vec::new()));
+        let mut core = DaemonCore::open_with_wireguard_full(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder)),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: None,
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+            Box::new(FakePolicyRules {
+                events: events.clone(),
+                rules,
+                journal_path: journal_path.clone(),
+            }),
+            Box::new(FakeDns {
+                result: crate::dns::DnsApply::Applied,
+                events: events.clone(),
+            }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nDNS=10.77.0.1\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let status = core.connect_wireguard(1000, "home", plan).unwrap();
+        assert!(status.dns_applied);
+        assert!(
+            matches!(core.owned(1000)[0].resources.last(), Some(OwnedResource::Dns(dns)) if dns.applied)
+        );
+        core.disconnect_wireguard(1000, "home").unwrap();
+        let events = events.lock().unwrap();
+        let dns_revert = events
+            .iter()
+            .position(|event| event == "dns-revert")
+            .unwrap();
+        let link_delete = events
+            .iter()
+            .position(|event| event.starts_with("delete:wg-"))
+            .unwrap();
+        assert!(dns_revert < link_delete);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn split_dns_without_route_only_domain_is_reported_not_applied() {
+        let dir = unique_dir("wireguard-split-dns-skipped");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let mut core = DaemonCore::open_with_wireguard_full(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder)),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: None,
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+            Box::new(FakePolicyRules {
+                events: events.clone(),
+                rules: Arc::new(Mutex::new(Vec::new())),
+                journal_path,
+            }),
+            Box::new(FakeDns {
+                result: crate::dns::DnsApply::Skipped,
+                events,
+            }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nDNS=10.77.0.1\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let status = core.connect_wireguard(1000, "home", plan).unwrap();
+        assert!(!status.dns_applied);
+        assert_eq!(status.warnings, vec![WireGuardWarning::DnsNotApplied]);
+        assert!(!core.owned(1000)[0]
+            .resources
+            .iter()
+            .any(|resource| matches!(resource, OwnedResource::Dns(_))));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    struct SequenceDns {
+        outcomes: Arc<Mutex<std::collections::VecDeque<crate::dns::DnsApply>>>,
+    }
+
+    impl crate::dns::DnsExecutor for SequenceDns {
+        fn apply(
+            &mut self,
+            _link: &str,
+            _servers: &[std::net::IpAddr],
+            _domains: &[String],
+            _full: bool,
+        ) -> Result<crate::dns::DnsApply, crate::dns::DnsError> {
+            Ok(self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(crate::dns::DnsApply::Applied))
+        }
+        fn revert(&mut self, _link: &str) -> Result<(), crate::dns::DnsError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn dns_reconcile_reports_unavailable_then_restores_applied_state() {
+        let dir = unique_dir("wireguard-dns-reconcile");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            crate::dns::DnsApply::Applied,
+            crate::dns::DnsApply::Unavailable,
+            crate::dns::DnsApply::Applied,
+        ])));
+        let mut core = DaemonCore::open_with_wireguard_full(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder)),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: None,
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+            Box::new(FakePolicyRules {
+                events,
+                rules: Arc::new(Mutex::new(Vec::new())),
+                journal_path,
+            }),
+            Box::new(SequenceDns { outcomes }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nDNS=10.77.0.1\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        assert!(
+            core.connect_wireguard(1000, "home", plan)
+                .unwrap()
+                .dns_applied
+        );
+        core.reapply_dns().unwrap();
+        let unavailable = core.wireguard_status(1000, "home");
+        assert!(!unavailable.dns_applied);
+        assert!(unavailable
+            .warnings
+            .contains(&WireGuardWarning::DnsNotApplied));
+        core.reapply_dns().unwrap();
+        let restored = core.wireguard_status(1000, "home");
+        assert!(restored.dns_applied);
+        assert!(!restored.warnings.contains(&WireGuardWarning::DnsNotApplied));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dns_unavailable_at_connect_remains_retryable_until_resolved_starts() {
+        let dir = unique_dir("wireguard-dns-initially-unavailable");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let outcomes = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            crate::dns::DnsApply::Unavailable,
+            crate::dns::DnsApply::Applied,
+        ])));
+        let mut core = DaemonCore::open_with_wireguard_full(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder)),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: None,
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+            Box::new(FakePolicyRules {
+                events,
+                rules: Arc::new(Mutex::new(Vec::new())),
+                journal_path,
+            }),
+            Box::new(SequenceDns { outcomes }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nDNS=10.77.0.1\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let unavailable = core.connect_wireguard(1000, "home", plan).unwrap();
+        assert_eq!(unavailable.state, TunnelState::Running);
+        assert!(!unavailable.dns_applied);
+        assert!(unavailable
+            .warnings
+            .contains(&WireGuardWarning::DnsNotApplied));
+        assert!(core.owned(1000)[0]
+            .resources
+            .iter()
+            .any(|resource| matches!(resource, OwnedResource::Dns(dns) if !dns.applied)));
+        core.reapply_dns().unwrap();
+        let restored = core.wireguard_status(1000, "home");
+        assert!(restored.dns_applied);
+        assert!(!restored.warnings.contains(&WireGuardWarning::DnsNotApplied));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wireguard_split_journals_before_create_and_tears_down_in_reverse_order() {
+        let dir = unique_dir("wireguard-split");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let journal_path = dir.join(JOURNAL_FILE);
+        let journal_path_in_hook = journal_path.clone();
+        let events_in_hook = events.clone();
+        let mut routes = FakeRoutes::new(&recorder);
+        routes.before_add = Some(Box::new(move || {
+            let loaded = JournalStore::new(&journal_path_in_hook).load().unwrap();
+            assert!(matches!(
+                loaded.entries[0].resources.last(),
+                Some(OwnedResource::Route(_))
+            ));
+            events_in_hook.lock().unwrap().push("route-wal".into());
+        }));
+        let mut core = DaemonCore::open_with_wireguard(
+            JournalStore::new(&journal_path),
+            Box::new(routes),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: Some(journal_path.clone()),
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nPostUp=echo SECRET-HOOK\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let status = core.connect_wireguard(1000, "home", plan).unwrap();
+        assert_eq!(status.state, net_manager_core::models::TunnelState::Running);
+        assert_eq!(
+            (status.latest_handshake, status.rx_bytes, status.tx_bytes),
+            (Some(42), 7, 8)
+        );
+        assert_eq!(status.warnings, vec![WireGuardWarning::IgnoredHook]);
+        assert_eq!(core.owned(1000)[0].resources.len(), 3);
+        assert!(!fs::read_to_string(&journal_path).unwrap().contains(key));
+        assert!(!fs::read_to_string(&journal_path)
+            .unwrap()
+            .contains("SECRET-HOOK"));
+        core.disconnect_wireguard(1000, "home").unwrap();
+        assert!(core.owned(1000).is_empty());
+        assert_eq!(
+            recorder.ops(),
+            vec![add("10.77.0.0/24"), remove("10.77.0.0/24")]
+        );
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "route-wal"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wireguard_failed_disconnect_persists_stale_for_restart_recovery() {
+        let dir = unique_dir("wireguard-stale");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
+        let mut core = DaemonCore::open_with_wireguard(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: true,
+                before_create: None,
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+        )
+        .unwrap();
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        core.connect_wireguard(1000, "home", plan).unwrap();
+        assert!(core.disconnect_wireguard(1000, "home").is_err());
+        assert_eq!(
+            JournalStore::new(&journal_path).load().unwrap().entries[0].state,
+            OwnedState::Stale
+        );
+        drop(core);
+        let recovered = DaemonCore::open_with_wireguard(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: None,
+            }),
+            Box::new(FakeWgConfig { events }),
+        )
+        .unwrap();
+        assert!(recovered.owned(1000).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wireguard_dump_extracts_numeric_health_without_keys() {
+        let dump = "PRIVATE\tPUBLIC\t51820\toff\nPEER\tPSK\t192.0.2.1:51820\t10.77.0.0/24\t42\t7\t8\t25\nPEER2\t(none)\t(none)\t192.0.2.0/24\t0\t3\t4\toff\n";
+        assert_eq!(parse_wg_dump(dump).unwrap(), (Some(42), 10, 12));
+        assert!(parse_wg_dump(
+            "PRIVATE\tPUBLIC\t51820\toff\nPEER\tPSK\tendpoint\tallowed\tSECRET\t7\t8\t25\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn endpoint_and_route_lookup_parsers_keep_only_network_metadata() {
+        let dump = "PRIVATE\tPUBLIC\t51820\t0xca6c\nPEER\tPSK\t198.18.0.1:51820\t0.0.0.0/0\t42\t7\t8\t25\nPEER2\tPSK\t[2001:db8::1]:51820\t::/0\t0\t0\t0\toff\n";
+        assert_eq!(
+            parse_wg_endpoint_ips(dump).unwrap(),
+            vec![
+                "198.18.0.1".parse::<std::net::IpAddr>().unwrap(),
+                "2001:db8::1".parse().unwrap()
+            ]
+        );
+        assert_eq!(
+            parse_ip_route_device(br#"[{"dst":"198.18.0.1","dev":"eth0"}]"#).unwrap(),
+            "eth0"
+        );
+        assert!(parse_ip_route_device(br#"[{"dst":"198.18.0.1"}]"#).is_err());
+    }
+
+    #[test]
+    fn wireguard_route_failure_rolls_back_link_and_addresses_without_secrets() {
+        let dir = unique_dir("wireguard-route-rollback");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        recorder
+            .fail_add
+            .lock()
+            .unwrap()
+            .push("10.77.0.0/24".into());
+        let mut core = DaemonCore::open_with_wireguard(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: None,
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let error = core.connect_wireguard(1000, "home", plan).unwrap_err();
+        assert!(!error.to_string().contains(key));
+        assert!(core.owned(1000).is_empty());
+        assert!(JournalStore::new(&journal_path)
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| event == "address-:10.77.0.2/32"));
+        assert!(events.iter().any(|event| event.starts_with("delete:wg-")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    struct AliaslessWg {
+        probe_error: bool,
+    }
+
+    impl WgSystem for AliaslessWg {
+        fn create_link(&mut self, _name: &str, _marker: &str) -> io::Result<u32> {
+            Err(io::Error::other("alias assignment failed"))
+        }
+        fn link_owned(&mut self, _name: &str, _index: u32, _marker: &str) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn link_present(&mut self, _name: &str, _index: u32) -> io::Result<bool> {
+            if self.probe_error {
+                Err(io::Error::other("link lookup failed"))
+            } else {
+                Ok(true)
+            }
+        }
+        fn delete_link(&mut self, _name: &str, _index: u32, _marker: &str) -> io::Result<()> {
+            panic!("must not delete unmarked link")
+        }
+        fn add_address(&mut self, _index: u32, _address: ipnet::IpNet) -> io::Result<()> {
+            unreachable!()
+        }
+        fn remove_address(&mut self, _index: u32, _address: ipnet::IpNet) -> io::Result<()> {
+            unreachable!()
+        }
+        fn set_mtu(&mut self, _index: u32, _mtu: u32) -> io::Result<()> {
+            unreachable!()
+        }
+        fn set_state(&mut self, _index: u32, _up: bool) -> io::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn aliasless_created_link_keeps_stale_ownership_instead_of_being_forgotten() {
+        let dir = unique_dir("wireguard-aliasless");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let recorder = Recorder::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut core = DaemonCore::open_with_wireguard(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder)),
+            Box::new(AliaslessWg { probe_error: false }),
+            Box::new(FakeWgConfig { events }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        assert!(core.connect_wireguard(1000, "home", plan).is_err());
+        assert_eq!(
+            JournalStore::new(&journal_path).load().unwrap().entries[0].state,
+            OwnedState::Stale
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_link_lookup_marks_wireguard_entry_stale() {
+        let dir = unique_dir("wireguard-lookup-failure");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let recorder = Recorder::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut core = DaemonCore::open_with_wireguard(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder)),
+            Box::new(AliaslessWg { probe_error: true }),
+            Box::new(FakeWgConfig { events }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        assert!(core.connect_wireguard(1000, "home", plan).is_err());
+        assert_eq!(
+            JournalStore::new(&journal_path).load().unwrap().entries[0].state,
+            OwnedState::Stale
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    struct ExistingForeignWg;
+
+    impl WgSystem for ExistingForeignWg {
+        fn create_link(&mut self, _name: &str, _marker: &str) -> io::Result<u32> {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "foreign link exists",
+            ))
+        }
+        fn link_owned(&mut self, _name: &str, _index: u32, _marker: &str) -> io::Result<bool> {
+            panic!("must not inspect foreign ownership after EEXIST")
+        }
+        fn delete_link(&mut self, _name: &str, _index: u32, _marker: &str) -> io::Result<()> {
+            panic!("must not delete foreign link")
+        }
+        fn add_address(&mut self, _index: u32, _address: ipnet::IpNet) -> io::Result<()> {
+            unreachable!()
+        }
+        fn remove_address(&mut self, _index: u32, _address: ipnet::IpNet) -> io::Result<()> {
+            unreachable!()
+        }
+        fn set_mtu(&mut self, _index: u32, _mtu: u32) -> io::Result<()> {
+            unreachable!()
+        }
+        fn set_state(&mut self, _index: u32, _up: bool) -> io::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn wireguard_create_eexist_does_not_claim_or_delete_foreign_link() {
+        let dir = unique_dir("wireguard-eexist");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let recorder = Recorder::default();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut core = DaemonCore::open_with_wireguard(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder)),
+            Box::new(ExistingForeignWg),
+            Box::new(FakeWgConfig { events }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        assert_eq!(
+            core.connect_wireguard(1000, "home", plan)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(core.owned(1000).is_empty());
+        assert!(JournalStore::new(&journal_path)
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

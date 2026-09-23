@@ -1,12 +1,9 @@
+use crate::route_runtime::RouteRuntime;
 use net_manager_core::backend_settings::BackendSettingsStore;
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::managed_xray::{self, MANAGED_XRAY_VERSION};
 use net_manager_core::models::*;
-use net_manager_core::policy::PolicyManager;
 use net_manager_core::profiles::{ProfileDocument, ProfileStore};
-use net_manager_core::route_state::{
-    AppliedRouteDocument, AppliedRouteStore, APPLIED_ROUTE_DOCUMENT_VERSION,
-};
 use net_manager_core::system_proxy::SystemProxyManager;
 use net_manager_core::vpn::{self, TunnelManager};
 use std::io;
@@ -15,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 
 pub(crate) struct RuntimeState {
     pub(crate) tunnels: TunnelManager,
-    pub(crate) policies: PolicyManager,
+    pub(crate) routes: RouteRuntime,
     pub(crate) proxy: SystemProxyManager,
 }
 
@@ -29,7 +26,6 @@ pub(crate) struct ResolvedBackendExecutable {
 pub(crate) struct AppState {
     pub(crate) profiles: ProfileStore,
     pub(crate) config_vault: ConfigVault,
-    pub(crate) applied_routes: AppliedRouteStore,
     pub(crate) backend_settings: BackendSettingsStore,
     pub(crate) managed_xray_root: PathBuf,
     pub(crate) backend_install_lock: tokio::sync::Mutex<()>,
@@ -105,9 +101,7 @@ impl AppState {
 
 pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
     let store = ProfileStore::new(data_dir.join("profiles.json"));
-    let applied_routes = AppliedRouteStore::new(data_dir.join("applied-routes.json"));
-    let mut policies = PolicyManager::new();
-    policies.restore(applied_routes.load()?.profiles)?;
+    let routes = RouteRuntime::new(&data_dir)?;
     let config_vault = ConfigVault::new(data_dir.join("configs"));
     config_vault.ensure_root_protected()?;
     let backend_settings = BackendSettingsStore::new(data_dir.join("backend-settings.json"));
@@ -118,7 +112,6 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
     Ok(AppState {
         profiles: store,
         config_vault,
-        applied_routes,
         backend_settings,
         managed_xray_root: data_dir.join("backends").join("xray"),
         backend_install_lock: tokio::sync::Mutex::new(()),
@@ -132,21 +125,10 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
                 setting_path(backend_document.xray),
                 data_dir.join("logs"),
             ),
-            policies,
+            routes,
             proxy: SystemProxyManager::new(data_dir.join("proxy-state.json"))?,
         }),
     })
-}
-
-pub(crate) fn persist_applied_routes(
-    store: &AppliedRouteStore,
-    policies: &PolicyManager,
-) -> Result<(), String> {
-    let document = AppliedRouteDocument {
-        version: APPLIED_ROUTE_DOCUMENT_VERSION,
-        profiles: policies.snapshot(),
-    };
-    store.save(&document).map_err(|e| e.to_string())
 }
 
 pub(crate) fn find_profile(store: &ProfileStore, id: &str) -> Result<Profile, String> {
@@ -278,31 +260,6 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn persist_applied_routes_writes_registry_snapshot() {
-        let dir = unique_dir("persist");
-        let store = AppliedRouteStore::new(dir.join("applied-routes.json"));
-        let mut policies = PolicyManager::with_executor(Box::new(NoopExecutor));
-        let mut p = profile("wg-work");
-        p.routes.push(PolicyRoute {
-            destination: "10.5.0.0/24".parse().unwrap(),
-            metric: 3,
-            via: None,
-        });
-        policies
-            .apply_profile(&p, &[iface("if0", "wg-work", InterfaceState::Up)])
-            .unwrap();
-
-        persist_applied_routes(&store, &policies).unwrap();
-
-        let doc = store.load().unwrap();
-        assert_eq!(doc.version, APPLIED_ROUTE_DOCUMENT_VERSION);
-        assert_eq!(doc.profiles.len(), 1);
-        assert_eq!(doc.profiles[0].profile_id, "p1");
-        assert_eq!(doc.profiles[0].routes.len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

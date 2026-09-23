@@ -1,21 +1,30 @@
 //! Connection handling: handshake, dispatch, events. Generic over the
 //! stream so tests drive it through `tokio::io::duplex`.
 
+use crate::always_on::{apply_definition, validate_definition, AlwaysOnStore};
 use crate::auth::{required_action, Action, AuthDecision, Authorizer, PeerIdentity};
 use crate::core::DaemonCore;
+use crate::openvpn::{prepare_openvpn, OpenVpnPlan};
 use crate::validate::{validate_apply, validate_iface_name, validate_owner};
+use crate::wireguard::parse_wireguard_config;
+use crate::xray::prepare_xray;
 use net_manager_core::daemon_protocol::{
-    encode_line, event, from_value, method, read_frame, ErrorCode, EventFrame, HelloParams,
-    HelloResult, LinkSetStateParams, OwnedChanged, OwnedListResult, OwnerParams, RequestFrame,
-    ResponseFrame, RoutesApplyParams, RoutesApplyResult, RoutesRemoveResult, HELLO_TIMEOUT_SECS,
-    MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    encode_line, event, from_value, method, read_frame, AlwaysOnKind, AlwaysOnListResult,
+    AlwaysOnProfileInfo, AlwaysOnRemoveParams, AlwaysOnRemoveResult, AlwaysOnResumeResult,
+    AlwaysOnSetParams, AlwaysOnSetResult, ErrorCode, EventFrame, HelloParams, HelloResult,
+    LinkSetStateParams, OpenVpnConnectRequest, OpenVpnConnectResult, OpenVpnDisconnectResult,
+    OpenVpnProbeResult, OpenVpnProfileParams, OwnedChanged, OwnedListResult, OwnerParams,
+    RequestFrame, ResponseFrame, RoutesApplyParams, RoutesApplyResult, RoutesRemoveResult,
+    WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
+    WireGuardProfileParams, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
+    XrayProfileParams, HELLO_TIMEOUT_SECS, MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc, Semaphore};
 
@@ -34,6 +43,7 @@ pub struct ServerContext<A> {
     pub events: broadcast::Sender<OwnerEvent>,
     pub connections: Arc<Semaphore>,
     pub hello_timeout: Duration,
+    pub always_on: Option<Arc<Mutex<AlwaysOnStore>>>,
 }
 
 impl<A: Authorizer> ServerContext<A> {
@@ -44,7 +54,14 @@ impl<A: Authorizer> ServerContext<A> {
             events: broadcast::channel(EVENT_CAPACITY).0,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             hello_timeout: Duration::from_secs(HELLO_TIMEOUT_SECS),
+            always_on: None,
         }
+    }
+
+    pub fn with_always_on_store(core: DaemonCore, authorizer: A, store: AlwaysOnStore) -> Self {
+        let mut context = Self::new(core, authorizer);
+        context.always_on = Some(Arc::new(Mutex::new(store)));
+        context
     }
 }
 
@@ -248,9 +265,268 @@ async fn handle<A: Authorizer>(
             let owners = with_core(ctx, move |core| Ok(core.owned(uid))).await?;
             to_value(&OwnedListResult { owners })
         }
+        method::ALWAYS_ON_LIST => {
+            let document = with_store(ctx, move |store| store.load_uid(uid)).await?;
+            to_value(&AlwaysOnListResult {
+                profiles: document
+                    .entries
+                    .iter()
+                    .map(|entry| AlwaysOnProfileInfo {
+                        kind: entry.definition.kind(),
+                        profile_id: entry.definition.profile_id().to_string(),
+                        enabled: entry.enabled,
+                    })
+                    .collect(),
+                paused: document.paused,
+                supported_kinds: vec![AlwaysOnKind::WireGuard, AlwaysOnKind::StaticRoutes],
+            })
+        }
+        method::ALWAYS_ON_SET => {
+            if matches!(
+                request.params["definition"]["kind"].as_str(),
+                Some("openVpn" | "xrayTun")
+            ) {
+                return Err((
+                    ErrorCode::UnsupportedMethod,
+                    "always-on backend is not supported".into(),
+                ));
+            }
+            let params: AlwaysOnSetParams = from_value(request.params)
+                .map_err(|_| invalid("invalid always-on definition".into()))?;
+            validate_definition(&params.definition)
+                .map_err(|_| invalid("invalid always-on definition".into()))?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let definition = params.definition;
+            let for_store = definition.clone();
+            let (stored, paused) = with_store(ctx, move |store| {
+                let stored = store.insert(uid, for_store)?;
+                Ok((stored, store.load_uid(uid)?.paused))
+            })
+            .await?;
+            let active = if paused {
+                false
+            } else {
+                let owner = definition.owner();
+                let active = with_core(ctx, move |core| {
+                    apply_definition(core, uid, &definition).map(|_| ())
+                })
+                .await
+                .is_ok();
+                if active {
+                    notify(ctx, uid, owner);
+                }
+                active
+            };
+            to_value(&AlwaysOnSetResult { stored, active })
+        }
+        method::ALWAYS_ON_REMOVE => {
+            let params: AlwaysOnRemoveParams = from_value(request.params)
+                .map_err(|_| invalid("invalid always-on removal".into()))?;
+            let owner = match params.kind {
+                AlwaysOnKind::WireGuard => format!("wg:{}", params.profile_id),
+                AlwaysOnKind::StaticRoutes => params.profile_id.clone(),
+            };
+            validate_owner(&owner).map_err(invalid)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let for_store = owner.clone();
+            let found = with_store(ctx, move |store| store.disable(uid, &for_store)).await?;
+            if !found {
+                return to_value(&AlwaysOnRemoveResult {
+                    removed: false,
+                    disconnected: false,
+                });
+            }
+            let for_core = owner.clone();
+            let disconnected = with_core(ctx, move |core| {
+                if !core.owned(uid).iter().any(|entry| entry.owner == for_core) {
+                    return Ok(false);
+                }
+                match params.kind {
+                    AlwaysOnKind::WireGuard => {
+                        core.disconnect_wireguard(uid, &params.profile_id)?;
+                    }
+                    AlwaysOnKind::StaticRoutes => {
+                        core.remove_owner(uid, &for_core)?;
+                    }
+                }
+                Ok(true)
+            })
+            .await
+            .map_err(|(code, _)| {
+                (
+                    code,
+                    "owner cleanup failed; definition remains disabled".into(),
+                )
+            })?;
+            let for_store = owner.clone();
+            with_store(ctx, move |store| store.remove(uid, &for_store)).await?;
+            if disconnected {
+                notify(ctx, uid, owner);
+            }
+            to_value(&AlwaysOnRemoveResult {
+                removed: true,
+                disconnected,
+            })
+        }
+        method::ALWAYS_ON_RESUME => {
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let document = with_store(ctx, move |store| {
+                store.resume(uid)?;
+                store.load_uid(uid)
+            })
+            .await?;
+            for entry in document.entries.into_iter().filter(|entry| entry.enabled) {
+                let owner = entry.definition.owner();
+                if with_core(ctx, move |core| {
+                    apply_definition(core, uid, &entry.definition).map(|_| ())
+                })
+                .await
+                .is_ok()
+                {
+                    notify(ctx, uid, owner);
+                }
+            }
+            to_value(&AlwaysOnResumeResult { resumed: true })
+        }
+        method::WIREGUARD_CONNECT => {
+            let params: WireGuardConnectParams = params(request.params)?;
+            validate_owner(&params.profile_id).map_err(invalid)?;
+            let plan = parse_wireguard_config(&params.config, &params.routes)
+                .map_err(|err| invalid(err.to_string()))?;
+            authorize(ctx, peer, Action::ConnectProfile).await?;
+            let profile_id = params.profile_id.clone();
+            let status = with_core(ctx, move |core| {
+                core.connect_wireguard(uid, &params.profile_id, plan)
+            })
+            .await?;
+            notify(ctx, uid, format!("wg:{profile_id}"));
+            to_value(&WireGuardConnectResult { status })
+        }
+        method::WIREGUARD_DISCONNECT => {
+            let params: WireGuardProfileParams = params(request.params)?;
+            validate_owner(&params.profile_id).map_err(invalid)?;
+            authorize(ctx, peer, Action::ConnectProfile).await?;
+            let profile_id = params.profile_id.clone();
+            let result = with_core(ctx, move |core| {
+                core.disconnect_wireguard(uid, &params.profile_id)
+            })
+            .await;
+            if !matches!(
+                &result,
+                Err((ErrorCode::NotFound | ErrorCode::InvalidParams, _))
+            ) {
+                notify(ctx, uid, format!("wg:{profile_id}"));
+            }
+            result?;
+            to_value(&WireGuardDisconnectResult { stopped: true })
+        }
+        method::WIREGUARD_STATUS => {
+            let params: WireGuardProfileParams = params(request.params)?;
+            validate_owner(&params.profile_id).map_err(invalid)?;
+            let status = with_core(ctx, move |core| {
+                Ok(core.wireguard_status(uid, &params.profile_id))
+            })
+            .await?;
+            to_value(&status)
+        }
+        method::OPENVPN_CONNECT => {
+            let request: OpenVpnConnectRequest = from_value(request.params)
+                .map_err(|_| invalid("invalid OpenVPN connect parameters".into()))?;
+            let plan = prepare_openvpn(uid, request).map_err(|err| invalid(err.to_string()))?;
+            authorize(ctx, peer, Action::ConnectProfile).await?;
+            let owner = format!("ovpn:{}", plan.profile_id);
+            let status = with_core(ctx, move |core| core.connect_openvpn(uid, plan)).await?;
+            notify(ctx, uid, owner);
+            to_value(&OpenVpnConnectResult { status })
+        }
+        method::OPENVPN_PROBE => {
+            let request: OpenVpnConnectRequest = from_value(request.params)
+                .map_err(|_| invalid("invalid OpenVPN probe parameters".into()))?;
+            if !request.profile.routes.is_empty() {
+                return Err(invalid("OpenVPN probe cannot apply routes".into()));
+            }
+            let plan = prepare_openvpn(uid, request).map_err(|err| invalid(err.to_string()))?;
+            authorize(ctx, peer, Action::ConnectProfile).await?;
+            // The detached task completes cleanup even if the RPC client disconnects.
+            let probe = tokio::spawn(run_openvpn_probe(
+                ctx.core.clone(),
+                uid,
+                plan,
+                Duration::from_secs(20),
+            ))
+            .await
+            .map_err(|_| (ErrorCode::Internal, "OpenVPN probe task failed".into()))??;
+            to_value(&probe)
+        }
+        method::OPENVPN_DISCONNECT => {
+            let params: OpenVpnProfileParams = params(request.params)?;
+            validate_owner(&format!("ovpn:{}", params.profile_id)).map_err(invalid)?;
+            authorize(ctx, peer, Action::ConnectProfile).await?;
+            let owner = format!("ovpn:{}", params.profile_id);
+            let result = with_core(ctx, move |core| {
+                core.disconnect_openvpn(uid, &params.profile_id)
+            })
+            .await;
+            if !matches!(
+                &result,
+                Err((ErrorCode::NotFound | ErrorCode::InvalidParams, _))
+            ) {
+                notify(ctx, uid, owner);
+            }
+            result?;
+            to_value(&OpenVpnDisconnectResult { stopped: true })
+        }
+        method::OPENVPN_STATUS => {
+            let params: OpenVpnProfileParams = params(request.params)?;
+            validate_owner(&format!("ovpn:{}", params.profile_id)).map_err(invalid)?;
+            let status = with_core(ctx, move |core| {
+                Ok(core.openvpn_status(uid, &params.profile_id))
+            })
+            .await?;
+            to_value(&status)
+        }
+        method::XRAY_CONNECT => {
+            let params: XrayConnectParams = from_value(request.params)
+                .map_err(|_| invalid("invalid Xray connect parameters".into()))?;
+            prepare_xray(uid, params.clone(), 1)
+                .map_err(|_| invalid("unsupported generated Xray TUN config".into()))?;
+            authorize(ctx, peer, Action::ConnectProfile).await?;
+            let owner = format!("xray:{}", params.profile_id);
+            let status = with_core(ctx, move |core| core.connect_xray(uid, params)).await?;
+            notify(ctx, uid, owner);
+            to_value(&XrayConnectResult { status })
+        }
+        method::XRAY_DISCONNECT => {
+            let params: XrayProfileParams = params(request.params)?;
+            validate_owner(&format!("xray:{}", params.profile_id)).map_err(invalid)?;
+            authorize(ctx, peer, Action::ConnectProfile).await?;
+            let owner = format!("xray:{}", params.profile_id);
+            let result = with_core(ctx, move |core| {
+                core.disconnect_xray(uid, &params.profile_id)
+            })
+            .await;
+            if !matches!(
+                &result,
+                Err((ErrorCode::NotFound | ErrorCode::InvalidParams, _))
+            ) {
+                notify(ctx, uid, owner);
+            }
+            result?;
+            to_value(&XrayDisconnectResult { stopped: true })
+        }
+        method::XRAY_STATUS => {
+            let params: XrayProfileParams = params(request.params)?;
+            validate_owner(&format!("xray:{}", params.profile_id)).map_err(invalid)?;
+            let status = with_core(ctx, move |core| {
+                Ok(core.xray_status(uid, &params.profile_id))
+            })
+            .await?;
+            to_value(&status)
+        }
         method::ROUTES_APPLY => {
             let params: RoutesApplyParams = params(request.params)?;
             validate_owner(&params.owner).map_err(invalid)?;
+            reject_wireguard_owner(&params.owner)?;
             validate_apply(&params.routes).map_err(invalid)?;
             authorize(ctx, peer, Action::SystemNetwork).await?;
             let owner = params.owner.clone();
@@ -264,6 +540,7 @@ async fn handle<A: Authorizer>(
         method::ROUTES_REMOVE => {
             let params: OwnerParams = params(request.params)?;
             validate_owner(&params.owner).map_err(invalid)?;
+            reject_wireguard_owner(&params.owner)?;
             authorize(ctx, peer, Action::ConnectProfile).await?;
             let owner = params.owner.clone();
             let result = with_core(ctx, move |core| core.remove_owner(uid, &params.owner)).await;
@@ -287,7 +564,24 @@ async fn handle<A: Authorizer>(
             Ok(Value::Null)
         }
         method::RECOVERY_CLEANUP => {
-            authorize(ctx, peer, Action::ConnectProfile).await?;
+            let action = if ctx.always_on.is_some()
+                && with_store(ctx, move |store| {
+                    Ok(store
+                        .load_uid(uid)?
+                        .entries
+                        .iter()
+                        .any(|entry| entry.enabled))
+                })
+                .await?
+            {
+                Action::SystemNetwork
+            } else {
+                Action::ConnectProfile
+            };
+            authorize(ctx, peer, action).await?;
+            if ctx.always_on.is_some() {
+                with_store(ctx, move |store| store.pause(uid)).await?;
+            }
             let result = with_core(ctx, move |core| core.cleanup_uid(uid)).await?;
             for owner in result.removed_owners.iter().chain(&result.failed) {
                 notify(ctx, uid, owner.clone());
@@ -329,7 +623,15 @@ where
     T: Send + 'static,
     F: FnOnce(&mut DaemonCore) -> io::Result<T> + Send + 'static,
 {
-    let core = ctx.core.clone();
+    with_core_shared(&ctx.core, f).await
+}
+
+async fn with_core_shared<T, F>(core: &Arc<Mutex<DaemonCore>>, f: F) -> Result<T, Failure>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut DaemonCore) -> io::Result<T> + Send + 'static,
+{
+    let core = core.clone();
     tokio::task::spawn_blocking(move || {
         let mut core = core.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&mut core)
@@ -337,6 +639,65 @@ where
     .await
     .map_err(|err| (ErrorCode::Internal, err.to_string()))?
     .map_err(|err| (error_code(&err), err.to_string()))
+}
+
+async fn run_openvpn_probe(
+    core: Arc<Mutex<DaemonCore>>,
+    uid: u32,
+    plan: OpenVpnPlan,
+    timeout: Duration,
+) -> Result<OpenVpnProbeResult, Failure> {
+    let profile_id = plan.profile_id.clone();
+    with_core_shared(&core, move |core| core.start_openvpn_probe(uid, plan)).await?;
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        let profile = profile_id.clone();
+        match with_core_shared(&core, move |core| core.poll_openvpn_probe(uid, &profile)).await {
+            Ok(Some(result)) => break Ok(result),
+            Ok(None) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(None) => {
+                break Err((
+                    ErrorCode::Unavailable,
+                    "OpenVPN probe timed out waiting for pushed routes".into(),
+                ))
+            }
+            Err(error) => break Err(error),
+        }
+    };
+    // A cleanup error takes precedence over probe data: never report routes
+    // while a privileged child or link may still exist.
+    with_core_shared(&core, move |core| {
+        core.finish_openvpn_probe(uid, &profile_id)
+    })
+    .await?;
+    outcome
+}
+
+async fn with_store<A, T, F>(ctx: &ServerContext<A>, f: F) -> Result<T, Failure>
+where
+    T: Send + 'static,
+    F: FnOnce(&AlwaysOnStore) -> io::Result<T> + Send + 'static,
+{
+    let store = ctx.always_on.clone().ok_or((
+        ErrorCode::Unavailable,
+        "always-on store is unavailable".into(),
+    ))?;
+    tokio::task::spawn_blocking(move || {
+        let store = store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&store)
+    })
+    .await
+    .map_err(|_| {
+        (
+            ErrorCode::Internal,
+            "always-on store operation failed".into(),
+        )
+    })?
+    .map_err(|err| (error_code(&err), "always-on store operation failed".into()))
 }
 
 fn error_code(err: &io::Error) -> ErrorCode {
@@ -360,6 +721,18 @@ fn params<T: DeserializeOwned>(value: Value) -> Result<T, Failure> {
 
 fn invalid(message: String) -> Failure {
     (ErrorCode::InvalidParams, message)
+}
+
+fn reject_wireguard_owner(owner: &str) -> Result<(), Failure> {
+    if owner.starts_with("wg:")
+        || owner.starts_with("ovpn:")
+        || owner.starts_with("ovpn-probe:")
+        || owner.starts_with("xray:")
+    {
+        Err(invalid("reserved tunnel owner prefix".into()))
+    } else {
+        Ok(())
+    }
 }
 
 fn to_value<T: Serialize>(value: &T) -> Result<Value, Failure> {
@@ -450,10 +823,13 @@ mod tests {
     use super::*;
     use crate::auth::{Action, AuthDecision, Authorizer, PeerIdentity};
     use crate::core::testing::{FakeLinks, FakeRoutes, Recorder};
-    use crate::core::DaemonCore;
+    use crate::core::{DaemonCore, WgConfigExecutor, WgSystem};
     use crate::journal::{JournalStore, JOURNAL_FILE};
+    use crate::openvpn_process::OpenVpnProcessRunner;
     use net_manager_core::daemon_protocol::MAX_FRAME_BYTES;
+    use net_manager_core::openvpn_management::{parse_push_reply, ManagementEvent};
     use serde_json::{json, Value};
+    use std::collections::VecDeque;
     use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -463,14 +839,99 @@ mod tests {
 
     static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+    struct FakeWireGuard;
+
+    impl WgSystem for FakeWireGuard {
+        fn create_link(&mut self, _name: &str, _owner_marker: &str) -> io::Result<u32> {
+            Ok(42)
+        }
+        fn link_owned(
+            &mut self,
+            _name: &str,
+            _index: u32,
+            _owner_marker: &str,
+        ) -> io::Result<bool> {
+            Ok(true)
+        }
+        fn delete_link(&mut self, _name: &str, _index: u32, _owner_marker: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn add_address(&mut self, _index: u32, _address: ipnet::IpNet) -> io::Result<()> {
+            Ok(())
+        }
+        fn remove_address(&mut self, _index: u32, _address: ipnet::IpNet) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_mtu(&mut self, _index: u32, _mtu: u32) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_state(&mut self, _index: u32, _up: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FakeWireGuardConfig;
+
+    impl WgConfigExecutor for FakeWireGuardConfig {
+        fn configure(&mut self, _name: &str, _config: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeProbeRunner {
+        started: Arc<AtomicUsize>,
+        stopped: Arc<AtomicUsize>,
+        cleaned: Arc<AtomicUsize>,
+        pending: Arc<Mutex<VecDeque<Vec<ManagementEvent>>>>,
+    }
+
+    impl OpenVpnProcessRunner for FakeProbeRunner {
+        fn verify_binary(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn link_index(&self, _name: &str) -> io::Result<Option<u32>> {
+            Ok(None)
+        }
+
+        fn start(
+            &mut self,
+            _uid: u32,
+            _name: &str,
+            _config: &net_manager_core::openvpn_config::SanitizedOpenVpnConfig,
+            _credentials: Option<net_manager_core::daemon_protocol::OpenVpnCredentials>,
+            _mark: u32,
+        ) -> io::Result<()> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn poll(&mut self, _name: &str) -> io::Result<Vec<ManagementEvent>> {
+            Ok(self.pending.lock().unwrap().pop_front().unwrap_or_default())
+        }
+
+        fn stop(&mut self, _name: &str) -> io::Result<()> {
+            self.stopped.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn cleanup(&mut self, _uid: u32, _name: &str) -> io::Result<()> {
+            self.cleaned.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     struct FakeAuthorizer {
         decision: AuthDecision,
         calls: AtomicUsize,
+        actions: Mutex<Vec<Action>>,
     }
 
     impl Authorizer for FakeAuthorizer {
-        async fn check(&self, _peer: &PeerIdentity, _action: Action) -> io::Result<AuthDecision> {
+        async fn check(&self, _peer: &PeerIdentity, action: Action) -> io::Result<AuthDecision> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.actions.lock().unwrap().push(action);
             Ok(self.decision)
         }
     }
@@ -497,10 +958,12 @@ mod tests {
             ));
             std::fs::create_dir_all(&dir).unwrap();
             let recorder = Recorder::default();
-            let core = DaemonCore::open(
+            let core = DaemonCore::open_with_wireguard(
                 JournalStore::new(dir.join(JOURNAL_FILE)),
                 Box::new(FakeRoutes::new(&recorder)),
                 Box::new(FakeLinks(recorder.clone())),
+                Box::new(FakeWireGuard),
+                Box::new(FakeWireGuardConfig),
             )
             .unwrap();
             let mut ctx = ServerContext::new(
@@ -508,6 +971,7 @@ mod tests {
                 FakeAuthorizer {
                     decision,
                     calls: AtomicUsize::new(0),
+                    actions: Mutex::new(Vec::new()),
                 },
             );
             tune(&mut ctx);
@@ -601,6 +1065,359 @@ mod tests {
 
     fn apply_params(owner: &str, dest: &str) -> Value {
         json!({"owner": owner, "routes": [{"destination": dest, "interfaceIndex": 2, "metric": 5}]})
+    }
+
+    fn wg_params(extra: &str) -> Value {
+        const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        json!({
+            "profileId": "home",
+            "config": format!("[Interface]\nPrivateKey={KEY}\nAddress=10.77.0.2/32\n{extra}\n[Peer]\nPublicKey={KEY}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n"),
+            "routes": []
+        })
+    }
+
+    #[tokio::test]
+    async fn xray_rejects_custom_root_config_before_authorization_without_echoing_secrets() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+        for config in [
+            r#"{"log":{"access":"/tmp/SECRET-LOG"},"outbounds":[]}"#,
+            r#"{"inbounds":[{"protocol":"dokodemo-door","listen":"0.0.0.0","port":1}],"outbounds":[]}"#,
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"redirect":"SECRET-TARGET"}}]}"#,
+        ] {
+            let reply = client
+                .call(
+                    2,
+                    method::XRAY_CONNECT,
+                    json!({"profileId":"home","config":config}),
+                )
+                .await;
+            assert_eq!(error_code(&reply), "invalidParams", "{reply}");
+            assert!(!reply.to_string().contains("SECRET-"));
+        }
+        assert_eq!(harness.auth_calls(), 0);
+        assert!(harness.recorder.ops().is_empty());
+    }
+
+    #[tokio::test]
+    async fn xray_status_is_scoped_to_peer_uid() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1001).await;
+        let reply = client
+            .call(2, method::XRAY_STATUS, json!({"profileId":"home"}))
+            .await;
+        assert_eq!(reply["result"]["state"], "stopped");
+        assert!(reply["result"]["interfaceName"].is_null());
+        assert_eq!(harness.auth_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn openvpn_rejects_unsafe_config_before_authorization() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+        for config in [
+            "client\nremote vpn.example\nplugin /tmp/evil.so\n",
+            "client\nremote vpn.example\nauth-user-pass\n",
+            "client\nremote vpn.example\nredirect-gateway def1\n",
+        ] {
+            let reply = client
+                .call(
+                    2,
+                    method::OPENVPN_CONNECT,
+                    json!({
+                        "profileId":"home", "config":config, "assets":{}, "routes":[]
+                    }),
+                )
+                .await;
+            assert_eq!(error_code(&reply), "invalidParams", "{reply}");
+        }
+        assert_eq!(harness.auth_calls(), 0);
+        assert!(harness.recorder.ops().is_empty());
+    }
+
+    #[tokio::test]
+    async fn openvpn_probe_rejects_unsafe_config_before_authorization() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+        let reply = client
+            .call(
+                2,
+                "openvpn.probe",
+                json!({
+                    "profileId": "home",
+                    "config": "client\nremote vpn.example\nplugin /tmp/SECRET.so\n",
+                    "assets": {},
+                    "routes": []
+                }),
+            )
+            .await;
+        assert_eq!(error_code(&reply), "invalidParams");
+        assert_eq!(harness.auth_calls(), 0);
+        assert!(!reply.to_string().contains("SECRET"));
+    }
+
+    #[tokio::test]
+    async fn openvpn_probe_returns_typed_routes_and_cleans_transient_owner() {
+        let dir = std::env::temp_dir().join(format!(
+            "netmgr-openvpn-probe-ok-{}-{}",
+            std::process::id(),
+            DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recorder = Recorder::default();
+        let runner = FakeProbeRunner::default();
+        runner
+            .pending
+            .lock()
+            .unwrap()
+            .push_back(vec![ManagementEvent::PushReply(
+                parse_push_reply("PUSH_REPLY,route 10.89.0.0 255.255.255.0").unwrap(),
+            )]);
+        let daemon = DaemonCore::open_with_openvpn(
+            JournalStore::new(dir.join(JOURNAL_FILE)),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(runner.clone()),
+        )
+        .unwrap();
+        let ctx = ServerContext::new(
+            daemon,
+            FakeAuthorizer {
+                decision: AuthDecision::Authorized,
+                calls: AtomicUsize::new(0),
+                actions: Mutex::new(Vec::new()),
+            },
+        );
+        let peer = PeerIdentity {
+            uid: 1000,
+            pid: 4242,
+            start_time: Some(1),
+            pidfd: None,
+        };
+        let response = dispatch(
+            RequestFrame {
+                id: 2,
+                method: method::OPENVPN_PROBE.into(),
+                params: json!({
+                    "profileId": "home",
+                    "config": "client\nremote vpn.example\n",
+                    "assets": {},
+                    "routes": []
+                }),
+            },
+            &peer,
+            &ctx,
+        )
+        .await;
+        let result: OpenVpnProbeResult = from_value(response.outcome.unwrap()).unwrap();
+        assert_eq!(
+            result.routes[0].destination,
+            "10.89.0.0/24".parse().unwrap()
+        );
+        assert_eq!(ctx.authorizer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.stopped.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.cleaned.load(Ordering::SeqCst), 1);
+        assert!(recorder.ops().is_empty());
+        assert!(JournalStore::new(dir.join(JOURNAL_FILE))
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn detached_probe_timeout_cleans_journal_without_holding_core_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "netmgr-openvpn-probe-{}-{}",
+            std::process::id(),
+            DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recorder = Recorder::default();
+        let runner = FakeProbeRunner::default();
+        let daemon = DaemonCore::open_with_openvpn(
+            JournalStore::new(dir.join(JOURNAL_FILE)),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(runner.clone()),
+        )
+        .unwrap();
+        let core = Arc::new(Mutex::new(daemon));
+        let request: OpenVpnConnectRequest = from_value(json!({
+            "profileId": "home",
+            "config": "client\nremote vpn.example\n",
+            "assets": {},
+            "routes": []
+        }))
+        .unwrap();
+        let plan = prepare_openvpn(1000, request).unwrap();
+        // Dropping the caller's handle must not cancel the cleanup task.
+        let handle = tokio::spawn(run_openvpn_probe(
+            core.clone(),
+            1000,
+            plan,
+            Duration::from_millis(200),
+        ));
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runner.started.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            with_core_shared(&core, |_| Ok(())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runner.cleaned.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runner.stopped.load(Ordering::SeqCst), 1);
+        assert!(JournalStore::new(dir.join(JOURNAL_FILE))
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        assert!(recorder.ops().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn openvpn_credentials_reach_authorization_without_appearing_in_errors() {
+        let harness = Harness::new(AuthDecision::Denied);
+        let mut client = harness.hello(1000).await;
+        let reply = client
+            .call(
+                2,
+                method::OPENVPN_CONNECT,
+                json!({
+                    "profileId": "home",
+                    "config": "client\nremote vpn.example\nauth-user-pass\n",
+                    "assets": {},
+                    "routes": [],
+                    "credentials": {
+                        "authUserPass": {
+                            "username": "alice",
+                            "password": "SECRET-AUTH-PASSWORD"
+                        }
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(error_code(&reply), "notAuthorized");
+        assert_eq!(harness.auth_calls(), 1);
+        assert!(!reply.to_string().contains("SECRET-AUTH-PASSWORD"));
+    }
+
+    #[tokio::test]
+    async fn malformed_openvpn_credentials_are_rejected_without_echoing_values() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+        let reply = client
+            .call(
+                2,
+                method::OPENVPN_CONNECT,
+                json!({
+                    "profileId": "home",
+                    "config": "client\nremote vpn.example\nauth-user-pass\n",
+                    "assets": {},
+                    "credentials": {"authUserPass": "SECRET-MALFORMED-CREDENTIAL"}
+                }),
+            )
+            .await;
+        assert_eq!(error_code(&reply), "invalidParams");
+        assert_eq!(harness.auth_calls(), 0);
+        assert!(!reply.to_string().contains("SECRET-MALFORMED-CREDENTIAL"));
+    }
+
+    #[tokio::test]
+    async fn wireguard_rejects_invalid_root_config_before_authorization() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+        assert_eq!(
+            error_code(
+                &client
+                    .call(
+                        2,
+                        method::WIREGUARD_CONNECT,
+                        wg_params("FwMark=SECRET-MARK")
+                    )
+                    .await
+            ),
+            "invalidParams"
+        );
+        assert_eq!(
+            error_code(
+                &client
+                    .call(3, method::WIREGUARD_CONNECT, wg_params("DNS=192.0.2.53"))
+                    .await
+            ),
+            "invalidParams"
+        );
+        assert_eq!(harness.auth_calls(), 0);
+        assert!(harness.recorder.ops().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_wireguard_status_is_stopped_and_scoped_to_peer_uid() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1001).await;
+        let reply = client
+            .call(2, method::WIREGUARD_STATUS, json!({"profileId":"home"}))
+            .await;
+        assert_eq!(reply["result"]["state"], json!("stopped"));
+        assert_eq!(harness.auth_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn wireguard_rpc_connect_status_and_disconnect_are_uid_scoped() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut mine = harness.hello(1000).await;
+        let mut other = harness.hello(1001).await;
+        let connected = mine.call(2, method::WIREGUARD_CONNECT, wg_params("")).await;
+        assert_eq!(connected["result"]["status"]["state"], json!("running"));
+        assert_eq!(
+            other
+                .call(2, method::WIREGUARD_STATUS, json!({"profileId":"home"}))
+                .await["result"]["state"],
+            json!("stopped")
+        );
+        assert_eq!(
+            error_code(
+                &mine
+                    .call(5, method::ROUTES_REMOVE, json!({"owner":"wg:home"}))
+                    .await
+            ),
+            "invalidParams"
+        );
+        assert_eq!(
+            error_code(
+                &other
+                    .call(3, method::WIREGUARD_DISCONNECT, json!({"profileId":"home"}))
+                    .await
+            ),
+            "notFound"
+        );
+        assert_eq!(
+            mine.call(3, method::WIREGUARD_DISCONNECT, json!({"profileId":"home"}))
+                .await["result"]["stopped"],
+            json!(true)
+        );
+        assert_eq!(
+            mine.call(4, method::WIREGUARD_STATUS, json!({"profileId":"home"}))
+                .await["result"]["state"],
+            json!("stopped")
+        );
+        assert_eq!(harness.auth_calls(), 3);
     }
 
     #[tokio::test]
@@ -840,5 +1657,77 @@ mod tests {
         let reply = second.recv().await.unwrap();
         assert_eq!(error_code(&reply), "busy");
         assert_eq!(second.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn always_on_static_registration_and_removal_are_uid_scoped() {
+        let mut harness = Harness::new(AuthDecision::Authorized);
+        let store = crate::always_on::AlwaysOnStore::new(harness.dir.join("profiles"));
+        Arc::get_mut(&mut harness.ctx).unwrap().always_on =
+            Some(Arc::new(Mutex::new(store.clone())));
+        let mut mine = harness.hello(1000).await;
+        let mut other = harness.hello(1001).await;
+        let definition = json!({"definition":{"kind":"staticRoutes","profile":{
+            "profileId":"office","interfaceName":"lo",
+            "routes":[{"destination":"203.0.113.0/24","metric":5}]
+        }}});
+
+        assert_eq!(
+            mine.call(2, method::ALWAYS_ON_SET, definition).await["result"]["active"],
+            true
+        );
+        assert_eq!(
+            other.call(2, method::ALWAYS_ON_LIST, Value::Null).await["result"]["profiles"],
+            json!([])
+        );
+        assert_eq!(
+            other
+                .call(
+                    3,
+                    method::ALWAYS_ON_REMOVE,
+                    json!({"kind":"staticRoutes","profileId":"office"})
+                )
+                .await["result"]["removed"],
+            false
+        );
+        assert_eq!(
+            mine.call(3, method::ALWAYS_ON_LIST, Value::Null).await["result"]["profiles"][0]
+                ["profileId"],
+            "office"
+        );
+        assert_eq!(
+            mine.call(
+                4,
+                method::ALWAYS_ON_REMOVE,
+                json!({"kind":"staticRoutes","profileId":"office"})
+            )
+            .await["result"]["removed"],
+            true
+        );
+        assert!(store.load_uid(1000).unwrap().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_cleanup_persists_pause_until_explicit_resume() {
+        let mut harness = Harness::new(AuthDecision::Authorized);
+        let store = crate::always_on::AlwaysOnStore::new(harness.dir.join("profiles"));
+        Arc::get_mut(&mut harness.ctx).unwrap().always_on =
+            Some(Arc::new(Mutex::new(store.clone())));
+        let mut client = harness.hello(1000).await;
+        let definition = json!({"definition":{"kind":"staticRoutes","profile":{
+            "profileId":"office","interfaceName":"lo",
+            "routes":[{"destination":"203.0.113.0/24","metric":5}]
+        }}});
+        client.call(2, method::ALWAYS_ON_SET, definition).await;
+        client.call(3, method::RECOVERY_CLEANUP, Value::Null).await;
+        assert_eq!(
+            harness.ctx.authorizer.actions.lock().unwrap().last(),
+            Some(&Action::SystemNetwork)
+        );
+        assert!(store.load_uid(1000).unwrap().paused);
+        assert!(harness.ctx.core.lock().unwrap().owned(1000).is_empty());
+        client.call(4, method::ALWAYS_ON_RESUME, Value::Null).await;
+        assert!(!store.load_uid(1000).unwrap().paused);
+        assert_eq!(harness.ctx.core.lock().unwrap().owned(1000).len(), 1);
     }
 }
