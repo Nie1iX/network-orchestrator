@@ -19,7 +19,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_SOCKET_PATH: &str = "/run/network-orchestrator/daemon.sock";
 pub const SOCKET_ENV: &str = "NETWORK_ORCHESTRATOR_SOCKET";
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Hard cap for one frame. The largest valid `openvpn.connect` (8 MiB of
+/// assets as base64, a fully JSON-escaped 256 KiB config, routes and
+/// credentials) is about 12.2 MiB; anything above the cap is `frameTooLarge`.
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ROUTES_PER_REQUEST: usize = 8192;
 pub const MAX_OWNER_BYTES: usize = 128;
 pub const HELLO_TIMEOUT_SECS: u64 = 5;

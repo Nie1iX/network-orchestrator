@@ -1,7 +1,7 @@
 use crate::core::DaemonCore;
 use crate::validate::{validate_apply, validate_iface_name, validate_owner};
 use crate::wireguard::parse_wireguard_config;
-use net_manager_core::daemon_protocol::{AlwaysOnDefinition, MAX_FRAME_BYTES};
+use net_manager_core::daemon_protocol::AlwaysOnDefinition;
 use net_manager_core::models::AppliedRoute;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 const VERSION: u32 = 1;
 const FILE: &str = "definitions.json";
-const MAX_DOCUMENT_BYTES: usize = 8 * MAX_FRAME_BYTES;
+const MAX_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 32;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]

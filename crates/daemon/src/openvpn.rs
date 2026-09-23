@@ -234,6 +234,49 @@ mod tests {
     }
 
     #[test]
+    fn largest_valid_connect_request_fits_one_frame_with_headroom() {
+        use net_manager_core::daemon_protocol::{
+            encode_line, method, RequestFrame, MAX_FRAME_BYTES,
+        };
+        use net_manager_core::openvpn_config::{MAX_ASSET_BYTES, MAX_CONFIG_BYTES};
+        let mut config = String::from("client\nremote vpn.example\nca assets/a\ncert assets/b\n");
+        // Control bytes in comments are the worst case for JSON escaping (6x).
+        let comment = format!("#{}\n", "\u{1}".repeat(200));
+        while config.len() + comment.len() <= MAX_CONFIG_BYTES {
+            config.push_str(&comment);
+        }
+        let mut input = params(&config);
+        for name in ["assets/a", "assets/b"] {
+            input.assets.insert(
+                name.into(),
+                base64::engine::general_purpose::STANDARD.encode(vec![7_u8; MAX_ASSET_BYTES]),
+            );
+        }
+        for index in 0..64_u32 {
+            input.routes.push(PolicyRoute {
+                destination: format!("10.{index}.0.0/16").parse().unwrap(),
+                metric: 5,
+                via: None,
+            });
+        }
+        let frame = RequestFrame {
+            id: u64::MAX,
+            method: method::OPENVPN_CONNECT.into(),
+            params: serde_json::to_value(&input).unwrap(),
+        };
+        let encoded = encode_line(&frame).unwrap().len();
+        prepare_openvpn(1000, input.clone()).expect("request is at the validation limits");
+        // Credentials (bounded to a few KiB) and asset names must still fit.
+        assert!(encoded + 64 * 1024 <= MAX_FRAME_BYTES, "{encoded}");
+        // The asset budget is really exhausted: one more byte is rejected.
+        input.assets.insert(
+            "assets/b".into(),
+            base64::engine::general_purpose::STANDARD.encode(vec![7_u8; MAX_ASSET_BYTES + 1]),
+        );
+        assert!(prepare_openvpn(1000, input).is_err());
+    }
+
+    #[test]
     fn rejects_missing_or_injected_credentials_before_authorization() {
         let mut request =
             OpenVpnConnectRequest::from(params("client\nremote vpn.example\nauth-user-pass\n"));
