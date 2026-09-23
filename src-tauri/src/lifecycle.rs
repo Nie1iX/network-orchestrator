@@ -56,30 +56,54 @@ pub(crate) async fn disconnect_all(
             crate::daemon_client::user_message(&err)
         )),
     }
-    match state.profiles.load() {
-        Ok(document) => {
-            let mut runtime = state.runtime.lock().await;
-            for profile in &document.profiles {
-                if profile.backend == TunnelBackend::WireGuard
-                    || (profile.backend == TunnelBackend::Xray
-                        && profile.xray_mode == XrayMode::Tun)
-                {
-                    continue;
-                }
-                if runtime.tunnels.status(profile).state == TunnelState::Running
-                    && runtime.tunnels.disconnect(profile).is_err()
-                {
-                    errors.push("local process cleanup failed".to_string());
-                }
-            }
-        }
-        Err(_) => errors.push("cannot read profiles for local cleanup".to_string()),
+    if let Err(err) = stop_local_tunnels(state).await {
+        errors.push(err);
     }
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors.join("; "))
     }
+}
+
+/// Stop the tunnels this UI process runs itself; daemon owners are untouched.
+#[cfg(target_os = "linux")]
+async fn stop_local_tunnels(state: &AppState) -> Result<(), String> {
+    let document = state
+        .profiles
+        .load()
+        .map_err(|_| "cannot read profiles for local cleanup".to_string())?;
+    let mut runtime = state.runtime.lock().await;
+    let mut failed = false;
+    for profile in &document.profiles {
+        if profile.backend == TunnelBackend::WireGuard
+            || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun)
+        {
+            continue;
+        }
+        if runtime.tunnels.status(profile).state == TunnelState::Running
+            && runtime.tunnels.disconnect(profile).is_err()
+        {
+            failed = true;
+        }
+    }
+    if failed {
+        Err("local process cleanup failed".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Cleanup before the UI process exits. On Linux daemon owners outlive the
+/// UI, so only UI-owned processes are stopped, best effort: a failure must
+/// not block Quit (the children also get SIGTERM when the UI dies).
+async fn exit_cleanup(state: &AppState) -> Result<(), String> {
+    if should_cleanup_on_ui_exit() {
+        return cleanup_all(state).await;
+    }
+    #[cfg(target_os = "linux")]
+    let _ = stop_local_tunnels(state).await;
+    Ok(())
 }
 
 fn should_cleanup_on_ui_exit() -> bool {
@@ -146,9 +170,6 @@ pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     let tauri::RunEvent::ExitRequested { api, .. } = event else {
         return;
     };
-    if !should_cleanup_on_ui_exit() {
-        return;
-    }
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
@@ -162,7 +183,7 @@ pub(crate) fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = handle.state::<AppState>();
-        match cleanup_all(&state).await {
+        match exit_cleanup(&state).await {
             Ok(()) => {
                 state.cleanup_complete.store(true, Ordering::SeqCst);
                 handle.exit(0);
@@ -335,6 +356,49 @@ mod tests {
         assert_eq!(
             state.runtime.lock().await.tunnels.status(&profile).state,
             TunnelState::Stopped
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_exit_stops_local_processes_without_daemon_rpc() {
+        use std::time::Duration;
+        use tokio::net::UnixListener;
+
+        let dir = unique_dir("exit-local-only");
+        let state = app_state(&dir);
+        let socket = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        state.runtime.lock().await.routes = crate::route_runtime::RouteRuntime::Daemon(
+            crate::daemon_client::DaemonClient::new(socket),
+        );
+        let mut profile = profile("if0");
+        profile.backend = TunnelBackend::None;
+        profile.routes.push(PolicyRoute {
+            destination: "10.79.0.0/16".parse().unwrap(),
+            metric: 5,
+            via: None,
+        });
+        state.profiles.upsert(profile.clone()).unwrap();
+        state
+            .runtime
+            .lock()
+            .await
+            .tunnels
+            .connect(&profile)
+            .unwrap();
+
+        exit_cleanup(&state).await.unwrap();
+
+        assert_eq!(
+            state.runtime.lock().await.tunnels.status(&profile).state,
+            TunnelState::Stopped
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "UI exit must not talk to the daemon"
         );
     }
 

@@ -561,6 +561,23 @@ fn run_xray_validation(exe: &Path, config: &[u8]) -> io::Result<()> {
     Err(io::Error::other(message))
 }
 
+/// Linux counterpart of `ChildJob`: SIGTERM the child when the thread that
+/// spawned it dies. Spawns run on long-lived UI runtime threads, so a crashed
+/// or killed UI no longer orphans its local Xray/OpenVPN processes.
+#[cfg(target_os = "linux")]
+fn terminate_with_parent(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the hook only calls prctl, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 fn spawn_xray(exe: &Path, config: &[u8], stdout: Stdio, stderr: Stdio) -> io::Result<Child> {
     let spec = xray_command_spec(exe, false);
     let mut command = Command::new(&spec.program);
@@ -571,6 +588,8 @@ fn spawn_xray(exe: &Path, config: &[u8], stdout: Stdio, stderr: Stdio) -> io::Re
         .stderr(stderr);
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
+    #[cfg(target_os = "linux")]
+    terminate_with_parent(&mut command);
     let mut child = command.spawn()?;
     match child.stdin.take() {
         Some(mut stdin) => {
@@ -1272,6 +1291,8 @@ impl TunnelManager {
                     .stderr(err);
                 #[cfg(windows)]
                 command.creation_flags(CREATE_NO_WINDOW);
+                #[cfg(target_os = "linux")]
+                terminate_with_parent(&mut command);
                 let mut child = command.spawn()?;
                 if let Err(err) = self.ensure_child_job().and_then(|job| job.assign(&child)) {
                     let _ = child.kill();
@@ -1462,6 +1483,41 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_xray_child_is_terminated_when_its_spawning_thread_dies() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::ExitStatusExt;
+        use std::time::{Duration, Instant};
+
+        let dir = unique_dir("pdeathsig");
+        let exe = dir.join("xray");
+        fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let spawner = exe.clone();
+        let mut child = std::thread::spawn(move || {
+            spawn_xray(&spawner, b"{}", Stdio::null(), Stdio::null()).unwrap()
+        })
+        .join()
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(status.and_then(|s| s.signal()), Some(libc::SIGTERM));
     }
 
     #[test]
