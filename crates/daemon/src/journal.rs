@@ -67,26 +67,29 @@ impl JournalStore {
         }
     }
 
-    /// Atomic replace: 0600 temp file, `sync_all`, rename, fsync directory.
     pub fn save(&self, doc: &JournalDocument) -> io::Result<()> {
-        let parent = self.path.parent().unwrap_or(Path::new("."));
-        fs::create_dir_all(parent)?;
         let json = serde_json::to_vec_pretty(doc)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let mut temp_name = self.path.clone().into_os_string();
-        temp_name.push(".tmp");
-        let temp_path = PathBuf::from(temp_name);
-        // A leftover temp file may carry other permissions; `mode` only
-        // applies on creation.
-        let _ = fs::remove_file(&temp_path);
-        let result =
-            write_synced(&temp_path, &json).and_then(|()| fs::rename(&temp_path, &self.path));
-        if let Err(err) = result {
-            let _ = fs::remove_file(&temp_path);
-            return Err(err);
-        }
-        sync_dir(parent)
+        write_atomic(&self.path, &json)
     }
+}
+
+/// Atomic replace: 0600 temp file, `sync_all`, rename, fsync directory.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temp_name = path.to_path_buf().into_os_string();
+    temp_name.push(".tmp");
+    let temp_path = PathBuf::from(temp_name);
+    // A leftover temp file may carry other permissions; `mode` only
+    // applies on creation.
+    let _ = fs::remove_file(&temp_path);
+    let result = write_synced(&temp_path, bytes).and_then(|()| fs::rename(&temp_path, path));
+    if let Err(err) = result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    sync_dir(parent)
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {

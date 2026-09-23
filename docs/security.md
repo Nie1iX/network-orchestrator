@@ -108,6 +108,19 @@ processes). The main concerns:
   `com.netmanager.app.connect-profile` (`allow_active=yes`). Read-only owner
   queries are filtered by uid, and an authorized user cannot remove another
   uid's owner.
+- Connecting a VPN profile is governed by the administrator-chosen VPN
+  password mode, stored by the daemon in
+  `/var/lib/network-orchestrator/settings.json` (0600) and changeable only
+  through `system-network`. `noPrompt` authorizes every connect with
+  `connect-profile`. `fullTunnelOnly` (default) additionally requires
+  `com.netmanager.app.connect-profile-admin` (`auth_admin_keep`) for
+  connects that capture all traffic of the machine: a WireGuard or Xray TUN
+  full tunnel (a default route or its halves, which also installs global DNS)
+  and every OpenVPN profile, because its server may push a full tunnel on any
+  (re)connect. `always` requires `connect-profile-admin` for every connect.
+  The client never decides this; a missing or invalid settings file falls
+  back to `fullTunnelOnly`. Split tunnels still install their own routes and
+  per-link DNS without a prompt in modes other than `always`.
 - Routes are added with a dedicated protocol number and exclusive netlink
   creation so an existing route is not overwritten. The daemon writes its
   ownership journal to `/var/lib/network-orchestrator/state.json` with mode

@@ -13,7 +13,10 @@
     OpenVPN and Xray profiles (including a full tunnel and its DNS), removing
     the caller's own routes and recovery cleanup. An active local session is
     allowed without a prompt, as NetworkManager allows VPN activation.
-  system-network: applying routes and changing link state. Prompts for an
+  connect-profile-admin: connecting a profile when the administrator-chosen
+    VPN password mode (daemon settings.set) requires it: full tunnels and
+    OpenVPN in the default mode, every connect in "always" mode.
+  system-network: changing that mode, applying routes and changing link state. Prompts for an
     administrator once and caches the result (auth_admin_keep).
 -->
 <policyconfig>
@@ -31,6 +34,18 @@
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.netmanager.app.connect-profile-admin">
+    <description>Connect a VPN profile that changes system-wide traffic</description>
+    <description xml:lang="ru">Подключить VPN-профиль, меняющий весь трафик системы</description>
+    <message>Network Orchestrator needs administrative privileges to connect this VPN profile.</message>
+    <message xml:lang="ru">Network Orchestrator требует права администратора для подключения этого VPN-профиля.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
     </defaults>
   </action>
 

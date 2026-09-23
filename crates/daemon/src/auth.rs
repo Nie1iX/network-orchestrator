@@ -2,7 +2,7 @@
 //! `CheckAuthorization` call itself (Linux only). The decision helpers are
 //! pure so they are tested without D-Bus.
 
-use net_manager_core::daemon_protocol::method;
+use net_manager_core::daemon_protocol::{method, VpnAuthMode};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -28,6 +28,9 @@ pub enum Action {
     SystemNetwork,
     /// `allow_active`: removing what the caller itself owns.
     ConnectProfile,
+    /// `auth_admin_keep`: connecting a profile when the administrator-chosen
+    /// [`VpnAuthMode`] requires a password for it.
+    ConnectProfileAdmin,
 }
 
 impl Action {
@@ -35,7 +38,18 @@ impl Action {
         match self {
             Action::SystemNetwork => "com.netmanager.app.system-network",
             Action::ConnectProfile => "com.netmanager.app.connect-profile",
+            Action::ConnectProfileAdmin => "com.netmanager.app.connect-profile-admin",
         }
+    }
+}
+
+/// Action for a connect request. `broad` means it captures all traffic of the
+/// machine (full tunnel or global DNS) or may do so (OpenVPN pushes).
+pub fn connect_action(mode: VpnAuthMode, broad: bool) -> Action {
+    match mode {
+        VpnAuthMode::NoPrompt => Action::ConnectProfile,
+        VpnAuthMode::FullTunnelOnly if !broad => Action::ConnectProfile,
+        VpnAuthMode::FullTunnelOnly | VpnAuthMode::Always => Action::ConnectProfileAdmin,
     }
 }
 
@@ -47,7 +61,8 @@ pub fn required_action(method_name: &str) -> Option<Action> {
         | method::LINK_SET_STATE
         | method::ALWAYS_ON_SET
         | method::ALWAYS_ON_REMOVE
-        | method::ALWAYS_ON_RESUME => Some(Action::SystemNetwork),
+        | method::ALWAYS_ON_RESUME
+        | method::SETTINGS_SET => Some(Action::SystemNetwork),
         method::ROUTES_REMOVE
         | method::RECOVERY_CLEANUP
         | method::WIREGUARD_CONNECT
@@ -262,6 +277,32 @@ mod tests {
             Action::ConnectProfile.polkit_id(),
             "com.netmanager.app.connect-profile"
         );
+    }
+
+    #[test]
+    fn connect_action_follows_the_administrator_chosen_mode() {
+        use net_manager_core::daemon_protocol::VpnAuthMode::*;
+        for broad in [false, true] {
+            assert_eq!(connect_action(NoPrompt, broad), Action::ConnectProfile);
+            assert_eq!(connect_action(Always, broad), Action::ConnectProfileAdmin);
+        }
+        assert_eq!(
+            connect_action(FullTunnelOnly, false),
+            Action::ConnectProfile
+        );
+        assert_eq!(
+            connect_action(FullTunnelOnly, true),
+            Action::ConnectProfileAdmin
+        );
+        assert_eq!(
+            Action::ConnectProfileAdmin.polkit_id(),
+            "com.netmanager.app.connect-profile-admin"
+        );
+        assert_eq!(
+            required_action(method::SETTINGS_SET),
+            Some(Action::SystemNetwork)
+        );
+        assert_eq!(required_action(method::SETTINGS_GET), None);
     }
 
     #[test]

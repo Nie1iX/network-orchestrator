@@ -107,6 +107,16 @@ ours -4 | grep -q "^203.0.113.0/24" && ok "root route intact" || fail "root rout
 as bob python3 "$CLIENT" routes.remove '{"owner":"b"}' >/dev/null && ok "bob removed own owner" || fail "bob remove"
 ours -4 | grep -q "^10.77.0.0/16" && fail "bob route still present" || ok "bob route removed"
 
+step "VPN password mode (daemon settings)"
+expect_eq "$(python3 "$CLIENT" settings.get)" '{"vpnAuthMode": "fullTunnelOnly"}' "default mode is fullTunnelOnly"
+out=$(as alice python3 "$CLIENT" settings.set '{"vpnAuthMode":"noPrompt"}' || true)
+echo "$out" | grep -q '"notAuthorized"' && ok "unauthorized user cannot change mode" || fail "expected notAuthorized, got $out"
+python3 "$CLIENT" settings.set '{"vpnAuthMode":"always"}' >/dev/null && ok "administrator changed mode" || fail "settings.set as root"
+expect_eq "$(stat -c %a /var/lib/network-orchestrator/settings.json)" 600 "settings file mode 0600"
+systemctl restart "$UNIT"; wait_socket
+expect_eq "$(as alice python3 "$CLIENT" settings.get)" '{"vpnAuthMode": "always"}' "mode persists across restart and is readable by users"
+python3 "$CLIENT" settings.set '{"vpnAuthMode":"fullTunnelOnly"}' >/dev/null || fail "restore default mode"
+
 step "link.set_state"
 python3 "$CLIENT" link.set_state '{"name":"dum0","up":false}' >/dev/null || fail "link down"
 ip -br link show dum0 | grep -q DOWN && ok "dum0 down" || fail "dum0 not down: $(ip -br link show dum0)"

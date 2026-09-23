@@ -47,9 +47,11 @@ pub mod method {
     pub const ALWAYS_ON_LIST: &str = "alwaysOn.list";
     pub const ALWAYS_ON_REMOVE: &str = "alwaysOn.remove";
     pub const ALWAYS_ON_RESUME: &str = "alwaysOn.resume";
+    pub const SETTINGS_GET: &str = "settings.get";
+    pub const SETTINGS_SET: &str = "settings.set";
 
     /// Methods implemented by the daemon and reported in `hello.capabilities`.
-    pub const CAPABILITIES: [&str; 20] = [
+    pub const CAPABILITIES: [&str; 22] = [
         ROUTES_APPLY,
         ROUTES_REMOVE,
         LINK_SET_STATE,
@@ -70,7 +72,37 @@ pub mod method {
         ALWAYS_ON_LIST,
         ALWAYS_ON_REMOVE,
         ALWAYS_ON_RESUME,
+        SETTINGS_GET,
+        SETTINGS_SET,
     ];
+}
+
+/// When connecting a VPN profile asks for an administrator password. Chosen
+/// by an administrator and enforced by the daemon, never by the client.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum VpnAuthMode {
+    /// Any profile connects without a prompt in an active session.
+    NoPrompt,
+    /// Split tunnels connect without a prompt; changes that capture all
+    /// traffic of the machine (full tunnel, global DNS) and every OpenVPN
+    /// profile (its server may push a full tunnel) require an administrator.
+    #[default]
+    FullTunnelOnly,
+    /// Every connect requires an administrator.
+    Always,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsResult {
+    pub vpn_auth_mode: VpnAuthMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsSetParams {
+    pub vpn_auth_mode: VpnAuthMode,
 }
 
 pub mod event {
@@ -859,7 +891,7 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","xray.connect","xray.disconnect","xray.status","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume"]}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","xray.connect","xray.disconnect","xray.status","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set"]}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);
@@ -870,6 +902,19 @@ mod tests {
             r#"{"id":1,"ok":false,"error":{"code":"protocolMismatch","message":"daemon speaks protocol 1, client 2"}}"#,
         );
         assert_eq!(error.code, ErrorCode::ProtocolMismatch);
+    }
+
+    #[test]
+    fn golden_settings() {
+        let (frame, params): (_, SettingsSetParams) =
+            request(r#"{"id":8,"method":"settings.set","params":{"vpnAuthMode":"always"}}"#);
+        assert_eq!(frame.method, method::SETTINGS_SET);
+        assert_eq!(params.vpn_auth_mode, VpnAuthMode::Always);
+        let (_, result): (_, SettingsResult) =
+            ok_response(r#"{"id":9,"ok":true,"result":{"vpnAuthMode":"fullTunnelOnly"}}"#);
+        assert_eq!(result.vpn_auth_mode, VpnAuthMode::FullTunnelOnly);
+        assert_eq!(VpnAuthMode::default(), VpnAuthMode::FullTunnelOnly);
+        let _: SettingsSetParams = serde_json::from_str(r#"{"vpnAuthMode":"noPrompt"}"#).unwrap();
     }
 
     #[test]

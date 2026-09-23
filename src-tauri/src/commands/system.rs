@@ -40,6 +40,51 @@ pub(crate) async fn daemon_status() -> Result<serde_json::Value, String> {
     }
 }
 
+/// Administrator-chosen VPN password mode; `None` where no daemon exists.
+#[tauri::command]
+pub(crate) async fn get_vpn_auth_mode(
+) -> Result<Option<net_manager_core::daemon_protocol::VpnAuthMode>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use net_manager_core::daemon_protocol::{method, SettingsResult};
+        let result: SettingsResult = crate::daemon_client::DaemonClient::system()
+            .request(method::SETTINGS_GET, serde_json::Value::Null)
+            .await
+            .map_err(|e| crate::daemon_client::user_message(&e))?;
+        Ok(Some(result.vpn_auth_mode))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
+    }
+}
+
+/// Changing the mode asks the daemon, which requires an administrator.
+#[tauri::command]
+pub(crate) async fn set_vpn_auth_mode(
+    mode: net_manager_core::daemon_protocol::VpnAuthMode,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use net_manager_core::daemon_protocol::{method, SettingsResult, SettingsSetParams};
+        let _: SettingsResult = crate::daemon_client::DaemonClient::system()
+            .request(
+                method::SETTINGS_SET,
+                SettingsSetParams {
+                    vpn_auth_mode: mode,
+                },
+            )
+            .await
+            .map_err(|e| crate::daemon_client::user_message(&e))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = mode;
+        Err("VPN password mode is managed by the Linux daemon".into())
+    }
+}
+
 /// Discover WireGuard configs in the standard Windows service location
 /// `C:\Program Files\WireGuard\Data\Configurations\`. Requires elevation to
 /// read the ACL-protected directory. Returns sorted absolute paths to

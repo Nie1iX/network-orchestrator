@@ -2,9 +2,12 @@
 //! stream so tests drive it through `tokio::io::duplex`.
 
 use crate::always_on::{apply_definition, validate_definition, AlwaysOnStore};
-use crate::auth::{required_action, Action, AuthDecision, Authorizer, PeerIdentity};
+use crate::auth::{
+    connect_action, required_action, Action, AuthDecision, Authorizer, PeerIdentity,
+};
 use crate::core::DaemonCore;
 use crate::openvpn::{prepare_openvpn, OpenVpnPlan};
+use crate::settings::{DaemonSettings, SettingsStore};
 use crate::validate::{validate_apply, validate_iface_name, validate_owner};
 use crate::wireguard::parse_wireguard_config;
 use crate::xray::prepare_xray;
@@ -15,9 +18,10 @@ use net_manager_core::daemon_protocol::{
     LinkSetStateParams, OpenVpnConnectRequest, OpenVpnConnectResult, OpenVpnDisconnectResult,
     OpenVpnProbeResult, OpenVpnProfileParams, OwnedChanged, OwnedListResult, OwnerParams,
     RequestFrame, ResponseFrame, RoutesApplyParams, RoutesApplyResult, RoutesRemoveResult,
-    WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
-    WireGuardProfileParams, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
-    XrayProfileParams, HELLO_TIMEOUT_SECS, MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    SettingsResult, SettingsSetParams, VpnAuthMode, WireGuardConnectParams, WireGuardConnectResult,
+    WireGuardDisconnectResult, WireGuardProfileParams, XrayConnectParams, XrayConnectResult,
+    XrayDisconnectResult, XrayProfileParams, HELLO_TIMEOUT_SECS, MAX_CONNECTIONS, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -44,6 +48,9 @@ pub struct ServerContext<A> {
     pub connections: Arc<Semaphore>,
     pub hello_timeout: Duration,
     pub always_on: Option<Arc<Mutex<AlwaysOnStore>>>,
+    pub settings: Arc<Mutex<DaemonSettings>>,
+    /// `None` keeps settings in memory only (tests).
+    pub settings_store: Option<Arc<SettingsStore>>,
 }
 
 impl<A: Authorizer> ServerContext<A> {
@@ -55,6 +62,8 @@ impl<A: Authorizer> ServerContext<A> {
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             hello_timeout: Duration::from_secs(HELLO_TIMEOUT_SECS),
             always_on: None,
+            settings: Arc::new(Mutex::new(DaemonSettings::default())),
+            settings_store: None,
         }
     }
 
@@ -62,6 +71,16 @@ impl<A: Authorizer> ServerContext<A> {
         let mut context = Self::new(core, authorizer);
         context.always_on = Some(Arc::new(Mutex::new(store)));
         context
+    }
+
+    pub fn with_settings_store(mut self, store: SettingsStore) -> Self {
+        self.settings = Arc::new(Mutex::new(store.load()));
+        self.settings_store = Some(Arc::new(store));
+        self
+    }
+
+    fn vpn_auth_mode(&self) -> VpnAuthMode {
+        self.settings.lock().unwrap().vpn_auth_mode
     }
 }
 
@@ -261,6 +280,26 @@ async fn handle<A: Authorizer>(
             "hello was already exchanged".into(),
         )),
         method::SUBSCRIBE => Ok(Value::Null),
+        method::SETTINGS_GET => to_value(&SettingsResult {
+            vpn_auth_mode: ctx.vpn_auth_mode(),
+        }),
+        method::SETTINGS_SET => {
+            let params: SettingsSetParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let settings = DaemonSettings {
+                vpn_auth_mode: params.vpn_auth_mode,
+            };
+            if let Some(store) = ctx.settings_store.clone() {
+                tokio::task::spawn_blocking(move || store.save(settings))
+                    .await
+                    .map_err(|_| (ErrorCode::Internal, "settings task failed".to_string()))?
+                    .map_err(|_| (ErrorCode::Internal, "cannot save settings".to_string()))?;
+            }
+            *ctx.settings.lock().unwrap() = settings;
+            to_value(&SettingsResult {
+                vpn_auth_mode: settings.vpn_auth_mode,
+            })
+        }
         method::OWNED_LIST => {
             let owners = with_core(ctx, move |core| Ok(core.owned(uid))).await?;
             to_value(&OwnedListResult { owners })
@@ -393,7 +432,8 @@ async fn handle<A: Authorizer>(
             validate_owner(&params.profile_id).map_err(invalid)?;
             let plan = parse_wireguard_config(&params.config, &params.routes)
                 .map_err(|err| invalid(err.to_string()))?;
-            authorize(ctx, peer, Action::ConnectProfile).await?;
+            let broad = plan.full_ipv4 || plan.full_ipv6;
+            authorize(ctx, peer, connect_action(ctx.vpn_auth_mode(), broad)).await?;
             let profile_id = params.profile_id.clone();
             let status = with_core(ctx, move |core| {
                 core.connect_wireguard(uid, &params.profile_id, plan)
@@ -433,7 +473,8 @@ async fn handle<A: Authorizer>(
             let request: OpenVpnConnectRequest = from_value(request.params)
                 .map_err(|_| invalid("invalid OpenVPN connect parameters".into()))?;
             let plan = prepare_openvpn(uid, request).map_err(|err| invalid(err.to_string()))?;
-            authorize(ctx, peer, Action::ConnectProfile).await?;
+            // The server may push a full tunnel at any (re)connect.
+            authorize(ctx, peer, connect_action(ctx.vpn_auth_mode(), true)).await?;
             let owner = format!("ovpn:{}", plan.profile_id);
             let status = with_core(ctx, move |core| core.connect_openvpn(uid, plan)).await?;
             notify(ctx, uid, owner);
@@ -490,7 +531,11 @@ async fn handle<A: Authorizer>(
                 .map_err(|_| invalid("invalid Xray connect parameters".into()))?;
             prepare_xray(uid, params.clone(), 1)
                 .map_err(|_| invalid("unsupported generated Xray TUN config".into()))?;
-            authorize(ctx, peer, Action::ConnectProfile).await?;
+            let broad = params
+                .routes
+                .iter()
+                .any(|route| captures_all_traffic(route.destination));
+            authorize(ctx, peer, connect_action(ctx.vpn_auth_mode(), broad)).await?;
             let owner = format!("xray:{}", params.profile_id);
             let status = with_core(ctx, move |core| core.connect_xray(uid, params)).await?;
             notify(ctx, uid, owner);
@@ -593,6 +638,14 @@ async fn handle<A: Authorizer>(
             format!("unsupported method '{}'", request.method),
         )),
     }
+}
+
+/// A default route or one of its halves: the tunnel takes all traffic.
+fn captures_all_traffic(destination: ipnet::IpNet) -> bool {
+    matches!(
+        destination.to_string().as_str(),
+        "0.0.0.0/0" | "0.0.0.0/1" | "128.0.0.0/1" | "::/0" | "::/1" | "8000::/1"
+    )
 }
 
 async fn authorize<A: Authorizer>(
@@ -826,6 +879,7 @@ mod tests {
     use crate::core::{DaemonCore, WgConfigExecutor, WgSystem};
     use crate::journal::{JournalStore, JOURNAL_FILE};
     use crate::openvpn_process::OpenVpnProcessRunner;
+    use net_manager_core::daemon_protocol::VpnAuthMode;
     use net_manager_core::daemon_protocol::MAX_FRAME_BYTES;
     use net_manager_core::openvpn_management::{parse_push_reply, ManagementEvent};
     use serde_json::{json, Value};
@@ -1074,6 +1128,87 @@ mod tests {
             "config": format!("[Interface]\nPrivateKey={KEY}\nAddress=10.77.0.2/32\n{extra}\n[Peer]\nPublicKey={KEY}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n"),
             "routes": []
         })
+    }
+
+    fn wg_full_params() -> Value {
+        const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        json!({
+            "profileId": "home",
+            "config": format!("[Interface]\nPrivateKey={KEY}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={KEY}\nEndpoint=192.0.2.1:51820\nAllowedIPs=0.0.0.0/0\n"),
+            "routes": []
+        })
+    }
+
+    #[tokio::test]
+    async fn settings_are_readable_by_anyone_and_changed_only_by_an_administrator() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+        let reply = client.call(2, method::SETTINGS_GET, Value::Null).await;
+        assert_eq!(
+            reply["result"]["vpnAuthMode"],
+            json!("fullTunnelOnly"),
+            "{reply}"
+        );
+        assert_eq!(harness.auth_calls(), 0);
+
+        let reply = client
+            .call(3, method::SETTINGS_SET, json!({"vpnAuthMode": "always"}))
+            .await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        assert_eq!(
+            *harness.ctx.authorizer.actions.lock().unwrap(),
+            [Action::SystemNetwork]
+        );
+        let reply = client.call(4, method::SETTINGS_GET, Value::Null).await;
+        assert_eq!(reply["result"]["vpnAuthMode"], json!("always"));
+
+        let denied = Harness::new(AuthDecision::Denied);
+        let mut client = denied.hello(1000).await;
+        let reply = client
+            .call(2, method::SETTINGS_SET, json!({"vpnAuthMode": "noPrompt"}))
+            .await;
+        assert_eq!(reply["error"]["code"], json!("notAuthorized"), "{reply}");
+        let reply = client.call(3, method::SETTINGS_GET, Value::Null).await;
+        assert_eq!(reply["result"]["vpnAuthMode"], json!("fullTunnelOnly"));
+    }
+
+    #[tokio::test]
+    async fn wireguard_connect_asks_for_an_administrator_per_mode_and_scope() {
+        let harness = Harness::new(AuthDecision::Denied);
+        let mut client = harness.hello(1000).await;
+        client
+            .call(2, method::WIREGUARD_CONNECT, wg_params(""))
+            .await;
+        client
+            .call(3, method::WIREGUARD_CONNECT, wg_full_params())
+            .await;
+        assert_eq!(
+            *harness.ctx.authorizer.actions.lock().unwrap(),
+            [Action::ConnectProfile, Action::ConnectProfileAdmin]
+        );
+
+        for (mode, expected) in [
+            (
+                VpnAuthMode::NoPrompt,
+                [Action::ConnectProfile, Action::ConnectProfile],
+            ),
+            (
+                VpnAuthMode::Always,
+                [Action::ConnectProfileAdmin, Action::ConnectProfileAdmin],
+            ),
+        ] {
+            let harness = Harness::with(AuthDecision::Denied, |ctx| {
+                ctx.settings.lock().unwrap().vpn_auth_mode = mode;
+            });
+            let mut client = harness.hello(1000).await;
+            client
+                .call(2, method::WIREGUARD_CONNECT, wg_params(""))
+                .await;
+            client
+                .call(3, method::WIREGUARD_CONNECT, wg_full_params())
+                .await;
+            assert_eq!(*harness.ctx.authorizer.actions.lock().unwrap(), expected);
+        }
     }
 
     #[tokio::test]

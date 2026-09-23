@@ -363,6 +363,9 @@ export interface BackendInstallProgress {
   total: number | null;
 }
 
+/** Daemon-enforced rule for when connecting a VPN asks for an admin password. */
+export type VpnAuthMode = "noPrompt" | "fullTunnelOnly" | "always";
+
 export interface PlatformCapabilities {
   os: string;
   systemProxy: boolean;

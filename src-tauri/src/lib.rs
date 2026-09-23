@@ -131,6 +131,8 @@ pub fn run() {
             remove_managed_xray,
             get_managed_xray_offer,
             get_platform_capabilities,
+            get_vpn_auth_mode,
+            set_vpn_auth_mode,
             get_auto_connect_result,
             get_login_autostart,
             set_login_autostart

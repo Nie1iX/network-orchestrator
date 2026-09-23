@@ -6,6 +6,13 @@ import UpdateChecker from "./UpdateChecker";
 import Page from "./Page";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import { usePlatformCapabilities } from "../platform";
+import { VpnAuthMode } from "../types";
+
+const VPN_AUTH_MODES: { value: VpnAuthMode; label: string }[] = [
+  { value: "noPrompt", label: "Never" },
+  { value: "fullTunnelOnly", label: "Full tunnel and OpenVPN only" },
+  { value: "always", label: "Every connection" },
+];
 
 export default function Settings() {
   const [version, setVersion] = useState<string | null>(null);
@@ -13,6 +20,9 @@ export default function Settings() {
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [autostartError, setAutostartError] = useState<string | null>(null);
   const caps = usePlatformCapabilities();
+  const [vpnAuthMode, setVpnAuthMode] = useState<VpnAuthMode | null>(null);
+  const [vpnAuthBusy, setVpnAuthBusy] = useState(false);
+  const [vpnAuthError, setVpnAuthError] = useState<string | null>(null);
 
   useEffect(() => {
     getVersion().then(setVersion).catch(() => setVersion(null));
@@ -32,6 +42,34 @@ export default function Settings() {
       active = false;
     };
   }, [caps?.os]);
+
+  useEffect(() => {
+    if (caps?.os !== "linux") return;
+    let active = true;
+    invoke<VpnAuthMode | null>("get_vpn_auth_mode")
+      .then((mode) => {
+        if (active) setVpnAuthMode(mode);
+      })
+      .catch((err) => {
+        if (active) setVpnAuthError(String(err));
+      });
+    return () => {
+      active = false;
+    };
+  }, [caps?.os]);
+
+  const changeVpnAuthMode = async (mode: VpnAuthMode) => {
+    setVpnAuthBusy(true);
+    setVpnAuthError(null);
+    try {
+      await invoke("set_vpn_auth_mode", { mode });
+      setVpnAuthMode(mode);
+    } catch (err) {
+      setVpnAuthError(String(err));
+    } finally {
+      setVpnAuthBusy(false);
+    }
+  };
 
   const toggleLoginAutostart = async () => {
     if (loginAutostart === null) return;
@@ -81,6 +119,37 @@ export default function Settings() {
               />
             </div>
             {autostartError && <p className="error">{autostartError}</p>}
+          </div>
+        </div>
+      )}
+
+      {caps?.os === "linux" && (
+        <div className="settings-group">
+          <div className="settings-group-title">Security</div>
+          <div className="settings-group-body">
+            <div className="settings-row">
+              <div className="settings-row-main">
+                <span className="settings-row-label">
+                  Ask for administrator password when connecting VPN
+                </span>
+                <span className="settings-row-sub">
+                  Applies to every user of this computer. Changing it requires
+                  an administrator password.
+                </span>
+              </div>
+              <select
+                value={vpnAuthMode ?? ""}
+                disabled={vpnAuthMode === null || vpnAuthBusy}
+                onChange={(e) => changeVpnAuthMode(e.target.value as VpnAuthMode)}
+              >
+                {VPN_AUTH_MODES.map((mode) => (
+                  <option key={mode.value} value={mode.value}>
+                    {mode.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {vpnAuthError && <p className="error">{vpnAuthError}</p>}
           </div>
         </div>
       )}

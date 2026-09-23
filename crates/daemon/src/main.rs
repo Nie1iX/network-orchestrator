@@ -22,6 +22,7 @@ mod linux {
     use network_orchestrator_daemon::netlink::NetlinkExecutor;
     use network_orchestrator_daemon::openvpn_process::TrustedOpenVpnProcess;
     use network_orchestrator_daemon::server::{bind_socket, serve, ServerContext};
+    use network_orchestrator_daemon::settings::{SettingsStore, SETTINGS_FILE};
     use network_orchestrator_daemon::xray_process::TrustedXrayProcess;
     use std::io;
     use std::path::PathBuf;
@@ -118,11 +119,10 @@ mod linux {
         .await
         .map_err(io::Error::other)??;
         let listener = bind_socket(&options.socket)?;
-        let ctx = Arc::new(ServerContext::with_always_on_store(
-            core,
-            PolkitAuthorizer::default(),
-            always_on,
-        ));
+        let ctx = Arc::new(
+            ServerContext::with_always_on_store(core, PolkitAuthorizer::default(), always_on)
+                .with_settings_store(SettingsStore::new(options.state_dir.join(SETTINGS_FILE))),
+        );
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigint = signal(SignalKind::interrupt())?;
         let dns_core = ctx.core.clone();

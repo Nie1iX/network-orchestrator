@@ -16,6 +16,7 @@ pub mod openvpn_process;
 #[cfg(target_os = "linux")]
 pub mod peer;
 pub mod server;
+pub mod settings;
 pub mod validate;
 pub mod wireguard;
 pub mod xray;
