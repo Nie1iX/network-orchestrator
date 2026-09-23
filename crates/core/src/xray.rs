@@ -713,9 +713,10 @@ fn percent_decode(input: &str) -> String {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = &input[index + 1..index + 3];
-            if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                decoded.push(byte);
+            let high = char::from(bytes[index + 1]).to_digit(16);
+            let low = char::from(bytes[index + 2]).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                decoded.push((high * 16 + low) as u8);
                 index += 3;
                 continue;
             }
@@ -1421,5 +1422,26 @@ mod tests {
         assert!(!has_tun_inbound(&with_socks));
         let no_inbounds = json!({"outbounds": []});
         assert!(!has_tun_inbound(&no_inbounds));
+    }
+
+    #[test]
+    fn percent_decode_does_not_panic_on_non_ascii_after_percent() {
+        assert_eq!(percent_decode("Speed 5%-Москва"), "Speed 5%-Москва");
+        assert_eq!(percent_decode("%М"), "%М");
+        assert_eq!(
+            share_link_name("vless://id@example.com:443#Speed 5%-Москва").as_deref(),
+            Some("Speed 5%-Москва")
+        );
+    }
+
+    #[test]
+    fn percent_decode_handles_trailing_and_invalid_escapes() {
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("a%4"), "a%4");
+        assert_eq!(percent_decode("%+1"), "%+1");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("a%41"), "aA");
+        assert_eq!(percent_decode("%D0%9C%D0%BE"), "Мо");
+        assert_eq!(percent_decode("%FF"), "\u{FFFD}");
     }
 }
