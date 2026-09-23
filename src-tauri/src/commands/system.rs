@@ -420,10 +420,15 @@ pub(crate) struct PlatformCapabilities {
     wireguard_standard_import: bool,
     managed_xray_install: bool,
     elevation_relaunch: bool,
-    /// In-app updater; Linux installs update through the package manager.
+    /// In-app updater: Windows and `.deb` installs; other Linux installs
+    /// update through their package manager.
     app_updates: bool,
     /// File-picker extensions for backend executables; empty means no filter.
     executable_extensions: Vec<String>,
+}
+
+fn app_updates_available(windows: bool, bundle: Option<tauri::utils::config::BundleType>) -> bool {
+    windows || matches!(bundle, Some(tauri::utils::config::BundleType::Deb))
 }
 
 fn platform_capabilities() -> PlatformCapabilities {
@@ -434,7 +439,7 @@ fn platform_capabilities() -> PlatformCapabilities {
         wireguard_standard_import: windows,
         managed_xray_install: cfg!(all(target_os = "windows", target_arch = "x86_64")),
         elevation_relaunch: windows,
-        app_updates: windows,
+        app_updates: app_updates_available(windows, tauri::utils::platform::bundle_type()),
         executable_extensions: if windows {
             vec!["exe".to_string()]
         } else {
@@ -895,6 +900,18 @@ mod tests {
                 "wireguardStandardImport",
             ]
         );
+    }
+
+    #[test]
+    fn app_updates_follow_platform_and_deb_bundle() {
+        use tauri::utils::config::BundleType;
+
+        assert!(app_updates_available(true, None));
+        assert!(app_updates_available(true, Some(BundleType::Nsis)));
+        assert!(app_updates_available(false, Some(BundleType::Deb)));
+        assert!(!app_updates_available(false, None));
+        assert!(!app_updates_available(false, Some(BundleType::AppImage)));
+        assert!(!app_updates_available(false, Some(BundleType::Rpm)));
     }
 
     #[cfg(windows)]
