@@ -1,4 +1,42 @@
-# E2E testing on a disposable Windows VM
+# E2E testing
+
+## Linux daemon in a disposable container
+
+`e2e/linux/run.sh` builds the daemon, starts Ubuntu 26.04 client and peer
+containers on a private Docker network, installs the service with systemd and
+polkit in the client, and runs `scenarios.sh` there. The scenarios exercise
+real netlink route and interface changes, polkit authorization, uid isolation,
+restart recovery, shutdown cleanup, WireGuard and OpenVPN split/full tunnels
+with real peer traffic and per-link DNS, OpenVPN management credentials,
+Xray VLESS/Hysteria2 proxy through SOCKS5 and HTTP CONNECT, Xray TUN,
+kernel policy-rule lookup, OpenVPN pushed-route probe, and WireGuard/static-route
+always-on replay. Each container has
+its own network namespace. Never run `scenarios.sh` directly on the host.
+
+```bash
+e2e/linux/run.sh
+```
+
+This requires Docker access and `/dev/net/tun`. The harness grants the
+client container `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and unconfined AppArmor so systemd
+can remount cgroup2. Use it on a development machine or CI worker that accepts
+those container privileges. The peer container needs `CAP_NET_ADMIN`. The
+current harness verifies the daemon and backends directly. Real Ubuntu desktop
+interaction, polkit prompt rendering and login-session autostart still need VM
+acceptance.
+
+After building a `.deb`, the packaged WebView-to-daemon static-route path can
+be checked in another disposable Ubuntu container:
+
+```bash
+e2e/linux/run_app_gui.sh --blank-config
+```
+
+This uses a container-only polkit rule for its headless user session, then
+checks save/connect/disconnect through the installed app's WebView and the
+kernel route table. It does not verify a visible polkit prompt or Wayland.
+
+## Windows on a disposable VM
 
 `crates/core/tests/windows_e2e.rs` contains opt-in integration scenarios that
 exercise real WireGuard/OpenVPN/Xray binaries and mutate the routing table.

@@ -44,6 +44,12 @@ processes). The main concerns:
   keys remain readable by the current user/SYSTEM/Administrators.
 - The original external files are never modified; if the source is not
   protected, the managed copy is — but the source itself stays as-is.
+- On Linux, the optional OpenVPN "Remember" choice stores credentials as
+  plaintext in a user-only `0600` file under that profile's vault directory.
+  Without "Remember", credentials are sent only for the current connection.
+  The daemon answers OpenVPN management prompts over its private Unix socket
+  and retains credentials in process memory for reconnect; they are not put
+  in argv, staged config files, or the ownership journal.
 
 ## Redaction
 
@@ -89,13 +95,54 @@ processes). The main concerns:
 - The proxy ownership record (`proxy-state.json`) is ACL-protected like the
   vault.
 
+### Linux daemon
+
+- `network-orchestrator-daemon` runs as a systemd service with
+  `CAP_NET_ADMIN`, restricted filesystems, address families, and device access.
+  Its socket is world-connectable; socket permissions are not the
+  authorization boundary.
+- The daemon identifies each client through `SO_PEERCRED`. Mutating requests
+  go through polkit `CheckAuthorization` for that process. Applying routes or
+  changing an interface uses `com.netmanager.app.system-network`
+  (`auth_admin_keep` for an active session). Removing owned routes uses
+  `com.netmanager.app.connect-profile` (`allow_active=yes`). Read-only owner
+  queries are filtered by uid, and an authorized user cannot remove another
+  uid's owner.
+- Routes are added with a dedicated protocol number and exclusive netlink
+  creation so an existing route is not overwritten. The daemon writes its
+  ownership journal to `/var/lib/network-orchestrator/state.json` with mode
+  0600 before each mutation. On restart and graceful stop it attempts to
+  remove journaled routes.
+- A malformed or unsupported journal blocks daemon startup and remains on
+  disk for inspection. It must be recovered before privileged mutations can
+  resume; starting with empty ownership would risk leaving routes behind.
+- Linux WireGuard links, OpenVPN processes, Xray TUN processes, full-tunnel
+  rules and per-link DNS use the daemon's ownership journal and cleanup.
+  Xray SOCKS/HTTP runs in the UI process. Docker E2E covers normal disconnect
+  and daemon crash recovery; desktop acceptance remains pending. The daemon
+  executes Xray TUN only from a root-owned, hash-verified package path and
+  accepts only a restricted generated-config schema.
+- Explicit always-on enrollment is currently limited to WireGuard and static
+  routes. The daemon stores typed per-uid definitions under its root-owned
+  state directory (`0700` directories, `0600` files), replays them after
+  recovery, and keeps a persistent pause after "Disconnect all" until an
+  authorized resume. OpenVPN and Xray TUN always-on enrollment is rejected.
+
 ## Known gaps
 
+- Public Linux package release needs a geo-data provenance and freshness review.
+  The pinned Xray archive includes `geoip.dat` built from sources that include
+  MaxMind GeoLite data; the [GeoLite EULA](https://www.maxmind.com/en/geolite/eula)
+  requires old databases to be replaced or destroyed after an update. The
+  locally built packages are test artifacts, not a cleared release.
 - Release artifacts are **unsigned** — no code-signing or update signing;
   SmartScreen warnings are expected.
-- Tauri CSP is currently `null` (`tauri.conf.json`) — no CSP hardening yet.
-- Xray health reports `Degraded` until listener/API/outbound verification
-  is implemented; OpenVPN health relies on log markers, not the management
-  interface.
+- Tauri applies a local-resource CSP in production; `style-src 'unsafe-inline'`
+  remains necessary for the app's dynamic inline styles. Development allows
+  the Vite localhost WebSocket for HMR.
+- Windows Xray health reports `Degraded` until listener/API/outbound
+  verification is implemented; Windows OpenVPN health relies on log markers.
+  Linux OpenVPN state comes from its management interface; Linux Xray TUN
+  status checks the managed process and interface.
 - No `ProxyAutoConfigURL`/`AutoConfigURL` handling — only the explicit
   `ProxyServer`/`ProxyOverride`/`ProxyEnable` values are managed.
