@@ -350,6 +350,12 @@ export default function InterfaceList() {
                               <span className="row-value mono">{iface.gateway}</span>
                             </div>
                           )}
+                          {iface.ipv6Gateway && (
+                            <div className="interface-row">
+                              <span className="row-label">IPv6 gateway</span>
+                              <span className="row-value mono">{iface.ipv6Gateway}</span>
+                            </div>
+                          )}
                           {iface.addresses.length > 0 && (
                             <div className="interface-section">
                               <span className="section-label">Addresses</span>

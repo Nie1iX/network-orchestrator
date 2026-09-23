@@ -33,6 +33,7 @@ const OWNER_COLORS = [
 
 function destGroup(dest: string): string {
   if (dest === "0.0.0.0/0") return "0.0.0.0/0 (default)";
+  if (dest === "::/0") return "::/0 (default)";
   const parts = dest.split(".");
   if (parts.length >= 2) return `${parts[0]}.${parts[1]}.0.0/16`;
   return dest;

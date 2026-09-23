@@ -37,6 +37,7 @@ pub(crate) fn iface(name: &str, friendly_name: &str, state: InterfaceState) -> N
         physical: true,
         mac: None,
         gateway: None,
+        ipv6_gateway: None,
         rx_bytes: None,
         tx_bytes: None,
         link_speed_mbps: None,

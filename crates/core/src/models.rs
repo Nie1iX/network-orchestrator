@@ -18,6 +18,9 @@ pub struct NetworkInterface {
     pub physical: bool,
     pub mac: Option<String>,
     pub gateway: Option<IpAddr>,
+    /// Default IPv6 next hop on this interface (often link-local).
+    #[serde(default)]
+    pub ipv6_gateway: Option<IpAddr>,
     pub rx_bytes: Option<u64>,
     pub tx_bytes: Option<u64>,
     pub link_speed_mbps: Option<u64>,
@@ -559,6 +562,7 @@ mod tests {
             physical: false,
             mac: None,
             gateway: None,
+            ipv6_gateway: None,
             rx_bytes: None,
             tx_bytes: None,
             link_speed_mbps: None,

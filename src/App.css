@@ -436,6 +436,7 @@ section {
 
 .row-value {
   text-align: right;
+  overflow-wrap: anywhere;
   display: flex;
   gap: var(--sp-3);
 }
@@ -763,6 +764,7 @@ section {
 .route-table th,
 .route-table td {
   text-align: left;
+  overflow-wrap: anywhere;
   padding: var(--sp-2) var(--sp-3);
   border-bottom: 1px solid var(--border);
 }
@@ -946,6 +948,7 @@ button:disabled {
 
 .detail-table td:last-child {
   text-align: right;
+  overflow-wrap: anywhere;
 }
 
 .detail-section {
@@ -2171,6 +2174,7 @@ button:disabled {
   border-radius: var(--r-full);
   font-size: 0.72rem;
   font-family: monospace;
+  overflow-wrap: anywhere;
   border: 1px solid var(--border);
   background: var(--bg-input);
   color: var(--text-secondary);

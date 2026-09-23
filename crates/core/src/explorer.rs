@@ -1,39 +1,39 @@
 use crate::models::*;
-#[cfg(not(target_os = "linux"))]
-use ipnet::IpNet;
 use net_route::Handle as RouteHandle;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
 // ── Route table reading (cross-platform via net-route) ──────────────────
 
-/// List all IPv4 routes from the system routing table.
+/// List all IPv4 and IPv6 routes from the system routing table.
 pub async fn list_routes() -> std::io::Result<Vec<RouteEntry>> {
     let handle = RouteHandle::new()?;
     let routes = handle.list().await?;
+    Ok(route_entries(routes, &build_ifindex_name_map()))
+}
 
-    let name_map = build_ifindex_name_map();
-
-    let mut result = Vec::new();
-    for r in routes {
-        if r.destination.is_ipv6() {
-            continue; // IPv4 only in MVP-0
-        }
-        let if_index = r.ifindex.unwrap_or(0);
-        let name = name_map
-            .get(&if_index)
-            .cloned()
-            .unwrap_or_else(|| format!("ifindex {}", if_index));
-        result.push(RouteEntry {
-            destination: r.destination,
-            prefix_len: r.prefix,
-            gateway: r.gateway,
-            interface_index: if_index,
-            interface_name: name,
-            metric: route_metric(&r),
-        });
-    }
-    Ok(result)
+fn route_entries(
+    routes: Vec<net_route::Route>,
+    name_map: &HashMap<u32, String>,
+) -> Vec<RouteEntry> {
+    routes
+        .into_iter()
+        .map(|r| {
+            let if_index = r.ifindex.unwrap_or(0);
+            let name = name_map
+                .get(&if_index)
+                .cloned()
+                .unwrap_or_else(|| format!("ifindex {}", if_index));
+            RouteEntry {
+                destination: r.destination,
+                prefix_len: r.prefix,
+                gateway: r.gateway,
+                interface_index: if_index,
+                interface_name: name,
+                metric: route_metric(&r),
+            }
+        })
+        .collect()
 }
 
 /// Build a map of interface index → friendly name.
@@ -60,36 +60,24 @@ fn route_metric(r: &net_route::Route) -> u32 {
 
 // ── Route lookup ────────────────────────────────────────────────────────
 
+/// Longest prefix wins; ties go to the lowest metric. Routes of the other
+/// address family never match.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn longest_prefix_match(dest: IpAddr, routes: &[RouteEntry]) -> Option<&RouteEntry> {
+    routes
+        .iter()
+        .filter(|r| {
+            ipnet::IpNet::new(r.destination, r.prefix_len).is_ok_and(|net| net.contains(&dest))
+        })
+        .min_by_key(|r| (std::cmp::Reverse(r.prefix_len), r.metric))
+}
+
 /// Given a destination IP, find which route and interface the OS would use.
 #[cfg(not(target_os = "linux"))]
 pub async fn lookup_route(dest: IpAddr) -> std::io::Result<RouteLookupResult> {
     let routes = list_routes().await?;
-
-    let mut best: Option<&RouteEntry> = None;
-    let mut best_prefix: u8 = 0;
-    let mut best_metric: u32 = u32::MAX;
-
-    for r in &routes {
-        if let IpAddr::V4(dst) = r.destination {
-            let net = match ipnet::Ipv4Net::new(dst, r.prefix_len) {
-                Ok(n) => IpNet::V4(n),
-                Err(_) => continue,
-            };
-            if net.contains(&dest) {
-                // Longest prefix wins; tie-break by lowest metric
-                if r.prefix_len > best_prefix
-                    || (r.prefix_len == best_prefix && r.metric < best_metric)
-                {
-                    best = Some(r);
-                    best_prefix = r.prefix_len;
-                    best_metric = r.metric;
-                }
-            }
-        }
-    }
-
-    let matched =
-        best.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no matching route"))?;
+    let matched = longest_prefix_match(dest, &routes)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no matching route"))?;
 
     Ok(RouteLookupResult {
         destination: dest,
@@ -422,8 +410,9 @@ fn adapter_to_model(adapter: &IP_ADAPTER_ADDRESSES_LH) -> NetworkInterface {
         physical: is_physical_windows(adapter.IfType),
         mac,
         gateway,
-        rx_bytes: None, // requires GetIfEntry2 — deferred
-        tx_bytes: None, // requires GetIfEntry2 — deferred
+        ipv6_gateway: None, // Windows keeps the single `gateway` field
+        rx_bytes: None,     // requires GetIfEntry2 — deferred
+        tx_bytes: None,     // requires GetIfEntry2 — deferred
         link_speed_mbps,
         category,
         description,
@@ -731,8 +720,12 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
 
         // Build result in deterministic order
         let mut result = Vec::new();
-        for (idx, name) in names.iter().enumerate() {
-            let if_index = (idx + 1) as u32;
+        for name in names.iter() {
+            // Kernel ifindex, so route entries (which carry the kernel index)
+            // resolve to the right interface name.
+            let if_index = std::ffi::CString::new(name.as_str())
+                .map(|c_name| libc::if_nametoindex(c_name.as_ptr()))
+                .unwrap_or(0);
             let addresses = addr_map.remove(name).unwrap_or_default();
             let kind = classify_interface_linux(name);
             let is_up = *is_up_map.get(name).unwrap_or(&false);
@@ -748,6 +741,7 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
                 .is_ok();
             let mac = read_linux_mac(name);
             let gateway = read_linux_gateway(name);
+            let ipv6_gateway = read_linux_ipv6_gateway(name);
             let dns_suffix = read_linux_dns_suffix();
             let rx_bytes = read_linux_stat(name, "statistics/rx_bytes");
             let tx_bytes = read_linux_stat(name, "statistics/tx_bytes");
@@ -767,6 +761,7 @@ pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
                 physical,
                 mac,
                 gateway,
+                ipv6_gateway,
                 rx_bytes,
                 tx_bytes,
                 link_speed_mbps,
@@ -865,6 +860,49 @@ fn read_linux_gateway(name: &str) -> Option<IpAddr> {
     // This is a best-effort heuristic.
     let routes = std::fs::read_to_string("/proc/net/route").ok()?;
     parse_proc_net_route_default_gateway(&routes, name).map(IpAddr::V4)
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_ipv6_gateway(name: &str) -> Option<IpAddr> {
+    let routes = std::fs::read_to_string("/proc/net/ipv6_route").ok()?;
+    parse_proc_net_ipv6_route_default_gateway(&routes, name).map(IpAddr::V6)
+}
+
+/// Lowest-metric IPv6 default next hop on `iface` in `/proc/net/ipv6_route`
+/// text (`dst dst_len src src_len next_hop metric refcnt use flags dev`, all
+/// hex). The file spans every routing table, so this is a best-effort view.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_net_ipv6_route_default_gateway(
+    text: &str,
+    iface: &str,
+) -> Option<std::net::Ipv6Addr> {
+    const RTF_GATEWAY: u32 = 0x2;
+    const RTF_REJECT: u32 = 0x200;
+    let mut best: Option<(u32, std::net::Ipv6Addr)> = None;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 || fields[9] != iface || fields[1] != "00" {
+            continue;
+        }
+        let (Ok(destination), Ok(next_hop), Ok(metric), Ok(flags)) = (
+            u128::from_str_radix(fields[0], 16),
+            u128::from_str_radix(fields[4], 16),
+            u32::from_str_radix(fields[5], 16),
+            u32::from_str_radix(fields[8], 16),
+        ) else {
+            continue;
+        };
+        if destination != 0
+            || next_hop == 0
+            || flags & RTF_GATEWAY == 0
+            || flags & RTF_REJECT != 0
+            || best.is_some_and(|(current, _)| current <= metric)
+        {
+            continue;
+        }
+        best = Some((metric, std::net::Ipv6Addr::from(next_hop)));
+    }
+    best.map(|(_, gateway)| gateway)
 }
 
 /// Gateway of the first IPv4 default route on `iface` in `/proc/net/route`
@@ -1043,6 +1081,81 @@ mod tests {
         assert_eq!(
             parse_proc_net_route_default_gateway(text, "wlp2s0"),
             Some(Ipv4Addr::new(192, 168, 1, 1))
+        );
+    }
+
+    #[test]
+    fn proc_net_ipv6_route_gateway_is_per_interface_and_lowest_metric() {
+        let text = "\
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003 wlp2s0\n\
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000002 00000064 00000001 00000000 00000003 wlp2s0\n\
+20010db8000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 wlp2s0\n\
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 00000400 00000001 00000000 00000001 wg0\n\
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n\
+garbage line\n";
+        assert_eq!(
+            parse_proc_net_ipv6_route_default_gateway(text, "wlp2s0"),
+            Some("fe80::2".parse().unwrap())
+        );
+        assert_eq!(parse_proc_net_ipv6_route_default_gateway(text, "wg0"), None);
+        assert_eq!(parse_proc_net_ipv6_route_default_gateway(text, "lo"), None);
+        assert_eq!(
+            parse_proc_net_ipv6_route_default_gateway(text, "enp0s3"),
+            None
+        );
+    }
+
+    #[test]
+    fn route_entries_keep_ipv6_routes_and_interface_names() {
+        let routes = vec![
+            net_route::Route::new("0.0.0.0".parse().unwrap(), 0)
+                .with_gateway("192.0.2.1".parse().unwrap())
+                .with_ifindex(2),
+            net_route::Route::new("2001:db8::".parse().unwrap(), 32).with_ifindex(7),
+            net_route::Route::new("::".parse().unwrap(), 0)
+                .with_gateway("fe80::1".parse().unwrap())
+                .with_ifindex(2),
+        ];
+        let names = HashMap::from([(2, "eth0".to_string()), (7, "wg0".to_string())]);
+        let entries = route_entries(routes, &names);
+        assert_eq!(entries.len(), 3);
+        let v6 = &entries[1];
+        assert_eq!(v6.destination, "2001:db8::".parse::<IpAddr>().unwrap());
+        assert_eq!(v6.prefix_len, 32);
+        assert_eq!(v6.interface_index, 7);
+        assert_eq!(v6.interface_name, "wg0");
+        assert_eq!(entries[2].gateway, Some("fe80::1".parse().unwrap()));
+        assert_eq!(entries[2].interface_name, "eth0");
+    }
+
+    #[test]
+    fn longest_prefix_match_supports_ipv6_and_keeps_families_apart() {
+        let entry = |dest: &str, prefix_len: u8, name: &str, metric: u32| RouteEntry {
+            destination: dest.parse().unwrap(),
+            prefix_len,
+            gateway: None,
+            interface_index: 1,
+            interface_name: name.into(),
+            metric,
+        };
+        let routes = [
+            entry("0.0.0.0", 0, "eth0-v4", 100),
+            entry("::", 0, "eth0", 1024),
+            entry("2001:db8::", 32, "wg-slow", 50),
+            entry("2001:db8::", 32, "wg0", 5),
+            entry("2001:db8:1::", 48, "wg1", 500),
+        ];
+        let best = |dest: &str| {
+            longest_prefix_match(dest.parse().unwrap(), &routes)
+                .map(|route| route.interface_name.as_str())
+        };
+        assert_eq!(best("2001:db8:1::5"), Some("wg1"));
+        assert_eq!(best("2001:db8:2::5"), Some("wg0"));
+        assert_eq!(best("2606:4700::1111"), Some("eth0"));
+        assert_eq!(best("8.8.8.8"), Some("eth0-v4"));
+        assert_eq!(
+            longest_prefix_match("8.8.8.8".parse().unwrap(), &routes[1..]),
+            None
         );
     }
 

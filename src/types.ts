@@ -36,6 +36,7 @@ export interface NetworkInterface {
   physical: boolean;
   mac: string | null;
   gateway: string | null;
+  ipv6Gateway: string | null;
   rxBytes: number | null;
   txBytes: number | null;
   linkSpeedMbps: number | null;

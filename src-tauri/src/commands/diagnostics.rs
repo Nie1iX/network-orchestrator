@@ -633,11 +633,8 @@ fn linux_owned_checks(
         .count();
     let main_routes: Vec<_> = journal_routes
         .iter()
-        .filter(|route| route.table.is_none() && route.destination.network().is_ipv4())
+        .filter(|route| route.table.is_none())
         .collect();
-    let ipv6_main_unknown = journal_routes
-        .iter()
-        .any(|route| route.table.is_none() && route.destination.network().is_ipv6());
     let missing_main = match &input.os_routes {
         Ok(os_routes) => main_routes
             .iter()
@@ -653,7 +650,7 @@ fn linux_owned_checks(
         diag_check("Applied routes", DiagnosticLevel::Error, format!(
             "Daemon route ownership is incomplete: {missing_expected} expected and {missing_main} main-table route(s) missing"
         ))
-    } else if expected.is_empty() || input.os_routes.is_err() || ipv6_main_unknown || journal_routes.iter().any(|route| route.table.is_some()) {
+    } else if expected.is_empty() || input.os_routes.is_err() || journal_routes.iter().any(|route| route.table.is_some()) {
         diag_check("Applied routes", DiagnosticLevel::Warning, format!(
             "{} route(s) journaled; expected coverage or non-main OS table is not fully verified",
             journal_routes.len()
@@ -1409,7 +1406,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn ipv6_owned_route_is_unknown_when_os_inventory_is_ipv4_only() {
+    fn ipv6_owned_main_route_is_verified_against_os_inventory() {
         use net_manager_core::daemon_protocol::OwnedListResult;
         use serde_json::json;
 
@@ -1427,11 +1424,24 @@ mod tests {
         }]}))
         .unwrap();
 
+        input.os_routes = Ok(vec![route_entry("2001:db8::", 32, 7, 1024)]);
         let checks = linux_owned_checks(&input, Some(&owned));
+        let applied = check_named(&checks, "Applied routes");
+        assert_eq!(applied.level, DiagnosticLevel::Warning);
+        assert!(
+            applied.message.contains("matching OS routes visible"),
+            "{}",
+            applied.message
+        );
 
-        assert_eq!(
-            check_named(&checks, "Applied routes").level,
-            DiagnosticLevel::Warning
+        input.os_routes = Ok(vec![route_entry("2001:db8::", 32, 8, 1024)]);
+        let checks = linux_owned_checks(&input, Some(&owned));
+        let applied = check_named(&checks, "Applied routes");
+        assert_eq!(applied.level, DiagnosticLevel::Error);
+        assert!(
+            applied.message.contains("1 main-table route(s) missing"),
+            "{}",
+            applied.message
         );
     }
 
