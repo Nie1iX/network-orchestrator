@@ -26,14 +26,19 @@ pub(crate) enum RouteRuntime {
     Daemon(DaemonClient),
 }
 
+/// Owner prefixes the daemon reserves for tunnels; they are never static routes.
+#[cfg(target_os = "linux")]
+const TUNNEL_OWNER_PREFIXES: [&str; 4] = ["wg:", "ovpn:", "ovpn-probe:", "xray:"];
+
 #[cfg(target_os = "linux")]
 fn static_route_snapshot(result: OwnedListResult) -> Vec<AppliedProfileRoutes> {
     result
         .owners
         .into_iter()
         .filter(|entry| {
-            !entry.owner.starts_with("wg:")
-                && !entry.owner.starts_with("ovpn:")
+            !TUNNEL_OWNER_PREFIXES
+                .iter()
+                .any(|prefix| entry.owner.starts_with(prefix))
                 && !entry.resources.iter().any(|resource| {
                     matches!(
                         resource,
@@ -228,6 +233,38 @@ mod tests {
             ],
         });
         assert!(snapshot.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reserved_tunnel_owner_prefixes_are_not_static_route_owners() {
+        use net_manager_core::daemon_protocol::{OwnedEntry, OwnedResource, OwnedState};
+        let route = OwnedResource::Route(AppliedRoute {
+            destination: "10.9.0.0/24".parse().unwrap(),
+            interface_index: 5,
+            metric: 5,
+            gateway: None,
+            table: None,
+        });
+        let entry = |owner: &str| OwnedEntry {
+            owner: owner.into(),
+            state: OwnedState::Applied,
+            resources: vec![route.clone()],
+        };
+        let snapshot = static_route_snapshot(OwnedListResult {
+            owners: vec![
+                entry("xray:p1"),
+                entry("ovpn-probe:p1"),
+                entry("wg:p1"),
+                entry("ovpn:p1"),
+                entry("static"),
+            ],
+        });
+        let owners: Vec<_> = snapshot
+            .iter()
+            .map(|item| item.profile_id.as_str())
+            .collect();
+        assert_eq!(owners, ["static"]);
     }
 
     #[tokio::test]
