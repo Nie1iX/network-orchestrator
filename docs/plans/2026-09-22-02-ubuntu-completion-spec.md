@@ -469,6 +469,38 @@ Xray запускается через daemon от root. IP-адрес, MTU, м�
 | S6 | Lifecycle | auto-connect, always-on, tray, re-attach UI, network change, diagnostics | B11, UC 16–21, 25 |
 | S7 | Пакет и приёмка | `.deb` + unit + polkit + deps, CSP, название, updater, документация; полный прогон §6 на чистой VM | B13–B15, UC 01, 22–24 |
 
+## 7a. Статус реализации (2026-09-23)
+
+S0–S7 реализованы на ветке `feat/linux-ubuntu-support`. Подробности — в
+планах `2026-09-22-03…10`.
+
+**Проверено запуском (Docker-стенд, `e2e/linux/run.sh`):**
+- daemon под systemd и polkit: маршруты v4/v6, `EXCL`, изоляция uid,
+  recovery после `kill -9`, teardown на `stop`, режим пароля VPN;
+- WireGuard split/full, включая flap uplink и восстановление правил;
+- OpenVPN split/full/DNS/auth через management;
+- Xray VLESS и Hysteria2 (proxy, interop), Xray TUN;
+- always-on static.
+
+**GUI smoke из `.deb`** (`e2e/linux/run_app_gui.sh`): WebView → daemon → маршрут
+в ядре и обратно.
+
+**Не проверено:**
+- приёмка §6 на чистой Ubuntu (VM или железо): GNOME tray, login autostart,
+  реальный suspend/resume, смена Wi‑Fi ↔ Ethernet под NetworkManager,
+  keyring с диалогом разблокировки;
+- smoke на Debian 13 и Arch (`makepkg -si`);
+- Windows в рантайме: там только clippy, приложение — с заглушками
+  компилятора.
+
+**Известные ограничения:**
+- OpenVPN always-on не поддерживается;
+- Xray обновляется только вместе с пакетом;
+- UI опрашивает статус polling'ом вместо событий `subscribe`;
+- vault-импорт не ограничивает размер OpenVPN assets (лимит 1 MiB
+  проверяет daemon);
+- IPv6 ECMP-маршруты показываются без интерфейса.
+
 ## 8. Решения владельца и открытые вопросы
 
 Решено 2026-09-22:
@@ -485,6 +517,9 @@ Xray запускается через daemon от root. IP-адрес, MTU, м�
 - **Q5 → kill switch — будущая опциональная функция**, сейчас не делаем.
   Архитектура (D2: отдельные таблицы и `ip rule`) не должна мешать добавить
   его позже.
+- **Q7 (2026-09-23) → режим пароля VPN на выбор администратора**:
+  `noPrompt` / `fullTunnelOnly` (по умолчанию) / `always`. Режим применяет
+  daemon; см. `docs/security.md`.
 - **Q6 → Ubuntu/Debian и Arch.** `.deb` + `PKGBUILD` (G1–G2); AppImage и
   Linux auto-update не делаем (G2a, G3). DoD: пакеты ставятся и проходят §6
   на Ubuntu 26.04; на Debian stable и Arch — smoke-проверка UC 01, 03, 09,
