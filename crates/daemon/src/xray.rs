@@ -189,12 +189,45 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                     return Err(rejected());
                 }
                 for item in items {
-                    string(item)?;
+                    routing_selector(key, string(item)?)?;
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Root Xray resolves `ext:`-style selectors to files next to its assets, so
+/// accept only the selector forms the app generates.
+fn routing_selector(key: &str, item: &str) -> io::Result<()> {
+    let valid = if key == "ip" {
+        match item.strip_prefix("geoip:") {
+            Some(country) => {
+                country == "private"
+                    || (country.len() == 2
+                        && country.bytes().all(|byte| byte.is_ascii_alphabetic()))
+            }
+            None => item.parse::<IpAddr>().is_ok() || item.parse::<ipnet::IpNet>().is_ok(),
+        }
+    } else {
+        match item.split_once(':') {
+            Some(("geosite", category)) => {
+                !category.is_empty()
+                    && category.len() <= 64
+                    && category
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            }
+            Some(("domain" | "full" | "keyword" | "regexp", value)) => !value.is_empty(),
+            Some(_) => false,
+            None => !item.contains(['/', '\\']),
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(rejected())
+    }
 }
 
 fn validate_vless_stream(stream: &Value) -> io::Result<()> {
@@ -479,6 +512,34 @@ mod tests {
             let mut input = params();
             input.config = generated.to_string();
             assert!(prepare_xray(1000, input, 51820).is_ok(), "generated schema was rejected");
+        }
+    }
+
+    #[test]
+    fn routing_selectors_cannot_load_arbitrary_asset_files() {
+        let with_rule = |rule: Value| {
+            let mut config: Value = serde_json::from_str(&params().config).unwrap();
+            config["routing"]["rules"] = json!([rule]);
+            let mut input = params();
+            input.config = config.to_string();
+            prepare_xray(1000, input, 51820)
+        };
+        for rule in [
+            json!({"type":"field","domain":["ext:geosite.dat:cn"],"outboundTag":"proxy"}),
+            json!({"type":"field","domain":["ext-domain:custom.dat:ads"],"outboundTag":"proxy"}),
+            json!({"type":"field","domain":["geosite:../../etc/shadow"],"outboundTag":"proxy"}),
+            json!({"type":"field","domain":["../../etc/shadow"],"outboundTag":"proxy"}),
+            json!({"type":"field","ip":["ext:../../etc/shadow:tag"],"outboundTag":"direct"}),
+            json!({"type":"field","ip":["ext-ip:geoip.dat:cn"],"outboundTag":"direct"}),
+            json!({"type":"field","ip":["example.test"],"outboundTag":"direct"}),
+        ] {
+            assert!(with_rule(rule.clone()).is_err(), "{rule}");
+        }
+        for rule in [
+            json!({"type":"field","domain":["example.com","domain:a.test","full:b.test","keyword:ads","regexp:^c\\.test$","geosite:category-ads_all"],"outboundTag":"proxy"}),
+            json!({"type":"field","ip":["geoip:private","geoip:us","10.0.0.0/8","::1/128","192.0.2.1"],"outboundTag":"direct"}),
+        ] {
+            assert!(with_rule(rule.clone()).is_ok(), "{rule}");
         }
     }
 
