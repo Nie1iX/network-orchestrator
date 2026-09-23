@@ -3144,15 +3144,21 @@ impl DaemonCore {
             .collect()
     }
 
-    /// Forget only static owners whose daemon-protocol routes disappeared from
-    /// the kernel (for example after a physical link flap). A later always-on
-    /// replay resolves the current ifindex before installing them again.
-    pub fn reconcile_static_routes(&mut self, observed: &[AppliedRoute]) -> io::Result<usize> {
+    /// Forget only always-on static owners (`replayable`) whose routes
+    /// disappeared from the kernel (for example after a physical link flap).
+    /// A later always-on replay resolves the current ifindex before installing
+    /// them again; other owners are never torn down here.
+    pub fn reconcile_static_routes(
+        &mut self,
+        observed: &[AppliedRoute],
+        replayable: &HashSet<(u32, String)>,
+    ) -> io::Result<usize> {
         let mut removed = 0;
         let mut failed = false;
         for index in (0..self.journal.entries.len()).rev() {
             let entry = &self.journal.entries[index];
             if entry.state != OwnedState::Applied
+                || !replayable.contains(&(entry.uid, entry.owner.clone()))
                 || entry.owner.starts_with("wg:")
                 || entry.owner.starts_with("ovpn:")
                 || entry.owner.starts_with("xray:")
@@ -3165,7 +3171,9 @@ impl DaemonCore {
                 continue;
             }
             let missing = entry.resources.iter().any(|resource| match resource {
-                OwnedResource::Route(route) => !observed.contains(route),
+                OwnedResource::Route(route) => !observed
+                    .iter()
+                    .any(|seen| kernel_route(seen) == kernel_route(route)),
                 _ => false,
             });
             if missing {
@@ -3576,6 +3584,15 @@ impl DaemonCore {
             eprintln!("network-orchestrator-daemon: failed to save journal: {err}");
         }
     }
+}
+
+/// The kernel stores an IPv6 route requested with metric 0 as metric 1024.
+fn kernel_route(route: &AppliedRoute) -> AppliedRoute {
+    let mut route = route.clone();
+    if route.destination.addr().is_ipv6() && route.metric == 0 {
+        route.metric = 1024;
+    }
+    route
 }
 
 /// Removing a route that is already gone is success: the goal state holds.

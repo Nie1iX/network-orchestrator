@@ -103,11 +103,16 @@ mod linux {
                 Box::new(TrustedOpenVpnProcess::new()),
                 Box::new(TrustedXrayProcess::new()),
             )?;
-            let report = always_on::replay(&mut core, &startup_always_on)?;
-            eprintln!(
-                "network-orchestrator-daemon: always-on replay started {}, active {}, blocked {}, failed {}",
-                report.started, report.already_active, report.blocked, report.failed
-            );
+            // Always-on is best effort: the socket must come up regardless.
+            match always_on::replay(&mut core, &startup_always_on) {
+                Ok(report) => eprintln!(
+                    "network-orchestrator-daemon: always-on replay started {}, active {}, blocked {}, failed {}",
+                    report.started, report.already_active, report.blocked, report.failed
+                ),
+                Err(err) => {
+                    eprintln!("network-orchestrator-daemon: always-on replay skipped: {err}")
+                }
+            }
             Ok::<_, io::Error>(core)
         })
         .await
@@ -163,7 +168,8 @@ mod linux {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let mut core = core.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let observed = netlink.owned_routes_snapshot()?;
-                    core.reconcile_static_routes(&observed)?;
+                    let replayable = always_on::replayable_owners(&store)?;
+                    core.reconcile_static_routes(&observed, &replayable)?;
                     always_on::replay(&mut core, &store)
                 })
                 .await;

@@ -4,6 +4,7 @@ use crate::wireguard::parse_wireguard_config;
 use net_manager_core::daemon_protocol::{AlwaysOnDefinition, MAX_FRAME_BYTES};
 use net_manager_core::models::AppliedRoute;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -146,6 +147,12 @@ pub fn apply_definition(
 pub fn replay(core: &mut DaemonCore, store: &AlwaysOnStore) -> io::Result<ReplayReport> {
     let mut report = ReplayReport::default();
     for (uid, document) in store.load_all()? {
+        // One unreadable per-uid store must not block the other users.
+        let Ok(document) = document else {
+            eprintln!("network-orchestrator-daemon: always-on store of uid {uid} is unreadable");
+            report.failed += 1;
+            continue;
+        };
         if document.paused {
             continue;
         }
@@ -170,6 +177,23 @@ pub fn replay(core: &mut DaemonCore, store: &AlwaysOnStore) -> io::Result<Replay
         }
     }
     Ok(report)
+}
+
+/// Owners that `replay` installs again: enabled entries of unpaused stores.
+pub fn replayable_owners(store: &AlwaysOnStore) -> io::Result<HashSet<(u32, String)>> {
+    let mut owners = HashSet::new();
+    for (uid, document) in store.load_all()? {
+        let Ok(document) = document else {
+            continue;
+        };
+        if document.paused {
+            continue;
+        }
+        for entry in document.entries.iter().filter(|entry| entry.enabled) {
+            owners.insert((uid, entry.definition.owner()));
+        }
+    }
+    Ok(owners)
 }
 
 impl AlwaysOnStore {
@@ -218,24 +242,28 @@ impl AlwaysOnStore {
         Ok(document)
     }
 
-    pub fn load_all(&self) -> io::Result<Vec<(u32, AlwaysOnDocument)>> {
+    /// Every uid store, each loaded independently so one broken store does
+    /// not hide the others. Entries that are not uid directories are ignored.
+    pub fn load_all(&self) -> io::Result<Vec<(u32, io::Result<AlwaysOnDocument>)>> {
         if !check_private_dir(&self.root, false)? {
             return Ok(Vec::new());
         }
         let mut uids = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
-            let uid = entry
+            if let Some(uid) = entry
                 .file_name()
                 .to_str()
                 .and_then(|name| name.parse::<u32>().ok())
-                .ok_or_else(invalid_data)?;
-            uids.push(uid);
+            {
+                uids.push(uid);
+            }
         }
         uids.sort_unstable();
-        uids.into_iter()
-            .map(|uid| Ok((uid, self.load_uid(uid)?)))
-            .collect()
+        Ok(uids
+            .into_iter()
+            .map(|uid| (uid, self.load_uid(uid)))
+            .collect())
     }
 
     pub fn insert(&self, uid: u32, definition: AlwaysOnDefinition) -> io::Result<bool> {
@@ -368,6 +396,7 @@ fn invalid_data() -> io::Error {
 mod tests {
     use super::*;
     use net_manager_core::daemon_protocol::{AlwaysOnDefinition, WireGuardConnectParams};
+    use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -493,18 +522,92 @@ mod tests {
         let owned = AppliedRoute::on_link("198.18.88.0/24".parse().unwrap(), 2, 5);
         core.apply_routes(1000, "office", vec![owned.clone()])
             .unwrap();
+        let replayable = HashSet::from([(1000, "office".to_string())]);
         assert_eq!(
-            core.reconcile_static_routes(std::slice::from_ref(&owned))
+            core.reconcile_static_routes(std::slice::from_ref(&owned), &replayable)
                 .unwrap(),
             0
         );
         let foreign = AppliedRoute::on_link("198.18.88.0/24".parse().unwrap(), 2, 99);
-        assert_eq!(core.reconcile_static_routes(&[foreign]).unwrap(), 1);
+        assert_eq!(
+            core.reconcile_static_routes(&[foreign], &replayable)
+                .unwrap(),
+            1
+        );
         assert!(core.owned(1000).is_empty());
         assert_eq!(
             recorder.ops().last(),
             Some(&Op::Remove(owned.destination.to_string()))
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn fake_core(dir: &Path) -> (DaemonCore, crate::core::testing::Recorder) {
+        use crate::core::testing::{FakeLinks, FakeRoutes, Recorder};
+        use crate::journal::{JournalStore, JOURNAL_FILE};
+
+        let recorder = Recorder::default();
+        let core = DaemonCore::open(
+            JournalStore::new(dir.join(JOURNAL_FILE)),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+        )
+        .unwrap();
+        (core, recorder)
+    }
+
+    fn static_routes(id: &str) -> AlwaysOnDefinition {
+        use net_manager_core::daemon_protocol::AlwaysOnStaticRoutes;
+        use net_manager_core::models::PolicyRoute;
+
+        AlwaysOnDefinition::StaticRoutes(AlwaysOnStaticRoutes {
+            profile_id: id.into(),
+            interface_name: "lo".into(),
+            routes: vec![PolicyRoute {
+                destination: "198.18.77.0/24".parse().unwrap(),
+                metric: 5,
+                via: None,
+            }],
+        })
+    }
+
+    #[test]
+    fn broken_uid_store_is_skipped_without_failing_replay() {
+        let dir = test_dir("broken-uid");
+        let store = AlwaysOnStore::new(dir.join("profiles"));
+        store.insert(1000, static_routes("office")).unwrap();
+        fs::write(dir.join("profiles/1000/definitions.json"), "{broken").unwrap();
+        store.insert(1001, static_routes("office")).unwrap();
+        let (mut core, _recorder) = fake_core(&dir);
+        let report = replay(&mut core, &store).unwrap();
+        assert_eq!((report.started, report.failed), (1, 1));
+        assert_eq!(core.owned(1001).len(), 1);
+        assert_eq!(
+            replayable_owners(&store).unwrap(),
+            HashSet::from([(1001, "office".to_string())])
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reconcile_normalizes_ipv6_metric_and_skips_non_always_on_owners() {
+        use net_manager_core::models::AppliedRoute;
+
+        let dir = test_dir("reconcile-scope");
+        let (mut core, recorder) = fake_core(&dir);
+        let v6 = AppliedRoute::on_link("fd00:77::/64".parse().unwrap(), 2, 0);
+        core.apply_routes(1000, "office", vec![v6.clone()]).unwrap();
+        let ui_owned = AppliedRoute::on_link("198.18.66.0/24".parse().unwrap(), 2, 5);
+        core.apply_routes(1000, "manual", vec![ui_owned]).unwrap();
+        let replayable = HashSet::from([(1000, "office".to_string())]);
+        let kernel_v6 = AppliedRoute { metric: 1024, ..v6 };
+        assert_eq!(
+            core.reconcile_static_routes(&[kernel_v6], &replayable)
+                .unwrap(),
+            0
+        );
+        assert_eq!(core.owned(1000).len(), 2);
+        assert_eq!(recorder.ops().len(), 2);
         fs::remove_dir_all(dir).unwrap();
     }
 }
