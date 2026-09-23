@@ -1050,6 +1050,8 @@ mod openvpn_tests {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            clock: Box::new(unix_now),
+            wireguard_connected_at: HashMap::new(),
             policy: Some(Box::new(policy.clone())),
             dns: Some(Box::new(dns.clone())),
         };
@@ -1209,6 +1211,36 @@ pub trait WgConfigExecutor: Send {
     }
 }
 
+/// WireGuard REJECT_AFTER_TIME: session keys older than this are unusable.
+const WIREGUARD_REJECT_AFTER_SECS: u64 = 180;
+/// How long a fresh tunnel may run without any handshake before it is failed.
+const WIREGUARD_HANDSHAKE_GRACE_SECS: u64 = 30;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// A tunnel whose peer never answered (after a grace period) or whose last
+/// handshake is past REJECT_AFTER_TIME cannot carry traffic.
+fn wireguard_handshake_state(
+    latest_handshake: Option<u64>,
+    connected_at: Option<u64>,
+    now: u64,
+) -> TunnelState {
+    let stale = match latest_handshake {
+        Some(handshake) => now.saturating_sub(handshake) > WIREGUARD_REJECT_AFTER_SECS,
+        None => connected_at
+            .is_some_and(|since| now.saturating_sub(since) > WIREGUARD_HANDSHAKE_GRACE_SECS),
+    };
+    if stale {
+        TunnelState::Failed
+    } else {
+        TunnelState::Running
+    }
+}
+
 pub struct DaemonCore {
     store: JournalStore,
     journal: JournalDocument,
@@ -1221,6 +1253,9 @@ pub struct DaemonCore {
     openvpn_runtime: HashMap<(u32, String), OpenVpnRuntime>,
     openvpn_failed: HashSet<(u32, String)>,
     openvpn_auth_failed: HashSet<(u32, String)>,
+    /// Unix seconds; injectable so handshake ageing is testable.
+    clock: Box<dyn Fn() -> u64 + Send>,
+    wireguard_connected_at: HashMap<(u32, String), u64>,
     #[cfg(target_os = "linux")]
     policy: Option<Box<dyn PolicyRuleExecutor>>,
     #[cfg(target_os = "linux")]
@@ -1351,6 +1386,8 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            clock: Box::new(unix_now),
+            wireguard_connected_at: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1387,6 +1424,8 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            clock: Box::new(unix_now),
+            wireguard_connected_at: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1421,6 +1460,8 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            clock: Box::new(unix_now),
+            wireguard_connected_at: HashMap::new(),
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -1449,6 +1490,8 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            clock: Box::new(unix_now),
+            wireguard_connected_at: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1481,6 +1524,8 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            clock: Box::new(unix_now),
+            wireguard_connected_at: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1518,6 +1563,8 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            clock: Box::new(unix_now),
+            wireguard_connected_at: HashMap::new(),
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -2797,6 +2844,8 @@ impl DaemonCore {
             self.persist();
             return Err(err);
         }
+        self.wireguard_connected_at
+            .insert((uid, owner), (self.clock)());
         Ok(self.wireguard_status(uid, profile_id))
     }
 
@@ -2900,7 +2949,18 @@ impl DaemonCore {
         {
             (Some(entry), Some(name)) if entry.state == OwnedState::Applied => {
                 match self.wg_config.as_ref().and_then(|wg| wg.health(name).ok()) {
-                    Some((handshake, rx, tx)) => (TunnelState::Running, handshake, rx, tx),
+                    Some((handshake, rx, tx)) => (
+                        wireguard_handshake_state(
+                            handshake,
+                            self.wireguard_connected_at
+                                .get(&(uid, owner.clone()))
+                                .copied(),
+                            (self.clock)(),
+                        ),
+                        handshake,
+                        rx,
+                        tx,
+                    ),
                     None => (TunnelState::Failed, None, 0, 0),
                 }
             }
@@ -3446,6 +3506,9 @@ impl DaemonCore {
     }
 
     fn teardown_wireguard_entry(&mut self, index: usize) -> io::Result<()> {
+        let entry = &self.journal.entries[index];
+        self.wireguard_connected_at
+            .remove(&(entry.uid, entry.owner.clone()));
         let resources = self.journal.entries[index].resources.clone();
         let link = resources
             .iter()
@@ -4610,6 +4673,8 @@ mod tests {
             }),
         )
         .unwrap();
+        // FakeWgConfig reports a handshake at t=42.
+        core.clock = Box::new(|| 50);
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
         let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
@@ -5061,6 +5126,8 @@ mod tests {
             Box::new(SequenceDns { outcomes }),
         )
         .unwrap();
+        // FakeWgConfig reports a handshake at t=42.
+        core.clock = Box::new(|| 50);
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nDNS=10.77.0.1\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
         let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
@@ -5112,6 +5179,8 @@ mod tests {
             }),
         )
         .unwrap();
+        // The fake peer handshook at t=42.
+        core.clock = Box::new(|| 50);
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nPostUp=echo SECRET-HOOK\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
         let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
@@ -5290,6 +5359,68 @@ mod tests {
         )
         .unwrap();
         assert!(recovered.owned(1000).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    struct DumpWgConfig(Arc<Mutex<String>>);
+
+    impl WgConfigExecutor for DumpWgConfig {
+        fn configure(&mut self, _name: &str, _config: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn health(&self, _name: &str) -> io::Result<(Option<u64>, u64, u64)> {
+            parse_wg_dump(&self.0.lock().unwrap())
+        }
+    }
+
+    #[test]
+    fn wireguard_status_reports_failed_for_stale_or_missing_handshake() {
+        let dir = unique_dir("wireguard-handshake");
+        let recorder = Recorder::default();
+        let dump = Arc::new(Mutex::new(String::new()));
+        let peer = |handshake: u64| {
+            format!("PRIVATE\tPUBLIC\t51820\toff\nPEER\t(none)\t192.0.2.1:51820\t10.77.0.0/24\t{handshake}\t5\t6\toff\n")
+        };
+        *dump.lock().unwrap() = peer(0);
+        let mut core = DaemonCore::open_with_wireguard(
+            JournalStore::new(dir.join(JOURNAL_FILE)),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(FakeWg {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail_remove_address: false,
+                before_create: None,
+            }),
+            Box::new(DumpWgConfig(dump.clone())),
+        )
+        .unwrap();
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let clock = now.clone();
+        core.clock = Box::new(move || clock.load(Ordering::SeqCst));
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        let state = |core: &DaemonCore| core.wireguard_status(1000, "home").state;
+        // No handshake yet: still starting inside the grace period.
+        assert_eq!(
+            core.connect_wireguard(1000, "home", plan).unwrap().state,
+            TunnelState::Running
+        );
+        now.store(1_030, Ordering::SeqCst);
+        assert_eq!(state(&core), TunnelState::Running);
+        now.store(1_031, Ordering::SeqCst);
+        assert_eq!(state(&core), TunnelState::Failed);
+        // A fresh handshake recovers; one older than REJECT_AFTER_TIME fails.
+        *dump.lock().unwrap() = peer(1_020);
+        assert_eq!(state(&core), TunnelState::Running);
+        now.store(1_200, Ordering::SeqCst);
+        assert_eq!(state(&core), TunnelState::Running);
+        now.store(1_201, Ordering::SeqCst);
+        let status = core.wireguard_status(1000, "home");
+        assert_eq!(status.state, TunnelState::Failed);
+        assert_eq!(status.latest_handshake, Some(1_020));
+        core.disconnect_wireguard(1000, "home").unwrap();
+        assert_eq!(state(&core), TunnelState::Stopped);
         fs::remove_dir_all(&dir).unwrap();
     }
 
