@@ -1402,7 +1402,7 @@ export default function ProfileManager() {
             <input type="checkbox" checked={rememberOpenVpnCredentials} onChange={(event) => setRememberOpenVpnCredentials(event.target.checked)} />
             Remember on this device
           </label>
-          <span className="profile-help">Stored in private app data on this device for automatic connections.</span>
+          <span className="profile-help">Stored in the system keyring (GNOME Keyring or KWallet). Without a keyring, kept only until the app exits.</span>
           {openVpnCredentialError && <p className="error" role="alert">{openVpnCredentialError}</p>}
         </form>
       </Modal>

@@ -33,6 +33,8 @@ pub(crate) struct AppState {
     pub(crate) shutting_down: AtomicBool,
     pub(crate) cleanup_complete: AtomicBool,
     pub(crate) runtime: tokio::sync::Mutex<RuntimeState>,
+    #[cfg(target_os = "linux")]
+    pub(crate) openvpn_credentials: crate::openvpn_credentials::OpenVpnCredentialStore,
 }
 
 pub(crate) fn resolve_backend_path(
@@ -128,6 +130,10 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
             routes,
             proxy: SystemProxyManager::new(data_dir.join("proxy-state.json"))?,
         }),
+        #[cfg(target_os = "linux")]
+        openvpn_credentials: crate::openvpn_credentials::OpenVpnCredentialStore::new(Box::new(
+            crate::openvpn_credentials::SecretServiceStore,
+        )),
     })
 }
 

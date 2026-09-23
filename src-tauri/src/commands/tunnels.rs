@@ -35,6 +35,8 @@ use net_manager_core::daemon_protocol::{
 };
 
 #[cfg(target_os = "linux")]
+use crate::openvpn_credentials::OpenVpnCredentialStore;
+#[cfg(target_os = "linux")]
 use base64::Engine;
 
 #[cfg(target_os = "linux")]
@@ -105,111 +107,6 @@ fn openvpn_credentials_path(
         return Err("managed OpenVPN config is invalid".into());
     }
     Ok(profile_dir.join("openvpn-credentials.json"))
-}
-
-#[cfg(target_os = "linux")]
-fn load_remembered_openvpn_credentials(
-    vault: &net_manager_core::config_vault::ConfigVault,
-    profile: &Profile,
-) -> Result<Option<OpenVpnCredentials>, String> {
-    use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    let path = openvpn_credentials_path(vault, profile)?;
-    let metadata = match std::fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("remembered OpenVPN credentials unavailable".into()),
-    };
-    if !metadata.file_type().is_file()
-        || metadata.permissions().mode() & 0o777 != 0o600
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.len() > 16 * 1024
-    {
-        return Err("remembered OpenVPN credentials unavailable".into());
-    }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .map_err(|_| "remembered OpenVPN credentials unavailable".to_string())?;
-    let opened = file
-        .metadata()
-        .map_err(|_| "remembered OpenVPN credentials unavailable".to_string())?;
-    if !opened.file_type().is_file()
-        || opened.permissions().mode() & 0o777 != 0o600
-        || opened.uid() != unsafe { libc::geteuid() }
-        || opened.ino() != metadata.ino()
-        || opened.dev() != metadata.dev()
-    {
-        return Err("remembered OpenVPN credentials unavailable".into());
-    }
-    let mut bytes = Vec::new();
-    file.take(16 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "remembered OpenVPN credentials unavailable".to_string())?;
-    if bytes.len() > 16 * 1024 {
-        return Err("remembered OpenVPN credentials unavailable".into());
-    }
-    let credentials: OpenVpnCredentials = serde_json::from_slice(&bytes)
-        .map_err(|_| "remembered OpenVPN credentials unavailable".to_string())?;
-    net_manager_core::openvpn_management::validate_openvpn_credentials(&credentials)
-        .map_err(|_| "remembered OpenVPN credentials unavailable".to_string())?;
-    Ok(Some(credentials))
-}
-
-#[cfg(target_os = "linux")]
-fn store_remembered_openvpn_credentials(
-    vault: &net_manager_core::config_vault::ConfigVault,
-    profile: &Profile,
-    credentials: &OpenVpnCredentials,
-) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = openvpn_credentials_path(vault, profile)?;
-    let parent = path.parent().unwrap();
-    net_manager_core::config_security::protect_path(parent)
-        .map_err(|_| "cannot protect OpenVPN credential vault".to_string())?;
-    let serialized = serde_json::to_vec(credentials)
-        .map_err(|_| "cannot encode OpenVPN credentials".to_string())?;
-    let suffix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|time| time.as_nanos())
-        .unwrap_or(0);
-    let temporary = path.with_extension(format!("json.tmp-{}-{suffix}", std::process::id()));
-    let outcome = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)
-            .map_err(|_| "cannot store OpenVPN credentials".to_string())?;
-        file.write_all(&serialized)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "cannot store OpenVPN credentials".to_string())?;
-        net_manager_core::config_security::protect_path(&temporary)
-            .map_err(|_| "cannot protect OpenVPN credentials".to_string())?;
-        std::fs::rename(&temporary, &path)
-            .map_err(|_| "cannot store OpenVPN credentials".to_string())?;
-        Ok(())
-    })();
-    if outcome.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    outcome
-}
-
-#[cfg(target_os = "linux")]
-fn remove_remembered_openvpn_credentials(
-    vault: &net_manager_core::config_vault::ConfigVault,
-    profile: &Profile,
-) -> Result<(), String> {
-    let path = openvpn_credentials_path(vault, profile)?;
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err("cannot remove remembered OpenVPN credentials".into()),
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -426,18 +323,9 @@ pub(crate) fn linux_openvpn_tunnel_status(status: OpenVpnStatusResult) -> Tunnel
 }
 
 #[cfg(target_os = "linux")]
-fn finish_openvpn_connect(
-    status: OpenVpnStatusResult,
-    persistence: Result<(), String>,
-    remember: bool,
-) -> TunnelStatus {
+fn finish_openvpn_connect(status: OpenVpnStatusResult, notice: Option<&str>) -> TunnelStatus {
     let mut status = linux_openvpn_tunnel_status(status);
-    if persistence.is_err() {
-        let notice = if remember {
-            "OpenVPN started, but credentials were not remembered"
-        } else {
-            "OpenVPN started, but old remembered credentials could not be removed"
-        };
+    if let Some(notice) = notice {
         status.message = Some(match status.message {
             Some(existing) => format!("{existing}; {notice}"),
             None => notice.to_string(),
@@ -450,22 +338,26 @@ fn finish_openvpn_connect(
 async fn linux_openvpn_connect(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
+    credential_store: &OpenVpnCredentialStore,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
-    linux_openvpn_connect_with_credentials(client, vault, profile, None, false).await
+    linux_openvpn_connect_with_credentials(client, vault, credential_store, profile, None, false)
+        .await
 }
 
 #[cfg(target_os = "linux")]
 async fn linux_openvpn_connect_with_credentials(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
+    credential_store: &OpenVpnCredentialStore,
     profile: &Profile,
     supplied_credentials: Option<OpenVpnCredentials>,
     remember: bool,
 ) -> Result<TunnelStatus, String> {
     let explicit = supplied_credentials.is_some();
-    let request = prepare_linux_openvpn_request(
+    let (request, load_notice) = prepare_linux_openvpn_request(
         vault,
+        credential_store,
         profile,
         supplied_credentials,
         profile.routes.clone(),
@@ -476,26 +368,30 @@ async fn linux_openvpn_connect_with_credentials(
         .request(method::OPENVPN_CONNECT, request)
         .await
         .map_err(|err| crate::daemon_client::user_message(&err))?;
-    let persistence = if explicit {
-        if remember {
-            store_remembered_openvpn_credentials(vault, profile, credentials.as_ref().unwrap())
-        } else {
-            remove_remembered_openvpn_credentials(vault, profile)
-        }
+    let notice = if !explicit {
+        load_notice
+    } else if remember {
+        credential_store.remember(&profile.id, credentials.as_ref().unwrap())
     } else {
-        Ok(())
+        let legacy = openvpn_credentials_path(vault, profile).ok();
+        credential_store
+            .forget(&profile.id, legacy.as_deref())
+            .err()
+            .map(|_| "OpenVPN started, but old remembered credentials could not be removed")
     };
-    Ok(finish_openvpn_connect(result.status, persistence, remember))
+    Ok(finish_openvpn_connect(result.status, notice))
 }
 
 #[cfg(target_os = "linux")]
+/// Builds the daemon request; the notice reports a credential migration.
 fn prepare_linux_openvpn_request(
     vault: &net_manager_core::config_vault::ConfigVault,
+    credential_store: &OpenVpnCredentialStore,
     profile: &Profile,
     supplied_credentials: Option<OpenVpnCredentials>,
     routes: Vec<PolicyRoute>,
     method_name: &str,
-) -> Result<OpenVpnConnectRequest, String> {
+) -> Result<(OpenVpnConnectRequest, Option<&'static str>), String> {
     if !vault.is_managed_profile_path(&profile.id, &profile.config_path) {
         return Err("OpenVPN profile must use its own managed config on Linux".into());
     }
@@ -541,12 +437,15 @@ fn prepare_linux_openvpn_request(
         }
     }
     let requirements = openvpn_credential_requirements(&config, &raw_assets);
-    let explicit = supplied_credentials.is_some();
-    let credentials = if explicit {
+    let mut notice = None;
+    let credentials = if supplied_credentials.is_some() {
         supplied_credentials
     } else if requirements.user_pass || requirements.key_passphrase {
-        load_remembered_openvpn_credentials(vault, profile)
-            .map_err(|_| "OpenVPN credentials required".to_string())?
+        let (remembered, load_notice) = credential_store
+            .load(&profile.id, &openvpn_credentials_path(vault, profile)?)
+            .map_err(|_| "OpenVPN credentials required".to_string())?;
+        notice = load_notice;
+        remembered
     } else {
         None
     };
@@ -602,17 +501,24 @@ fn prepare_linux_openvpn_request(
     {
         return Err("OpenVPN config too large for daemon protocol".into());
     }
-    Ok(request)
+    Ok((request, notice))
 }
 
 #[cfg(target_os = "linux")]
 async fn linux_openvpn_probe(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
+    credential_store: &OpenVpnCredentialStore,
     profile: &Profile,
 ) -> Result<Vec<AnalyzedRoute>, String> {
-    let request =
-        prepare_linux_openvpn_request(vault, profile, None, Vec::new(), method::OPENVPN_PROBE)?;
+    let (request, _) = prepare_linux_openvpn_request(
+        vault,
+        credential_store,
+        profile,
+        None,
+        Vec::new(),
+        method::OPENVPN_PROBE,
+    )?;
     let result: OpenVpnProbeResult = client
         .request(method::OPENVPN_PROBE, request)
         .await
@@ -978,6 +884,7 @@ pub(crate) async fn connect_profile(
         let status = linux_openvpn_connect(
             &crate::daemon_client::DaemonClient::system(),
             &state.config_vault,
+            &state.openvpn_credentials,
             &profile,
         )
         .await?;
@@ -1236,6 +1143,7 @@ pub(crate) async fn connect_openvpn_with_credentials(
         let status = linux_openvpn_connect_with_credentials(
             &crate::daemon_client::DaemonClient::system(),
             &state.config_vault,
+            &state.openvpn_credentials,
             &profile,
             Some(credentials),
             remember,
@@ -1387,6 +1295,7 @@ pub(crate) async fn probe_openvpn_routes(
         linux_openvpn_probe(
             &crate::daemon_client::DaemonClient::system(),
             &state.config_vault,
+            &state.openvpn_credentials,
             &profile,
         )
         .await
@@ -1489,6 +1398,13 @@ mod tests {
     use crate::test_support::*;
 
     #[cfg(target_os = "linux")]
+    fn test_credential_store() -> OpenVpnCredentialStore {
+        OpenVpnCredentialStore::new(Box::new(
+            crate::openvpn_credentials::tests::FakeKeyring::default(),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn linux_openvpn_sends_managed_config_and_assets_to_daemon() {
         use net_manager_core::daemon_protocol::{method, RequestFrame, ResponseFrame};
@@ -1565,7 +1481,7 @@ mod tests {
         });
         let client = crate::daemon_client::DaemonClient::new(socket);
         assert_eq!(
-            linux_openvpn_connect(&client, &vault, &profile)
+            linux_openvpn_connect(&client, &vault, &test_credential_store(), &profile)
                 .await
                 .unwrap()
                 .state,
@@ -1599,7 +1515,7 @@ mod tests {
             .unwrap()
             .config_path;
         let client = crate::daemon_client::DaemonClient::new(dir.join("missing.sock"));
-        let error = linux_openvpn_connect(&client, &vault, &profile)
+        let error = linux_openvpn_connect(&client, &vault, &test_credential_store(), &profile)
             .await
             .unwrap_err();
         assert_eq!(error, "OpenVPN credentials required");
@@ -1622,9 +1538,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn remembered_openvpn_credentials_are_private_and_removed_with_profile() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = unique_dir("ovpn-remember");
+    fn implicit_connect_migrates_plaintext_credentials_into_keyring() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = unique_dir("ovpn-remember-migrate");
         let source = dir.join("client.ovpn");
         std::fs::write(&source, "client\nremote vpn.example\nauth-user-pass\n").unwrap();
         let vault = net_manager_core::config_vault::ConfigVault::new(dir.join("configs"));
@@ -1634,44 +1550,47 @@ mod tests {
             .import(&p.id, TunnelBackend::OpenVpn, &source)
             .unwrap()
             .config_path;
-        let credentials = net_manager_core::daemon_protocol::OpenVpnCredentials {
+        let credentials = OpenVpnCredentials {
             auth_user_pass: Some(net_manager_core::daemon_protocol::OpenVpnUserPass {
                 username: "private-user".into(),
                 password: "private-password".into(),
             }),
             private_key_passphrase: None,
         };
-        store_remembered_openvpn_credentials(&vault, &p, &credentials).unwrap();
-        let saved = load_remembered_openvpn_credentials(&vault, &p)
-            .unwrap()
+        let legacy = openvpn_credentials_path(&vault, &p).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&legacy)
+            .and_then(|mut file| {
+                std::io::Write::write_all(&mut file, &serde_json::to_vec(&credentials).unwrap())
+            })
             .unwrap();
-        assert_eq!(saved, credentials);
-        let path = openvpn_credentials_path(&vault, &p).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::metadata(path.parent().unwrap())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        remove_remembered_openvpn_credentials(&vault, &p).unwrap();
-        assert!(load_remembered_openvpn_credentials(&vault, &p)
-            .unwrap()
-            .is_none());
-        store_remembered_openvpn_credentials(&vault, &p, &credentials).unwrap();
-        vault.remove_profile(&p.id).unwrap();
-        assert!(!path.exists());
+        let keyring = crate::openvpn_credentials::tests::FakeKeyring::default();
+        let entries = keyring.entries.clone();
+        let store = OpenVpnCredentialStore::new(Box::new(keyring));
+
+        let (request, notice) = prepare_linux_openvpn_request(
+            &vault,
+            &store,
+            &p,
+            None,
+            Vec::new(),
+            method::OPENVPN_CONNECT,
+        )
+        .unwrap();
+
+        assert_eq!(request.credentials, Some(credentials));
+        assert_eq!(notice, None);
+        assert!(!legacy.exists());
+        assert!(entries.lock().unwrap().contains_key(&p.id));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn remembered_openvpn_credentials_reject_symlinked_profile_directory() {
+    fn legacy_credentials_path_rejects_symlinked_profile_directory() {
         let dir = unique_dir("ovpn-remember-symlink");
         let source = dir.join("client.ovpn");
         std::fs::write(&source, "client\nremote vpn.example\nauth-user-pass\n").unwrap();
@@ -1686,15 +1605,7 @@ mod tests {
         let external = dir.join("external");
         std::fs::rename(&profile_dir, &external).unwrap();
         std::os::unix::fs::symlink(&external, &profile_dir).unwrap();
-        let credentials = OpenVpnCredentials {
-            auth_user_pass: Some(net_manager_core::daemon_protocol::OpenVpnUserPass {
-                username: "user".into(),
-                password: "private-password".into(),
-            }),
-            private_key_passphrase: None,
-        };
-        assert!(store_remembered_openvpn_credentials(&vault, &p, &credentials).is_err());
-        assert!(!external.join("openvpn-credentials.json").exists());
+        assert!(openvpn_credentials_path(&vault, &p).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1779,9 +1690,13 @@ mod tests {
             }
         });
         let client = crate::daemon_client::DaemonClient::new(socket);
+        let keyring = crate::openvpn_credentials::tests::FakeKeyring::default();
+        let entries = keyring.entries.clone();
+        let store = OpenVpnCredentialStore::new(Box::new(keyring));
         let result = linux_openvpn_connect_with_credentials(
             &client,
             &vault,
+            &store,
             &p,
             Some(credentials.clone()),
             true,
@@ -1789,12 +1704,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.state, TunnelState::Running);
+        assert_eq!(result.message, None);
+        let saved: OpenVpnCredentials =
+            serde_json::from_slice(&entries.lock().unwrap()[&p.id]).unwrap();
+        assert_eq!(saved, credentials);
+        assert!(!openvpn_credentials_path(&vault, &p).unwrap().exists());
         assert_eq!(
-            load_remembered_openvpn_credentials(&vault, &p).unwrap(),
-            Some(credentials)
-        );
-        assert_eq!(
-            linux_openvpn_connect(&client, &vault, &p)
+            linux_openvpn_connect(&client, &vault, &store, &p)
                 .await
                 .unwrap()
                 .state,
@@ -1813,6 +1729,7 @@ mod tests {
         use tokio::net::UnixListener;
 
         let dir = unique_dir("ovpn-probe-managed");
+        let store = test_credential_store();
         let source = dir.join("client.ovpn");
         std::fs::write(&source, "client\nremote vpn.example\nauth-user-pass\n").unwrap();
         let vault = net_manager_core::config_vault::ConfigVault::new(dir.join("configs"));
@@ -1830,6 +1747,7 @@ mod tests {
         assert_eq!(
             prepare_linux_openvpn_request(
                 &vault,
+                &store,
                 &profile,
                 None,
                 Vec::new(),
@@ -1845,7 +1763,7 @@ mod tests {
             }),
             private_key_passphrase: None,
         };
-        store_remembered_openvpn_credentials(&vault, &profile, &credentials).unwrap();
+        assert_eq!(store.remember(&profile.id, &credentials), None);
         let socket = dir.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
@@ -1894,7 +1812,7 @@ mod tests {
                 .unwrap();
         });
         let client = crate::daemon_client::DaemonClient::new(socket);
-        let routes = linux_openvpn_probe(&client, &vault, &profile)
+        let routes = linux_openvpn_probe(&client, &vault, &store, &profile)
             .await
             .unwrap();
         assert_eq!(routes.len(), 1);
@@ -1918,7 +1836,7 @@ mod tests {
             .unwrap()
             .config_path;
         let client = crate::daemon_client::DaemonClient::new(dir.join("missing.sock"));
-        let error = linux_openvpn_connect(&client, &vault, &profile)
+        let error = linux_openvpn_connect(&client, &vault, &test_credential_store(), &profile)
             .await
             .unwrap_err();
         assert!(error.contains("too large for daemon protocol"), "{error}");
@@ -1942,7 +1860,7 @@ mod tests {
         std::fs::remove_file(&profile.config_path).unwrap();
         std::os::unix::fs::symlink(&source, &profile.config_path).unwrap();
         let client = crate::daemon_client::DaemonClient::new(dir.join("missing.sock"));
-        let error = linux_openvpn_connect(&client, &vault, &profile)
+        let error = linux_openvpn_connect(&client, &vault, &test_credential_store(), &profile)
             .await
             .unwrap_err();
         assert!(
@@ -2198,7 +2116,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn remembered_credential_write_failure_does_not_hide_running_tunnel() {
+    fn session_only_credentials_notice_does_not_hide_running_tunnel() {
         let status = OpenVpnStatusResult {
             profile_id: "p1".into(),
             state: OpenVpnConnectionState::Connected,
@@ -2208,11 +2126,13 @@ mod tests {
             applied_routes: Vec::new(),
             warnings: Vec::new(),
         };
-        let result = finish_openvpn_connect(status, Err("private secret".into()), true);
+        let result = finish_openvpn_connect(
+            status,
+            Some(crate::openvpn_credentials::SESSION_ONLY_NOTICE),
+        );
         assert_eq!(result.state, TunnelState::Running);
         let message = result.message.unwrap();
-        assert!(message.contains("not remembered"));
-        assert!(!message.contains("private secret"));
+        assert!(message.contains("only until the app exits"), "{message}");
     }
 
     #[cfg(target_os = "linux")]

@@ -124,6 +124,10 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
             )
             .unwrap(),
         }),
+        #[cfg(target_os = "linux")]
+        openvpn_credentials: crate::openvpn_credentials::OpenVpnCredentialStore::new(Box::new(
+            crate::openvpn_credentials::tests::FakeKeyring::default(),
+        )),
     }
 }
 

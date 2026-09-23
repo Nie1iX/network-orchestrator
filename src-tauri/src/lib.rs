@@ -5,6 +5,8 @@ mod commands;
 mod daemon_client;
 mod elevation;
 mod lifecycle;
+#[cfg(target_os = "linux")]
+mod openvpn_credentials;
 mod route_runtime;
 mod state;
 #[cfg(test)]

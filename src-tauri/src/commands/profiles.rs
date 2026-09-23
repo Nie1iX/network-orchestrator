@@ -436,6 +436,12 @@ pub(crate) async fn delete_profile(
         .config_vault
         .remove_profile(&id)
         .map_err(|err| format!("profile deleted, but managed config cleanup failed: {err}"))?;
+    #[cfg(target_os = "linux")]
+    if profile.backend == TunnelBackend::OpenVpn {
+        state.openvpn_credentials.forget(&id, None).map_err(|_| {
+            "profile deleted, but remembered OpenVPN credentials could not be removed".to_string()
+        })?;
+    }
     Ok(redact_profiles_for_ipc(doc.profiles))
 }
 
