@@ -134,7 +134,6 @@ pub(crate) async fn start(app: tauri::AppHandle) {
     let result = connect_on_startup(&app).await;
     app.state::<AutoConnectStatus>().record(result);
     let _ = app.emit("auto-connect-result", result);
-    crate::commands::profiles::run_subscription_refresh_loop(app).await;
 }
 
 #[cfg(test)]

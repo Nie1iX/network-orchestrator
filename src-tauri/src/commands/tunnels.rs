@@ -2497,6 +2497,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), allow(irrefutable_let_patterns))]
     async fn cleanup_stale_clears_tracked_routes_and_persists_registry() {
         let dir = unique_dir("cleanup-stale");
         let state = app_state(&dir);

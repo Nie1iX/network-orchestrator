@@ -1,18 +1,17 @@
 use net_manager_core::daemon_protocol::{
-    AlwaysOnDefinition, AlwaysOnKind, AlwaysOnListResult, AlwaysOnRemoveResult,
-    AlwaysOnResumeResult, AlwaysOnSetResult,
+    AlwaysOnKind, AlwaysOnListResult, AlwaysOnRemoveResult, AlwaysOnResumeResult, AlwaysOnSetResult,
 };
-use net_manager_core::models::Profile;
 use tauri::State;
 
 use crate::state::AppState;
 
 #[cfg(target_os = "linux")]
 use net_manager_core::daemon_protocol::{
-    method, AlwaysOnRemoveParams, AlwaysOnSetParams, AlwaysOnStaticRoutes, WireGuardConnectParams,
+    method, AlwaysOnDefinition, AlwaysOnRemoveParams, AlwaysOnSetParams, AlwaysOnStaticRoutes,
+    WireGuardConnectParams,
 };
 #[cfg(target_os = "linux")]
-use net_manager_core::models::TunnelBackend;
+use net_manager_core::models::{Profile, TunnelBackend};
 
 #[cfg(target_os = "linux")]
 fn build_definition(

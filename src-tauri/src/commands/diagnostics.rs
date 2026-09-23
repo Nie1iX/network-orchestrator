@@ -1066,6 +1066,7 @@ pub(crate) async fn diagnose_profile(
         protocol_health,
         proxy_owner,
     };
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut checks = build_diagnostics(&input);
     #[cfg(target_os = "linux")]
     if linux_daemon_tunnel(&profile) {

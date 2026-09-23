@@ -200,6 +200,7 @@ fn linux_xray_backend_availability(
 pub(crate) async fn get_backend_availability(
     state: State<'_, AppState>,
 ) -> Result<Vec<BackendAvailability>, String> {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut availability = collect_backend_availability(&state);
     #[cfg(target_os = "linux")]
     {

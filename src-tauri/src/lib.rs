@@ -65,8 +65,12 @@ pub fn run() {
             }
             #[cfg(target_os = "linux")]
             app.manage(auto_connect::AutoConnectStatus::default());
-            #[cfg(target_os = "linux")]
-            tauri::async_runtime::spawn(auto_connect::start(app.handle().clone()));
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                #[cfg(target_os = "linux")]
+                auto_connect::start(handle.clone()).await;
+                commands::profiles::run_subscription_refresh_loop(handle).await;
+            });
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(explorer::route_watcher_loop(move || {
                 let _ = handle.emit("route-changed", ());

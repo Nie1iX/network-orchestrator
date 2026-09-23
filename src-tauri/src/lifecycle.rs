@@ -200,6 +200,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), allow(irrefutable_let_patterns))]
     async fn cleanup_all_removes_owned_routes_and_persists_empty_registry() {
         let dir = unique_dir("cleanup-all");
         let state = app_state(&dir);
