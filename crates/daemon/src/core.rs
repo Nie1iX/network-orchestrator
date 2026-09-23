@@ -1051,7 +1051,7 @@ mod openvpn_tests {
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
-            wireguard_connected_at: HashMap::new(),
+            wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             policy: Some(Box::new(policy.clone())),
             dns: Some(Box::new(dns.clone())),
@@ -1218,8 +1218,9 @@ pub trait WgConfigExecutor: Send {
 
 /// WireGuard REJECT_AFTER_TIME: session keys older than this are unusable.
 const WIREGUARD_REJECT_AFTER_SECS: u64 = 180;
-/// How long a fresh tunnel may run without any handshake before it is failed.
-const WIREGUARD_HANDSHAKE_GRACE_SECS: u64 = 30;
+/// How long sent packets may go without a handshake before the tunnel is
+/// failed; WireGuard retries the initiation about every 5 s.
+const WIREGUARD_UNANSWERED_SECS: u64 = 20;
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -1227,23 +1228,47 @@ fn unix_now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// A tunnel whose peer never answered (after a grace period) or whose last
-/// handshake is past REJECT_AFTER_TIME cannot carry traffic.
-fn wireguard_handshake_state(
+/// Transmit counter at the moment a tunnel was first seen without a usable
+/// handshake, and when it first grew after that.
+#[derive(Debug, Clone, Copy)]
+struct HandshakeWatch {
+    baseline_tx: u64,
+    sending_since: Option<u64>,
+}
+
+/// WireGuard only handshakes when it has something to send, so a missing or
+/// expired handshake alone is normal for an idle tunnel. The tunnel is
+/// failed only when packets keep leaving (tx grows) without any handshake
+/// completing for `WIREGUARD_UNANSWERED_SECS`.
+fn observe_handshake(
+    watch: Option<HandshakeWatch>,
     latest_handshake: Option<u64>,
-    connected_at: Option<u64>,
+    tx: u64,
     now: u64,
-) -> TunnelState {
-    let stale = match latest_handshake {
-        Some(handshake) => now.saturating_sub(handshake) > WIREGUARD_REJECT_AFTER_SECS,
-        None => connected_at
-            .is_some_and(|since| now.saturating_sub(since) > WIREGUARD_HANDSHAKE_GRACE_SECS),
-    };
-    if stale {
+) -> (TunnelState, Option<HandshakeWatch>) {
+    let usable = latest_handshake
+        .is_some_and(|handshake| now.saturating_sub(handshake) <= WIREGUARD_REJECT_AFTER_SECS);
+    if usable {
+        return (TunnelState::Running, None);
+    }
+    let mut watch = watch
+        .filter(|watch| tx >= watch.baseline_tx)
+        .unwrap_or(HandshakeWatch {
+            baseline_tx: tx,
+            sending_since: None,
+        });
+    if tx > watch.baseline_tx && watch.sending_since.is_none() {
+        watch.sending_since = Some(now);
+    }
+    let failed = watch
+        .sending_since
+        .is_some_and(|since| now.saturating_sub(since) >= WIREGUARD_UNANSWERED_SECS);
+    let state = if failed {
         TunnelState::Failed
     } else {
         TunnelState::Running
-    }
+    };
+    (state, Some(watch))
 }
 
 pub struct DaemonCore {
@@ -1260,7 +1285,7 @@ pub struct DaemonCore {
     openvpn_auth_failed: HashSet<(u32, String)>,
     /// Unix seconds; injectable so handshake ageing is testable.
     clock: Box<dyn Fn() -> u64 + Send>,
-    wireguard_connected_at: HashMap<(u32, String), u64>,
+    wireguard_handshake: HashMap<(u32, String), HandshakeWatch>,
     /// WireGuard/Xray owners torn down by network reconcile; reported
     /// `failed` until the user reconnects or disconnects.
     tunnel_failed: HashSet<(u32, String)>,
@@ -1395,7 +1420,7 @@ impl DaemonCore {
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
-            wireguard_connected_at: HashMap::new(),
+            wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             #[cfg(target_os = "linux")]
             policy: None,
@@ -1434,7 +1459,7 @@ impl DaemonCore {
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
-            wireguard_connected_at: HashMap::new(),
+            wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             #[cfg(target_os = "linux")]
             policy: None,
@@ -1471,7 +1496,7 @@ impl DaemonCore {
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
-            wireguard_connected_at: HashMap::new(),
+            wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             policy: Some(policy),
             dns: Some(dns),
@@ -1502,7 +1527,7 @@ impl DaemonCore {
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
-            wireguard_connected_at: HashMap::new(),
+            wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             #[cfg(target_os = "linux")]
             policy: None,
@@ -1537,7 +1562,7 @@ impl DaemonCore {
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
-            wireguard_connected_at: HashMap::new(),
+            wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             #[cfg(target_os = "linux")]
             policy: None,
@@ -1577,7 +1602,7 @@ impl DaemonCore {
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
-            wireguard_connected_at: HashMap::new(),
+            wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             policy: Some(policy),
             dns: Some(dns),
@@ -2867,8 +2892,7 @@ impl DaemonCore {
             return Err(err);
         }
         self.tunnel_failed.remove(&(uid, owner.clone()));
-        self.wireguard_connected_at
-            .insert((uid, owner), (self.clock)());
+        self.wireguard_handshake.remove(&(uid, owner));
         Ok(self.wireguard_status(uid, profile_id))
     }
 
@@ -2944,7 +2968,7 @@ impl DaemonCore {
         result
     }
 
-    pub fn wireguard_status(&self, uid: u32, profile_id: &str) -> WireGuardStatusResult {
+    pub fn wireguard_status(&mut self, uid: u32, profile_id: &str) -> WireGuardStatusResult {
         let owner = format!("wg:{profile_id}");
         let entry = self
             .journal
@@ -2975,18 +2999,20 @@ impl DaemonCore {
         {
             (Some(entry), Some(name)) if entry.state == OwnedState::Applied => {
                 match self.wg_config.as_ref().and_then(|wg| wg.health(name).ok()) {
-                    Some((handshake, rx, tx)) => (
-                        wireguard_handshake_state(
+                    Some((handshake, rx, tx)) => {
+                        let key = (uid, owner.clone());
+                        let (state, watch) = observe_handshake(
+                            self.wireguard_handshake.get(&key).copied(),
                             handshake,
-                            self.wireguard_connected_at
-                                .get(&(uid, owner.clone()))
-                                .copied(),
+                            tx,
                             (self.clock)(),
-                        ),
-                        handshake,
-                        rx,
-                        tx,
-                    ),
+                        );
+                        match watch {
+                            Some(watch) => self.wireguard_handshake.insert(key, watch),
+                            None => self.wireguard_handshake.remove(&key),
+                        };
+                        (state, handshake, rx, tx)
+                    }
                     None => (TunnelState::Failed, None, 0, 0),
                 }
             }
@@ -3662,7 +3688,7 @@ impl DaemonCore {
 
     fn teardown_wireguard_entry(&mut self, index: usize) -> io::Result<()> {
         let entry = &self.journal.entries[index];
-        self.wireguard_connected_at
+        self.wireguard_handshake
             .remove(&(entry.uid, entry.owner.clone()));
         let resources = self.journal.entries[index].resources.clone();
         let link = resources
@@ -4892,8 +4918,6 @@ mod tests {
             }),
         )
         .unwrap();
-        // FakeWgConfig reports a handshake at t=42.
-        core.clock = Box::new(|| 50);
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
         let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
@@ -5345,8 +5369,6 @@ mod tests {
             Box::new(SequenceDns { outcomes }),
         )
         .unwrap();
-        // FakeWgConfig reports a handshake at t=42.
-        core.clock = Box::new(|| 50);
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nDNS=10.77.0.1\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
         let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
@@ -5398,8 +5420,6 @@ mod tests {
             }),
         )
         .unwrap();
-        // The fake peer handshook at t=42.
-        core.clock = Box::new(|| 50);
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\nPostUp=echo SECRET-HOOK\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
         let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
@@ -5672,8 +5692,6 @@ mod tests {
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
         let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
-        // FakeWgConfig reports a handshake at t=42.
-        core.clock = Box::new(|| 50);
         core.connect_wireguard(1000, "home", plan).unwrap();
         FullWgFixture {
             dir,
@@ -5811,14 +5829,14 @@ mod tests {
     }
 
     #[test]
-    fn wireguard_status_reports_failed_for_stale_or_missing_handshake() {
+    fn wireguard_status_fails_only_when_sent_traffic_gets_no_handshake() {
         let dir = unique_dir("wireguard-handshake");
         let recorder = Recorder::default();
         let dump = Arc::new(Mutex::new(String::new()));
-        let peer = |handshake: u64| {
-            format!("PRIVATE\tPUBLIC\t51820\toff\nPEER\t(none)\t192.0.2.1:51820\t10.77.0.0/24\t{handshake}\t5\t6\toff\n")
+        let set_peer = |handshake: u64, tx: u64| {
+            *dump.lock().unwrap() = format!("PRIVATE\tPUBLIC\t51820\toff\nPEER\t(none)\t192.0.2.1:51820\t10.77.0.0/24\t{handshake}\t5\t{tx}\toff\n");
         };
-        *dump.lock().unwrap() = peer(0);
+        set_peer(0, 0);
         let mut core = DaemonCore::open_with_wireguard(
             JournalStore::new(dir.join(JOURNAL_FILE)),
             Box::new(FakeRoutes::new(&recorder)),
@@ -5837,27 +5855,44 @@ mod tests {
         let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
         let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
-        let state = |core: &DaemonCore| core.wireguard_status(1000, "home").state;
-        // No handshake yet: still starting inside the grace period.
+        let state_at = |core: &mut DaemonCore, at: u64| {
+            now.store(at, Ordering::SeqCst);
+            core.wireguard_status(1000, "home").state
+        };
         assert_eq!(
             core.connect_wireguard(1000, "home", plan).unwrap().state,
             TunnelState::Running
         );
-        now.store(1_030, Ordering::SeqCst);
-        assert_eq!(state(&core), TunnelState::Running);
-        now.store(1_031, Ordering::SeqCst);
-        assert_eq!(state(&core), TunnelState::Failed);
-        // A fresh handshake recovers; one older than REJECT_AFTER_TIME fails.
-        *dump.lock().unwrap() = peer(1_020);
-        assert_eq!(state(&core), TunnelState::Running);
-        now.store(1_200, Ordering::SeqCst);
-        assert_eq!(state(&core), TunnelState::Running);
-        now.store(1_201, Ordering::SeqCst);
-        let status = core.wireguard_status(1000, "home");
+        // Idle split tunnel: WireGuard does not handshake without traffic.
+        for at in [1_010, 1_030, 1_060] {
+            assert_eq!(state_at(&mut core, at), TunnelState::Running, "{at}");
+        }
+        // Packets leave (handshake initiations are retried every ~5 s) but no
+        // handshake completes: failed once that lasts 20 s.
+        set_peer(0, 148);
+        assert_eq!(state_at(&mut core, 1_062), TunnelState::Running);
+        set_peer(0, 444);
+        assert_eq!(state_at(&mut core, 1_077), TunnelState::Running);
+        set_peer(0, 740);
+        assert_eq!(state_at(&mut core, 1_087), TunnelState::Failed);
+        // A completed handshake recovers and resets the tracking.
+        set_peer(1_090, 900);
+        assert_eq!(state_at(&mut core, 1_090), TunnelState::Running);
+        // Idle long after the handshake (keys expired, nothing sent): running.
+        assert_eq!(state_at(&mut core, 1_271), TunnelState::Running);
+        assert_eq!(state_at(&mut core, 1_400), TunnelState::Running);
+        // Traffic resumes but the peer is gone: failed after 20 s of retries.
+        set_peer(1_090, 1_048);
+        assert_eq!(state_at(&mut core, 1_401), TunnelState::Running);
+        assert_eq!(state_at(&mut core, 1_420), TunnelState::Running);
+        let status = {
+            now.store(1_421, Ordering::SeqCst);
+            core.wireguard_status(1000, "home")
+        };
         assert_eq!(status.state, TunnelState::Failed);
-        assert_eq!(status.latest_handshake, Some(1_020));
+        assert_eq!(status.latest_handshake, Some(1_090));
         core.disconnect_wireguard(1000, "home").unwrap();
-        assert_eq!(state(&core), TunnelState::Stopped);
+        assert_eq!(state_at(&mut core, 1_422), TunnelState::Stopped);
         fs::remove_dir_all(&dir).unwrap();
     }
 
