@@ -418,6 +418,10 @@ enum Command {
         table: u32,
         reply: mpsc::Sender<io::Result<bool>>,
     },
+    RulePresent {
+        rule: OwnedRuleResource,
+        reply: mpsc::Sender<io::Result<bool>>,
+    },
     Link {
         index: u32,
         up: bool,
@@ -664,6 +668,12 @@ async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedRecei
                 .await;
                 let _ = reply.send(result);
             }
+            Command::RulePresent { rule, reply } => {
+                let result = get_rules(&handle)
+                    .await
+                    .map(|rules| rules.iter().any(|message| is_owned_rule(message, &rule)));
+                let _ = reply.send(result);
+            }
             Command::TableInUse { table, reply } => {
                 let result = async {
                     if get_rules(&handle)
@@ -832,6 +842,42 @@ async fn delete_fresh_link(handle: &rtnetlink::Handle, name: &str, index: u32) -
     }
 }
 
+/// Legacy multicast mask for link, address, route and policy-rule changes.
+/// rtnetlink has no constant for `RTNLGRP_IPV6_RULE` (group 19).
+const NETWORK_CHANGE_GROUPS: u32 = {
+    use rtnetlink::constants::*;
+    const RTMGRP_IPV6_RULE: u32 = 1 << (19 - 1);
+    RTMGRP_LINK
+        | RTMGRP_IPV4_IFADDR
+        | RTMGRP_IPV6_IFADDR
+        | RTMGRP_IPV4_ROUTE
+        | RTMGRP_IPV6_ROUTE
+        | RTMGRP_IPV4_RULE
+        | RTMGRP_IPV6_RULE
+};
+
+/// Call `on_change` for every link, route or policy-rule notification until
+/// the returned task is aborted. Messages are only a wake-up signal; the
+/// reconcile pass reads the kernel state itself.
+pub fn watch_network_changes(
+    on_change: impl Fn() + Send + 'static,
+) -> io::Result<tokio::task::JoinHandle<()>> {
+    use futures::StreamExt;
+    use netlink_sys::{AsyncSocket, SocketAddr};
+    let (mut connection, _handle, mut messages) = rtnetlink::new_connection()?;
+    connection
+        .socket_mut()
+        .socket_mut()
+        .bind(&SocketAddr::new(0, NETWORK_CHANGE_GROUPS))?;
+    Ok(tokio::spawn(async move {
+        let connection = tokio::spawn(connection);
+        while messages.next().await.is_some() {
+            on_change();
+        }
+        connection.abort();
+    }))
+}
+
 fn actor_gone() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "netlink actor is not running")
 }
@@ -879,6 +925,11 @@ impl PolicyRuleExecutor for NetlinkExecutor {
 
     fn table_in_use(&mut self, table: u32) -> io::Result<bool> {
         self.call_with(|reply| Command::TableInUse { table, reply })
+    }
+
+    fn rule_present(&mut self, rule: &OwnedRuleResource) -> io::Result<bool> {
+        let rule = rule.clone();
+        self.call_with(|reply| Command::RulePresent { rule, reply })
     }
 }
 

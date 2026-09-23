@@ -19,9 +19,9 @@ mod linux {
     use network_orchestrator_daemon::core::{DaemonCore, TrustedWgCommand};
     use network_orchestrator_daemon::dns::ResolvectlDnsExecutor;
     use network_orchestrator_daemon::journal::{JournalStore, JOURNAL_FILE};
-    use network_orchestrator_daemon::netlink::NetlinkExecutor;
+    use network_orchestrator_daemon::netlink::{watch_network_changes, NetlinkExecutor};
     use network_orchestrator_daemon::openvpn_process::TrustedOpenVpnProcess;
-    use network_orchestrator_daemon::server::{bind_socket, serve, ServerContext};
+    use network_orchestrator_daemon::server::{bind_socket, serve, OwnerEvent, ServerContext};
     use network_orchestrator_daemon::settings::{SettingsStore, SETTINGS_FILE};
     use network_orchestrator_daemon::xray_process::TrustedXrayProcess;
     use std::io;
@@ -87,6 +87,7 @@ mod linux {
     async fn run(options: Options) -> io::Result<()> {
         let netlink = NetlinkExecutor::spawn()?;
         let reconcile_netlink = netlink.clone();
+        let network_netlink = netlink.clone();
         let store = JournalStore::new(options.state_dir.join(JOURNAL_FILE));
         let always_on = AlwaysOnStore::new(options.state_dir.join("profiles"));
         let startup_always_on = always_on.clone();
@@ -175,6 +176,42 @@ mod linux {
                 .await;
             }
         });
+        // Uplink changes (link, address, route, rule) wake an early pass; the
+        // interval also covers resume from suspend and missed notifications.
+        let network_wake = Arc::new(tokio::sync::Notify::new());
+        let watcher_wake = network_wake.clone();
+        let network_watch = watch_network_changes(move || watcher_wake.notify_one())
+            .map_err(|err| {
+                eprintln!("network-orchestrator-daemon: network change watch unavailable: {err}")
+            })
+            .ok();
+        let network_core = ctx.core.clone();
+        let network_events = ctx.events.clone();
+        let network_reconcile = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    () = network_wake.notified() => {
+                        // A flap or resume arrives as a burst of messages.
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+                let core = network_core.clone();
+                let netlink = network_netlink.clone();
+                let changed = tokio::task::spawn_blocking(move || {
+                    let mut core = core.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let observed = netlink.owned_routes_snapshot()?;
+                    Ok::<_, io::Error>(core.reconcile_network(&observed))
+                })
+                .await;
+                if let Ok(Ok(changed)) = changed {
+                    for (uid, owner) in changed {
+                        let _ = network_events.send(OwnerEvent { uid, owner });
+                    }
+                }
+            }
+        });
         eprintln!(
             "network-orchestrator-daemon: listening on {}",
             options.socket.display()
@@ -190,6 +227,12 @@ mod linux {
         let _ = openvpn_reconcile.await;
         always_on_reconcile.abort();
         let _ = always_on_reconcile.await;
+        network_reconcile.abort();
+        let _ = network_reconcile.await;
+        if let Some(watch) = network_watch {
+            watch.abort();
+            let _ = watch.await;
+        }
         let _ = std::fs::remove_file(&options.socket);
         let core = ctx.core.clone();
         let result = tokio::task::spawn_blocking(move || {

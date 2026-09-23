@@ -2733,6 +2733,7 @@ dependencies = [
  "libc",
  "net-manager-core",
  "netlink-packet-route",
+ "netlink-sys",
  "rtnetlink",
  "serde",
  "serde_json",

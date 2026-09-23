@@ -1052,6 +1052,7 @@ mod openvpn_tests {
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
             wireguard_connected_at: HashMap::new(),
+            tunnel_failed: HashSet::new(),
             policy: Some(Box::new(policy.clone())),
             dns: Some(Box::new(dns.clone())),
         };
@@ -1181,6 +1182,10 @@ pub trait PolicyRuleExecutor: Send {
     fn table_in_use(&mut self, table: u32) -> io::Result<bool>;
     fn add_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()>;
     fn remove_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()>;
+    /// Whether exactly this daemon-owned rule is installed.
+    fn rule_present(&mut self, rule: &OwnedRuleResource) -> io::Result<bool> {
+        Ok(self.rules_snapshot()?.contains(rule))
+    }
 }
 
 pub trait WgConfigExecutor: Send {
@@ -1256,6 +1261,9 @@ pub struct DaemonCore {
     /// Unix seconds; injectable so handshake ageing is testable.
     clock: Box<dyn Fn() -> u64 + Send>,
     wireguard_connected_at: HashMap<(u32, String), u64>,
+    /// WireGuard/Xray owners torn down by network reconcile; reported
+    /// `failed` until the user reconnects or disconnects.
+    tunnel_failed: HashSet<(u32, String)>,
     #[cfg(target_os = "linux")]
     policy: Option<Box<dyn PolicyRuleExecutor>>,
     #[cfg(target_os = "linux")]
@@ -1388,6 +1396,7 @@ impl DaemonCore {
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
             wireguard_connected_at: HashMap::new(),
+            tunnel_failed: HashSet::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1426,6 +1435,7 @@ impl DaemonCore {
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
             wireguard_connected_at: HashMap::new(),
+            tunnel_failed: HashSet::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1462,6 +1472,7 @@ impl DaemonCore {
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
             wireguard_connected_at: HashMap::new(),
+            tunnel_failed: HashSet::new(),
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -1492,6 +1503,7 @@ impl DaemonCore {
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
             wireguard_connected_at: HashMap::new(),
+            tunnel_failed: HashSet::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1526,6 +1538,7 @@ impl DaemonCore {
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
             wireguard_connected_at: HashMap::new(),
+            tunnel_failed: HashSet::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1565,6 +1578,7 @@ impl DaemonCore {
             openvpn_auth_failed: HashSet::new(),
             clock: Box::new(unix_now),
             wireguard_connected_at: HashMap::new(),
+            tunnel_failed: HashSet::new(),
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -1676,6 +1690,7 @@ impl DaemonCore {
             self.persist();
             return Err(xray_stage("journal_commit", err));
         }
+        self.tunnel_failed.remove(&(uid, owner));
         Ok(self.xray_status(uid, &plan.profile_id))
     }
 
@@ -1824,9 +1839,15 @@ impl DaemonCore {
 
     pub fn disconnect_xray(&mut self, uid: u32, profile_id: &str) -> io::Result<()> {
         let owner = format!("xray:{profile_id}");
-        let index = self.position(uid, &owner).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "Xray profile is not connected")
-        })?;
+        let Some(index) = self.position(uid, &owner) else {
+            if self.tunnel_failed.remove(&(uid, owner)) {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Xray profile is not connected",
+            ));
+        };
         let result = self.teardown_entry(index);
         self.store.save(&self.journal)?;
         result
@@ -1846,6 +1867,7 @@ impl DaemonCore {
             })
         });
         let state = match (entry, process) {
+            (None, _) if self.tunnel_failed.contains(&(uid, owner.clone())) => TunnelState::Failed,
             (None, _) => TunnelState::Stopped,
             (Some(entry), Some(process)) if entry.state == OwnedState::Applied => {
                 if self
@@ -2844,6 +2866,7 @@ impl DaemonCore {
             self.persist();
             return Err(err);
         }
+        self.tunnel_failed.remove(&(uid, owner.clone()));
         self.wireguard_connected_at
             .insert((uid, owner), (self.clock)());
         Ok(self.wireguard_status(uid, profile_id))
@@ -2907,12 +2930,15 @@ impl DaemonCore {
 
     pub fn disconnect_wireguard(&mut self, uid: u32, profile_id: &str) -> io::Result<()> {
         let owner = wireguard_owner(profile_id)?;
-        let index = self.position(uid, &owner).ok_or_else(|| {
-            io::Error::new(
+        let Some(index) = self.position(uid, &owner) else {
+            if self.tunnel_failed.remove(&(uid, owner)) {
+                return Ok(());
+            }
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "WireGuard profile is not connected",
-            )
-        })?;
+            ));
+        };
         let result = self.teardown_entry(index);
         self.store.save(&self.journal)?;
         result
@@ -2965,6 +2991,9 @@ impl DaemonCore {
                 }
             }
             (Some(_), _) => (TunnelState::Failed, None, 0, 0),
+            (None, _) if self.tunnel_failed.contains(&(uid, owner)) => {
+                (TunnelState::Failed, None, 0, 0)
+            }
             (None, _) => (TunnelState::Stopped, None, 0, 0),
         };
         WireGuardStatusResult {
@@ -3114,6 +3143,130 @@ impl DaemonCore {
         Ok(())
     }
 
+    /// Re-verify daemon-owned tunnels after an uplink change or resume.
+    /// Missing owned routes and policy rules are installed again; a tunnel
+    /// whose transport is gone, or whose state cannot be restored without
+    /// claiming a foreign rule, is torn down (no dead default route stays)
+    /// and reported `failed`. Returns the owners that changed.
+    #[cfg(target_os = "linux")]
+    pub fn reconcile_network(&mut self, observed: &[AppliedRoute]) -> Vec<(u32, String)> {
+        let mut changed = Vec::new();
+        for index in (0..self.journal.entries.len()).rev() {
+            let entry = &self.journal.entries[index];
+            if entry.state != OwnedState::Applied {
+                continue;
+            }
+            let key = (entry.uid, entry.owner.clone());
+            let restored = match self.tunnel_alive(index) {
+                None => continue,
+                Some(false) => Err(io::Error::other("tunnel transport is gone")),
+                Some(true) => self.restore_owned_network(index, observed),
+            };
+            match restored {
+                Ok(false) => {}
+                Ok(true) => changed.push(key),
+                Err(err) => {
+                    eprintln!(
+                        "network-orchestrator-daemon: network reconcile failed an owner: {}",
+                        err.kind()
+                    );
+                    if key.1.starts_with("ovpn:") {
+                        let _ = self.fail_openvpn(key.0, &key.1);
+                    } else {
+                        let _ = self.teardown_entry(index);
+                        self.persist();
+                        self.tunnel_failed.insert(key.clone());
+                    }
+                    changed.push(key);
+                }
+            }
+        }
+        changed
+    }
+
+    /// `Some(alive)` for an owned tunnel whose health is known; `None` for
+    /// other owners and for transient states (lookup errors, OpenVPN
+    /// reconnects, which `reconcile_openvpn` owns).
+    #[cfg(target_os = "linux")]
+    fn tunnel_alive(&mut self, index: usize) -> Option<bool> {
+        let entry = &self.journal.entries[index];
+        let runtime = self.openvpn_runtime.get(&(entry.uid, entry.owner.clone()));
+        entry.resources.iter().find_map(|resource| match resource {
+            OwnedResource::WireGuardLink(link) => self
+                .wg
+                .as_mut()?
+                .link_owned(&link.name, link.index, &link.owner_marker)
+                .ok(),
+            OwnedResource::XrayProcess(process) if process.index != 0 => {
+                let runner = self.xray.as_mut()?;
+                Some(
+                    runner.health(&process.name).unwrap_or(false)
+                        && runner.link_index(&process.name).ok()? == Some(process.index),
+                )
+            }
+            OwnedResource::OpenVpnProcess(process) => {
+                let connected = runtime
+                    .is_some_and(|runtime| runtime.snapshot.state == Some(OpenVpnState::Connected));
+                let link = self
+                    .openvpn
+                    .as_ref()?
+                    .link_index(&process.name)
+                    .ok()
+                    .flatten()?;
+                let same_link = entry.resources.iter().all(|resource| {
+                    !matches!(resource, OwnedResource::Route(route) if route.interface_index != link)
+                });
+                (connected && same_link).then_some(true)
+            }
+            _ => None,
+        })
+    }
+
+    /// Install owned routes, then owned rules, that are missing. A foreign
+    /// route with the same key counts as present; a rule priority taken by a
+    /// foreign rule is an error, so it is never claimed.
+    #[cfg(target_os = "linux")]
+    fn restore_owned_network(
+        &mut self,
+        index: usize,
+        observed: &[AppliedRoute],
+    ) -> io::Result<bool> {
+        let resources = self.journal.entries[index].resources.clone();
+        let mut restored = false;
+        for resource in &resources {
+            let OwnedResource::Route(route) = resource else {
+                continue;
+            };
+            if observed
+                .iter()
+                .any(|seen| kernel_route(seen) == kernel_route(route))
+            {
+                continue;
+            }
+            match self.routes.add_route(route) {
+                Ok(()) => restored = true,
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+        }
+        for resource in &resources {
+            let OwnedResource::Rule(rule) = resource else {
+                continue;
+            };
+            let policy = self.policy.as_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "policy executor is unavailable",
+                )
+            })?;
+            if !policy.rule_present(rule)? {
+                policy.add_rule(rule)?;
+                restored = true;
+            }
+        }
+        Ok(restored)
+    }
+
     /// Apply `routes` for `(uid, owner)` all-or-nothing. The journal entry is
     /// persisted as `applying` before the first kernel change.
     pub fn apply_routes(
@@ -3255,6 +3408,8 @@ impl DaemonCore {
     }
 
     pub fn cleanup_uid(&mut self, uid: u32) -> io::Result<CleanupResult> {
+        self.tunnel_failed
+            .retain(|(owner_uid, _)| *owner_uid != uid);
         self.teardown(|entry| entry.uid == uid)
     }
 
@@ -3846,6 +4001,70 @@ mod xray_core_tests {
             Ok(())
         }
     }
+    /// An Xray child that exits (taking its TUN link) once "killed" is logged.
+    struct Dying(Events);
+    impl XrayProcessRunner for Dying {
+        fn verify_binary(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn link_index(&self, _: &str) -> io::Result<Option<u32>> {
+            let events = self.0.list();
+            Ok(
+                (events.contains(&"spawn".to_owned()) && !events.contains(&"killed".to_owned()))
+                    .then_some(42),
+            )
+        }
+        fn start(&mut self, _: u32, _: &str, _: &str) -> io::Result<()> {
+            self.0.push("spawn");
+            Ok(())
+        }
+        fn health(&mut self, name: &str) -> io::Result<bool> {
+            Ok(self.link_index(name)?.is_some())
+        }
+        fn stop(&mut self, _: &str) -> io::Result<()> {
+            self.0.push("stop");
+            Ok(())
+        }
+        fn cleanup(&mut self, _: u32, _: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn network_reconcile_fails_xray_whose_process_died() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-dead-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Dying(events.clone())),
+        )
+        .unwrap();
+        core.connect_xray(1000, params()).unwrap();
+        let observed: Vec<_> = core.owned(1000)[0]
+            .resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) => Some(route.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(core.reconcile_network(&observed).is_empty());
+        events.push("killed");
+        assert_eq!(
+            core.reconcile_network(&observed),
+            vec![(1000, "xray:home".to_string())]
+        );
+        assert!(core.owned(1000).is_empty());
+        assert_eq!(core.xray_status(1000, "home").state, TunnelState::Failed);
+        core.disconnect_xray(1000, "home").unwrap();
+        assert_eq!(core.xray_status(1000, "home").state, TunnelState::Stopped);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn split_xray_is_journaled_before_spawn_and_cleans_up_in_reverse_order() {
         let events = Events::default();
@@ -5359,6 +5578,224 @@ mod tests {
         )
         .unwrap();
         assert!(recovered.owned(1000).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Kernel-like rule table: one rule per (family, priority), exact removal.
+    #[derive(Clone, Default)]
+    struct KernelRules(Arc<Mutex<Vec<OwnedRuleResource>>>);
+
+    impl PolicyRuleExecutor for KernelRules {
+        fn rules_snapshot(&mut self) -> io::Result<Vec<OwnedRuleResource>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn table_in_use(&mut self, _table: u32) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn add_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()> {
+            let mut rules = self.0.lock().unwrap();
+            if rules
+                .iter()
+                .any(|seen| seen.family == rule.family && seen.priority == rule.priority)
+            {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "occupied"));
+            }
+            rules.push(rule.clone());
+            Ok(())
+        }
+        fn remove_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()> {
+            let mut rules = self.0.lock().unwrap();
+            let before = rules.len();
+            rules.retain(|seen| seen != rule);
+            if rules.len() == before {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no such rule"));
+            }
+            Ok(())
+        }
+    }
+
+    /// A WireGuard link that can vanish (e.g. deleted while suspended).
+    struct VanishingWg(Arc<std::sync::atomic::AtomicBool>);
+
+    impl WgSystem for VanishingWg {
+        fn create_link(&mut self, _name: &str, _marker: &str) -> io::Result<u32> {
+            Ok(42)
+        }
+        fn link_owned(&mut self, _name: &str, _index: u32, _marker: &str) -> io::Result<bool> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+        fn delete_link(&mut self, _name: &str, _index: u32, _marker: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn add_address(&mut self, _index: u32, _address: ipnet::IpNet) -> io::Result<()> {
+            Ok(())
+        }
+        fn remove_address(&mut self, _index: u32, _address: ipnet::IpNet) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_mtu(&mut self, _index: u32, _mtu: u32) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_state(&mut self, _index: u32, _up: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FullWgFixture {
+        dir: PathBuf,
+        core: DaemonCore,
+        recorder: Recorder,
+        rules: KernelRules,
+        link: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn full_wireguard_fixture(name: &str) -> FullWgFixture {
+        let dir = unique_dir(name);
+        let recorder = Recorder::default();
+        let rules = KernelRules::default();
+        let link = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut core = DaemonCore::open_with_wireguard_full(
+            JournalStore::new(dir.join(JOURNAL_FILE)),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(VanishingWg(link.clone())),
+            Box::new(FakeWgConfig {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Box::new(rules.clone()),
+            Box::new(FakeDns {
+                result: crate::dns::DnsApply::Skipped,
+                events: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/0\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        // FakeWgConfig reports a handshake at t=42.
+        core.clock = Box::new(|| 50);
+        core.connect_wireguard(1000, "home", plan).unwrap();
+        FullWgFixture {
+            dir,
+            core,
+            recorder,
+            rules,
+            link,
+        }
+    }
+
+    fn owned_routes(core: &DaemonCore) -> Vec<AppliedRoute> {
+        core.owned(1000)
+            .into_iter()
+            .flat_map(|entry| entry.resources)
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) => Some(route),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn network_reconcile_restores_flushed_owned_rules_and_routes_idempotently() {
+        let FullWgFixture {
+            dir,
+            mut core,
+            recorder,
+            rules,
+            link: _link,
+        } = full_wireguard_fixture("reconcile-restore");
+        let applied_rules = rules.0.lock().unwrap().clone();
+        let applied_routes = owned_routes(&core);
+        assert_eq!(applied_rules.len(), 2);
+        // Everything is in place: nothing to do.
+        let before = recorder.ops().len();
+        assert!(core.reconcile_network(&applied_routes).is_empty());
+        assert_eq!(recorder.ops().len(), before);
+        // A network manager flushed foreign (to it) rules and routes; an
+        // unrelated rule elsewhere must be left alone.
+        let foreign = OwnedRuleResource {
+            family: IpFamily::Ipv4,
+            priority: 32000,
+            table: 200,
+            fwmark: None,
+            invert: false,
+            suppress_prefix_length: None,
+        };
+        *rules.0.lock().unwrap() = vec![foreign.clone()];
+        let changed = core.reconcile_network(&[]);
+        assert_eq!(changed, vec![(1000, "wg:home".to_string())]);
+        let restored = rules.0.lock().unwrap().clone();
+        assert!(restored.contains(&foreign));
+        assert!(applied_rules.iter().all(|rule| restored.contains(rule)));
+        assert_eq!(
+            recorder.ops()[before..],
+            [add("0.0.0.0/0")],
+            "only the owned default route is re-added"
+        );
+        assert_eq!(
+            core.wireguard_status(1000, "home").state,
+            TunnelState::Running
+        );
+        assert!(core.reconcile_network(&applied_routes).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn network_reconcile_fails_tunnel_whose_link_vanished_without_dead_default_route() {
+        let FullWgFixture {
+            dir,
+            mut core,
+            recorder,
+            rules,
+            link,
+        } = full_wireguard_fixture("reconcile-vanished");
+        let applied_routes = owned_routes(&core);
+        link.store(false, Ordering::SeqCst);
+        let before = recorder.ops().len();
+        let changed = core.reconcile_network(&applied_routes);
+        assert_eq!(changed, vec![(1000, "wg:home".to_string())]);
+        assert!(core.owned(1000).is_empty());
+        assert!(rules.0.lock().unwrap().is_empty(), "policy rules removed");
+        // The kernel dropped the link's routes with it; nothing is re-added.
+        assert!(!recorder.ops()[before..]
+            .iter()
+            .any(|op| matches!(op, Op::Add(_))));
+        assert_eq!(
+            core.wireguard_status(1000, "home").state,
+            TunnelState::Failed
+        );
+        // Nothing left to reconcile; an explicit disconnect acknowledges it.
+        assert!(core.reconcile_network(&[]).is_empty());
+        core.disconnect_wireguard(1000, "home").unwrap();
+        assert_eq!(
+            core.wireguard_status(1000, "home").state,
+            TunnelState::Stopped
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn network_reconcile_never_claims_a_foreign_rule_at_the_owned_priority() {
+        let FullWgFixture {
+            dir,
+            mut core,
+            recorder: _recorder,
+            rules,
+            link: _link,
+        } = full_wireguard_fixture("reconcile-foreign");
+        let applied_routes = owned_routes(&core);
+        let mut foreign = rules.0.lock().unwrap()[1].clone();
+        foreign.table = 200;
+        foreign.fwmark = None;
+        foreign.invert = false;
+        *rules.0.lock().unwrap() = vec![foreign.clone()];
+        let changed = core.reconcile_network(&applied_routes);
+        assert_eq!(changed, vec![(1000, "wg:home".to_string())]);
+        assert_eq!(*rules.0.lock().unwrap(), vec![foreign]);
+        assert_eq!(
+            core.wireguard_status(1000, "home").state,
+            TunnelState::Failed
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
