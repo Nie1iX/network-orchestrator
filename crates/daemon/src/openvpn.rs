@@ -266,8 +266,10 @@ mod tests {
         };
         let encoded = encode_line(&frame).unwrap().len();
         prepare_openvpn(1000, input.clone()).expect("request is at the validation limits");
-        // Credentials (bounded to a few KiB) and asset names must still fit.
+        // Credentials (bounded to a few KiB) and asset names must still fit,
+        // while 64 connections x MAX_FRAME_BYTES stays a small memory budget.
         assert!(encoded + 64 * 1024 <= MAX_FRAME_BYTES, "{encoded}");
+        assert!(MAX_FRAME_BYTES - encoded <= 1536 * 1024, "{encoded}");
         // The asset budget is really exhausted: one more byte is rejected.
         input.assets.insert(
             "assets/b".into(),

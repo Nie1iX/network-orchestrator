@@ -3,8 +3,8 @@ use std::fmt;
 use std::path::{Component, Path};
 
 pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
-pub const MAX_ASSET_BYTES: usize = 4 * 1024 * 1024;
-const MAX_TOTAL_ASSET_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ASSET_BYTES: usize = 512 * 1024;
+const MAX_TOTAL_ASSET_BYTES: usize = 1024 * 1024;
 const MAX_ASSETS: usize = 32;
 /// OpenVPN reads config lines (and inline blocks) with `fgets` into a
 /// 256-byte buffer. A longer line is split, and a chunk that happens to start
@@ -520,6 +520,25 @@ mod tests {
             "A".repeat(254)
         );
         assert!(sanitize(&longest_ok).is_ok());
+    }
+
+    #[test]
+    fn asset_limits_fit_real_bundles_and_bound_daemon_memory() {
+        // Real certificates, keys and pkcs12 bundles are kilobytes.
+        assert_eq!(MAX_ASSET_BYTES, 512 * 1024);
+        assert_eq!(MAX_TOTAL_ASSET_BYTES, 1024 * 1024);
+        let config = "client\nremote vpn.example\nca assets/a\ncert assets/b\nkey assets/c\n";
+        let mut assets = BTreeMap::new();
+        assets.insert("assets/a".to_owned(), vec![b'A'; MAX_ASSET_BYTES]);
+        assets.insert("assets/b".to_owned(), vec![b'B'; MAX_ASSET_BYTES]);
+        assets.insert("assets/c".to_owned(), vec![b'C'; 1]);
+        let staging = Path::new("/run/network-orchestrator/test");
+        assert_eq!(
+            sanitize_openvpn_config(config, &assets, staging).err(),
+            Some(OpenVpnConfigError::TooLarge)
+        );
+        let config = "client\nremote vpn.example\nca assets/a\ncert assets/b\n";
+        assert!(sanitize_openvpn_config(config, &assets, staging).is_ok());
     }
 
     #[test]
