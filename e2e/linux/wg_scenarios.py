@@ -262,6 +262,43 @@ full_status = rpc("wireguard.status", {"profileId": "wg-full"})
 assert full_status["latestHandshake"] and full_status["rxBytes"] > 0
 print("ok   full tunnel payload and handshake survive the route switch", flush=True)
 
+
+def wait_for(predicate, message, attempts=40):
+    for _ in range(attempts):
+        try:
+            if predicate():
+                return
+        except RuntimeError:
+            pass
+        time.sleep(0.5)
+    raise RuntimeError(message)
+
+
+def full_state_present():
+    rules = docker_exec(client_name, "ip", "-4", "rule", "show")
+    table = docker_exec(client_name, "ip", "-4", "route", "show", "table", "51820")
+    return "10000:" in rules and "10001:" in rules and "default" in table
+
+
+# Uplink flap: the kernel drops the eth0 default; a network manager re-adds
+# it and, like networkd with ManageForeignRoutingPolicyRules, flushes rules
+# and routes it does not know. The daemon must restore only its own state.
+docker_exec(client_name, "ip", "link", "set", "eth0", "down")
+time.sleep(1)
+docker_exec(client_name, "ip", "link", "set", "eth0", "up")
+docker_exec(client_name, "ip", "-4", "rule", "del", "priority", "10001")
+docker_exec(client_name, "ip", "-4", "route", "flush", "table", "51820")
+docker_exec(
+    client_name, "ip", "-4", "route", "replace", "default", "via", server_ip, "dev", "eth0"
+)
+wait_for(full_state_present, "daemon did not restore full-tunnel rules and route")
+wait_for(
+    lambda: docker_exec(client_name, "python3", "-c", payload_probe) == "netorch-e2e-server",
+    "full tunnel payload did not recover after uplink flap",
+)
+assert rpc("wireguard.status", {"profileId": "wg-full"})["state"] == "running"
+print("ok   uplink flap restores owned rules, route and payload", flush=True)
+
 assert rpc("wireguard.disconnect", {"profileId": "wg-full"}) == {"stopped": True}
 rules_after_disconnect = docker_exec(client_name, "ip", "-4", "rule", "show")
 assert "10000:" not in rules_after_disconnect and "10001:" not in rules_after_disconnect
@@ -269,9 +306,27 @@ table_after_disconnect = docker_exec(
     client_name, "ip", "-4", "route", "show", "table", "51820"
 )
 assert "default" not in table_after_disconnect
-docker_exec(client_name, "ip", "-4", "route", "replace", *original_default)
 assert rpc("wireguard.status", {"profileId": "wg-full"})["state"] == "stopped"
 print("ok   full tunnel disconnect restores daemon-owned network state", flush=True)
+
+vanish = rpc(
+    "wireguard.connect", {"profileId": "wg-full-vanish", "config": full_config, "routes": []}
+)["status"]
+assert vanish["state"] == "running" and full_state_present()
+docker_exec(client_name, "ip", "link", "del", vanish["interfaceName"])
+wait_for(
+    lambda: rpc("wireguard.status", {"profileId": "wg-full-vanish"})["state"] == "failed",
+    "daemon did not report a vanished WireGuard link as failed",
+)
+rules = docker_exec(client_name, "ip", "-4", "rule", "show")
+assert "10000:" not in rules and "10001:" not in rules, "dead tunnel kept policy rules"
+assert not any(
+    entry["owner"] == "wg:wg-full-vanish" for entry in rpc("owned.list", None)["owners"]
+)
+assert rpc("wireguard.disconnect", {"profileId": "wg-full-vanish"}) == {"stopped": True}
+assert rpc("wireguard.status", {"profileId": "wg-full-vanish"})["state"] == "stopped"
+docker_exec(client_name, "ip", "-4", "route", "replace", *original_default)
+print("ok   vanished transport is failed without leftover policy routing", flush=True)
 
 print("\n=== WireGuard full tunnel applies per-link DNS", flush=True)
 run(
@@ -471,4 +526,4 @@ assert result["removed"] and result["disconnected"]
 route = docker_exec(client_name, "ip", "-4", "route", "show", "10.77.0.0/24")
 assert "wg-" not in route, "WireGuard always-on route survived disable"
 print("ok   disable removed definition, link and route", flush=True)
-print("ALL 26 WIREGUARD CHECKS PASSED", flush=True)
+print("ALL 28 WIREGUARD CHECKS PASSED", flush=True)
