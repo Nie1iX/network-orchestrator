@@ -180,8 +180,33 @@ fn keyring_error(_: dbus_secret_service::Error) -> io::Error {
     io::Error::other("secret service request failed")
 }
 
+/// Secret Service calls block on D-Bus, up to a minute while an unlock prompt
+/// is open; keep other async tasks running on the multi-thread runtime.
+fn blocking<T>(call: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(call)
+        }
+        _ => call(),
+    }
+}
+
 impl SecretStore for SecretServiceStore {
     fn load(&self, profile_id: &str) -> io::Result<Option<Vec<u8>>> {
+        blocking(|| Self::load_blocking(profile_id))
+    }
+
+    fn save(&self, profile_id: &str, secret: &[u8]) -> io::Result<()> {
+        blocking(|| Self::save_blocking(profile_id, secret))
+    }
+
+    fn delete(&self, profile_id: &str) -> io::Result<()> {
+        blocking(|| Self::delete_blocking(profile_id))
+    }
+}
+
+impl SecretServiceStore {
+    fn load_blocking(profile_id: &str) -> io::Result<Option<Vec<u8>>> {
         let service = Self::connect()?;
         let found = service
             .search_items(Self::attributes(profile_id))
@@ -193,7 +218,7 @@ impl SecretStore for SecretServiceStore {
         item.get_secret().map(Some).map_err(keyring_error)
     }
 
-    fn save(&self, profile_id: &str, secret: &[u8]) -> io::Result<()> {
+    fn save_blocking(profile_id: &str, secret: &[u8]) -> io::Result<()> {
         let service = Self::connect()?;
         let collection = service.get_default_collection().map_err(keyring_error)?;
         collection.ensure_unlocked().map_err(keyring_error)?;
@@ -209,7 +234,7 @@ impl SecretStore for SecretServiceStore {
             .map_err(keyring_error)
     }
 
-    fn delete(&self, profile_id: &str) -> io::Result<()> {
+    fn delete_blocking(profile_id: &str) -> io::Result<()> {
         let service = Self::connect()?;
         let found = service
             .search_items(Self::attributes(profile_id))
