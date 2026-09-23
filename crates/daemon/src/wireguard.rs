@@ -167,6 +167,9 @@ pub fn parse_wireguard_config(
                     if address.addr().is_unspecified() || address.addr().is_multicast() {
                         return Err(WireGuardPlanError("invalid Address"));
                     }
+                    if plan.addresses.contains(&address) {
+                        continue;
+                    }
                     plan.addresses.push(address);
                     if plan.addresses.len() > MAX_ADDRESSES {
                         return Err(WireGuardPlanError("too many Address entries"));
@@ -390,14 +393,15 @@ pub fn parse_wireguard_config(
             }
         }
     }
-    plan.full_ipv4 = plan
-        .routes
-        .iter()
-        .any(|r| matches!(r.destination, IpNet::V4(net) if net.prefix_len() == 0));
-    plan.full_ipv6 = plan
-        .routes
-        .iter()
-        .any(|r| matches!(r.destination, IpNet::V6(net) if net.prefix_len() == 0));
+    // def1-style halves capture everything too, so they need the same
+    // marked-transport policy routing as a default route.
+    let has = |network: &str| {
+        plan.routes
+            .iter()
+            .any(|route| route.destination == network.parse::<IpNet>().unwrap())
+    };
+    plan.full_ipv4 = has("0.0.0.0/0") || (has("0.0.0.0/1") && has("128.0.0.0/1"));
+    plan.full_ipv6 = has("::/0") || (has("::/1") && has("8000::/1"));
     for server in &plan.dns_servers {
         let reachable = plan
             .routes
@@ -615,6 +619,31 @@ mod tests {
         let source = format!("{source}[Peer]\nPublicKey={KEY}\nAllowedIPs=10.1.0.0/16\n");
         let error = parse_wireguard_config(&source, &[]).unwrap_err();
         assert!(error.to_string().contains("overlapping AllowedIPs"));
+    }
+
+    #[test]
+    fn def1_style_halves_are_a_full_tunnel() {
+        let source = config(
+            "Address=10.77.0.2/32, fd77::2/128",
+            "AllowedIPs=0.0.0.0/1, 128.0.0.0/1, ::/1, 8000::/1",
+        );
+        let plan = parse_wireguard_config(&source, &[]).unwrap();
+        assert!(plan.full_ipv4 && plan.full_ipv6);
+        let half = config("Address=10.77.0.2/32", "AllowedIPs=0.0.0.0/1");
+        assert!(!parse_wireguard_config(&half, &[]).unwrap().full_ipv4);
+    }
+
+    #[test]
+    fn duplicate_addresses_are_owned_once() {
+        let source = config(
+            "Address=10.77.0.2/32, 10.77.0.2/32\nAddress=10.77.0.2/32",
+            "AllowedIPs=10.0.0.0/8",
+        );
+        let plan = parse_wireguard_config(&source, &[]).unwrap();
+        assert_eq!(
+            plan.addresses,
+            vec!["10.77.0.2/32".parse::<IpNet>().unwrap()]
+        );
     }
 
     #[test]

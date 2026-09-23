@@ -1246,21 +1246,26 @@ impl OpenVpnNetworkPlan {
     }
 
     fn is_full_route(&self, destination: IpNet) -> bool {
-        match destination {
-            IpNet::V4(_) => {
-                self.full_ipv4
-                    && matches!(
-                        destination.to_string().as_str(),
-                        "0.0.0.0/0" | "0.0.0.0/1" | "128.0.0.0/1"
-                    )
-            }
-            IpNet::V6(_) => {
-                self.full_ipv6
-                    && matches!(
-                        destination.to_string().as_str(),
-                        "::/0" | "::/1" | "8000::/1"
-                    )
-            }
+        is_full_route(self.full_ipv4, self.full_ipv6, destination)
+    }
+}
+
+/// A default route or one of its def1 halves in a family that is fully tunnelled.
+fn is_full_route(full_ipv4: bool, full_ipv6: bool, destination: IpNet) -> bool {
+    match destination {
+        IpNet::V4(_) => {
+            full_ipv4
+                && matches!(
+                    destination.to_string().as_str(),
+                    "0.0.0.0/0" | "0.0.0.0/1" | "128.0.0.0/1"
+                )
+        }
+        IpNet::V6(_) => {
+            full_ipv6
+                && matches!(
+                    destination.to_string().as_str(),
+                    "::/0" | "::/1" | "8000::/1"
+                )
         }
     }
 }
@@ -2584,6 +2589,25 @@ impl DaemonCore {
                 .as_mut()
                 .unwrap()
                 .configure(&name, &plan.setconf)?;
+            let in_full_table = |destination: IpNet| {
+                full.is_some() && is_full_route(plan.full_ipv4, plan.full_ipv6, destination)
+            };
+            // Main-table routes and address prefixes on the tunnel link would
+            // send the encrypted transport back into the tunnel.
+            for endpoint in self.wg_config.as_ref().unwrap().endpoint_ips(&name)? {
+                if plan
+                    .addresses
+                    .iter()
+                    .any(|address| address.trunc().contains(&endpoint))
+                    || plan.routes.iter().any(|route| {
+                        !in_full_table(route.destination) && route.destination.contains(&endpoint)
+                    })
+                {
+                    return Err(invalid_input(
+                        "WireGuard endpoint is covered by tunnel routes or addresses".into(),
+                    ));
+                }
+            }
             if let Some(full) = &full {
                 self.wg_config
                     .as_mut()
@@ -2613,10 +2637,8 @@ impl DaemonCore {
                     continue;
                 }
                 let mut applied = AppliedRoute::on_link(route.destination, ifindex, route.metric);
-                if route.destination.prefix_len() == 0 {
-                    if let Some(full) = &full {
-                        applied.table = Some(full.table);
-                    }
+                if in_full_table(route.destination) {
+                    applied.table = full.as_ref().map(|full| full.table);
                 }
                 self.journal.entries[index]
                     .resources
@@ -5029,6 +5051,112 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event == "route-wal"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    struct EndpointWgConfig(std::net::IpAddr);
+
+    impl WgConfigExecutor for EndpointWgConfig {
+        fn configure(&mut self, _name: &str, _config: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn endpoint_ips(&self, _name: &str) -> io::Result<Vec<std::net::IpAddr>> {
+            Ok(vec![self.0])
+        }
+    }
+
+    #[test]
+    fn split_route_or_address_covering_endpoint_is_rejected_before_mutation() {
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        for (address, allowed, rejected) in [
+            ("10.77.0.2/32", "192.0.2.0/24", true),
+            ("192.0.2.2/24", "10.0.0.0/8", true),
+            ("10.77.0.2/32", "10.0.0.0/8", false),
+        ] {
+            let dir = unique_dir("wireguard-endpoint-loop");
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let recorder = Recorder::default();
+            let mut core = DaemonCore::open_with_wireguard(
+                JournalStore::new(dir.join(JOURNAL_FILE)),
+                Box::new(FakeRoutes::new(&recorder)),
+                Box::new(FakeLinks(recorder.clone())),
+                Box::new(FakeWg {
+                    events: events.clone(),
+                    fail_remove_address: false,
+                    before_create: None,
+                }),
+                Box::new(EndpointWgConfig("192.0.2.1".parse().unwrap())),
+            )
+            .unwrap();
+            let config = format!("[Interface]\nPrivateKey={key}\nAddress={address}\n[Peer]\nPublicKey={key}\nEndpoint=vpn.example.test:51820\nAllowedIPs={allowed}\n");
+            let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+            let result = core.connect_wireguard(1000, "home", plan);
+            if rejected {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert!(error.to_string().contains("endpoint"));
+                assert!(recorder.ops().is_empty());
+                let events = events.lock().unwrap();
+                assert!(!events.iter().any(|event| event.starts_with("address+")));
+                assert!(events.iter().any(|event| event.starts_with("delete:wg-")));
+                assert!(core.owned(1000).is_empty());
+            } else {
+                result.unwrap();
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn wireguard_def1_halves_use_full_table_and_policy_rules() {
+        let dir = unique_dir("wireguard-full-halves");
+        let journal_path = dir.join(JOURNAL_FILE);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let rules = Arc::new(Mutex::new(Vec::new()));
+        let mut core = DaemonCore::open_with_wireguard_full(
+            JournalStore::new(&journal_path),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: None,
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+            Box::new(FakePolicyRules {
+                events: events.clone(),
+                rules: rules.clone(),
+                journal_path: journal_path.clone(),
+            }),
+            Box::new(FakeDns {
+                result: crate::dns::DnsApply::Skipped,
+                events,
+            }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=198.18.0.1:51820\nAllowedIPs=0.0.0.0/1, 128.0.0.0/1\n");
+        let plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        core.connect_wireguard(1000, "home", plan).unwrap();
+        let routes: Vec<_> = core.owned(1000)[0]
+            .resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) => Some((route.destination.to_string(), route.table)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            routes,
+            vec![
+                ("0.0.0.0/1".to_string(), Some(51820)),
+                ("128.0.0.0/1".to_string(), Some(51820))
+            ]
+        );
+        assert_eq!(rules.lock().unwrap().len(), 2);
         fs::remove_dir_all(&dir).unwrap();
     }
 

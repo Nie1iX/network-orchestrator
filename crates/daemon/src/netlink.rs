@@ -374,11 +374,24 @@ pub fn classify_errno(errno: i32) -> io::ErrorKind {
     }
 }
 
+/// RTM_DELADDR reports an address that is already gone as EADDRNOTAVAIL.
+pub fn classify_address_delete_errno(errno: i32) -> io::ErrorKind {
+    if errno == libc::EADDRNOTAVAIL {
+        io::ErrorKind::NotFound
+    } else {
+        classify_errno(errno)
+    }
+}
+
 pub fn netlink_error_to_io(err: rtnetlink::Error) -> io::Error {
+    netlink_error_with(err, classify_errno)
+}
+
+fn netlink_error_with(err: rtnetlink::Error, classify: fn(i32) -> io::ErrorKind) -> io::Error {
     match err {
         rtnetlink::Error::NetlinkError(message) => {
             let errno = message.raw_code().abs();
-            io::Error::new(classify_errno(errno), message.to_io().to_string())
+            io::Error::new(classify(errno), message.to_io().to_string())
         }
         other => io::Error::other(other.to_string()),
     }
@@ -779,14 +792,16 @@ async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedRecei
                         .add(index, address.addr(), address.prefix_len())
                         .execute()
                         .await
+                        .map_err(netlink_error_to_io)
                 } else {
                     handle
                         .address()
                         .del(address_delete_request(index, address))
                         .execute()
                         .await
+                        .map_err(|err| netlink_error_with(err, classify_address_delete_errno))
                 };
-                let _ = reply.send(result.map_err(netlink_error_to_io));
+                let _ = reply.send(result);
             }
             Command::WgMtu { index, mtu, reply } => {
                 let _ = reply.send(
@@ -1286,6 +1301,19 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert_eq!(classify_errno(libc::EBUSY), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn address_delete_treats_missing_address_as_already_gone() {
+        assert_eq!(
+            classify_address_delete_errno(libc::EADDRNOTAVAIL),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            classify_address_delete_errno(libc::EPERM),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(classify_errno(libc::EADDRNOTAVAIL), io::ErrorKind::Other);
     }
 
     #[test]
