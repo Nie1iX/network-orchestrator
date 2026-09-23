@@ -314,15 +314,17 @@ vanish = rpc(
 )["status"]
 assert vanish["state"] == "running" and full_state_present()
 docker_exec(client_name, "ip", "link", "del", vanish["interfaceName"])
+# `wg show` fails at once, so status turns failed before the debounced
+# reconcile; wait for the owner itself to be torn down.
 wait_for(
-    lambda: rpc("wireguard.status", {"profileId": "wg-full-vanish"})["state"] == "failed",
-    "daemon did not report a vanished WireGuard link as failed",
+    lambda: not any(
+        entry["owner"] == "wg:wg-full-vanish" for entry in rpc("owned.list", None)["owners"]
+    ),
+    "daemon did not tear down a vanished WireGuard owner",
 )
+assert rpc("wireguard.status", {"profileId": "wg-full-vanish"})["state"] == "failed"
 rules = docker_exec(client_name, "ip", "-4", "rule", "show")
 assert "10000:" not in rules and "10001:" not in rules, "dead tunnel kept policy rules"
-assert not any(
-    entry["owner"] == "wg:wg-full-vanish" for entry in rpc("owned.list", None)["owners"]
-)
 assert rpc("wireguard.disconnect", {"profileId": "wg-full-vanish"}) == {"stopped": True}
 assert rpc("wireguard.status", {"profileId": "wg-full-vanish"})["state"] == "stopped"
 docker_exec(client_name, "ip", "-4", "route", "replace", *original_default)
