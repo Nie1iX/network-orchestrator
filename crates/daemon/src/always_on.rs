@@ -61,7 +61,10 @@ pub fn validate_definition(definition: &AlwaysOnDefinition) -> io::Result<()> {
             parse_wireguard_config(&profile.config, &profile.routes).map_err(|_| invalid_data())?;
         }
         AlwaysOnDefinition::StaticRoutes(profile) => {
-            if owner.starts_with("wg:") || owner.starts_with("ovpn:") || owner.starts_with("xray:")
+            if owner.starts_with("wg:")
+                || owner.starts_with("ovpn:")
+                || owner.starts_with("ovpn-probe:")
+                || owner.starts_with("xray:")
             {
                 return Err(invalid_data());
             }
@@ -451,6 +454,25 @@ mod tests {
         assert!(store.insert(1000, wireguard("home")).is_err());
         assert!(fs::read_dir(&target).unwrap().next().is_none());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn static_definitions_cannot_use_tunnel_owner_prefixes() {
+        use net_manager_core::daemon_protocol::AlwaysOnStaticRoutes;
+        use net_manager_core::models::PolicyRoute;
+
+        for owner in ["wg:home", "ovpn:home", "ovpn-probe:home", "xray:home"] {
+            let definition = AlwaysOnDefinition::StaticRoutes(AlwaysOnStaticRoutes {
+                profile_id: owner.into(),
+                interface_name: "eth0".into(),
+                routes: vec![PolicyRoute {
+                    destination: "10.1.0.0/16".parse().unwrap(),
+                    metric: 5,
+                    via: None,
+                }],
+            });
+            assert!(validate_definition(&definition).is_err(), "{owner}");
+        }
     }
 
     #[test]

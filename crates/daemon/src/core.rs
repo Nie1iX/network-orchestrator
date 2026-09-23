@@ -256,6 +256,32 @@ mod openvpn_tests {
         let recovered = core(&dir, &recovered_process, &routes);
         assert!(recovered.journal.entries.is_empty());
         assert!(routes.ops().is_empty());
+        let calls = recovered_process.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|call| call.starts_with("stop:")));
+        assert!(calls.iter().any(|call| call.starts_with("cleanup:")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn uid_cleanup_stops_active_probe_process_and_staging() {
+        let dir = unique_dir("probe-uid-cleanup");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut daemon = core(&dir, &process, &routes);
+        daemon.start_openvpn_probe(1000, plan()).unwrap();
+        let result = daemon.cleanup_uid(1000).unwrap();
+        assert_eq!(result.removed_owners, ["ovpn-probe:home"]);
+        assert!(daemon.journal.entries.is_empty());
+        let calls = process.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|call| call.starts_with("stop:")));
+        assert!(calls.iter().any(|call| call.starts_with("cleanup:")));
+        assert!(daemon
+            .apply_routes(
+                1000,
+                "ovpn-probe:home",
+                vec![AppliedRoute::on_link("10.1.0.0/16".parse().unwrap(), 2, 5)]
+            )
+            .is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -346,6 +372,40 @@ mod openvpn_tests {
         core.connect_openvpn(1000, plan()).unwrap();
         assert!(core.openvpn_status(1000, "home").warnings.is_empty());
         core.disconnect_openvpn(1000, "home").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn one_failed_owner_does_not_stop_reconciling_the_others() {
+        let dir = unique_dir("reconcile-continue");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        let office = prepare_openvpn(
+            1000,
+            OpenVpnConnectParams {
+                profile_id: "office".into(),
+                config: "client\nremote vpn.example 1194\n".into(),
+                assets: BTreeMap::new(),
+                routes: vec![],
+            },
+        )
+        .unwrap();
+        core.connect_openvpn(1000, office).unwrap();
+        // The queue is shared: whichever owner is polled first fails.
+        process.pending.lock().unwrap().extend([
+            vec![ManagementEvent::AuthenticationFailed],
+            vec![
+                ManagementEvent::PushReply(
+                    parse_push_reply("PUSH_REPLY,route 10.89.0.0 255.255.0.0").unwrap(),
+                ),
+                ManagementEvent::State(OpenVpnState::Connected),
+            ],
+        ]);
+        assert!(core.reconcile_openvpn().is_err());
+        assert!(process.pending.lock().unwrap().is_empty());
+        assert_eq!(routes.ops(), vec![Op::Add("10.89.0.0/16".into())]);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2210,10 +2270,15 @@ impl DaemonCore {
             })
             .cloned()
             .collect();
+        // One failing owner must not starve the others; report the first error.
+        let mut first_error = None;
         for (uid, owner) in owners {
-            self.reconcile_openvpn_owner(uid, &owner)?;
+            if let Err(err) = self.reconcile_openvpn_owner(uid, &owner) {
+                eprintln!("network-orchestrator-daemon: OpenVPN reconcile failed: {err}");
+                first_error.get_or_insert(err);
+            }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     fn reconcile_openvpn_owner(&mut self, uid: u32, owner: &str) -> io::Result<()> {
@@ -2998,7 +3063,11 @@ impl DaemonCore {
         routes: Vec<AppliedRoute>,
     ) -> io::Result<usize> {
         validate_owner(owner).map_err(invalid_input)?;
-        if owner.starts_with("wg:") || owner.starts_with("ovpn:") || owner.starts_with("xray:") {
+        if owner.starts_with("wg:")
+            || owner.starts_with("ovpn:")
+            || owner.starts_with("ovpn-probe:")
+            || owner.starts_with("xray:")
+        {
             return Err(invalid_input("reserved owner prefix".into()));
         }
         validate_apply(&routes).map_err(invalid_input)?;
@@ -3161,7 +3230,8 @@ impl DaemonCore {
         if self.journal.entries[index].owner.starts_with("xray:") {
             return self.teardown_xray_entry(index);
         }
-        if self.journal.entries[index].owner.starts_with("ovpn:") {
+        let owner = &self.journal.entries[index].owner;
+        if owner.starts_with("ovpn:") || owner.starts_with("ovpn-probe:") {
             return self.teardown_openvpn_entry(index);
         }
         if self.journal.entries[index].owner.starts_with("wg:") {
