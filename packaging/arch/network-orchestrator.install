@@ -3,3 +3,13 @@ post_install() {
         '  sudo systemctl enable --now network-orchestrator.service' \
         'Use pacman to update Network Orchestrator.'
 }
+
+post_upgrade() {
+    printf '%s\n' 'Restart the daemon to use the new version:' \
+        '  sudo systemctl try-restart network-orchestrator.service'
+}
+
+pre_remove() {
+    # Stop before the binary disappears so the daemon tears down its tunnels.
+    systemctl disable --now network-orchestrator.service 2>/dev/null || true
+}

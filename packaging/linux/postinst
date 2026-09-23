@@ -4,9 +4,11 @@ set -e
 case "$1" in
     configure|abort-upgrade|abort-remove|abort-deconfigure)
         if command -v systemctl >/dev/null 2>&1; then
-            systemctl daemon-reload
+            # enable works offline; reload/start need systemd as PID 1
+            # (not the case in chroots, image builds or WSL).
             systemctl enable network-orchestrator.service
             if [ -d /run/systemd/system ]; then
+                systemctl daemon-reload
                 systemctl start network-orchestrator.service
             fi
         fi

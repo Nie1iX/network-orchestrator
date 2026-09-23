@@ -5,7 +5,9 @@ pkgdesc='Desktop network route and VPN manager'
 arch=('x86_64')
 url='https://github.com/Nie1iX/network-orchestrator'
 license=('MIT' 'MPL-2.0' 'GPL-3.0-only')
-depends=('webkit2gtk-4.1' 'polkit' 'iproute2' 'systemd')
+# libappindicator-gtk3 (provided by libappindicator) is loaded at runtime by
+# the tray; without it the app aborts at startup.
+depends=('webkit2gtk-4.1' 'polkit' 'iproute2' 'systemd' 'libappindicator-gtk3')
 optdepends=('wireguard-tools: WireGuard tunnels'
             'openvpn: OpenVPN tunnels')
 makedepends=('cargo' 'nodejs' 'npm' 'pkgconf' 'openssl' 'libappindicator-gtk3' 'librsvg' 'xdotool')

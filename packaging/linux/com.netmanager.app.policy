@@ -9,8 +9,10 @@
   client process on the other end of its Unix socket; nothing is run via
   pkexec, so there is no exec.path annotation.
 
-  connect-profile: removing the caller's own routes and recovery cleanup.
-    An active local session is allowed without a prompt.
+  connect-profile: connecting and disconnecting the caller's own WireGuard,
+    OpenVPN and Xray profiles (including a full tunnel and its DNS), removing
+    the caller's own routes and recovery cleanup. An active local session is
+    allowed without a prompt, as NetworkManager allows VPN activation.
   system-network: applying routes and changing link state. Prompts for an
     administrator once and caches the result (auth_admin_keep).
 -->
@@ -21,10 +23,10 @@
   <icon_name>network-workgroup</icon_name>
 
   <action id="com.netmanager.app.connect-profile">
-    <description>Remove network changes made by Network Orchestrator</description>
-    <description xml:lang="ru">Отменить сетевые изменения Network Orchestrator</description>
-    <message>Network Orchestrator needs authorization to remove its network changes.</message>
-    <message xml:lang="ru">Network Orchestrator требует авторизацию для отмены своих сетевых изменений.</message>
+    <description>Connect and disconnect Network Orchestrator VPN profiles</description>
+    <description xml:lang="ru">Подключать и отключать VPN-профили Network Orchestrator</description>
+    <message>Network Orchestrator needs authorization to connect or disconnect a VPN profile.</message>
+    <message xml:lang="ru">Network Orchestrator требует авторизацию для подключения или отключения VPN-профиля.</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
