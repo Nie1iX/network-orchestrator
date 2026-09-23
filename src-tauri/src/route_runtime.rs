@@ -28,10 +28,10 @@ pub(crate) enum RouteRuntime {
 
 /// Owner prefixes the daemon reserves for tunnels; they are never static routes.
 #[cfg(target_os = "linux")]
-const TUNNEL_OWNER_PREFIXES: [&str; 4] = ["wg:", "ovpn:", "ovpn-probe:", "xray:"];
+pub(crate) const TUNNEL_OWNER_PREFIXES: [&str; 4] = ["wg:", "ovpn:", "ovpn-probe:", "xray:"];
 
 #[cfg(target_os = "linux")]
-fn static_route_snapshot(result: OwnedListResult) -> Vec<AppliedProfileRoutes> {
+pub(crate) fn static_route_snapshot(result: OwnedListResult) -> Vec<AppliedProfileRoutes> {
     result
         .owners
         .into_iter()

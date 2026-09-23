@@ -1,4 +1,5 @@
 use crate::commands::diagnostics::applied_route_present;
+#[cfg(not(target_os = "linux"))]
 use crate::lifecycle::cleanup_all;
 use crate::state::AppState;
 use net_manager_core::explorer;
@@ -12,6 +13,76 @@ fn daemon_owned_profile(profile: &Profile) -> bool {
         profile.backend,
         TunnelBackend::WireGuard | TunnelBackend::OpenVpn
     ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun)
+}
+
+/// Owners that are leftovers rather than healthy state: non-applied journal
+/// entries, static owners without a profile or with missing routes, and
+/// daemon tunnels whose status failed. Newest first, like daemon teardown.
+#[cfg(target_os = "linux")]
+fn linux_leftover_owners(
+    entries: &[net_manager_core::daemon_protocol::OwnedEntry],
+    profiles: &[Profile],
+    statuses: &[(String, TunnelStatus)],
+    os_routes: &[RouteEntry],
+) -> Vec<String> {
+    use net_manager_core::daemon_protocol::{OwnedResource, OwnedState};
+
+    let mut owners: Vec<String> = entries
+        .iter()
+        .rev()
+        .filter(|entry| {
+            let tunnel = crate::route_runtime::TUNNEL_OWNER_PREFIXES
+                .iter()
+                .any(|prefix| entry.owner.starts_with(prefix));
+            entry.state != OwnedState::Applied
+                || (!tunnel
+                    && (!profiles.iter().any(|p| p.id == entry.owner)
+                        || entry.resources.iter().any(|resource| {
+                            matches!(resource, OwnedResource::Route(route)
+                                if !os_routes.iter().any(|e| applied_route_present(route, e)))
+                        })))
+        })
+        .map(|entry| entry.owner.clone())
+        .collect();
+    for (profile_id, status) in statuses {
+        if status.state != TunnelState::Failed {
+            continue;
+        }
+        let Some(profile) = profiles
+            .iter()
+            .find(|p| &p.id == profile_id && daemon_owned_profile(p))
+        else {
+            continue;
+        };
+        if let Some(owner) = crate::auto_connect::daemon_owner(profile) {
+            if !owners.contains(&owner) {
+                owners.push(owner);
+            }
+        }
+    }
+    owners
+}
+
+/// The per-owner daemon method that removes `owner`. Probe owners have no
+/// per-owner method; the daemon clears them on its own restart.
+#[cfg(target_os = "linux")]
+fn cleanup_request(owner: &str) -> Option<(&'static str, serde_json::Value)> {
+    use net_manager_core::daemon_protocol::method;
+    use serde_json::json;
+
+    if owner.starts_with("ovpn-probe:") {
+        return None;
+    }
+    for (prefix, method) in [
+        ("wg:", method::WIREGUARD_DISCONNECT),
+        ("ovpn:", method::OPENVPN_DISCONNECT),
+        ("xray:", method::XRAY_DISCONNECT),
+    ] {
+        if let Some(profile_id) = owner.strip_prefix(prefix) {
+            return Some((method, json!({ "profileId": profile_id })));
+        }
+    }
+    Some((method::ROUTES_REMOVE, json!({ "owner": owner })))
 }
 
 pub(crate) fn build_recovery_report(
@@ -120,6 +191,11 @@ pub(crate) fn build_recovery_report(
 }
 
 async fn collect_report(state: &AppState) -> Result<RecoveryReport, String> {
+    collect(state).await.map(|(report, _)| report)
+}
+
+/// The recovery report plus, on Linux, the daemon owners that are leftovers.
+async fn collect(state: &AppState) -> Result<(RecoveryReport, Vec<String>), String> {
     let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let os_routes = explorer::list_routes().await.map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
@@ -157,15 +233,36 @@ async fn collect_report(state: &AppState) -> Result<RecoveryReport, String> {
             .filter(|p| !daemon_owned_profile(p))
             .map(|p| (p.id.clone(), runtime.tunnels.status(p))),
     );
-    let ownership = runtime.routes.snapshot().await?;
+    #[cfg(not(target_os = "linux"))]
+    let (ownership, leftovers) = (runtime.routes.snapshot().await?, Vec::new());
     let proxy_ownership = runtime.proxy.ownership().cloned();
     drop(runtime);
-    Ok(build_recovery_report(
-        &profiles,
-        &statuses,
-        &ownership,
-        &os_routes,
-        proxy_ownership.as_ref(),
+    #[cfg(target_os = "linux")]
+    let (ownership, leftovers) = {
+        use net_manager_core::daemon_protocol::{method, OwnedListResult};
+
+        let mut owned: OwnedListResult = client
+            .request(method::OWNED_LIST, serde_json::Value::Null)
+            .await
+            .map_err(|e| crate::daemon_client::user_message(&e))?;
+        let leftovers = linux_leftover_owners(&owned.owners, &profiles, &statuses, &os_routes);
+        owned
+            .owners
+            .retain(|entry| leftovers.contains(&entry.owner));
+        (
+            crate::route_runtime::static_route_snapshot(owned),
+            leftovers,
+        )
+    };
+    Ok((
+        build_recovery_report(
+            &profiles,
+            &statuses,
+            &ownership,
+            &os_routes,
+            proxy_ownership.as_ref(),
+        ),
+        leftovers,
     ))
 }
 
@@ -181,10 +278,32 @@ pub(crate) async fn cleanup_recovery(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<RecoveryReport, String> {
+    // Linux: remove only leftover daemon owners; healthy tunnels, static
+    // routes and always-on state stay untouched.
     #[cfg(target_os = "linux")]
-    crate::lifecycle::disconnect_all(&state, &crate::daemon_client::DaemonClient::system()).await?;
-    cleanup_all(&state).await?;
-    let _ = app.emit("route-changed", ());
+    {
+        let (_, leftovers) = collect(&state).await?;
+        let client = crate::daemon_client::DaemonClient::system();
+        let mut failed = 0;
+        for (method, params) in leftovers.iter().filter_map(|owner| cleanup_request(owner)) {
+            if client
+                .request::<_, serde_json::Value>(method, params)
+                .await
+                .is_err()
+            {
+                failed += 1;
+            }
+        }
+        let _ = app.emit("route-changed", ());
+        if failed > 0 {
+            return Err(format!("daemon could not clean up {failed} owner(s)"));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cleanup_all(&state).await?;
+        let _ = app.emit("route-changed", ());
+    }
     collect_report(&state).await
 }
 
@@ -354,6 +473,109 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.kind == RecoveryIssueKind::StatusCheckFailed));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_leftovers_skip_healthy_owners() {
+        use net_manager_core::daemon_protocol::{OwnedEntry, OwnedResource, OwnedState};
+
+        let with_id = |id: &str, backend: TunnelBackend| {
+            let mut p = profile("if0");
+            p.id = id.into();
+            p.backend = backend;
+            p
+        };
+        let mut xray = with_id("xray-failed", TunnelBackend::Xray);
+        xray.xray_mode = XrayMode::Tun;
+        let profiles = vec![
+            with_id("static-ok", TunnelBackend::None),
+            with_id("static-stale", TunnelBackend::None),
+            with_id("static-missing", TunnelBackend::None),
+            with_id("wg-ok", TunnelBackend::WireGuard),
+            with_id("wg-applying", TunnelBackend::WireGuard),
+            with_id("ovpn-failed", TunnelBackend::OpenVpn),
+            xray,
+        ];
+        let route = |dest: &str| {
+            OwnedResource::Route(AppliedRoute {
+                destination: dest.parse().unwrap(),
+                interface_index: 5,
+                metric: 10,
+                gateway: None,
+                table: None,
+            })
+        };
+        let entry = |owner: &str, state: OwnedState, resources: Vec<OwnedResource>| OwnedEntry {
+            owner: owner.into(),
+            state,
+            resources,
+        };
+        let entries = vec![
+            entry("static-ok", OwnedState::Applied, vec![route("10.1.0.0/24")]),
+            entry(
+                "static-stale",
+                OwnedState::Stale,
+                vec![route("10.1.0.0/24")],
+            ),
+            entry("gone", OwnedState::Applied, vec![route("10.1.0.0/24")]),
+            entry(
+                "static-missing",
+                OwnedState::Applied,
+                vec![route("10.2.0.0/24")],
+            ),
+            entry("wg:wg-ok", OwnedState::Applied, Vec::new()),
+            entry("wg:wg-applying", OwnedState::Applying, Vec::new()),
+            entry("ovpn:ovpn-failed", OwnedState::Applied, Vec::new()),
+            entry("ovpn-probe:ovpn-failed", OwnedState::Stale, Vec::new()),
+        ];
+        let statuses = vec![
+            status("wg-ok", TunnelState::Running),
+            status("wg-applying", TunnelState::Running),
+            status("ovpn-failed", TunnelState::Failed),
+            status("xray-failed", TunnelState::Failed),
+        ];
+        let os_routes = vec![route_entry("10.1.0.0", 24, 5, 10)];
+
+        let leftovers = linux_leftover_owners(&entries, &profiles, &statuses, &os_routes);
+
+        assert_eq!(
+            leftovers,
+            [
+                "ovpn-probe:ovpn-failed",
+                "wg:wg-applying",
+                "static-missing",
+                "gone",
+                "static-stale",
+                "ovpn:ovpn-failed",
+                "xray:xray-failed",
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cleanup_uses_the_owner_specific_daemon_method() {
+        use net_manager_core::daemon_protocol::method;
+        use serde_json::json;
+
+        assert_eq!(
+            cleanup_request("wg:home"),
+            Some((method::WIREGUARD_DISCONNECT, json!({"profileId": "home"})))
+        );
+        assert_eq!(
+            cleanup_request("ovpn:office"),
+            Some((method::OPENVPN_DISCONNECT, json!({"profileId": "office"})))
+        );
+        assert_eq!(
+            cleanup_request("xray:proxy"),
+            Some((method::XRAY_DISCONNECT, json!({"profileId": "proxy"})))
+        );
+        assert_eq!(
+            cleanup_request("static"),
+            Some((method::ROUTES_REMOVE, json!({"owner": "static"})))
+        );
+        assert_eq!(cleanup_request("ovpn-probe:office"), None);
     }
 
     #[test]

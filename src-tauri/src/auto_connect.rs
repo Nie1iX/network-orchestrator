@@ -43,7 +43,7 @@ pub(crate) fn get_auto_connect_result(
     status.current()
 }
 
-fn daemon_owner(profile: &Profile) -> Option<String> {
+pub(crate) fn daemon_owner(profile: &Profile) -> Option<String> {
     match profile.backend {
         TunnelBackend::None => Some(profile.id.clone()),
         TunnelBackend::WireGuard => Some(format!("wg:{}", profile.id)),
