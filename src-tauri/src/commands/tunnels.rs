@@ -1827,7 +1827,12 @@ mod tests {
         let dir = unique_dir("ovpn-oversize-frame");
         let source = dir.join("secret-client.ovpn");
         std::fs::write(&source, "client\nremote vpn.example 1194\nca large.crt\n").unwrap();
-        std::fs::write(dir.join("large.crt"), vec![b'A'; 850_000]).unwrap();
+        // Larger than MAX_FRAME_BYTES even before base64 and JSON overhead.
+        std::fs::write(
+            dir.join("large.crt"),
+            vec![b'A'; net_manager_core::daemon_protocol::MAX_FRAME_BYTES + 1],
+        )
+        .unwrap();
         let vault = net_manager_core::config_vault::ConfigVault::new(dir.join("configs"));
         let mut profile = profile("tun0");
         profile.backend = TunnelBackend::OpenVpn;
