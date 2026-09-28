@@ -115,6 +115,9 @@ python3 "$CLIENT" settings.set '{"vpnAuthMode":"always"}' >/dev/null && ok "admi
 expect_eq "$(stat -c %a /var/lib/network-orchestrator/settings.json)" 600 "settings file mode 0600"
 systemctl restart "$UNIT"; wait_socket
 expect_eq "$(as alice python3 "$CLIENT" settings.get)" '{"vpnAuthMode": "always"}' "mode persists across restart and is readable by users"
+printf '{ corrupt' > /var/lib/network-orchestrator/settings.json
+systemctl restart "$UNIT"; wait_socket
+expect_eq "$(as alice python3 "$CLIENT" settings.get)" '{"vpnAuthMode": "always"}' "corrupt settings require administrator confirmation"
 python3 "$CLIENT" settings.set '{"vpnAuthMode":"fullTunnelOnly"}' >/dev/null || fail "restore default mode"
 
 step "link.set_state"

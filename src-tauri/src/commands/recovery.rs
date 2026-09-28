@@ -22,7 +22,7 @@ fn daemon_owned_profile(profile: &Profile) -> bool {
 fn linux_leftover_owners(
     entries: &[net_manager_core::daemon_protocol::OwnedEntry],
     profiles: &[Profile],
-    statuses: &[(String, TunnelStatus)],
+    statuses: &[(String, Result<TunnelStatus, String>)],
     os_routes: &[RouteEntry],
 ) -> Vec<String> {
     use net_manager_core::daemon_protocol::{OwnedResource, OwnedState};
@@ -45,7 +45,10 @@ fn linux_leftover_owners(
         .map(|entry| entry.owner.clone())
         .collect();
     for (profile_id, status) in statuses {
-        if status.state != TunnelState::Failed {
+        if !status
+            .as_ref()
+            .is_ok_and(|status| status.state == TunnelState::Failed)
+        {
             continue;
         }
         let Some(profile) = profiles
@@ -199,7 +202,8 @@ async fn collect(state: &AppState) -> Result<(RecoveryReport, Vec<String>), Stri
     let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let os_routes = explorer::list_routes().await.map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
-    let mut statuses = Vec::with_capacity(profiles.len());
+    let mut statuses: Vec<(String, Result<TunnelStatus, String>)> =
+        Vec::with_capacity(profiles.len());
     #[cfg(target_os = "linux")]
     let client = crate::daemon_client::DaemonClient::system();
     #[cfg(target_os = "linux")]
@@ -212,12 +216,7 @@ async fn collect(state: &AppState) -> Result<(RecoveryReport, Vec<String>), Stri
             } else {
                 crate::commands::tunnels::linux_xray_status(&client, profile).await
             };
-            let status = result.unwrap_or_else(|err| TunnelStatus {
-                profile_id: profile.id.clone(),
-                state: TunnelState::Failed,
-                message: Some(err),
-            });
-            statuses.push((profile.id.clone(), status));
+            statuses.push((profile.id.clone(), result));
         }
     }
     let mut runtime = state.runtime.lock().await;
@@ -231,7 +230,7 @@ async fn collect(state: &AppState) -> Result<(RecoveryReport, Vec<String>), Stri
         profiles
             .iter()
             .filter(|p| !daemon_owned_profile(p))
-            .map(|p| (p.id.clone(), runtime.tunnels.status(p))),
+            .map(|p| (p.id.clone(), Ok(runtime.tunnels.status(p)))),
     );
     #[cfg(not(target_os = "linux"))]
     let (ownership, leftovers) = (runtime.routes.snapshot().await?, Vec::new());
@@ -254,6 +253,18 @@ async fn collect(state: &AppState) -> Result<(RecoveryReport, Vec<String>), Stri
             leftovers,
         )
     };
+    #[cfg(target_os = "linux")]
+    let statuses: Vec<_> = statuses
+        .into_iter()
+        .map(|(profile_id, result)| {
+            let status = result.unwrap_or_else(|err| TunnelStatus {
+                profile_id: profile_id.clone(),
+                state: TunnelState::Failed,
+                message: Some(err),
+            });
+            (profile_id, status)
+        })
+        .collect();
     Ok((
         build_recovery_report(
             &profiles,
@@ -534,7 +545,10 @@ mod tests {
             status("wg-applying", TunnelState::Running),
             status("ovpn-failed", TunnelState::Failed),
             status("xray-failed", TunnelState::Failed),
-        ];
+        ]
+        .into_iter()
+        .map(|(profile_id, status)| (profile_id, Ok(status)))
+        .collect::<Vec<_>>();
         let os_routes = vec![route_entry("10.1.0.0", 24, 5, 10)];
 
         let leftovers = linux_leftover_owners(&entries, &profiles, &statuses, &os_routes);
@@ -551,6 +565,23 @@ mod tests {
                 "xray:xray-failed",
             ]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn status_rpc_error_does_not_offer_applied_tunnel_for_cleanup() {
+        use net_manager_core::daemon_protocol::{OwnedEntry, OwnedState};
+
+        let mut p = profile("wg-work");
+        p.id = "home".into();
+        let entry = OwnedEntry {
+            owner: "wg:home".into(),
+            state: OwnedState::Applied,
+            resources: Vec::new(),
+        };
+        let rpc_error = ("home".into(), Err("daemon response timed out".into()));
+
+        assert!(linux_leftover_owners(&[entry], &[p], &[rpc_error], &[]).is_empty());
     }
 
     #[cfg(target_os = "linux")]

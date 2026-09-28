@@ -216,10 +216,11 @@ Xray запускается через daemon от root. IP-адрес, MTU, м�
     перепишется `/etc/resolv.conf`);
   - maintainer-скрипты `.deb` пишем вручную (Tauri не даёт debhelper);
   - Arch `.install` только печатает подсказку `systemctl enable --now`.
-- **Updater (G3):** `tauri-plugin-updater` умеет `.deb` (`pkexec dpkg -i`).
-  Для `.deb` его **оставляем** (иначе нет обновлений до появления
-  APT-репозитория). Для Arch-сборки выключаем: без маркера бандла она
-  попадёт в ветку AppImage.
+- **Updater (G3):** `tauri-plugin-updater` умеет `.deb` (`pkexec dpkg -i`),
+  но в `tauri.conf.json` нет подписанного endpoint'а. Поэтому на Linux он
+  скрыт (2026-09-23). Включить для `.deb`, когда появятся endpoint и ключ
+  подписи. Для Arch-сборки выключен всегда: без маркера бандла она попадёт в
+  ветку AppImage.
 - **DNS (D3):** root вызывает resolved без polkit. Per-link настройки
   теряются при рестарте resolved, поэтому daemon применяет их заново.
 

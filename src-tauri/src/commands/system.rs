@@ -465,15 +465,15 @@ pub(crate) struct PlatformCapabilities {
     wireguard_standard_import: bool,
     managed_xray_install: bool,
     elevation_relaunch: bool,
-    /// In-app updater: Windows and `.deb` installs; other Linux installs
-    /// update through their package manager.
+    /// In-app updater remains hidden on Linux while no signed endpoint exists;
+    /// `.deb` and other Linux installs update through their package manager.
     app_updates: bool,
     /// File-picker extensions for backend executables; empty means no filter.
     executable_extensions: Vec<String>,
 }
 
-fn app_updates_available(windows: bool, bundle: Option<tauri::utils::config::BundleType>) -> bool {
-    windows || matches!(bundle, Some(tauri::utils::config::BundleType::Deb))
+fn app_updates_available(windows: bool, _bundle: Option<tauri::utils::config::BundleType>) -> bool {
+    windows
 }
 
 fn platform_capabilities() -> PlatformCapabilities {
@@ -948,12 +948,12 @@ mod tests {
     }
 
     #[test]
-    fn app_updates_follow_platform_and_deb_bundle() {
+    fn deb_does_not_offer_updater_without_an_endpoint() {
         use tauri::utils::config::BundleType;
 
         assert!(app_updates_available(true, None));
         assert!(app_updates_available(true, Some(BundleType::Nsis)));
-        assert!(app_updates_available(false, Some(BundleType::Deb)));
+        assert!(!app_updates_available(false, Some(BundleType::Deb)));
         assert!(!app_updates_available(false, None));
         assert!(!app_updates_available(false, Some(BundleType::AppImage)));
         assert!(!app_updates_available(false, Some(BundleType::Rpm)));

@@ -289,13 +289,19 @@ async fn handle<A: Authorizer>(
             let settings = DaemonSettings {
                 vpn_auth_mode: params.vpn_auth_mode,
             };
-            if let Some(store) = ctx.settings_store.clone() {
-                tokio::task::spawn_blocking(move || store.save(settings))
-                    .await
-                    .map_err(|_| (ErrorCode::Internal, "settings task failed".to_string()))?
-                    .map_err(|_| (ErrorCode::Internal, "cannot save settings".to_string()))?;
-            }
-            *ctx.settings.lock().unwrap() = settings;
+            let live = ctx.settings.clone();
+            let store = ctx.settings_store.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut current = live.lock().unwrap();
+                if let Some(store) = store {
+                    store.save(settings)?;
+                }
+                *current = settings;
+                Ok::<(), io::Error>(())
+            })
+            .await
+            .map_err(|_| (ErrorCode::Internal, "settings task failed".to_string()))?
+            .map_err(|_| (ErrorCode::Internal, "cannot save settings".to_string()))?;
             to_value(&SettingsResult {
                 vpn_auth_mode: settings.vpn_auth_mode,
             })
@@ -1173,6 +1179,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_settings_updates_keep_disk_and_live_mode_in_sync() {
+        let dir = std::env::temp_dir().join(format!(
+            "netorch-concurrent-settings-{}-{}",
+            std::process::id(),
+            DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::settings::SETTINGS_FILE);
+        let store_path = path.clone();
+        let harness = Harness::with(AuthDecision::Authorized, move |ctx| {
+            ctx.settings_store = Some(Arc::new(SettingsStore::new(store_path)));
+        });
+        let mut clients = Vec::new();
+        for uid in 1000..1032 {
+            clients.push(harness.hello(uid).await);
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(clients.len() + 1));
+        let mut tasks = Vec::new();
+        for (index, mut client) in clients.into_iter().enumerate() {
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                client
+                    .call(
+                        index as u64 + 2,
+                        method::SETTINGS_SET,
+                        json!({"vpnAuthMode": if index % 2 == 0 { "always" } else { "noPrompt" }}),
+                    )
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            let reply = task.await.unwrap();
+            assert_eq!(reply["ok"], json!(true), "{reply}");
+        }
+        assert_eq!(
+            SettingsStore::new(&path).load().vpn_auth_mode,
+            harness.ctx.vpn_auth_mode()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn wireguard_connect_asks_for_an_administrator_per_mode_and_scope() {
         let harness = Harness::new(AuthDecision::Denied);
         let mut client = harness.hello(1000).await;
@@ -1209,6 +1259,38 @@ mod tests {
                 .await;
             assert_eq!(*harness.ctx.authorizer.actions.lock().unwrap(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn decomposed_full_tunnels_are_rejected_before_authorization() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+        let mut wireguard = wg_params("");
+        wireguard["config"] = json!(wireguard["config"].as_str().unwrap().replace(
+            "AllowedIPs=10.77.0.0/24",
+            "AllowedIPs=0.0.0.0/2,64.0.0.0/2,128.0.0.0/2,192.0.0.0/2"
+        ));
+        let reply = client.call(2, method::WIREGUARD_CONNECT, wireguard).await;
+        assert_eq!(error_code(&reply), "invalidParams", "{reply}");
+
+        let config = net_manager_core::xray::generate_share_link_config(
+            "vless://11111111-2222-3333-4444-555555555555@node.test:443?type=raw&security=none",
+            10808,
+        )
+        .unwrap();
+        let routes: Vec<_> = ["0.0.0.0/2", "64.0.0.0/2", "128.0.0.0/2", "192.0.0.0/2"]
+            .into_iter()
+            .map(|destination| json!({"destination": destination, "metric": 5}))
+            .collect();
+        let reply = client
+            .call(
+                3,
+                method::XRAY_CONNECT,
+                json!({"profileId":"home","config":config.to_string(),"routes":routes}),
+            )
+            .await;
+        assert_eq!(error_code(&reply), "invalidParams", "{reply}");
+        assert_eq!(harness.auth_calls(), 0);
     }
 
     #[tokio::test]

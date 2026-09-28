@@ -33,24 +33,28 @@ impl SettingsStore {
         Self { path: path.into() }
     }
 
-    /// Missing or unreadable file → defaults. Settings only tune prompts, so
-    /// a broken file must not keep the daemon from starting.
+    /// A missing file uses the initial default. A damaged file requires
+    /// administrator confirmation for every VPN connection instead of
+    /// silently weakening a previously selected prompt policy.
     pub fn load(&self) -> DaemonSettings {
+        let fail_closed = DaemonSettings {
+            vpn_auth_mode: VpnAuthMode::Always,
+        };
         let raw = match fs::read(&self.path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return DaemonSettings::default(),
             Err(err) => {
                 eprintln!(
-                    "network-orchestrator-daemon: cannot read settings, using defaults: {err}"
+                    "network-orchestrator-daemon: cannot read settings, requiring administrator confirmation: {err}"
                 );
-                return DaemonSettings::default();
+                return fail_closed;
             }
         };
         match serde_json::from_slice::<SettingsDocument>(&raw) {
             Ok(doc) if doc.version == SETTINGS_VERSION => doc.settings,
             _ => {
-                eprintln!("network-orchestrator-daemon: settings file is invalid, using defaults");
-                DaemonSettings::default()
+                eprintln!("network-orchestrator-daemon: settings file is invalid, requiring administrator confirmation");
+                fail_closed
             }
         }
     }
@@ -112,15 +116,26 @@ mod tests {
     }
 
     #[test]
-    fn invalid_file_falls_back_to_defaults() {
+    fn invalid_file_requires_administrator_confirmation() {
         let (store, dir) = store("invalid");
         for body in [
             &b"{ not json"[..],
             br#"{"version":9,"vpnAuthMode":"noPrompt"}"#,
         ] {
             fs::write(dir.join(SETTINGS_FILE), body).unwrap();
-            assert_eq!(store.load(), DaemonSettings::default());
+            assert_eq!(store.load().vpn_auth_mode, VpnAuthMode::Always);
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_settings_fail_closed_for_vpn_authorization() {
+        let (store, dir) = store("fail-closed");
+        fs::write(dir.join(SETTINGS_FILE), b"{ corrupt").unwrap();
+        assert_eq!(store.load().vpn_auth_mode, VpnAuthMode::Always);
+        fs::remove_file(dir.join(SETTINGS_FILE)).unwrap();
+        fs::create_dir(dir.join(SETTINGS_FILE)).unwrap();
+        assert_eq!(store.load().vpn_auth_mode, VpnAuthMode::Always);
         fs::remove_dir_all(dir).unwrap();
     }
 }

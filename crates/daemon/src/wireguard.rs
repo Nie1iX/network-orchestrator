@@ -1,6 +1,7 @@
 //! Pure validation and planning for a Linux WireGuard client connection.
 //! No filesystem, subprocess or network access happens here.
 
+use crate::validate::full_coverage;
 use base64::Engine;
 use ipnet::IpNet;
 use net_manager_core::models::PolicyRoute;
@@ -402,6 +403,12 @@ pub fn parse_wireguard_config(
     };
     plan.full_ipv4 = has("0.0.0.0/0") || (has("0.0.0.0/1") && has("128.0.0.0/1"));
     plan.full_ipv6 = has("::/0") || (has("::/1") && has("8000::/1"));
+    let (covers_ipv4, covers_ipv6) = full_coverage(plan.routes.iter().map(|r| r.destination));
+    if (covers_ipv4 && !plan.full_ipv4) || (covers_ipv6 && !plan.full_ipv6) {
+        return Err(WireGuardPlanError(
+            "unsupported full-tunnel route decomposition",
+        ));
+    }
     for server in &plan.dns_servers {
         let reachable = plan
             .routes
@@ -631,6 +638,15 @@ mod tests {
         assert!(plan.full_ipv4 && plan.full_ipv6);
         let half = config("Address=10.77.0.2/32", "AllowedIPs=0.0.0.0/1");
         assert!(!parse_wireguard_config(&half, &[]).unwrap().full_ipv4);
+    }
+
+    #[test]
+    fn noncanonical_full_coverage_cannot_be_treated_as_split_tunnel() {
+        let source = config(
+            "Address=10.77.0.2/32",
+            "AllowedIPs=0.0.0.0/2, 64.0.0.0/2, 128.0.0.0/2, 192.0.0.0/2",
+        );
+        assert!(parse_wireguard_config(&source, &[]).is_err());
     }
 
     #[test]

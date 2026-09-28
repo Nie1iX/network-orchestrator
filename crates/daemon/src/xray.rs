@@ -1,4 +1,4 @@
-use crate::validate::validate_owner;
+use crate::validate::{full_coverage, validate_owner};
 use net_manager_core::daemon_protocol::XrayConnectParams;
 use net_manager_core::models::PolicyRoute;
 use serde_json::{json, Map, Value};
@@ -383,6 +383,10 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         .routes
         .iter()
         .any(|r| r.destination.to_string() == "::/0");
+    let (covers_ipv4, covers_ipv6) = full_coverage(params.routes.iter().map(|r| r.destination));
+    if (covers_ipv4 && !full_ipv4) || (covers_ipv6 && !full_ipv6) {
+        return Err(rejected());
+    }
     for server in &params.dns_servers {
         if !params
             .routes
@@ -547,6 +551,20 @@ mod tests {
     fn def1_style_routes_cannot_bypass_full_tunnel_marking() {
         let mut input = params();
         input.routes = ["0.0.0.0/1", "128.0.0.0/1"]
+            .into_iter()
+            .map(|destination| PolicyRoute {
+                destination: destination.parse().unwrap(),
+                metric: 5,
+                via: None,
+            })
+            .collect();
+        assert!(prepare_xray(1000, input, 51820).is_err());
+    }
+
+    #[test]
+    fn noncanonical_full_coverage_cannot_bypass_full_tunnel_marking() {
+        let mut input = params();
+        input.routes = ["0.0.0.0/2", "64.0.0.0/2", "128.0.0.0/2", "192.0.0.0/2"]
             .into_iter()
             .map(|destination| PolicyRoute {
                 destination: destination.parse().unwrap(),

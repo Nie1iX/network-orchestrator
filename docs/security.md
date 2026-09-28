@@ -118,8 +118,11 @@ processes). The main concerns:
   full tunnel (a default route or its halves, which also installs global DNS)
   and every OpenVPN profile, because its server may push a full tunnel on any
   (re)connect. `always` requires `connect-profile-admin` for every connect.
-  The client never decides this; a missing or invalid settings file falls
-  back to `fullTunnelOnly`. Split tunnels still install their own routes and
+  The client never decides this. A missing settings file means
+  `fullTunnelOnly`; an unreadable or invalid one fails closed to `always`.
+  Route sets whose union covers a whole address family without being the
+  canonical default route or its halves are rejected, so a split-looking
+  profile cannot skip the full-tunnel prompt. Split tunnels still install their own routes and
   per-link DNS without a prompt in modes other than `always`.
 - Routes are added with a dedicated protocol number and exclusive netlink
   creation so an existing route is not overwritten. The daemon writes its
