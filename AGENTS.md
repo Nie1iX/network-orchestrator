@@ -47,10 +47,12 @@ npm run build
   focused tests.
 - `npm run tauri dev` — dev run; on Windows,
   `npm run tauri build -- --bundles nsis` builds unsigned NSIS under
-  `target/release/bundle/nsis/`; on Linux use `scripts/build-linux-deb.sh` or
+  `target/release/bundle/nsis/`; on Linux use `scripts/build-linux-deb.sh`
+  (`.deb`), `scripts/build-linux-deb.sh rpm` (Fedora `.rpm`) or
   `scripts/build-linux-arch.sh`.
 - `npm audit --audit-level=high` — dependency audit.
-- `e2e/linux/run.sh` — Linux daemon/WireGuard E2E in disposable Docker containers;
+- `e2e/linux/run.sh` (`E2E_DISTRO=fedora` for a Fedora 44 client) — Linux
+  daemon/tunnel E2E in disposable Docker containers;
   requires Docker, `/dev/net/tun`, `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and
   unconfined AppArmor for containerized systemd.
 

@@ -1,9 +1,13 @@
 #!/bin/sh
-# Build a local .deb without installing or starting any host service.
+# Build a local .deb (default) or .rpm (`rpm` argument) without installing
+# or starting any host service.
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
+# The rpm bundler copies file modes from disk (the deb one normalizes them),
+# so build outputs must not inherit a group-writable umask.
+umask 022
 
 if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
     echo "error: the pinned Xray bundle supports Linux x86_64 only" >&2
@@ -27,5 +31,14 @@ cargo run -q --release -p net-manager-core --example package_linux_xray -- \
     install "$XRAY_ARCHIVE" "$REPO_ROOT/target/release/xray-package"
 
 cargo build --release -p network-orchestrator-daemon
+chmod 0755 target/release/network-orchestrator-daemon \
+    target/release/xray-package/v26.3.27/xray
+chmod 0644 target/release/xray-package/v26.3.27/*.dat \
+    target/release/xray-package/v26.3.27/LICENSE \
+    target/release/xray-package/v26.3.27/README.md \
+    packaging/linux/network-orchestrator.service \
+    packaging/linux/com.netmanager.app.policy packaging/linux/xray-NOTICES
 test -x target/release/network-orchestrator-daemon
-npm run tauri build -- --bundles deb --no-sign
+# An up-to-date app binary is not relinked, so fix a mode left by an old umask.
+if [ -f target/release/net-manager-app ]; then chmod 0755 target/release/net-manager-app; fi
+npm run tauri build -- --bundles "${1:-deb}" --no-sign

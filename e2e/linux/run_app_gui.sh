@@ -1,28 +1,38 @@
 #!/bin/sh
 # Packaged Tauri WebView -> daemon -> kernel route in one disposable Ubuntu container.
 # Never run the Python scenario directly on the host: it mutates container routes.
-# Usage: run_app_gui.sh [--blank-config] [path/to/package.deb]
+# Usage: run_app_gui.sh [--blank-config] [path/to/package.deb|package.rpm]
+# A .rpm runs in the Fedora 44 client image, a .deb in the Ubuntu one.
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-DEB="$REPO_ROOT/target/release/bundle/deb/Network Orchestrator_0.1.1_amd64.deb"
+PKG="$REPO_ROOT/target/release/bundle/deb/Network Orchestrator_0.1.1_amd64.deb"
 BLANK_CONFIG=0
 for arg in "$@"; do
     case "$arg" in
         --blank-config) BLANK_CONFIG=1 ;;
-        *.deb) DEB="$arg" ;;
+        *.deb|*.rpm) PKG="$arg" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
-IMAGE=netorch-e2e-client
 NAME="netorch-app-gui-$$"
+case "$PKG" in
+    *.rpm)
+        IMAGE=netorch-e2e-client-fedora DOCKERFILE=Dockerfile.fedora PKG_EXT=rpm
+        INSTALL='dnf -y -q --setopt=install_weak_deps=False --disablerepo=fedora-cisco-openh264 install xorg-x11-server-Xvfb xdotool scrot openbox dbus-x11 python3-websockets /opt/netorch/network-orchestrator.rpm'
+        ;;
+    *)
+        IMAGE=netorch-e2e-client DOCKERFILE=Dockerfile PKG_EXT=deb
+        INSTALL='apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends xvfb xdotool scrot openbox dbus-x11 python3-websockets /opt/netorch/network-orchestrator.deb'
+        ;;
+esac
 
-if [ ! -f "$DEB" ]; then
-    echo "missing .deb: $DEB" >&2
+if [ ! -f "$PKG" ]; then
+    echo "missing package: $PKG" >&2
     exit 1
 fi
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    docker build -q -t "$IMAGE" "$REPO_ROOT/e2e/linux" >/dev/null
+    docker build -q -t "$IMAGE" -f "$REPO_ROOT/e2e/linux/$DOCKERFILE" "$REPO_ROOT/e2e/linux" >/dev/null
 fi
 
 cleanup() {
@@ -33,7 +43,7 @@ trap cleanup EXIT
 docker run -d --name "$NAME" -e container=docker \
     --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
     --device /dev/net/tun --tmpfs /run --tmpfs /run/lock --cgroupns=private \
-    -v "$DEB:/opt/netorch/network-orchestrator.deb:ro" \
+    -v "$PKG:/opt/netorch/network-orchestrator.$PKG_EXT:ro" \
     -v "$REPO_ROOT/e2e/linux:/opt/netorch/e2e:ro" \
     "$IMAGE" >/dev/null
 
@@ -44,11 +54,8 @@ for _ in $(seq 60); do
 done
 case "$state" in running|degraded) ;; *) echo "container systemd failed: $state" >&2; exit 1 ;; esac
 
+docker exec "$NAME" bash -euc "$INSTALL >/tmp/netorch-install.log"
 docker exec "$NAME" bash -euc '
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        xvfb xdotool scrot openbox dbus-x11 python3-websockets \
-        /opt/netorch/network-orchestrator.deb >/tmp/netorch-apt.log
     systemctl is-active --quiet network-orchestrator.service
     install -m 0644 /opt/netorch/e2e/app_gui_polkit.rules \
         /etc/polkit-1/rules.d/49-netorch-e2e.rules

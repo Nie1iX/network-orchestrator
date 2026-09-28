@@ -3,9 +3,9 @@
 # systemd service, together with its polkit policy.
 #
 # This is a LOCAL DEV convenience, not a packaging story: a real Linux
-# package installs the same files, but the binary goes to /usr/lib
+# package installs the same files, but the binary goes to /usr/bin
 # (the path in packaging/linux/network-orchestrator.service). Here it goes
-# to /usr/local/lib and ExecStart is rewritten to match.
+# to /usr/local/bin and ExecStart is rewritten to match.
 #
 # Usage:
 #   scripts/install-linux-daemon-dev.sh              build, install, (re)start
@@ -21,14 +21,15 @@ UNIT_SRC="$REPO_ROOT/packaging/linux/$UNIT_NAME"
 UNIT_DST="/etc/systemd/system/$UNIT_NAME"
 POLICY_SRC="$REPO_ROOT/packaging/linux/com.netmanager.app.policy"
 POLICY_DST="/usr/share/polkit-1/actions/com.netmanager.app.policy"
-DAEMON_DIR="/usr/local/lib/network-orchestrator"
+DAEMON_DIR="/usr/local/bin"
 DAEMON_PATH="$DAEMON_DIR/network-orchestrator-daemon"
+OLD_DAEMON_PATH="/usr/local/lib/network-orchestrator/network-orchestrator-daemon"
 STATE_DIR="/var/lib/network-orchestrator"
 OLD_HELPER_PATH="/usr/local/libexec/network-orchestrator/linux-helper"
 OLD_POLICY_PATH="/usr/share/polkit-1/actions/com.netmanager.app.linux-helper.policy"
 
 remove_old_helper() {
-    for old in "$OLD_HELPER_PATH" "$OLD_POLICY_PATH"; do
+    for old in "$OLD_HELPER_PATH" "$OLD_POLICY_PATH" "$OLD_DAEMON_PATH"; do
         if [ -e "$old" ]; then
             echo "==> Removing old helper leftover $old (requires root)"
             sudo rm -f "$old"
@@ -43,7 +44,7 @@ uninstall() {
     echo "==> Removing unit, binary, policy and state (requires root)"
     sudo rm -f "$UNIT_DST" "$DAEMON_PATH" "$POLICY_DST"
     remove_old_helper
-    sudo rmdir "$DAEMON_DIR" 2>/dev/null || true
+    sudo rmdir "$(dirname "$OLD_DAEMON_PATH")" 2>/dev/null || true
     sudo rm -rf "$STATE_DIR"
     sudo systemctl daemon-reload
 
@@ -78,7 +79,7 @@ sudo install -m 0755 "$BUILT_BIN" "$DAEMON_PATH"
 echo "==> Installing unit to $UNIT_DST (requires root)"
 UNIT_TMP="$(mktemp)"
 trap 'rm -f "$UNIT_TMP"' EXIT
-sed "s|^ExecStart=/usr/lib/network-orchestrator/network-orchestrator-daemon\$|ExecStart=$DAEMON_PATH|" \
+sed "s|^ExecStart=/usr/bin/network-orchestrator-daemon\$|ExecStart=$DAEMON_PATH|" \
     "$UNIT_SRC" >"$UNIT_TMP"
 if ! grep -qx "ExecStart=$DAEMON_PATH" "$UNIT_TMP"; then
     echo "error: failed to rewrite ExecStart in $UNIT_SRC" >&2

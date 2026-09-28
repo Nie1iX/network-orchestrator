@@ -8,10 +8,16 @@
 # (cgroup remount) — dev machine / CI only.
 #
 # Usage: e2e/linux/run.sh [--keep]   (--keep leaves the container running)
+#        E2E_DISTRO=fedora e2e/linux/run.sh   (Fedora 44 client, Ubuntu peer)
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-IMAGE=netorch-e2e-client
+SERVER_IMAGE=netorch-e2e-client
+case "${E2E_DISTRO:-ubuntu}" in
+    ubuntu) IMAGE=$SERVER_IMAGE; DOCKERFILE=Dockerfile ;;
+    fedora) IMAGE=netorch-e2e-client-fedora; DOCKERFILE=Dockerfile.fedora ;;
+    *) echo "unknown E2E_DISTRO: $E2E_DISTRO" >&2; exit 2 ;;
+esac
 NAME=netorch-e2e-$$
 SERVER=netorch-e2e-server-$$
 NETWORK=netorch-e2e-net-$$
@@ -20,8 +26,9 @@ KEEP=${1:-}
 echo "==> Building daemon (release)"
 (cd "$REPO_ROOT" && cargo build --release -p network-orchestrator-daemon)
 
-echo "==> Building image $IMAGE"
-docker build -q -t "$IMAGE" "$REPO_ROOT/e2e/linux" >/dev/null
+echo "==> Building images $SERVER_IMAGE, $IMAGE"
+docker build -q -t "$SERVER_IMAGE" "$REPO_ROOT/e2e/linux" >/dev/null
+docker build -q -t "$IMAGE" -f "$REPO_ROOT/e2e/linux/$DOCKERFILE" "$REPO_ROOT/e2e/linux" >/dev/null
 
 cleanup() {
     if [ "$KEEP" = "--keep" ]; then
@@ -40,7 +47,7 @@ docker network create "$NETWORK" >/dev/null
 docker run -d --name "$SERVER" --network "$NETWORK" --network-alias wg-server \
     --cap-add NET_ADMIN --device /dev/net/tun \
     -v "$REPO_ROOT/e2e/linux:/opt/netorch/e2e:ro" \
-    --entrypoint python3 "$IMAGE" \
+    --entrypoint python3 "$SERVER_IMAGE" \
     -m http.server 8765 --bind 0.0.0.0 --directory /opt/netorch/e2e >/dev/null
 
 echo "==> Starting $NAME"
@@ -62,7 +69,7 @@ echo "    systemd: $state"
 echo "==> Installing daemon as a package would"
 docker exec "$NAME" sh -eu -c '
     install -D -m 0755 /opt/netorch/bin/network-orchestrator-daemon \
-        /usr/lib/network-orchestrator/network-orchestrator-daemon
+        /usr/bin/network-orchestrator-daemon
     install -m 0644 /opt/netorch/packaging/network-orchestrator.service /usr/lib/systemd/system/
     install -m 0644 /opt/netorch/packaging/com.netmanager.app.policy /usr/share/polkit-1/actions/
     systemctl daemon-reload

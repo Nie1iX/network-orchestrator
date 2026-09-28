@@ -1,0 +1,10 @@
+#!/bin/sh
+# rpm %postun: $1 = 0 on erase, >= 1 on upgrade. State under
+# /var/lib/network-orchestrator is kept on erase (rpm has no purge).
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || :
+    if [ "$1" -ge 1 ]; then
+        systemctl try-restart network-orchestrator.service || :
+    fi
+fi
+exit 0

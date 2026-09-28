@@ -2,8 +2,9 @@
 
 ## Linux daemon in a disposable container
 
-`e2e/linux/run.sh` builds the daemon, starts Ubuntu 26.04 client and peer
-containers on a private Docker network, installs the service with systemd and
+`e2e/linux/run.sh` builds the daemon, starts an Ubuntu 26.04 (default) or
+Fedora 44 (`E2E_DISTRO=fedora`; firewalld and resolved enabled, SELinux not
+enforced in Docker) client and an Ubuntu peer container on a private Docker network, installs the service with systemd and
 polkit in the client, and runs `scenarios.sh` there. The scenarios exercise
 real netlink route and interface changes, polkit authorization, uid isolation,
 restart recovery, shutdown cleanup, WireGuard and OpenVPN split/full tunnels
@@ -25,11 +26,13 @@ current harness verifies the daemon and backends directly. Real Ubuntu desktop
 interaction, polkit prompt rendering and login-session autostart still need VM
 acceptance.
 
-After building a `.deb`, the packaged WebView-to-daemon static-route path can
-be checked in another disposable Ubuntu container:
+After building a `.deb` or `.rpm`, the packaged WebView-to-daemon static-route
+path can be checked in another disposable container (Ubuntu for `.deb`,
+Fedora 44 for `.rpm`):
 
 ```bash
 e2e/linux/run_app_gui.sh --blank-config
+e2e/linux/run_app_gui.sh target/release/bundle/rpm/*.rpm
 ```
 
 This uses a container-only polkit rule for its headless user session, then

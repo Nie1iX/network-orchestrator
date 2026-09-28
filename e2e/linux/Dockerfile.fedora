@@ -1,0 +1,19 @@
+# Fedora 44 variant of the disposable E2E "client" (see Dockerfile). Fedora
+# defaults kept on purpose: firewalld (with its reverse-path filter) and
+# systemd-resolved are enabled. SELinux is not enforced inside Docker.
+FROM fedora:44
+RUN dnf -y install --setopt=install_weak_deps=False \
+      systemd systemd-resolved dbus-broker polkit iproute wireguard-tools \
+      openvpn python3 ca-certificates procps-ng curl openssl util-linux \
+      shadow-utils firewalld which \
+    && dnf clean all \
+    && systemctl enable systemd-resolved firewalld \
+    # Resolve peer aliases through Docker's DNS like the Ubuntu client: with
+    # nss-resolve a single-label name gets the host's search domains and can
+    # hit a real external host. Tunnel DNS is checked via resolvectl.
+    && sed -i 's/^hosts:.*/hosts: files myhostname dns/' /etc/nsswitch.conf \
+    && useradd --create-home --uid 1001 alice \
+    && useradd --create-home --uid 1002 bob
+STOPSIGNAL SIGRTMIN+3
+# Docker mounts cgroup2 read-only; systemd needs it writable to start.
+ENTRYPOINT ["sh", "-c", "mount -o remount,rw /sys/fs/cgroup && exec /sbin/init"]

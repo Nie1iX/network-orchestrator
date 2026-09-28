@@ -34,7 +34,7 @@ package() {
 
     install -Dm0755 target/release/net-manager-app "${pkgdir}/usr/bin/net-manager-app"
     install -Dm0755 target/release/network-orchestrator-daemon \
-        "${pkgdir}/usr/lib/network-orchestrator/network-orchestrator-daemon"
+        "${pkgdir}/usr/bin/network-orchestrator-daemon"
     install -Dm0644 packaging/linux/network-orchestrator.service \
         "${pkgdir}/usr/lib/systemd/system/network-orchestrator.service"
     install -Dm0644 packaging/linux/com.netmanager.app.policy \

@@ -1,0 +1,13 @@
+#!/bin/sh
+# rpm %preun: $1 = 0 on erase, >= 1 on upgrade (the new version restarts
+# the daemon from %postun).
+if [ "$1" -eq 0 ]; then
+    if [ -d /run/systemd/system ]; then
+        # A unit left failed by an earlier crash must not block removal.
+        systemctl reset-failed network-orchestrator.service 2>/dev/null || :
+        # SIGTERM gives the daemon time to tear down its owned tunnels.
+        systemctl stop network-orchestrator.service || exit 1
+    fi
+    systemctl disable network-orchestrator.service 2>/dev/null || :
+fi
+exit 0

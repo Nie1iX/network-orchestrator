@@ -3,8 +3,10 @@
 A Tauri 2 desktop app for WireGuard, OpenVPN, Xray/VLESS, policy routes, and
 network exploration. Tunnel management works on Windows. On Linux, the
 privileged daemon, WireGuard and OpenVPN split/full tunnels with per-link DNS,
-Xray VLESS/Hysteria2 SOCKS5/HTTP proxy and Xray TUN have passed container E2E.
-Desktop acceptance on a clean Ubuntu install is still pending.
+Xray VLESS/Hysteria2 SOCKS5/HTTP proxy and Xray TUN have passed container E2E
+on Ubuntu 26.04 and Fedora 44 clients. Packages: `.deb` (Ubuntu/Debian),
+`.rpm` (Fedora) and an Arch `PKGBUILD`. Desktop acceptance on a real install
+is still pending.
 
 ## Development status
 
@@ -88,8 +90,8 @@ backends were found.
 
 ### Linux development
 
-On Ubuntu, install the daemon and its polkit policy before testing route or
-interface changes:
+On Ubuntu or Fedora, install the daemon and its polkit policy before testing
+route or interface changes:
 
 ```bash
 scripts/install-linux-daemon-dev.sh
@@ -97,17 +99,19 @@ systemctl status network-orchestrator.service
 npm run tauri dev
 ```
 
-The script builds the daemon, installs it under `/usr/local/lib/`, and starts
+The script builds the daemon, installs it under `/usr/local/bin/`, and starts
 the service. It requires `sudo`; `--uninstall` stops the service and removes
 the development installation and its state. Route changes require polkit
 authorization. The daemon's Unix socket is
 `/run/network-orchestrator/daemon.sock`.
 
-The Linux E2E test runs in disposable Ubuntu 26.04 Docker containers on a
-private network, each with its own network namespace:
+The Linux E2E test runs in disposable Docker containers on a private network,
+each with its own network namespace. The client is Ubuntu 26.04 by default or
+Fedora 44 (firewalld and resolved enabled); the peer is Ubuntu:
 
 ```bash
 e2e/linux/run.sh
+E2E_DISTRO=fedora e2e/linux/run.sh
 ```
 
 It needs Docker, `/dev/net/tun`, `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and an
@@ -118,11 +122,12 @@ Build local Linux packages without installing them on the host:
 
 ```bash
 scripts/build-linux-deb.sh
+scripts/build-linux-deb.sh rpm
 scripts/build-linux-arch.sh
 ```
 
-The unsigned `.deb` is under `target/release/bundle/deb/`; the Arch package is
-under `target/arch/`. The Arch build uses a disposable Docker container.
+The unsigned `.deb` and `.rpm` are under `target/release/bundle/{deb,rpm}/`;
+the Arch package is under `target/arch/`. The Arch build uses a disposable Docker container.
 
 ## Development
 
