@@ -92,6 +92,7 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
               {iface.mtu !== null && <tr><td>MTU</td><td>{iface.mtu}</td></tr>}
               {iface.linkSpeedMbps !== null && <tr><td>Link speed</td><td>{iface.linkSpeedMbps} Mbps</td></tr>}
               {iface.gateway && <tr><td>Gateway</td><td className="mono">{iface.gateway}</td></tr>}
+              {iface.ipv6Gateway && <tr><td>IPv6 gateway</td><td className="mono">{iface.ipv6Gateway}</td></tr>}
               {iface.dnsSuffix && <tr><td>DNS suffix</td><td className="mono">{iface.dnsSuffix}</td></tr>}
               {iface.rxBytes !== null && <tr><td>RX total</td><td>{formatBytes(iface.rxBytes)}</td></tr>}
               {iface.txBytes !== null && <tr><td>TX total</td><td>{formatBytes(iface.txBytes)}</td></tr>}

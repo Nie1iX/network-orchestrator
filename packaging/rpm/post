@@ -1,0 +1,12 @@
+#!/bin/sh
+# rpm %post: $1 = 1 on install, >= 2 on upgrade.
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || :
+fi
+if [ "$1" -eq 1 ]; then
+    systemctl enable network-orchestrator.service || :
+    if [ -d /run/systemd/system ]; then
+        systemctl start network-orchestrator.service || :
+    fi
+fi
+exit 0

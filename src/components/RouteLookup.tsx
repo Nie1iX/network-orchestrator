@@ -55,6 +55,11 @@ export default function RouteLookup() {
           <p>
             <span className="section-label">Interface:</span> {result.interfaceName}
           </p>
+          {result.table && (
+            <p>
+              <span className="section-label">Routing table:</span> {result.table}
+            </p>
+          )}
           <div className="matched-route">
             <span className="section-label">Matched route</span>
             <table className="route-table">

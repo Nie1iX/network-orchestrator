@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,9 +22,15 @@ tokio = { version = "1", features = ["full"] }
 tauri-plugin-dialog = "=2.7.3"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
-reqwest = { version = "=0.13.5", features = ["stream"] }
+reqwest = { version = "=0.13.5", features = ["stream", "socks"] }
 futures-util = "=0.3.31"
 base64 = "0.22"
+tauri-plugin-single-instance = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tauri-plugin-autostart = "2"
+libc = "0.2"
+dbus-secret-service = { version = "4.1", features = ["crypto-rust"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [

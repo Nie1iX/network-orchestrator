@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        if command -v systemctl >/dev/null 2>&1; then
+            # SIGTERM gives the daemon time to tear down its owned tunnels.
+            if [ -d /run/systemd/system ]; then
+                # A unit left failed by an earlier crash must not block removal.
+                systemctl reset-failed network-orchestrator.service 2>/dev/null || true
+                systemctl stop network-orchestrator.service
+                if systemctl is-failed --quiet network-orchestrator.service; then
+                    echo "network-orchestrator.service failed to stop cleanly" >&2
+                    exit 1
+                fi
+            fi
+            if [ "$1" = remove ]; then
+                systemctl disable network-orchestrator.service
+            fi
+        fi
+        ;;
+esac
+
+exit 0

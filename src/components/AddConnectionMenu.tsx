@@ -15,8 +15,8 @@ const BACKEND_OPTIONS: { backend: TunnelBackend; title: string; desc: string }[]
   },
   {
     backend: "xray",
-    title: "Xray / VLESS",
-    desc: "Import a vless:// link or an existing Xray JSON config.",
+    title: "Xray",
+    desc: "Import a vless:// or hysteria2:// link, or an Xray JSON config.",
   },
   {
     backend: "none",
@@ -54,7 +54,7 @@ export default function AddConnectionMenu({
               Paste a link or import a file
             </span>
             <span className="add-connection-desc">
-              Subscription URL, vless:// link, or a config file
+              Subscription URL, share link, or a config file
             </span>
           </span>
         </button>

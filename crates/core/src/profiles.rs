@@ -95,10 +95,21 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
     if profile.name.trim().is_empty() {
         return Err(invalid_data("profile name must not be blank"));
     }
-    if profile.config_path.to_string_lossy().trim().is_empty() {
+    if profile.backend != TunnelBackend::None
+        && profile.config_path.to_string_lossy().trim().is_empty()
+    {
         return Err(invalid_data("profile config path must not be blank"));
     }
-    if !profile.routes.is_empty() && profile.interface_name.trim().is_empty() {
+    let daemon_assigned_interface = cfg!(target_os = "linux")
+        && (matches!(
+            profile.backend,
+            TunnelBackend::WireGuard | TunnelBackend::OpenVpn
+        ) || (profile.backend == TunnelBackend::Xray
+            && profile.xray_mode == crate::models::XrayMode::Tun));
+    if !profile.routes.is_empty()
+        && profile.interface_name.trim().is_empty()
+        && !daemon_assigned_interface
+    {
         return Err(invalid_data(
             "profile interface name must not be blank when policy routes are set",
         ));
@@ -109,6 +120,20 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
                 "route metric {} exceeds maximum 9999",
                 route.metric
             )));
+        }
+        if let Some(via) = route.via {
+            if via.is_unspecified() {
+                return Err(invalid_data(format!(
+                    "route {} gateway must not be unspecified",
+                    route.destination
+                )));
+            }
+            if via.is_ipv4() != matches!(route.destination, ipnet::IpNet::V4(_)) {
+                return Err(invalid_data(format!(
+                    "route {} gateway {via} is from a different address family",
+                    route.destination
+                )));
+            }
         }
     }
     if profile.backend != TunnelBackend::Xray && !profile.domain_policies.is_empty() {
@@ -209,6 +234,7 @@ mod tests {
             routes: vec![PolicyRoute {
                 destination: "10.7.0.0/24".parse().unwrap(),
                 metric: 5,
+                via: None,
             }],
             auto_connect: true,
             ..Default::default()
@@ -266,13 +292,15 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 
         let mut blank_iface = wg_profile();
+        blank_iface.backend = TunnelBackend::None;
+        blank_iface.config_path = PathBuf::new();
         blank_iface.interface_name = "   ".into();
         let err = validate_profile(&blank_iface).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
-    fn blank_interface_allowed_only_without_routes() {
+    fn blank_interface_allowed_for_unrouted_and_linux_daemon_tunnels() {
         let mut profile = wg_profile();
         profile.interface_name = "   ".into();
         profile.routes = vec![];
@@ -281,6 +309,79 @@ mod tests {
         profile.routes = vec![PolicyRoute {
             destination: "10.7.0.0/24".parse().unwrap(),
             metric: 5,
+            via: None,
+        }];
+        if cfg!(target_os = "linux") {
+            assert!(validate_profile(&profile).is_ok());
+        } else {
+            let err = validate_profile(&profile).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn static_routes_profile_needs_no_config_file() {
+        let profile = Profile {
+            id: "local-routes".into(),
+            name: "Local routes".into(),
+            backend: TunnelBackend::None,
+            config_path: PathBuf::new(),
+            interface_name: "eth0".into(),
+            routes: vec![PolicyRoute {
+                destination: "203.0.113.0/24".parse().unwrap(),
+                metric: 5,
+                via: None,
+            }],
+            ..Default::default()
+        };
+        assert!(validate_profile(&profile).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_managed_tunnels_need_no_user_interface_name_for_policy_routes() {
+        let mut wg = wg_profile();
+        wg.interface_name.clear();
+        let mut openvpn = wg.clone();
+        openvpn.backend = TunnelBackend::OpenVpn;
+        openvpn.config_path = PathBuf::from("client.ovpn");
+        let mut xray_tun = wg.clone();
+        xray_tun.backend = TunnelBackend::Xray;
+        xray_tun.config_path = PathBuf::from("config.json");
+        xray_tun.xray_mode = crate::models::XrayMode::Tun;
+        for profile in [&wg, &openvpn, &xray_tun] {
+            assert!(validate_profile(profile).is_ok(), "{:?}", profile.backend);
+        }
+        xray_tun.xray_mode = crate::models::XrayMode::Socks;
+        assert!(validate_profile(&xray_tun).is_err());
+    }
+
+    #[test]
+    fn policy_route_without_via_deserializes() {
+        let route: PolicyRoute =
+            serde_json::from_str(r#"{"destination":"10.7.0.0/24","metric":5}"#).unwrap();
+        assert_eq!(route.via, None);
+    }
+
+    #[test]
+    fn profile_validation_rejects_via_family_mismatch() {
+        let mut profile = wg_profile();
+        profile.routes = vec![PolicyRoute {
+            destination: "10.7.0.0/24".parse().unwrap(),
+            metric: 5,
+            via: Some("fe80::1".parse().unwrap()),
+        }];
+        let err = validate_profile(&profile).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn profile_validation_rejects_unspecified_via() {
+        let mut profile = wg_profile();
+        profile.routes = vec![PolicyRoute {
+            destination: "10.7.0.0/24".parse().unwrap(),
+            metric: 5,
+            via: Some("0.0.0.0".parse().unwrap()),
         }];
         let err = validate_profile(&profile).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

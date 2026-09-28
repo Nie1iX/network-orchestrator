@@ -1,0 +1,53 @@
+# Network Orchestrator privileged daemon.
+#
+# Runs as root with only CAP_NET_ADMIN in the bounding set. Clients connect
+# over a Unix socket in RuntimeDirectory; every mutating request is
+# authorised through polkit (system D-Bus, AF_UNIX) and applied via
+# rtnetlink (AF_NETLINK).
+#
+# Deliberately NOT enabled (to be revisited in S3–S5):
+#   ProtectKernelTunables  - later stages must write /proc/sys (forwarding,
+#                            rp_filter) for policy routing and tunnels.
+#   MemoryDenyWriteExecute - inherited by child processes; tunnel backends
+#                            spawned by the daemon later may need W+X pages.
+#   PrivateDevices         - its private /dev has no /dev/net/tun; device
+#                            access is limited via DevicePolicy/DeviceAllow.
+
+[Unit]
+Description=Network Orchestrator privileged daemon
+After=dbus.service polkit.service
+
+[Service]
+Type=simple
+# /usr/bin on every distro: Arch forbids /usr/libexec, and on Fedora a binary
+# under /usr/lib gets the SELinux type lib_t, for which systemd has no
+# transition to unconfined_service_t (bin_t has one).
+ExecStart=/usr/bin/network-orchestrator-daemon
+Restart=on-failure
+RestartSec=1
+KillMode=mixed
+TimeoutStopSec=30
+
+RuntimeDirectory=network-orchestrator
+RuntimeDirectoryMode=0755
+StateDirectory=network-orchestrator
+StateDirectoryMode=0700
+UMask=0077
+
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+
+[Install]
+WantedBy=multi-user.target

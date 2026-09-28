@@ -7,6 +7,8 @@ use ipnet::{IpNet, Ipv4Net};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::fs;
 use std::io;
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -303,17 +305,77 @@ pub fn resolve_wireguard_executable(configured: Option<&Path>) -> io::Result<Pat
     )
 }
 
+#[cfg(windows)]
+const OPENVPN_EXE_NAME: &str = "openvpn.exe";
+#[cfg(not(windows))]
+const OPENVPN_EXE_NAME: &str = "openvpn";
+
+#[cfg(windows)]
+const XRAY_EXE_NAME: &str = "xray.exe";
+#[cfg(not(windows))]
+const XRAY_EXE_NAME: &str = "xray";
+
 pub fn resolve_openvpn_executable(configured: Option<&Path>) -> io::Result<PathBuf> {
     resolve_executable(
         configured,
-        "openvpn.exe",
+        OPENVPN_EXE_NAME,
         "OpenVPN",
         &openvpn_standard_paths(),
     )
 }
 
 pub fn resolve_xray_executable(configured: Option<&Path>) -> io::Result<PathBuf> {
-    resolve_executable(configured, "xray.exe", "Xray", &xray_standard_paths())
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        resolve_xray_executable_with_package_root(
+            configured,
+            Path::new(crate::managed_xray::LINUX_XRAY_PACKAGE_ROOT),
+            crate::managed_xray::verify_managed_linux_executable,
+        )
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        resolve_executable(configured, XRAY_EXE_NAME, "Xray", &xray_standard_paths())
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn resolve_xray_executable_with_package_root(
+    configured: Option<&Path>,
+    root: &Path,
+    verify: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    if configured.is_none() {
+        if let Some(package) = verified_package_xray_at(root, verify)? {
+            return Ok(package);
+        }
+    }
+    resolve_executable(configured, XRAY_EXE_NAME, "Xray", &xray_standard_paths())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn verified_package_xray_at(
+    root: &Path,
+    verify: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<Option<PathBuf>> {
+    let executable = crate::managed_xray::linux_managed_version_dir(root).join("xray");
+    match fs::symlink_metadata(&executable) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "packaged Xray is unavailable",
+            ))
+        }
+        Ok(_) => {}
+    }
+    verify(root, &executable).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "packaged Xray failed integrity verification",
+        )
+    })?;
+    Ok(Some(executable))
 }
 
 fn resolve_executable(
@@ -379,7 +441,19 @@ fn openvpn_standard_paths() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn openvpn_standard_paths() -> Vec<PathBuf> {
+    [
+        "/usr/bin/openvpn",
+        "/usr/sbin/openvpn",
+        "/usr/local/bin/openvpn",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn openvpn_standard_paths() -> Vec<PathBuf> {
     Vec::new()
 }
@@ -391,7 +465,15 @@ fn xray_standard_paths() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn xray_standard_paths() -> Vec<PathBuf> {
+    ["/usr/bin/xray", "/usr/local/bin/xray", "/opt/xray/xray"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn xray_standard_paths() -> Vec<PathBuf> {
     Vec::new()
 }
@@ -417,13 +499,12 @@ fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
             profile.config_path.display()
         ))
     })?;
-    let with_policies = crate::xray::apply_domain_policies(&base, &profile.domain_policies)
-        .map_err(|err| {
-            invalid_data(format!(
-                "failed to apply domain policies to '{}': {err}",
-                profile.config_path.display()
-            ))
-        })?;
+    let with_policies = crate::xray::apply_profile_routing(
+        &base,
+        &profile.domain_policies,
+        profile.private_lan_direct,
+    )
+    .map_err(|_| invalid_data("failed to apply Xray routing policies"))?;
     let merged = if profile.xray_mode == crate::models::XrayMode::Tun {
         crate::xray::apply_tun_inbound(
             &with_policies,
@@ -480,6 +561,23 @@ fn run_xray_validation(exe: &Path, config: &[u8]) -> io::Result<()> {
     Err(io::Error::other(message))
 }
 
+/// Linux counterpart of `ChildJob`: SIGTERM the child when the thread that
+/// spawned it dies. Spawns run on long-lived UI runtime threads, so a crashed
+/// or killed UI no longer orphans its local Xray/OpenVPN processes.
+#[cfg(target_os = "linux")]
+fn terminate_with_parent(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the hook only calls prctl, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 fn spawn_xray(exe: &Path, config: &[u8], stdout: Stdio, stderr: Stdio) -> io::Result<Child> {
     let spec = xray_command_spec(exe, false);
     let mut command = Command::new(&spec.program);
@@ -490,6 +588,8 @@ fn spawn_xray(exe: &Path, config: &[u8], stdout: Stdio, stderr: Stdio) -> io::Re
         .stderr(stderr);
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
+    #[cfg(target_os = "linux")]
+    terminate_with_parent(&mut command);
     let mut child = command.spawn()?;
     match child.stdin.take() {
         Some(mut stdin) => {
@@ -1191,6 +1291,8 @@ impl TunnelManager {
                     .stderr(err);
                 #[cfg(windows)]
                 command.creation_flags(CREATE_NO_WINDOW);
+                #[cfg(target_os = "linux")]
+                terminate_with_parent(&mut command);
                 let mut child = command.spawn()?;
                 if let Err(err) = self.ensure_child_job().and_then(|job| job.assign(&child)) {
                     let _ = child.kill();
@@ -1383,6 +1485,41 @@ mod tests {
         dir
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_xray_child_is_terminated_when_its_spawning_thread_dies() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::ExitStatusExt;
+        use std::time::{Duration, Instant};
+
+        let dir = unique_dir("pdeathsig");
+        let exe = dir.join("xray");
+        fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let spawner = exe.clone();
+        let mut child = std::thread::spawn(move || {
+            spawn_xray(&spawner, b"{}", Stdio::null(), Stdio::null()).unwrap()
+        })
+        .join()
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(status.and_then(|s| s.signal()), Some(libc::SIGTERM));
+    }
+
     #[test]
     fn set_executable_replaces_backend_path() {
         let mut manager = TunnelManager::new();
@@ -1430,12 +1567,27 @@ mod tests {
         fs::remove_dir_all(manager.log_dir.clone().unwrap()).unwrap();
     }
 
+    // Windows treats `/` as a valid separator alongside `\`, so a forward-
+    // slash literal like "C:/configs/work.conf" parses identically on
+    // Windows and portably (as a plain absolute-looking path) elsewhere,
+    // letting these fixtures run cross-platform. `\`-only literals used to
+    // break `file_name()`/`std::path::absolute()` derived assertions on
+    // non-Windows, where `\` is just an ordinary filename character.
+    #[cfg(windows)]
+    fn sample_absolute_path(file: &str) -> PathBuf {
+        PathBuf::from(format!("C:/configs/{file}"))
+    }
+    #[cfg(not(windows))]
+    fn sample_absolute_path(file: &str) -> PathBuf {
+        PathBuf::from(format!("/configs/{file}"))
+    }
+
     fn wg_profile() -> Profile {
         Profile {
             id: "work-wg".into(),
             name: "Work WireGuard".into(),
             backend: TunnelBackend::WireGuard,
-            config_path: PathBuf::from(r"C:\configs\work.conf"),
+            config_path: sample_absolute_path("work.conf"),
             interface_name: "wg-work".into(),
             ..Default::default()
         }
@@ -1446,7 +1598,7 @@ mod tests {
             id: "work-xray".into(),
             name: "Work Xray".into(),
             backend: TunnelBackend::Xray,
-            config_path: PathBuf::from(r"C:\configs\node.json"),
+            config_path: sample_absolute_path("node.json"),
             interface_name: String::new(),
             xray_socks_port: Some(10808),
             ..Default::default()
@@ -1458,7 +1610,7 @@ mod tests {
             id: "home-ovpn".into(),
             name: "Home OpenVPN".into(),
             backend: TunnelBackend::OpenVpn,
-            config_path: PathBuf::from(r"C:\configs\home.ovpn"),
+            config_path: sample_absolute_path("home.ovpn"),
             interface_name: "ovpn-home".into(),
             ..Default::default()
         }
@@ -1467,15 +1619,15 @@ mod tests {
     #[test]
     fn tunnel_name_strips_conf_and_conf_dpapi_case_insensitively() {
         assert_eq!(
-            wireguard_tunnel_name(Path::new(r"C:\c\work.conf")).unwrap(),
+            wireguard_tunnel_name(Path::new("C:/c/work.conf")).unwrap(),
             "work"
         );
         assert_eq!(
-            wireguard_tunnel_name(Path::new(r"C:\c\work.conf.dpapi")).unwrap(),
+            wireguard_tunnel_name(Path::new("C:/c/work.conf.dpapi")).unwrap(),
             "work"
         );
         assert_eq!(
-            wireguard_tunnel_name(Path::new(r"C:\c\WORK.CONF.DPAPI")).unwrap(),
+            wireguard_tunnel_name(Path::new("C:/c/WORK.CONF.DPAPI")).unwrap(),
             "WORK"
         );
     }
@@ -1532,7 +1684,7 @@ mod tests {
             spec.args,
             vec![
                 OsString::from("--config"),
-                OsString::from(r"C:\configs\home.ovpn"),
+                sample_absolute_path("home.ovpn").into_os_string(),
                 OsString::from("--route-nopull"),
             ]
         );
@@ -1544,13 +1696,14 @@ mod tests {
         profile.routes = vec![PolicyRoute {
             destination: "10.8.0.0/24".parse().unwrap(),
             metric: 10,
+            via: None,
         }];
         let spec = openvpn_connect_spec(Path::new(r"C:\ovpn\openvpn.exe"), &profile).unwrap();
         assert_eq!(
             spec.args,
             vec![
                 OsString::from("--config"),
-                OsString::from(r"C:\configs\home.ovpn"),
+                sample_absolute_path("home.ovpn").into_os_string(),
                 OsString::from("--route-nopull"),
             ]
         );
@@ -1621,7 +1774,7 @@ mod tests {
             "WireGuardTunnel$work"
         );
         let mut dpapi = wg_profile();
-        dpapi.config_path = PathBuf::from(r"C:\configs\site.conf.dpapi");
+        dpapi.config_path = sample_absolute_path("site.conf.dpapi");
         assert_eq!(
             wireguard_service_name(&dpapi).unwrap(),
             "WireGuardTunnel$site"
@@ -1742,6 +1895,28 @@ mod tests {
     }
 
     #[test]
+    fn prepare_xray_config_applies_private_lan_preset_after_user_rules() {
+        let dir = unique_dir("xray-private-lan");
+        let path = dir.join("node.json");
+        fs::write(&path, r#"{"outbounds":[{"tag":"proxy","protocol":"vless"},{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[]}}"#).unwrap();
+        let mut profile = xray_profile();
+        profile.config_path = path;
+        profile.private_lan_direct = true;
+        profile.domain_policies = vec![DomainPolicy {
+            domains: vec!["geoip:us".into()],
+            target: DomainRouteTarget::Block,
+        }];
+        let config: serde_json::Value =
+            serde_json::from_slice(&prepare_xray_config(&profile).unwrap()).unwrap();
+        assert_eq!(
+            config["routing"]["rules"][0]["ip"],
+            serde_json::json!(["geoip:us"])
+        );
+        assert_eq!(config["routing"]["rules"][1]["ip"][0], "10.0.0.0/8");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn prepare_xray_config_rejects_malformed_json_without_echoing_content() {
         let dir = unique_dir("xray-badjson");
         let path = dir.join("node.json");
@@ -1778,11 +1953,76 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_standard_paths_use_unsuffixed_binary_names() {
+        for path in xray_standard_paths() {
+            assert_eq!(path.file_name().unwrap(), "xray");
+        }
+        for path in openvpn_standard_paths() {
+            assert_eq!(path.file_name().unwrap(), "openvpn");
+        }
+    }
+
     #[test]
     fn resolve_xray_executable_rejects_missing_configured_path() {
         let dir = unique_dir("xray-exe");
         let err = resolve_xray_executable(Some(&dir.join("missing-xray.exe"))).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn package_xray_candidate_is_used_only_after_verification() {
+        let dir = unique_dir("xray-package-candidate");
+        let root = dir.join("xray");
+        let candidate = root
+            .join(crate::managed_xray::LINUX_XRAY_VERSION)
+            .join("xray");
+        fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        fs::write(&candidate, b"synthetic binary").unwrap();
+        let verified = verified_package_xray_at(&root, |_, path| {
+            assert_eq!(path, candidate);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(verified, Some(candidate.clone()));
+        let err = verified_package_xray_at(&root, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tampered secret",
+            ))
+        })
+        .unwrap_err();
+        assert!(!err.to_string().contains("tampered secret"));
+        assert!(!err.to_string().contains(&dir.display().to_string()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn xray_auto_detect_prefers_verified_package_but_respects_explicit_path() {
+        let dir = unique_dir("xray-package-priority");
+        let root = dir.join("xray");
+        let package = root
+            .join(crate::managed_xray::LINUX_XRAY_VERSION)
+            .join("xray");
+        fs::create_dir_all(package.parent().unwrap()).unwrap();
+        fs::write(&package, b"package").unwrap();
+        let explicit = dir.join("configured-xray");
+        fs::write(&explicit, b"configured").unwrap();
+        assert_eq!(
+            resolve_xray_executable_with_package_root(None, &root, |_, _| Ok(())).unwrap(),
+            package
+        );
+        assert_eq!(
+            resolve_xray_executable_with_package_root(Some(&explicit), &root, |_, _| panic!(
+                "package verifier must not run for configured path"
+            ))
+            .unwrap(),
+            explicit
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2352,6 +2592,7 @@ mod table_off_tests {
         let mut profile = wg_profile_with_routes(vec![PolicyRoute {
             destination: "10.20.0.0/16".parse().unwrap(),
             metric: 5,
+            via: None,
         }]);
         profile.config_path = config_path.clone();
 
@@ -2487,6 +2728,7 @@ mod table_off_tests {
             vec![PolicyRoute {
                 destination: "10.0.0.0/24".parse().unwrap(),
                 metric: 10,
+                via: None,
             }],
         );
         let status = manager.connect(&profile).unwrap();
@@ -2512,6 +2754,7 @@ mod table_off_tests {
             vec![PolicyRoute {
                 destination: "10.0.0.0/24".parse().unwrap(),
                 metric: 10,
+                via: None,
             }],
         );
         let health = manager.protocol_health(&profile);

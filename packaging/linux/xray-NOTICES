@@ -1,0 +1,16 @@
+Network Orchestrator includes the unmodified Xray-core v26.3.27 Linux binary.
+Release and source: https://github.com/XTLS/Xray-core/releases/tag/v26.3.27
+License: Mozilla Public License 2.0 (see the accompanying LICENSE file).
+
+The geoip.dat and geosite.dat files are from that pinned Xray-core release.
+The Xray-core v26.3.27 asset workflow sources geo data from
+Loyalsoldier/v2ray-rules-dat, licensed under GPL-3.0:
+https://github.com/Loyalsoldier/v2ray-rules-dat
+https://github.com/Loyalsoldier/v2ray-rules-dat/blob/master/LICENSE
+On Debian and Ubuntu the GPL-3.0 text is at /usr/share/common-licenses/GPL-3.
+The data project documents its additional upstream data sources in its README.
+
+The rule set's GeoIP build uses MaxMind GeoLite2 Country data by default.
+This product includes GeoLite Data created by MaxMind, available from
+https://www.maxmind.com. See the GeoLite End User License Agreement:
+https://www.maxmind.com/en/geolite/eula

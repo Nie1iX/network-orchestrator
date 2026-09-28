@@ -1,7 +1,9 @@
 use crate::elevation;
 use crate::state::{resolve_backend_path, AppState, ResolvedBackendExecutable, RuntimeState};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+use net_manager_core::managed_xray::ManagedXrayInstallation;
 use net_manager_core::managed_xray::{
-    self, ManagedXrayInstallation, MANAGED_XRAY_URL, MANAGED_XRAY_VERSION, MAX_XRAY_ARCHIVE_BYTES,
+    self, MANAGED_XRAY_URL, MANAGED_XRAY_VERSION, MAX_XRAY_ARCHIVE_BYTES,
 };
 use net_manager_core::models::{
     BackendAvailability, BackendExecutableSetting, BackendExecutableSource, Profile, TunnelBackend,
@@ -12,11 +14,75 @@ use serde::Serialize;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use tauri::{Emitter, State};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+use tauri::Emitter;
+use tauri::State;
 
 #[tauri::command]
 pub(crate) async fn is_elevated() -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(false)
+    }
+    #[cfg(not(target_os = "linux"))]
     elevation::is_elevated().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn daemon_status() -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "linux")]
+    {
+        serde_json::to_value(crate::daemon_client::daemon_status().await).map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(serde_json::json!({"state":"notRequired","message":""}))
+    }
+}
+
+/// Administrator-chosen VPN password mode; `None` where no daemon exists.
+#[tauri::command]
+pub(crate) async fn get_vpn_auth_mode(
+) -> Result<Option<net_manager_core::daemon_protocol::VpnAuthMode>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use net_manager_core::daemon_protocol::{method, SettingsResult};
+        let result: SettingsResult = crate::daemon_client::DaemonClient::system()
+            .request(method::SETTINGS_GET, serde_json::Value::Null)
+            .await
+            .map_err(|e| crate::daemon_client::user_message(&e))?;
+        Ok(Some(result.vpn_auth_mode))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
+    }
+}
+
+/// Changing the mode asks the daemon, which requires an administrator.
+#[tauri::command]
+pub(crate) async fn set_vpn_auth_mode(
+    mode: net_manager_core::daemon_protocol::VpnAuthMode,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use net_manager_core::daemon_protocol::{method, SettingsResult, SettingsSetParams};
+        let _: SettingsResult = crate::daemon_client::DaemonClient::system()
+            .request(
+                method::SETTINGS_SET,
+                SettingsSetParams {
+                    vpn_auth_mode: mode,
+                },
+            )
+            .await
+            .map_err(|e| crate::daemon_client::user_message(&e))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = mode;
+        Err("VPN password mode is managed by the Linux daemon".into())
+    }
 }
 
 /// Discover WireGuard configs in the standard Windows service location
@@ -88,6 +154,17 @@ pub(crate) fn collect_backend_availability(state: &AppState) -> Vec<BackendAvail
     ]
     .into_iter()
     .map(|backend| {
+        #[cfg(target_os = "linux")]
+        if matches!(backend, TunnelBackend::WireGuard | TunnelBackend::OpenVpn) {
+            return BackendAvailability {
+                backend,
+                available: false,
+                path: None,
+                source: None,
+                version: None,
+                message: "Network daemon status pending.".into(),
+            };
+        }
         backend_entry(
             backend,
             state.resolve_backend_executable(backend),
@@ -97,11 +174,158 @@ pub(crate) fn collect_backend_availability(state: &AppState) -> Vec<BackendAvail
     .collect()
 }
 
+#[cfg(target_os = "linux")]
+fn linux_wireguard_backend_availability(
+    status: crate::daemon_client::DaemonStatus,
+    supported: bool,
+) -> BackendAvailability {
+    let available = status.state == crate::daemon_client::DaemonState::Ready && supported;
+    BackendAvailability {
+        backend: TunnelBackend::WireGuard,
+        available,
+        path: None,
+        source: None,
+        version: None,
+        message: if status.state == crate::daemon_client::DaemonState::Ready && !supported {
+            "Network daemon does not support WireGuard. Update the daemon.".into()
+        } else {
+            status.message
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_openvpn_backend_availability(
+    status: crate::daemon_client::DaemonStatus,
+    supported: bool,
+) -> BackendAvailability {
+    let available = status.state == crate::daemon_client::DaemonState::Ready && supported;
+    BackendAvailability {
+        backend: TunnelBackend::OpenVpn,
+        available,
+        path: None,
+        source: None,
+        version: None,
+        message: if status.state == crate::daemon_client::DaemonState::Ready && !supported {
+            "Network daemon does not support OpenVPN. Update the daemon.".into()
+        } else {
+            status.message
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_xray_backend_availability(
+    mut entry: BackendAvailability,
+    status: &crate::daemon_client::DaemonStatus,
+    supported: bool,
+    package_verified: bool,
+) -> BackendAvailability {
+    let tun_available =
+        status.state == crate::daemon_client::DaemonState::Ready && supported && package_verified;
+    let socks_available = entry.available;
+    entry.available |= tun_available;
+    entry.message = match (socks_available, tun_available) {
+        (true, true) => "Xray SOCKS5/HTTP and TUN available.".into(),
+        (false, true) => {
+            "Xray TUN available; SOCKS5/HTTP executable setting is unavailable.".into()
+        }
+        (true, false) => {
+            "Xray SOCKS5/HTTP available; TUN requires verified package Xray and network daemon."
+                .into()
+        }
+        (false, false) => {
+            "Xray unavailable; TUN requires verified package Xray and network daemon.".into()
+        }
+    };
+    entry
+}
+
 #[tauri::command]
 pub(crate) async fn get_backend_availability(
     state: State<'_, AppState>,
 ) -> Result<Vec<BackendAvailability>, String> {
-    Ok(collect_backend_availability(&state))
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut availability = collect_backend_availability(&state);
+    #[cfg(target_os = "linux")]
+    {
+        let client = crate::daemon_client::DaemonClient::system();
+        let hello = client.hello().await;
+        let status = if hello.is_ok() {
+            crate::daemon_client::DaemonStatus {
+                state: crate::daemon_client::DaemonState::Ready,
+                message: "Network daemon is ready.".into(),
+            }
+        } else {
+            crate::daemon_client::daemon_status().await
+        };
+        for entry in availability.iter_mut().filter(|entry| {
+            matches!(
+                entry.backend,
+                TunnelBackend::WireGuard | TunnelBackend::OpenVpn
+            )
+        }) {
+            let methods = match entry.backend {
+                TunnelBackend::WireGuard => [
+                    net_manager_core::daemon_protocol::method::WIREGUARD_CONNECT,
+                    net_manager_core::daemon_protocol::method::WIREGUARD_DISCONNECT,
+                    net_manager_core::daemon_protocol::method::WIREGUARD_STATUS,
+                ],
+                TunnelBackend::OpenVpn => [
+                    net_manager_core::daemon_protocol::method::OPENVPN_CONNECT,
+                    net_manager_core::daemon_protocol::method::OPENVPN_DISCONNECT,
+                    net_manager_core::daemon_protocol::method::OPENVPN_STATUS,
+                ],
+                _ => unreachable!(),
+            };
+            let supported = hello.as_ref().is_ok_and(|result| {
+                methods
+                    .iter()
+                    .all(|method| result.capabilities.iter().any(|cap| cap == method))
+            });
+            *entry = match entry.backend {
+                TunnelBackend::WireGuard => {
+                    linux_wireguard_backend_availability(status.clone(), supported)
+                }
+                TunnelBackend::OpenVpn => {
+                    linux_openvpn_backend_availability(status.clone(), supported)
+                }
+                _ => unreachable!(),
+            };
+        }
+        if let Some(entry) = availability
+            .iter_mut()
+            .find(|entry| entry.backend == TunnelBackend::Xray)
+        {
+            let supported = hello.as_ref().is_ok_and(|result| {
+                [
+                    net_manager_core::daemon_protocol::method::XRAY_CONNECT,
+                    net_manager_core::daemon_protocol::method::XRAY_DISCONNECT,
+                    net_manager_core::daemon_protocol::method::XRAY_STATUS,
+                ]
+                .iter()
+                .all(|method| result.capabilities.iter().any(|cap| cap == method))
+            });
+            #[cfg(target_arch = "x86_64")]
+            let package_verified = {
+                let root =
+                    std::path::Path::new(net_manager_core::managed_xray::LINUX_XRAY_PACKAGE_ROOT);
+                let executable =
+                    net_manager_core::managed_xray::linux_managed_version_dir(root).join("xray");
+                net_manager_core::managed_xray::verify_managed_linux_executable(root, &executable)
+                    .is_ok()
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let package_verified = false;
+            *entry = linux_xray_backend_availability(
+                entry.clone(),
+                &status,
+                supported,
+                package_verified,
+            );
+        }
+    }
+    Ok(availability)
 }
 
 fn backend_running_error(
@@ -232,6 +456,49 @@ pub(crate) fn get_managed_xray_offer() -> ManagedXrayOffer {
     managed_xray_offer()
 }
 
+/// Which OS-specific features the frontend may offer on this platform.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlatformCapabilities {
+    os: &'static str,
+    system_proxy: bool,
+    wireguard_standard_import: bool,
+    managed_xray_install: bool,
+    elevation_relaunch: bool,
+    /// In-app updater remains hidden on Linux while no signed endpoint exists;
+    /// `.deb` and other Linux installs update through their package manager.
+    app_updates: bool,
+    /// File-picker extensions for backend executables; empty means no filter.
+    executable_extensions: Vec<String>,
+}
+
+fn app_updates_available(windows: bool, _bundle: Option<tauri::utils::config::BundleType>) -> bool {
+    windows
+}
+
+fn platform_capabilities() -> PlatformCapabilities {
+    let windows = cfg!(windows);
+    PlatformCapabilities {
+        os: std::env::consts::OS,
+        system_proxy: windows,
+        wireguard_standard_import: windows,
+        managed_xray_install: cfg!(all(target_os = "windows", target_arch = "x86_64")),
+        elevation_relaunch: windows,
+        app_updates: app_updates_available(windows, tauri::utils::platform::bundle_type()),
+        executable_extensions: if windows {
+            vec!["exe".to_string()]
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+#[tauri::command]
+pub(crate) fn get_platform_capabilities() -> PlatformCapabilities {
+    platform_capabilities()
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BackendInstallProgress {
@@ -241,6 +508,10 @@ struct BackendInstallProgress {
     total: Option<u64>,
 }
 
+// Used by `install_managed_xray_inner` on 64-bit Windows and directly by
+// unit tests on every platform; never used by the plain (non-test,
+// non-Windows) lib build, hence `any(test, ...)`.
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 fn checked_download_len(current: usize, chunk_len: usize) -> io::Result<usize> {
     match current.checked_add(chunk_len) {
         Some(total) if total <= MAX_XRAY_ARCHIVE_BYTES => Ok(total),
@@ -251,6 +522,7 @@ fn checked_download_len(current: usize, chunk_len: usize) -> io::Result<usize> {
     }
 }
 
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 fn append_download_chunk(buffer: &mut Vec<u8>, chunk: &[u8], cancelled: bool) -> io::Result<()> {
     if cancelled {
         return Err(io::Error::new(
@@ -263,6 +535,7 @@ fn append_download_chunk(buffer: &mut Vec<u8>, chunk: &[u8], cancelled: bool) ->
     Ok(())
 }
 
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 fn validate_download_length(actual: usize, declared: Option<u64>) -> io::Result<()> {
     if let Some(declared) = declared {
         if declared != actual as u64 {
@@ -290,6 +563,7 @@ fn require_managed_xray_setting(
     }
 }
 
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn cleanup_created_installation(installation: &ManagedXrayInstallation) -> io::Result<()> {
     if installation.created {
         std::fs::remove_dir_all(&installation.version_dir)?;
@@ -297,6 +571,7 @@ fn cleanup_created_installation(installation: &ManagedXrayInstallation) -> io::R
     Ok(())
 }
 
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 fn install_failure_message(primary: String, cleanup: io::Result<()>) -> String {
     match cleanup {
         Ok(()) => primary,
@@ -533,6 +808,168 @@ mod tests {
     use super::*;
     use crate::test_support::{app_state, unique_dir};
     use std::io;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_capabilities_hide_windows_only_features() {
+        let caps = platform_capabilities();
+        assert_eq!(caps.os, "linux");
+        assert!(!caps.system_proxy);
+        assert!(!caps.wireguard_standard_import);
+        assert!(!caps.managed_xray_install);
+        assert!(!caps.elevation_relaunch);
+        assert!(!caps.app_updates);
+        assert!(caps.executable_extensions.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_wireguard_availability_tracks_daemon_without_executable_path() {
+        use crate::daemon_client::{DaemonState, DaemonStatus};
+
+        let dir = unique_dir("wg-availability");
+        let state = app_state(&dir);
+        let entry = collect_backend_availability(&state)
+            .into_iter()
+            .find(|entry| entry.backend == TunnelBackend::WireGuard)
+            .unwrap();
+        assert!(entry.path.is_none());
+        assert!(!entry.message.contains("wireguard.exe"));
+
+        let ready = linux_wireguard_backend_availability(
+            DaemonStatus {
+                state: DaemonState::Ready,
+                message: "Network daemon is ready.".into(),
+            },
+            true,
+        );
+        assert!(ready.available);
+        assert!(ready.path.is_none());
+        let old = linux_wireguard_backend_availability(
+            DaemonStatus {
+                state: DaemonState::Ready,
+                message: "Network daemon is ready.".into(),
+            },
+            false,
+        );
+        assert!(!old.available);
+        assert!(old.message.contains("WireGuard"));
+        let stopped = linux_wireguard_backend_availability(
+            DaemonStatus {
+                state: DaemonState::NotRunning,
+                message: "Network daemon is not running.".into(),
+            },
+            false,
+        );
+        assert!(!stopped.available);
+        assert!(stopped.message.contains("not running"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_openvpn_availability_tracks_daemon_without_executable_path() {
+        use crate::daemon_client::{DaemonState, DaemonStatus};
+
+        let dir = unique_dir("ovpn-availability");
+        let state = app_state(&dir);
+        let entry = collect_backend_availability(&state)
+            .into_iter()
+            .find(|entry| entry.backend == TunnelBackend::OpenVpn)
+            .unwrap();
+        assert!(entry.path.is_none());
+        assert!(!entry.message.contains("openvpn.exe"));
+
+        let ready = linux_openvpn_backend_availability(
+            DaemonStatus {
+                state: DaemonState::Ready,
+                message: "Network daemon is ready.".into(),
+            },
+            true,
+        );
+        assert!(ready.available);
+        assert!(ready.path.is_none());
+        let old = linux_openvpn_backend_availability(
+            DaemonStatus {
+                state: DaemonState::Ready,
+                message: "Network daemon is ready.".into(),
+            },
+            false,
+        );
+        assert!(!old.available);
+        assert!(old.message.contains("OpenVPN"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_xray_tun_availability_requires_verified_package_and_daemon_methods() {
+        let baseline = BackendAvailability {
+            backend: TunnelBackend::Xray,
+            available: false,
+            path: None,
+            source: None,
+            version: None,
+            message: "unavailable".into(),
+        };
+        let ready = crate::daemon_client::DaemonStatus {
+            state: crate::daemon_client::DaemonState::Ready,
+            message: "ready".into(),
+        };
+        let available = linux_xray_backend_availability(baseline.clone(), &ready, true, true);
+        assert!(available.available);
+        assert!(available.message.contains("TUN available"));
+        assert!(!linux_xray_backend_availability(baseline.clone(), &ready, false, true).available);
+        assert!(!linux_xray_backend_availability(baseline, &ready, true, false).available);
+    }
+
+    #[test]
+    fn capabilities_serialize_with_frontend_field_names() {
+        let value = serde_json::to_value(platform_capabilities()).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "appUpdates",
+                "elevationRelaunch",
+                "executableExtensions",
+                "managedXrayInstall",
+                "os",
+                "systemProxy",
+                "wireguardStandardImport",
+            ]
+        );
+    }
+
+    #[test]
+    fn deb_does_not_offer_updater_without_an_endpoint() {
+        use tauri::utils::config::BundleType;
+
+        assert!(app_updates_available(true, None));
+        assert!(app_updates_available(true, Some(BundleType::Nsis)));
+        assert!(!app_updates_available(false, Some(BundleType::Deb)));
+        assert!(!app_updates_available(false, None));
+        assert!(!app_updates_available(false, Some(BundleType::AppImage)));
+        assert!(!app_updates_available(false, Some(BundleType::Rpm)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capabilities_expose_windows_features() {
+        let caps = platform_capabilities();
+        assert_eq!(caps.os, "windows");
+        assert!(caps.system_proxy);
+        assert!(caps.wireguard_standard_import);
+        assert!(caps.elevation_relaunch);
+        assert!(caps.app_updates);
+        assert_eq!(caps.executable_extensions, vec!["exe".to_string()]);
+    }
 
     #[test]
     fn backend_entry_maps_found_and_missing() {

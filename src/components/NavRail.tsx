@@ -54,7 +54,7 @@ function RailButton({
 export default function NavRail({ tab, setTab, activeCount }: NavRailProps) {
   return (
     <nav className="rail">
-      <div className="rail-brand" title="Network Manager">
+      <div className="rail-brand" title="Network Orchestrator">
         <NetworkIcon size={20} />
       </div>
       <div className="rail-group">

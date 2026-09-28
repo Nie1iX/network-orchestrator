@@ -1,0 +1,1332 @@
+//! Wire protocol between the app and `network-orchestrator-daemon`.
+//!
+//! Newline-delimited JSON over a unix socket. Every request is a
+//! [`RequestFrame`]; the daemon answers with a [`ResponseFrame`] carrying the
+//! same `id`, and pushes [`EventFrame`]s to subscribed connections. Params
+//! and results are typed per method but travel as raw JSON inside the frame,
+//! so an unknown method still parses and can be answered with
+//! `unsupportedMethod`.
+
+use crate::models::{AnalyzedRoute, AppliedRoute, PolicyRoute, TunnelState};
+use ipnet::IpNet;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::io;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+
+pub const PROTOCOL_VERSION: u32 = 1;
+pub const DEFAULT_SOCKET_PATH: &str = "/run/network-orchestrator/daemon.sock";
+pub const SOCKET_ENV: &str = "NETWORK_ORCHESTRATOR_SOCKET";
+/// Hard cap for one frame. The largest valid `openvpn.connect` (1 MiB of
+/// assets as base64, a fully JSON-escaped 256 KiB config, routes and
+/// credentials) is about 2.9 MiB; anything above the cap is `frameTooLarge`.
+/// With `MAX_CONNECTIONS` readers this bounds buffers to 256 MiB.
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_ROUTES_PER_REQUEST: usize = 8192;
+pub const MAX_OWNER_BYTES: usize = 128;
+pub const HELLO_TIMEOUT_SECS: u64 = 5;
+pub const MAX_CONNECTIONS: usize = 64;
+
+pub mod method {
+    pub const HELLO: &str = "hello";
+    pub const ROUTES_APPLY: &str = "routes.apply";
+    pub const ROUTES_REMOVE: &str = "routes.remove";
+    pub const LINK_SET_STATE: &str = "link.set_state";
+    pub const OWNED_LIST: &str = "owned.list";
+    pub const RECOVERY_CLEANUP: &str = "recovery.cleanup";
+    pub const SUBSCRIBE: &str = "subscribe";
+    pub const WIREGUARD_CONNECT: &str = "wireguard.connect";
+    pub const WIREGUARD_DISCONNECT: &str = "wireguard.disconnect";
+    pub const WIREGUARD_STATUS: &str = "wireguard.status";
+    pub const OPENVPN_CONNECT: &str = "openvpn.connect";
+    pub const OPENVPN_DISCONNECT: &str = "openvpn.disconnect";
+    pub const OPENVPN_STATUS: &str = "openvpn.status";
+    pub const OPENVPN_PROBE: &str = "openvpn.probe";
+    pub const XRAY_CONNECT: &str = "xray.connect";
+    pub const XRAY_DISCONNECT: &str = "xray.disconnect";
+    pub const XRAY_STATUS: &str = "xray.status";
+    pub const ALWAYS_ON_SET: &str = "alwaysOn.set";
+    pub const ALWAYS_ON_LIST: &str = "alwaysOn.list";
+    pub const ALWAYS_ON_REMOVE: &str = "alwaysOn.remove";
+    pub const ALWAYS_ON_RESUME: &str = "alwaysOn.resume";
+    pub const SETTINGS_GET: &str = "settings.get";
+    pub const SETTINGS_SET: &str = "settings.set";
+
+    /// Methods implemented by the daemon and reported in `hello.capabilities`.
+    pub const CAPABILITIES: [&str; 22] = [
+        ROUTES_APPLY,
+        ROUTES_REMOVE,
+        LINK_SET_STATE,
+        OWNED_LIST,
+        RECOVERY_CLEANUP,
+        SUBSCRIBE,
+        WIREGUARD_CONNECT,
+        WIREGUARD_DISCONNECT,
+        WIREGUARD_STATUS,
+        OPENVPN_CONNECT,
+        OPENVPN_DISCONNECT,
+        OPENVPN_STATUS,
+        OPENVPN_PROBE,
+        XRAY_CONNECT,
+        XRAY_DISCONNECT,
+        XRAY_STATUS,
+        ALWAYS_ON_SET,
+        ALWAYS_ON_LIST,
+        ALWAYS_ON_REMOVE,
+        ALWAYS_ON_RESUME,
+        SETTINGS_GET,
+        SETTINGS_SET,
+    ];
+}
+
+/// When connecting a VPN profile asks for an administrator password. Chosen
+/// by an administrator and enforced by the daemon, never by the client.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum VpnAuthMode {
+    /// Any profile connects without a prompt in an active session.
+    NoPrompt,
+    /// Split tunnels connect without a prompt; changes that capture all
+    /// traffic of the machine (full tunnel, global DNS) and every OpenVPN
+    /// profile (its server may push a full tunnel) require an administrator.
+    #[default]
+    FullTunnelOnly,
+    /// Every connect requires an administrator.
+    Always,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsResult {
+    pub vpn_auth_mode: VpnAuthMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsSetParams {
+    pub vpn_auth_mode: VpnAuthMode,
+}
+
+pub mod event {
+    pub const OWNED_CHANGED: &str = "owned.changed";
+    /// Sent when a subscriber missed events; the client must re-read state.
+    pub const RESYNC: &str = "resync";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RequestFrame {
+    pub id: u64,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub params: Value,
+}
+
+/// `{"id","ok":true,"result"}` or `{"id","ok":false,"error"}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawResponse", into = "RawResponse")]
+pub struct ResponseFrame {
+    pub id: u64,
+    pub outcome: Result<Value, ErrorBody>,
+}
+
+impl ResponseFrame {
+    pub fn ok(id: u64, result: Value) -> Self {
+        Self {
+            id,
+            outcome: Ok(result),
+        }
+    }
+
+    pub fn error(id: u64, code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            id,
+            outcome: Err(ErrorBody {
+                code,
+                message: message.into(),
+            }),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawResponse {
+    id: u64,
+    ok: bool,
+    // `Some(Value::Null)` still serializes as `"result":null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<ErrorBody>,
+}
+
+impl TryFrom<RawResponse> for ResponseFrame {
+    type Error = String;
+
+    fn try_from(raw: RawResponse) -> Result<Self, String> {
+        let outcome = match (raw.ok, raw.error) {
+            (true, _) => Ok(raw.result.unwrap_or(Value::Null)),
+            (false, Some(error)) => Err(error),
+            (false, None) => return Err("error response without an error body".into()),
+        };
+        Ok(Self {
+            id: raw.id,
+            outcome,
+        })
+    }
+}
+
+impl From<ResponseFrame> for RawResponse {
+    fn from(frame: ResponseFrame) -> Self {
+        match frame.outcome {
+            Ok(result) => Self {
+                id: frame.id,
+                ok: true,
+                result: Some(result),
+                error: None,
+            },
+            Err(error) => Self {
+                id: frame.id,
+                ok: false,
+                result: None,
+                error: Some(error),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErrorBody {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ErrorCode {
+    HandshakeRequired,
+    ProtocolMismatch,
+    UnsupportedMethod,
+    InvalidParams,
+    FrameTooLarge,
+    Busy,
+    NotAuthorized,
+    AuthorizationDismissed,
+    Conflict,
+    NotFound,
+    Unavailable,
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventFrame {
+    pub event: String,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub data: Value,
+}
+
+impl EventFrame {
+    pub fn new(event: &str, data: Value) -> Self {
+        Self {
+            event: event.to_string(),
+            data,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HelloParams {
+    pub protocol: u32,
+    pub client: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HelloResult {
+    pub protocol: u32,
+    pub daemon_version: String,
+    pub uid: u32,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutesApplyParams {
+    pub owner: String,
+    pub routes: Vec<AppliedRoute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutesApplyResult {
+    pub applied: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnerParams {
+    pub owner: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutesRemoveResult {
+    pub removed: usize,
+}
+
+/// The app reads the vault entry and sends its contents over the local socket.
+/// Daemon must not accept a client-supplied path to a privileged config file.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardConnectParams {
+    pub profile_id: String,
+    pub config: String,
+    #[serde(default)]
+    pub routes: Vec<PolicyRoute>,
+}
+
+impl std::fmt::Debug for WireGuardConnectParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireGuardConnectParams")
+            .field("profile_id", &self.profile_id)
+            .field("config", &"[REDACTED]")
+            .field("routes", &self.routes)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardProfileParams {
+    pub profile_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum WireGuardWarning {
+    IgnoredHook,
+    IgnoredSaveConfig,
+    DnsNotApplied,
+    Ipv6NotCovered,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardStatusResult {
+    pub profile_id: String,
+    pub state: TunnelState,
+    pub interface_name: Option<String>,
+    pub latest_handshake: Option<u64>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub dns_applied: bool,
+    pub warnings: Vec<WireGuardWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardConnectResult {
+    pub status: WireGuardStatusResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardDisconnectResult {
+    pub stopped: bool,
+}
+
+/// The app sends vault contents, not paths for the privileged daemon to open.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVpnConnectParams {
+    pub profile_id: String,
+    pub config: String,
+    /// Managed asset bytes encoded as base64, keyed by their config references.
+    pub assets: BTreeMap<String, String>,
+    #[serde(default)]
+    pub routes: Vec<PolicyRoute>,
+}
+
+impl std::fmt::Debug for OpenVpnConnectParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenVpnConnectParams")
+            .field("profile_id", &self.profile_id)
+            .field("config", &"[REDACTED]")
+            .field("assets", &"[REDACTED]")
+            .field("routes", &self.routes)
+            .finish()
+    }
+}
+
+/// Credentials are carried in the connect request only and are never journaled.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVpnUserPass {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for OpenVpnUserPass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenVpnUserPass")
+            .field("username", &"[REDACTED]")
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVpnCredentials {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_user_pass: Option<OpenVpnUserPass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key_passphrase: Option<String>,
+}
+
+impl std::fmt::Debug for OpenVpnCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenVpnCredentials")
+            .field(
+                "auth_user_pass",
+                &self.auth_user_pass.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "private_key_passphrase",
+                &self.private_key_passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+/// Keeps legacy connect fields flat while allowing optional secret fields.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVpnConnectRequest {
+    #[serde(flatten)]
+    pub profile: OpenVpnConnectParams,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<OpenVpnCredentials>,
+}
+
+impl From<OpenVpnConnectParams> for OpenVpnConnectRequest {
+    fn from(profile: OpenVpnConnectParams) -> Self {
+        Self {
+            profile,
+            credentials: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for OpenVpnConnectRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenVpnConnectRequest")
+            .field("profile", &self.profile)
+            .field(
+                "credentials",
+                &self.credentials.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVpnProfileParams {
+    pub profile_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum OpenVpnConnectionState {
+    Stopped,
+    Connecting,
+    Connected,
+    Reconnecting,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum OpenVpnWarning {
+    DnsNotApplied,
+    Ipv6NotCovered,
+    AuthenticationFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVpnStatusResult {
+    pub profile_id: String,
+    pub state: OpenVpnConnectionState,
+    pub interface_name: Option<String>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub applied_routes: Vec<IpNet>,
+    pub warnings: Vec<OpenVpnWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVpnConnectResult {
+    pub status: OpenVpnStatusResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVpnDisconnectResult {
+    pub stopped: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVpnProbeResult {
+    pub routes: Vec<AnalyzedRoute>,
+}
+
+/// Managed generated Xray JSON from the app's vault; never a user path.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayConnectParams {
+    pub profile_id: String,
+    pub config: String,
+    #[serde(default)]
+    pub routes: Vec<PolicyRoute>,
+    #[serde(default)]
+    pub dns_servers: Vec<std::net::IpAddr>,
+    #[serde(default)]
+    pub dns_domains: Vec<String>,
+}
+
+impl std::fmt::Debug for XrayConnectParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("XrayConnectParams")
+            .field("profile_id", &self.profile_id)
+            .field("config", &"[REDACTED]")
+            .field("routes", &self.routes)
+            .field("dns_servers", &self.dns_servers)
+            .field("dns_domains", &self.dns_domains)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayProfileParams {
+    pub profile_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayStatusResult {
+    pub profile_id: String,
+    pub state: TunnelState,
+    pub interface_name: Option<String>,
+    pub dns_applied: bool,
+    pub ipv4_covered: bool,
+    pub ipv6_covered: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayConnectResult {
+    pub status: XrayStatusResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayDisconnectResult {
+    pub stopped: bool,
+}
+
+/// Only these backends support pre-login replay. OpenVPN credentials and Xray
+/// plaintext need a separate persistence/security review before enrollment.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AlwaysOnKind {
+    WireGuard,
+    StaticRoutes,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlwaysOnStaticRoutes {
+    pub profile_id: String,
+    /// Stable interface name, resolved to an ifindex again after reboot.
+    pub interface_name: String,
+    pub routes: Vec<PolicyRoute>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "profile", rename_all = "camelCase")]
+pub enum AlwaysOnDefinition {
+    WireGuard(WireGuardConnectParams),
+    StaticRoutes(AlwaysOnStaticRoutes),
+}
+
+impl AlwaysOnDefinition {
+    pub fn kind(&self) -> AlwaysOnKind {
+        match self {
+            Self::WireGuard(_) => AlwaysOnKind::WireGuard,
+            Self::StaticRoutes(_) => AlwaysOnKind::StaticRoutes,
+        }
+    }
+
+    pub fn profile_id(&self) -> &str {
+        match self {
+            Self::WireGuard(profile) => &profile.profile_id,
+            Self::StaticRoutes(profile) => &profile.profile_id,
+        }
+    }
+
+    pub fn owner(&self) -> String {
+        match self {
+            Self::WireGuard(profile) => format!("wg:{}", profile.profile_id),
+            Self::StaticRoutes(profile) => profile.profile_id.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AlwaysOnDefinition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlwaysOnDefinition")
+            .field("kind", &self.kind())
+            .field("profile", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlwaysOnSetParams {
+    pub definition: AlwaysOnDefinition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlwaysOnRemoveParams {
+    pub kind: AlwaysOnKind,
+    pub profile_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlwaysOnProfileInfo {
+    pub kind: AlwaysOnKind,
+    pub profile_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlwaysOnListResult {
+    pub profiles: Vec<AlwaysOnProfileInfo>,
+    pub paused: bool,
+    pub supported_kinds: Vec<AlwaysOnKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlwaysOnSetResult {
+    pub stored: bool,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlwaysOnRemoveResult {
+    pub removed: bool,
+    pub disconnected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlwaysOnResumeResult {
+    pub resumed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkSetStateParams {
+    pub name: String,
+    pub up: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum OwnedState {
+    /// Write-ahead record: netlink changes may be partially applied.
+    Applying,
+    Applied,
+    /// Teardown failed; the listed resources may still exist.
+    Stale,
+}
+
+/// One resource the daemon created for an owner. Tagged by `kind` so later
+/// stages can add links, rules, DNS or processes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum OwnedResource {
+    Route(AppliedRoute),
+    WireGuardLink(WireGuardLinkResource),
+    OpenVpnProcess(OpenVpnProcessResource),
+    XrayProcess(XrayProcessResource),
+    Address(WireGuardAddressResource),
+    Rule(OwnedRuleResource),
+    Dns(WireGuardDnsResource),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum IpFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardFullResource {
+    pub table: u32,
+    pub fwmark: u32,
+    pub priority_main: u32,
+    pub priority_tunnel: u32,
+    pub ipv4: bool,
+    pub ipv6: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedRuleResource {
+    pub family: IpFamily,
+    pub priority: u32,
+    pub table: u32,
+    pub fwmark: Option<u32>,
+    pub invert: bool,
+    pub suppress_prefix_length: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardDnsResource {
+    pub interface_index: u32,
+    pub name: String,
+    pub servers: Vec<std::net::IpAddr>,
+    pub domains: Vec<String>,
+    pub full: bool,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardLinkResource {
+    pub name: String,
+    /// Zero means creation was journaled but the kernel index was not yet known.
+    pub index: u32,
+    pub owner_marker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<WireGuardFullResource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<WireGuardWarning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WireGuardAddressResource {
+    pub interface_index: u32,
+    pub address: IpNet,
+}
+
+/// Journal marker for a daemon-owned OpenVPN process, without a reusable PID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVpnProcessResource {
+    pub name: String,
+    pub owner_marker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_mark: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<WireGuardFullResource>,
+}
+
+/// Journal marker for a daemon-owned Xray TUN process. Config stays private.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayProcessResource {
+    pub name: String,
+    /// Zero until the process creates the TUN link.
+    #[serde(default)]
+    pub index: u32,
+    pub owner_marker: String,
+    pub transport_mark: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<WireGuardFullResource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedEntry {
+    pub owner: String,
+    pub state: OwnedState,
+    pub resources: Vec<OwnedResource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedListResult {
+    pub owners: Vec<OwnedEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupResult {
+    pub removed_owners: Vec<String>,
+    /// Owners whose teardown failed; they stay listed as `stale`.
+    pub failed: Vec<String>,
+}
+
+/// Payload of the `owned.changed` event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedChanged {
+    pub owner: String,
+}
+
+/// Decode typed params/results; malformed input is `InvalidData`.
+pub fn from_value<T: DeserializeOwned>(value: Value) -> io::Result<T> {
+    serde_json::from_value(value).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+/// Serialize one frame as a single JSON line terminated by `\n`.
+pub fn encode_line<T: Serialize>(frame: &T) -> io::Result<Vec<u8>> {
+    let mut line =
+        serde_json::to_vec(frame).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+/// Read one `\n`-terminated frame (without the newline).
+///
+/// - `Ok(None)` on a clean EOF between frames;
+/// - `InvalidData` as soon as the frame grows past `max` bytes, without
+///   waiting for the rest of it;
+/// - `UnexpectedEof` if the peer closes mid-frame.
+pub async fn read_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed in the middle of a frame",
+                ))
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let chunk = &available[..newline.unwrap_or(available.len())];
+        if line.len() + chunk.len() > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame exceeds {max} bytes"),
+            ));
+        }
+        line.extend_from_slice(chunk);
+        let consumed = chunk.len() + usize::from(newline.is_some());
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(line));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::AppliedRoute;
+    use serde::de::DeserializeOwned;
+    use serde_json::{json, Value};
+    use std::time::Duration;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    /// Parse `text` into `T`, serialize it back and require the exact same
+    /// JSON value (field order aside).
+    fn round_trip<T: Serialize + DeserializeOwned>(text: &str) -> T {
+        let original: Value = serde_json::from_str(text).unwrap();
+        let typed: T = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&typed).unwrap(), original, "{text}");
+        typed
+    }
+
+    fn request<P: Serialize + DeserializeOwned>(text: &str) -> (RequestFrame, P) {
+        let frame: RequestFrame = round_trip(text);
+        let params: P = from_value(frame.params.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&params).unwrap(), frame.params);
+        (frame, params)
+    }
+
+    fn ok_response<R: Serialize + DeserializeOwned>(text: &str) -> (u64, R) {
+        let frame: ResponseFrame = round_trip(text);
+        let value = frame.outcome.clone().expect("ok response");
+        let result: R = from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&result).unwrap(), value);
+        (frame.id, result)
+    }
+
+    fn error_response(text: &str) -> (u64, ErrorBody) {
+        let frame: ResponseFrame = round_trip(text);
+        (frame.id, frame.outcome.expect_err("error response"))
+    }
+
+    #[test]
+    fn golden_hello() {
+        let (frame, params): (_, HelloParams) = request(
+            r#"{"id":1,"method":"hello","params":{"protocol":1,"client":"net-manager-app/0.1.1"}}"#,
+        );
+        assert_eq!(frame.method, method::HELLO);
+        assert_eq!(params.protocol, PROTOCOL_VERSION);
+        assert_eq!(params.client, "net-manager-app/0.1.1");
+
+        let (id, result): (_, HelloResult) = ok_response(
+            r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","xray.connect","xray.disconnect","xray.status","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set"]}}"#,
+        );
+        assert_eq!(id, 1);
+        assert_eq!(result.uid, 1000);
+        assert_eq!(result.daemon_version, "0.1.1");
+        assert_eq!(result.capabilities, method::CAPABILITIES);
+
+        let (_, error) = error_response(
+            r#"{"id":1,"ok":false,"error":{"code":"protocolMismatch","message":"daemon speaks protocol 1, client 2"}}"#,
+        );
+        assert_eq!(error.code, ErrorCode::ProtocolMismatch);
+    }
+
+    #[test]
+    fn golden_settings() {
+        let (frame, params): (_, SettingsSetParams) =
+            request(r#"{"id":8,"method":"settings.set","params":{"vpnAuthMode":"always"}}"#);
+        assert_eq!(frame.method, method::SETTINGS_SET);
+        assert_eq!(params.vpn_auth_mode, VpnAuthMode::Always);
+        let (_, result): (_, SettingsResult) =
+            ok_response(r#"{"id":9,"ok":true,"result":{"vpnAuthMode":"fullTunnelOnly"}}"#);
+        assert_eq!(result.vpn_auth_mode, VpnAuthMode::FullTunnelOnly);
+        assert_eq!(VpnAuthMode::default(), VpnAuthMode::FullTunnelOnly);
+        let _: SettingsSetParams = serde_json::from_str(r#"{"vpnAuthMode":"noPrompt"}"#).unwrap();
+    }
+
+    #[test]
+    fn golden_routes_apply() {
+        let (frame, params): (_, RoutesApplyParams) = request(
+            r#"{"id":2,"method":"routes.apply","params":{"owner":"static-office","routes":[
+              {"destination":"203.0.113.0/24","interfaceIndex":2,"gateway":"192.168.1.1","metric":5},
+              {"destination":"2001:db8::/32","interfaceIndex":2,"metric":5}]}}"#,
+        );
+        assert_eq!(frame.method, method::ROUTES_APPLY);
+        assert_eq!(params.owner, "static-office");
+        assert_eq!(
+            params.routes[0].gateway,
+            Some("192.168.1.1".parse().unwrap())
+        );
+        assert_eq!(
+            params.routes[1],
+            AppliedRoute::on_link("2001:db8::/32".parse().unwrap(), 2, 5)
+        );
+
+        let (_, result): (_, RoutesApplyResult) =
+            ok_response(r#"{"id":2,"ok":true,"result":{"applied":2}}"#);
+        assert_eq!(result.applied, 2);
+
+        let (_, error) = error_response(
+            r#"{"id":2,"ok":false,"error":{"code":"authorizationDismissed","message":"authorization dialog was dismissed; nothing was applied"}}"#,
+        );
+        assert_eq!(error.code, ErrorCode::AuthorizationDismissed);
+    }
+
+    #[test]
+    fn golden_always_on_wireguard_and_static_are_typed_and_redacted() {
+        let (_, set): (_, AlwaysOnSetParams) = request(
+            r#"{"id":20,"method":"alwaysOn.set","params":{"definition":{"kind":"wireGuard","profile":{"profileId":"home","config":"[Interface]\nPrivateKey = secret-marker\n","routes":[]}}}}"#,
+        );
+        assert_eq!(set.definition.owner(), "wg:home");
+        assert!(!format!("{set:?}").contains("secret-marker"));
+        let (_, static_set): (_, AlwaysOnSetParams) = request(
+            r#"{"id":21,"method":"alwaysOn.set","params":{"definition":{"kind":"staticRoutes","profile":{"profileId":"office","interfaceName":"eth0","routes":[{"destination":"203.0.113.0/24","metric":5,"via":"192.0.2.1"}]}}}}"#,
+        );
+        assert_eq!(static_set.definition.owner(), "office");
+        assert_eq!(method::ALWAYS_ON_SET, "alwaysOn.set");
+        assert_eq!(method::ALWAYS_ON_REMOVE, "alwaysOn.remove");
+        assert_eq!(method::ALWAYS_ON_RESUME, "alwaysOn.resume");
+    }
+
+    #[test]
+    fn golden_routes_remove() {
+        let (frame, params): (_, OwnerParams) =
+            request(r#"{"id":3,"method":"routes.remove","params":{"owner":"static-office"}}"#);
+        assert_eq!(frame.method, method::ROUTES_REMOVE);
+        assert_eq!(params.owner, "static-office");
+        let (_, result): (_, RoutesRemoveResult) =
+            ok_response(r#"{"id":3,"ok":true,"result":{"removed":2}}"#);
+        assert_eq!(result.removed, 2);
+    }
+
+    #[test]
+    fn golden_link_set_state() {
+        let (frame, params): (_, LinkSetStateParams) =
+            request(r#"{"id":4,"method":"link.set_state","params":{"name":"enp0s3","up":false}}"#);
+        assert_eq!(frame.method, method::LINK_SET_STATE);
+        assert_eq!(params.name, "enp0s3");
+        assert!(!params.up);
+        let (_, result): (_, Value) = ok_response(r#"{"id":4,"ok":true,"result":null}"#);
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn golden_owned_list() {
+        let frame: RequestFrame = round_trip(r#"{"id":5,"method":"owned.list"}"#);
+        assert_eq!(frame.method, method::OWNED_LIST);
+        assert_eq!(frame.params, Value::Null);
+
+        let (_, result): (_, OwnedListResult) = ok_response(
+            r#"{"id":5,"ok":true,"result":{"owners":[{"owner":"static-office","state":"applied","resources":[
+              {"kind":"route","destination":"203.0.113.0/24","interfaceIndex":2,"gateway":"192.168.1.1","metric":5}]}]}}"#,
+        );
+        let entry = &result.owners[0];
+        assert_eq!(entry.owner, "static-office");
+        assert_eq!(entry.state, OwnedState::Applied);
+        let OwnedResource::Route(route) = &entry.resources[0] else {
+            panic!("expected route");
+        };
+        assert_eq!(route.gateway, Some("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn golden_recovery_cleanup() {
+        let frame: RequestFrame = round_trip(r#"{"id":6,"method":"recovery.cleanup"}"#);
+        assert_eq!(frame.method, method::RECOVERY_CLEANUP);
+        let (_, result): (_, CleanupResult) = ok_response(
+            r#"{"id":6,"ok":true,"result":{"removedOwners":["static-office"],"failed":[]}}"#,
+        );
+        assert_eq!(result.removed_owners, vec!["static-office".to_string()]);
+        assert!(result.failed.is_empty());
+    }
+
+    #[test]
+    fn golden_subscribe_and_events() {
+        let frame: RequestFrame = round_trip(r#"{"id":7,"method":"subscribe"}"#);
+        assert_eq!(frame.method, method::SUBSCRIBE);
+        let (_, result): (_, Value) = ok_response(r#"{"id":7,"ok":true,"result":null}"#);
+        assert_eq!(result, Value::Null);
+
+        let event: EventFrame =
+            round_trip(r#"{"event":"owned.changed","data":{"owner":"static-office"}}"#);
+        assert_eq!(event.event, event::OWNED_CHANGED);
+        let data: OwnedChanged = from_value(event.data).unwrap();
+        assert_eq!(data.owner, "static-office");
+
+        let event: EventFrame = round_trip(r#"{"event":"resync"}"#);
+        assert_eq!(event.event, event::RESYNC);
+    }
+
+    #[test]
+    fn golden_wireguard_methods() {
+        let (frame, params): (_, WireGuardConnectParams) = request(
+            r#"{"id":8,"method":"wireguard.connect","params":{"profileId":"home","config":"[Interface]\nPrivateKey = test\n","routes":[]}}"#,
+        );
+        assert_eq!(frame.method, method::WIREGUARD_CONNECT);
+        assert_eq!(params.profile_id, "home");
+        assert!(params.config.contains("[Interface]"));
+        assert!(params.routes.is_empty());
+
+        let (_, result): (_, WireGuardConnectResult) = ok_response(
+            r#"{"id":8,"ok":true,"result":{"status":{"profileId":"home","state":"running","interfaceName":"wg-ab12","latestHandshake":null,"rxBytes":0,"txBytes":0,"dnsApplied":true,"warnings":[]}}}"#,
+        );
+        assert_eq!(result.status.interface_name.as_deref(), Some("wg-ab12"));
+        assert!(result.status.dns_applied);
+
+        let (frame, params): (_, WireGuardProfileParams) =
+            request(r#"{"id":9,"method":"wireguard.status","params":{"profileId":"home"}}"#);
+        assert_eq!(frame.method, method::WIREGUARD_STATUS);
+        assert_eq!(params.profile_id, "home");
+        let (_, status): (_, WireGuardStatusResult) = ok_response(
+            r#"{"id":9,"ok":true,"result":{"profileId":"home","state":"running","interfaceName":"wg-ab12","latestHandshake":42,"rxBytes":7,"txBytes":8,"dnsApplied":false,"warnings":["dnsNotApplied","ignoredSaveConfig"]}}"#,
+        );
+        assert_eq!(
+            status.warnings,
+            vec![
+                WireGuardWarning::DnsNotApplied,
+                WireGuardWarning::IgnoredSaveConfig
+            ]
+        );
+
+        let (frame, _): (_, WireGuardProfileParams) =
+            request(r#"{"id":10,"method":"wireguard.disconnect","params":{"profileId":"home"}}"#);
+        assert_eq!(frame.method, method::WIREGUARD_DISCONNECT);
+        let (_, result): (_, WireGuardDisconnectResult) =
+            ok_response(r#"{"id":10,"ok":true,"result":{"stopped":true}}"#);
+        assert!(result.stopped);
+    }
+
+    #[test]
+    fn golden_openvpn_methods() {
+        let (frame, params): (_, OpenVpnConnectParams) = request(
+            r#"{"id":11,"method":"openvpn.connect","params":{"profileId":"office","config":"client\nremote vpn.example 1194\n","assets":{"ca.crt":"Y2VydA=="},"routes":[{"destination":"10.9.0.0/16","metric":5}]}}"#,
+        );
+        assert_eq!(frame.method, method::OPENVPN_CONNECT);
+        assert_eq!(params.profile_id, "office");
+        assert_eq!(params.assets["ca.crt"], "Y2VydA==");
+        assert_eq!(params.routes[0].destination, "10.9.0.0/16".parse().unwrap());
+
+        let (_, result): (_, OpenVpnConnectResult) = ok_response(
+            r#"{"id":11,"ok":true,"result":{"status":{"profileId":"office","state":"connecting","interfaceName":"ovpn-ab12","rxBytes":0,"txBytes":0,"appliedRoutes":[],"warnings":[]}}}"#,
+        );
+        assert_eq!(result.status.state, OpenVpnConnectionState::Connecting);
+
+        let (frame, params): (_, OpenVpnProfileParams) =
+            request(r#"{"id":12,"method":"openvpn.status","params":{"profileId":"office"}}"#);
+        assert_eq!(frame.method, method::OPENVPN_STATUS);
+        assert_eq!(params.profile_id, "office");
+        let (_, status): (_, OpenVpnStatusResult) = ok_response(
+            r#"{"id":12,"ok":true,"result":{"profileId":"office","state":"connected","interfaceName":"ovpn-ab12","rxBytes":7,"txBytes":8,"appliedRoutes":["10.9.0.0/16"],"warnings":["dnsNotApplied","ipv6NotCovered"]}}"#,
+        );
+        assert_eq!(status.state, OpenVpnConnectionState::Connected);
+        assert_eq!(status.applied_routes, vec!["10.9.0.0/16".parse().unwrap()]);
+        assert_eq!(
+            status.warnings,
+            vec![
+                OpenVpnWarning::DnsNotApplied,
+                OpenVpnWarning::Ipv6NotCovered
+            ]
+        );
+
+        let (frame, _): (_, OpenVpnProfileParams) =
+            request(r#"{"id":13,"method":"openvpn.disconnect","params":{"profileId":"office"}}"#);
+        assert_eq!(frame.method, method::OPENVPN_DISCONNECT);
+        let (_, result): (_, OpenVpnDisconnectResult) =
+            ok_response(r#"{"id":13,"ok":true,"result":{"stopped":true}}"#);
+        assert!(result.stopped);
+    }
+
+    #[test]
+    fn golden_openvpn_probe_returns_analyzed_routes() {
+        let (frame, params): (_, OpenVpnConnectRequest) = request(
+            r#"{"id":14,"method":"openvpn.probe","params":{"profileId":"office","config":"client\nremote vpn.example\n","assets":{},"routes":[]}}"#,
+        );
+        assert_eq!(frame.method, method::OPENVPN_PROBE);
+        assert_eq!(params.profile.profile_id, "office");
+        assert!(params.credentials.is_none());
+        let (_, result): (_, OpenVpnProbeResult) = ok_response(
+            r#"{"id":14,"ok":true,"result":{"routes":[{"destination":"10.89.0.0/24","source":"OpenVPN pushed","metric":null}]}}"#,
+        );
+        assert_eq!(
+            result.routes[0].destination,
+            "10.89.0.0/24".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn golden_xray_methods_and_redacted_config() {
+        let (frame, params): (_, XrayConnectParams) = request(
+            r#"{"id":21,"method":"xray.connect","params":{"profileId":"office","config":"{\"outbounds\":[]}","routes":[{"destination":"10.9.0.0/16","metric":5}],"dnsServers":["10.9.0.53"],"dnsDomains":["corp.example"]}}"#,
+        );
+        assert_eq!(frame.method, method::XRAY_CONNECT);
+        assert_eq!(params.routes[0].destination, "10.9.0.0/16".parse().unwrap());
+        assert!(!format!("{params:?}").contains("outbounds"));
+        let (_, result): (_, XrayConnectResult) = ok_response(
+            r#"{"id":21,"ok":true,"result":{"status":{"profileId":"office","state":"running","interfaceName":"xray-ab12","dnsApplied":true,"ipv4Covered":false,"ipv6Covered":false}}}"#,
+        );
+        assert_eq!(result.status.state, TunnelState::Running);
+        let (frame, _): (_, XrayProfileParams) =
+            request(r#"{"id":22,"method":"xray.status","params":{"profileId":"office"}}"#);
+        assert_eq!(frame.method, method::XRAY_STATUS);
+        let (frame, _): (_, XrayProfileParams) =
+            request(r#"{"id":23,"method":"xray.disconnect","params":{"profileId":"office"}}"#);
+        assert_eq!(frame.method, method::XRAY_DISCONNECT);
+        let (_, result): (_, XrayDisconnectResult) =
+            ok_response(r#"{"id":23,"ok":true,"result":{"stopped":true}}"#);
+        assert!(result.stopped);
+    }
+
+    #[test]
+    fn openvpn_request_debug_redacts_config_and_asset_names_and_values() {
+        let params: OpenVpnConnectParams = from_value(json!({
+            "profileId": "office",
+            "config": "secret-config-marker",
+            "assets": {"secret-asset-name": "secret-asset-value"}
+        }))
+        .unwrap();
+        assert!(params.routes.is_empty());
+        let debug = format!("{params:?}");
+        assert!(debug.contains("[REDACTED]"));
+        for secret in [
+            "secret-config-marker",
+            "secret-asset-name",
+            "secret-asset-value",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn openvpn_credentials_round_trip_without_debug_disclosure() {
+        let request: OpenVpnConnectRequest = from_value(json!({
+            "profileId": "office",
+            "config": "secret-config-marker",
+            "assets": {"secret-asset-name": "secret-asset-value"},
+            "credentials": {
+                "authUserPass": {
+                    "username": "secret-user-marker",
+                    "password": "secret-password-marker"
+                },
+                "privateKeyPassphrase": "secret-key-marker"
+            }
+        }))
+        .unwrap();
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["profileId"], "office");
+        assert_eq!(
+            encoded["credentials"]["authUserPass"]["username"],
+            "secret-user-marker"
+        );
+        let debug = format!("{request:?} {:?}", request.credentials.as_ref().unwrap());
+        for secret in [
+            "secret-config-marker",
+            "secret-asset-name",
+            "secret-asset-value",
+            "secret-user-marker",
+            "secret-password-marker",
+            "secret-key-marker",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        let legacy: OpenVpnConnectRequest = from_value(json!({
+            "profileId": "office",
+            "config": "client\nremote vpn.example\n",
+            "assets": {}
+        }))
+        .unwrap();
+        assert!(legacy.credentials.is_none());
+    }
+
+    #[test]
+    fn openvpn_process_resource_contains_no_pid_or_secrets() {
+        let entry: OwnedEntry = round_trip(
+            r#"{"owner":"ovpn:office","state":"applied","resources":[{"kind":"openVpnProcess","name":"ovpn-ab12","ownerMarker":"network-orchestrator:1000:ovpn:office"}]}"#,
+        );
+        assert!(
+            matches!(&entry.resources[0], OwnedResource::OpenVpnProcess(resource) if resource.name == "ovpn-ab12")
+        );
+    }
+
+    #[test]
+    fn openvpn_process_journals_transport_mark_and_full_policy_plan() {
+        let entry: OwnedEntry = round_trip(
+            r#"{"owner":"ovpn:office","state":"applied","resources":[{"kind":"openVpnProcess","name":"ovpn-ab12","ownerMarker":"network-orchestrator:1000:ovpn:office","transportMark":51820,"full":{"table":51820,"fwmark":51820,"priorityMain":10000,"priorityTunnel":10001,"ipv4":true,"ipv6":false}}]}"#,
+        );
+        assert!(
+            matches!(&entry.resources[0], OwnedResource::OpenVpnProcess(resource) if resource.name == "ovpn-ab12")
+        );
+    }
+
+    #[test]
+    fn full_wireguard_resources_are_kind_tagged_and_secret_free() {
+        let entry: OwnedEntry = round_trip(
+            r#"{"owner":"wg:home","state":"applied","resources":[
+              {"kind":"wireGuardLink","name":"wg-ab12","index":42,"ownerMarker":"network-orchestrator:1000:wg:home","full":{"table":51820,"fwmark":51820,"priorityMain":10000,"priorityTunnel":10001,"ipv4":true,"ipv6":false}},
+              {"kind":"rule","family":"ipv4","priority":10000,"table":254,"fwmark":null,"invert":false,"suppressPrefixLength":0},
+              {"kind":"dns","interfaceIndex":42,"name":"wg-ab12","servers":["10.77.0.1"],"domains":[],"full":true,"applied":true}
+            ]}"#,
+        );
+        assert_eq!(entry.resources.len(), 3);
+        assert!(matches!(&entry.resources[1], OwnedResource::Rule(rule) if rule.priority == 10000));
+    }
+
+    #[test]
+    fn s1_owned_route_remains_readable() {
+        let old = r#"{"owner":"office","state":"applied","resources":[{"kind":"route","destination":"10.0.0.0/8","interfaceIndex":2,"metric":5}]}"#;
+        let entry: OwnedEntry = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            entry.resources.as_slice(),
+            [OwnedResource::Route(_)]
+        ));
+    }
+
+    #[test]
+    fn unknown_method_parses_as_frame() {
+        let frame: RequestFrame =
+            serde_json::from_str(r#"{"id":9,"method":"frobnicate","params":{"x":1}}"#).unwrap();
+        assert_eq!(frame.id, 9);
+        assert_eq!(frame.method, "frobnicate");
+        assert_eq!(frame.params, json!({"x":1}));
+    }
+
+    #[test]
+    fn owned_resource_route_is_kind_tagged() {
+        let resource =
+            OwnedResource::Route(AppliedRoute::on_link("10.0.0.0/8".parse().unwrap(), 3, 1));
+        assert_eq!(
+            serde_json::to_value(&resource).unwrap(),
+            json!({"kind":"route","destination":"10.0.0.0/8","interfaceIndex":3,"metric":1})
+        );
+    }
+
+    #[test]
+    fn unknown_resource_kind_is_invalid_data() {
+        let err =
+            from_value::<OwnedResource>(json!({"kind":"dns","server":"1.1.1.1"})).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn encode_line_appends_single_newline() {
+        let line = encode_line(&EventFrame::new(event::RESYNC, Value::Null)).unwrap();
+        assert_eq!(line, b"{\"event\":\"resync\"}\n");
+    }
+
+    #[tokio::test]
+    async fn read_frame_splits_lines() {
+        let mut reader: &[u8] = b"{\"a\":1}\n{\"b\":2}\n";
+        assert_eq!(
+            read_frame(&mut reader, 64).await.unwrap().unwrap(),
+            b"{\"a\":1}"
+        );
+        assert_eq!(
+            read_frame(&mut reader, 64).await.unwrap().unwrap(),
+            b"{\"b\":2}"
+        );
+        assert!(read_frame(&mut reader, 64).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_without_newline() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        writer.write_all(&[b'a'; 64]).await.unwrap();
+        // The writer stays open: the limit must trip without waiting for
+        // a newline or EOF.
+        let mut reader = BufReader::new(reader);
+        let result = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader, 16))
+            .await
+            .expect("read_frame must not wait for a newline");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn read_frame_returns_none_on_clean_eof() {
+        let mut reader: &[u8] = b"";
+        assert!(read_frame(&mut reader, 16).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_eof_mid_frame() {
+        let mut reader: &[u8] = b"{\"a\":";
+        let err = read_frame(&mut reader, 16).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+}

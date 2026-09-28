@@ -1,7 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { confirm, message } from "@tauri-apps/plugin-dialog";
+import type { DaemonStatus } from "./types";
 
 export async function ensureElevation(action: string): Promise<boolean> {
+  const daemon = await invoke<DaemonStatus>("daemon_status");
+  if (daemon.state === "ready") return true;
+  if (daemon.state !== "notRequired") {
+    await message(`${action} requires the network daemon. ${daemon.message}`, {
+      title: "Network daemon unavailable",
+      kind: "warning",
+    });
+    return false;
+  }
   const elevated = await invoke<boolean>("is_elevated");
   if (elevated) return true;
   const approved = await confirm(

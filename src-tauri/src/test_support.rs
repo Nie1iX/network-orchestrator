@@ -3,9 +3,7 @@ use crate::state::{AppState, RuntimeState};
 use net_manager_core::backend_settings::BackendSettingsStore;
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::models::*;
-use net_manager_core::policy::PolicyManager;
 use net_manager_core::profiles::ProfileStore;
-use net_manager_core::route_state::AppliedRouteStore;
 use net_manager_core::system_proxy::{ProxyAdapter, ProxySnapshot, SystemProxyManager};
 use net_manager_core::vpn::TunnelManager;
 use std::fs;
@@ -39,6 +37,7 @@ pub(crate) fn iface(name: &str, friendly_name: &str, state: InterfaceState) -> N
         physical: true,
         mac: None,
         gateway: None,
+        ipv6_gateway: None,
         rx_bytes: None,
         tx_bytes: None,
         link_speed_mbps: None,
@@ -107,7 +106,6 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
     AppState {
         profiles: ProfileStore::new(dir.join("profiles.json")),
         config_vault: ConfigVault::new(dir.join("configs")),
-        applied_routes: AppliedRouteStore::new(dir.join("applied-routes.json")),
         backend_settings: BackendSettingsStore::new(dir.join("backend-settings.json")),
         managed_xray_root: dir.join("backends").join("xray"),
         backend_install_lock: tokio::sync::Mutex::new(()),
@@ -116,13 +114,20 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
         cleanup_complete: AtomicBool::new(false),
         runtime: tokio::sync::Mutex::new(RuntimeState {
             tunnels: TunnelManager::new(),
-            policies: PolicyManager::with_executor(Box::new(NoopExecutor)),
+            routes: crate::route_runtime::RouteRuntime::local_with_executor(
+                dir,
+                Box::new(NoopExecutor),
+            ),
             proxy: SystemProxyManager::with_adapter(
                 dir.join("proxy-state.json"),
                 Box::new(NoopProxyAdapter),
             )
             .unwrap(),
         }),
+        #[cfg(target_os = "linux")]
+        openvpn_credentials: crate::openvpn_credentials::OpenVpnCredentialStore::new(Box::new(
+            crate::openvpn_credentials::tests::FakeKeyring::default(),
+        )),
     }
 }
 

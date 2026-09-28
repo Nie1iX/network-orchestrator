@@ -7,13 +7,16 @@ Guidance for agents/contributors working in this repository.
 - `crates/core` — pure Rust library: models, static analysis, config vault,
   DPAPI, policy routes, tunnel manager, route plan, system proxy, explorer,
   backend executable settings, managed Xray verification.
+- `crates/daemon` — Linux privileged system service: Unix socket protocol,
+  polkit authorization, netlink mutations, ownership journal and recovery.
 - `src-tauri` — Tauri 2 shell: commands in `src-tauri/src/commands/`,
   `state.rs` (AppState + runtime mutex), `lifecycle.rs` (shutdown cleanup),
   `test_support.rs` fixtures.
 - `src` — React/TypeScript frontend; `src/types.ts` mirrors Rust models
   (camelCase).
-- `docs/plans` — per-stage implementation plans; `docs/testing.md` — E2E env
-  contract.
+- `e2e/linux` — disposable Docker test harness for the Linux daemon.
+- `docs/plans` — per-stage implementation plans; `docs/testing.md` — Linux
+  Docker and Windows VM E2E contracts.
 
 ## Setup
 
@@ -23,7 +26,10 @@ cargo fetch
 rustup component add clippy rustfmt
 ```
 
-Windows + MSVC + WebView2 required for full functionality.
+Windows + MSVC + WebView2 are required for Windows tunnel functionality.
+On Linux, the daemon requires systemd and polkit for network mutations;
+WireGuard also needs `wireguard-tools`, OpenVPN needs `openvpn`, and DNS needs
+`systemd-resolved`.
 
 ## Quality gate (run before reporting done)
 
@@ -39,9 +45,16 @@ npm run build
 
 - `cargo test -p net-manager-core <filter>` / `-p net-manager-app <filter>` —
   focused tests.
-- `npm run tauri dev` — dev run; `npm run tauri build` — unsigned NSIS under
-  `target/release/bundle/nsis/`.
+- `npm run tauri dev` — dev run; on Windows,
+  `npm run tauri build -- --bundles nsis` builds unsigned NSIS under
+  `target/release/bundle/nsis/`; on Linux use `scripts/build-linux-deb.sh`
+  (`.deb`), `scripts/build-linux-deb.sh rpm` (Fedora `.rpm`) or
+  `scripts/build-linux-arch.sh`.
 - `npm audit --audit-level=high` — dependency audit.
+- `e2e/linux/run.sh` (`E2E_DISTRO=fedora` for a Fedora 44 client) — Linux
+  daemon/tunnel E2E in disposable Docker containers;
+  requires Docker, `/dev/net/tun`, `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and
+  unconfined AppArmor for containerized systemd.
 
 ## Safety rules
 
@@ -51,6 +64,8 @@ npm run build
   processes. They require the env contract in `docs/testing.md`.
 - No VPN/UAC/registry/network mutations in ordinary tests — use fake
   adapters, temp dirs, and in-memory fixtures.
+- Run Linux netlink/systemd E2E only inside the disposable `e2e/linux`
+  container. Never run its scenario script directly on the host.
 - Never log or return config contents, VLESS URIs, private keys, UUIDs, or
   passwords; use existing redaction helpers and keep paths out of errors
   where they may contain user secrets.

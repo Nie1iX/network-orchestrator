@@ -369,16 +369,32 @@ mod imp {
     use std::io;
     use std::path::Path;
 
+    /// Restrict a file to `0600` and a directory to `0700` (owner read/write/
+    /// execute only). This is the Unix analogue of the Windows protected
+    /// DACL: no group or other access at all.
     pub fn protect_path(path: &Path) -> io::Result<()> {
-        std::fs::metadata(path).map(|_| ())
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path)?;
+        let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(mode);
+        std::fs::set_permissions(path, permissions)
     }
 
-    pub fn inspect_path_protection(_path: &Path) -> io::Result<PathProtection> {
+    /// Report whether `path` currently has exactly the owner-only mode
+    /// `protect_path` sets. There is no Unix equivalent of separate
+    /// "system"/"administrators" principals, so all four fields collapse to
+    /// the same owner-only check.
+    pub fn inspect_path_protection(path: &Path) -> io::Result<PathProtection> {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(path)?;
+        let expected_mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+        let protected = metadata.permissions().mode() & 0o777 == expected_mode;
         Ok(PathProtection {
-            protected_dacl: true,
-            current_user: true,
-            system: true,
-            administrators: true,
+            protected_dacl: protected,
+            current_user: protected,
+            system: protected,
+            administrators: protected,
         })
     }
 
@@ -402,6 +418,20 @@ mod imp {
             "DPAPI protection is only available on Windows",
         ))
     }
+
+    pub fn read_with_backup_semantics(path: &Path) -> io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+
+    /// Test-only: there is no Unix equivalent of machine-scope DPAPI, so any
+    /// test that needs this must stay `#[cfg(windows)]`-gated itself.
+    #[cfg(test)]
+    pub fn protect_machine_data(_data: &[u8]) -> io::Result<Vec<u8>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "DPAPI protection is only available on Windows",
+        ))
+    }
 }
 
 pub use imp::{
@@ -411,11 +441,6 @@ pub use imp::{
 
 #[cfg(test)]
 pub use imp::protect_machine_data;
-
-#[cfg(not(windows))]
-pub fn read_with_backup_semantics(path: &Path) -> io::Result<Vec<u8>> {
-    std::fs::read(path)
-}
 
 #[cfg(test)]
 mod tests {

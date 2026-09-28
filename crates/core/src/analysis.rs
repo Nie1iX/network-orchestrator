@@ -728,6 +728,7 @@ mod tests {
         p.routes.push(PolicyRoute {
             destination: net("192.168.7.0/24"),
             metric: 5,
+            via: None,
         });
         let result = analyze_profile(&p).unwrap();
         assert_eq!(
@@ -1087,6 +1088,7 @@ mod tests {
             p.routes.push(PolicyRoute {
                 destination: net("10.9.9.0/24"),
                 metric: 1,
+                via: None,
             });
             let result = analyze_profile(&p).unwrap();
             assert!(result
@@ -1363,6 +1365,7 @@ mod tests {
         p.routes = vec![PolicyRoute {
             destination: "10.0.0.0/24".parse().unwrap(),
             metric: 5,
+            via: None,
         }];
         let analysis = analyze_profile(&p).unwrap();
         assert!(analysis.warnings.is_empty());

@@ -1,9 +1,11 @@
-use crate::models::{AppliedProfileRoutes, AppliedRoute, NetworkInterface, Profile};
+use crate::models::{
+    AppliedProfileRoutes, AppliedRoute, InterfaceCategory, NetworkInterface, Profile,
+};
+use ipnet::IpNet;
 use std::collections::HashMap;
 use std::io;
-
-#[cfg(windows)]
 use std::net::IpAddr;
+
 #[cfg(windows)]
 use windows::Win32::Foundation::{ERROR_NOT_FOUND, WIN32_ERROR};
 #[cfg(windows)]
@@ -18,6 +20,53 @@ use windows::Win32::Networking::WinSock::{
 pub trait RouteExecutor: Send {
     fn add_route(&mut self, route: &AppliedRoute) -> io::Result<()>;
     fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()>;
+}
+
+/// Add `routes` in order; on the first failure remove the ones already
+/// added (in reverse). The error keeps the original kind and comes with the
+/// routes whose rollback failed, i.e. those that may still be installed.
+pub fn apply_routes_transactional(
+    executor: &mut dyn RouteExecutor,
+    routes: &[AppliedRoute],
+) -> Result<(), (io::Error, Vec<AppliedRoute>)> {
+    for (added, route) in routes.iter().enumerate() {
+        if let Err(err) = executor.add_route(route) {
+            let mut message = err.to_string();
+            let mut still_applied = Vec::new();
+            for rollback in routes[..added].iter().rev() {
+                if let Err(rb_err) = executor.remove_route(rollback) {
+                    message.push_str(&format!(
+                        "; rollback failed for {}: {}",
+                        rollback.destination, rb_err
+                    ));
+                    still_applied.push(rollback.clone());
+                }
+            }
+            return Err((io::Error::new(err.kind(), message), still_applied));
+        }
+    }
+    Ok(())
+}
+
+/// Remove `routes` in reverse order, continuing past failures. On error
+/// returns the routes that could not be removed and a joined message.
+pub fn remove_routes_best_effort(
+    executor: &mut dyn RouteExecutor,
+    routes: &[AppliedRoute],
+) -> Result<(), (Vec<AppliedRoute>, String)> {
+    let mut failed: Vec<AppliedRoute> = Vec::new();
+    let mut messages: Vec<String> = Vec::new();
+    for route in routes.iter().rev() {
+        if let Err(err) = executor.remove_route(route) {
+            messages.push(format!("{}: {}", route.destination, err));
+            failed.push(route.clone());
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err((failed, messages.join("; ")))
+    }
 }
 
 pub struct PolicyManager {
@@ -53,22 +102,7 @@ impl PolicyManager {
             ));
         }
         let routes = plan_profile_routes(profile, interfaces)?;
-        let mut added: Vec<AppliedRoute> = Vec::with_capacity(routes.len());
-        for route in &routes {
-            if let Err(err) = self.executor.add_route(route) {
-                let mut message = err.to_string();
-                for rollback in added.iter().rev() {
-                    if let Err(rb_err) = self.executor.remove_route(rollback) {
-                        message.push_str(&format!(
-                            "; rollback failed for {}: {}",
-                            rollback.destination, rb_err
-                        ));
-                    }
-                }
-                return Err(io::Error::new(err.kind(), message));
-            }
-            added.push(route.clone());
-        }
+        apply_routes_transactional(self.executor.as_mut(), &routes).map_err(|(err, _)| err)?;
         self.applied.insert(profile.id.clone(), routes.clone());
         Ok(routes)
     }
@@ -80,19 +114,13 @@ impl PolicyManager {
                 format!("profile '{profile_id}' has no applied routes"),
             ));
         };
-        let mut failed: Vec<AppliedRoute> = Vec::new();
-        let mut messages: Vec<String> = Vec::new();
-        for route in routes.iter().rev() {
-            if let Err(err) = self.executor.remove_route(route) {
-                messages.push(format!("{}: {}", route.destination, err));
-                failed.push(route.clone());
+        match remove_routes_best_effort(self.executor.as_mut(), &routes) {
+            Ok(()) => Ok(()),
+            Err((failed, message)) => {
+                self.applied.insert(profile_id.to_string(), failed);
+                Err(io::Error::other(message))
             }
         }
-        if failed.is_empty() {
-            return Ok(());
-        }
-        self.applied.insert(profile_id.to_string(), failed);
-        Err(io::Error::other(messages.join("; ")))
     }
 
     pub fn applied_for(&self, profile_id: &str) -> &[AppliedRoute] {
@@ -166,12 +194,30 @@ pub fn plan_profile_routes(
     Ok(profile
         .routes
         .iter()
-        .map(|route| AppliedRoute {
-            destination: route.destination,
-            interface_index: interface.if_index,
-            metric: route.metric,
+        .map(|route| {
+            let destination = route.destination.trunc();
+            AppliedRoute {
+                destination,
+                interface_index: interface.if_index,
+                metric: route.metric,
+                gateway: route
+                    .via
+                    .or_else(|| interface_gateway_for(interface, &destination)),
+                table: None,
+            }
         })
         .collect())
+}
+
+/// The interface's default gateway is a valid next hop only on a physical
+/// uplink and for the same address family; VPN/tunnel routes stay on-link.
+fn interface_gateway_for(interface: &NetworkInterface, destination: &IpNet) -> Option<IpAddr> {
+    if interface.category != InterfaceCategory::Physical {
+        return None;
+    }
+    interface
+        .gateway
+        .filter(|gateway| gateway.is_ipv4() == destination.addr().is_ipv4())
 }
 
 fn resolve_interface<'a>(
@@ -224,6 +270,13 @@ fn populate_forward_row(row: &mut MIB_IPFORWARD_ROW2, route: &AppliedRoute) {
                 },
             };
             row.NextHop.Ipv4.sin_family = AF_INET;
+            if let Some(IpAddr::V4(gateway)) = route.gateway {
+                row.NextHop.Ipv4.sin_addr = IN_ADDR {
+                    S_un: IN_ADDR_0 {
+                        S_addr: u32::from_ne_bytes(gateway.octets()),
+                    },
+                };
+            }
         }
         IpAddr::V6(v6) => {
             row.DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
@@ -231,6 +284,13 @@ fn populate_forward_row(row: &mut MIB_IPFORWARD_ROW2, route: &AppliedRoute) {
                 u: IN6_ADDR_0 { Byte: v6.octets() },
             };
             row.NextHop.Ipv6.sin6_family = AF_INET6;
+            if let Some(IpAddr::V6(gateway)) = route.gateway {
+                row.NextHop.Ipv6.sin6_addr = IN6_ADDR {
+                    u: IN6_ADDR_0 {
+                        Byte: gateway.octets(),
+                    },
+                };
+            }
         }
     }
 }
@@ -285,14 +345,14 @@ impl RouteExecutor for UnsupportedRouteExecutor {
     fn add_route(&mut self, _route: &AppliedRoute) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "policy routes are only supported on Windows",
+            "policy routes are only supported on Windows and Linux",
         ))
     }
 
     fn remove_route(&mut self, _route: &AppliedRoute) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "policy routes are only supported on Windows",
+            "policy routes are only supported on Windows and Linux",
         ))
     }
 }
@@ -300,10 +360,7 @@ impl RouteExecutor for UnsupportedRouteExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{
-        InterfaceCategory, InterfaceKind, InterfaceState, PolicyRoute, TunnelBackend,
-    };
-    use std::net::IpAddr;
+    use crate::models::{InterfaceKind, InterfaceState, PolicyRoute, TunnelBackend};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
@@ -321,6 +378,7 @@ mod tests {
             physical: true,
             mac: None,
             gateway: None,
+            ipv6_gateway: None,
             rx_bytes: None,
             tx_bytes: None,
             link_speed_mbps: None,
@@ -347,6 +405,7 @@ mod tests {
         PolicyRoute {
             destination: dest.parse().unwrap(),
             metric,
+            via: None,
         }
     }
 
@@ -420,8 +479,94 @@ mod tests {
                 destination: "10.7.0.0/24".parse().unwrap(),
                 interface_index: 7,
                 metric: 5,
+                gateway: None,
+                table: None,
             }]
         );
+    }
+
+    fn iface_with_gateway(
+        category: InterfaceCategory,
+        gateway: Option<IpAddr>,
+    ) -> NetworkInterface {
+        let mut interface = iface("x", "wg-work", 7);
+        interface.category = category;
+        interface.gateway = gateway;
+        interface
+    }
+
+    #[test]
+    fn planner_copies_explicit_via_to_gateway() {
+        let interfaces = vec![iface_with_gateway(
+            InterfaceCategory::Vpn,
+            Some("10.0.0.1".parse().unwrap()),
+        )];
+        let mut r = route("10.7.0.0/24", 5);
+        r.via = Some("10.7.0.254".parse().unwrap());
+        let planned = plan_profile_routes(&profile(vec![r]), &interfaces).unwrap();
+        assert_eq!(planned[0].gateway, Some("10.7.0.254".parse().unwrap()));
+        assert_eq!(planned[0].table, None);
+    }
+
+    #[test]
+    fn planner_uses_interface_gateway_for_physical_only() {
+        let gateway = Some("192.168.1.1".parse().unwrap());
+        let p = profile(vec![route("10.7.0.0/24", 5)]);
+
+        let physical = vec![iface_with_gateway(InterfaceCategory::Physical, gateway)];
+        let planned = plan_profile_routes(&p, &physical).unwrap();
+        assert_eq!(planned[0].gateway, gateway);
+        assert_eq!(planned[0].table, None);
+
+        for category in [
+            InterfaceCategory::Virtual,
+            InterfaceCategory::System,
+            InterfaceCategory::Tunnel,
+            InterfaceCategory::Filter,
+        ] {
+            let interfaces = vec![iface_with_gateway(category, gateway)];
+            let planned = plan_profile_routes(&p, &interfaces).unwrap();
+            assert_eq!(planned[0].gateway, None, "{category:?}");
+        }
+    }
+
+    #[test]
+    fn planner_skips_default_gateway_for_vpn_interface() {
+        let interfaces = vec![iface_with_gateway(
+            InterfaceCategory::Vpn,
+            Some("10.0.0.1".parse().unwrap()),
+        )];
+        let p = profile(vec![route("10.7.0.0/24", 5)]);
+        let planned = plan_profile_routes(&p, &interfaces).unwrap();
+        assert_eq!(planned[0].gateway, None);
+    }
+
+    #[test]
+    fn planner_skips_gateway_on_family_mismatch() {
+        let v4_gateway = vec![iface_with_gateway(
+            InterfaceCategory::Physical,
+            Some("192.168.1.1".parse().unwrap()),
+        )];
+        let v6_route = profile(vec![route("2001:db8::/32", 5)]);
+        let planned = plan_profile_routes(&v6_route, &v4_gateway).unwrap();
+        assert_eq!(planned[0].gateway, None);
+
+        let v6_gateway = vec![iface_with_gateway(
+            InterfaceCategory::Physical,
+            Some("fe80::1".parse().unwrap()),
+        )];
+        let v4_route = profile(vec![route("10.7.0.0/24", 5)]);
+        let planned = plan_profile_routes(&v4_route, &v6_gateway).unwrap();
+        assert_eq!(planned[0].gateway, None);
+    }
+
+    #[test]
+    fn planner_truncates_host_bits() {
+        let interfaces = vec![iface("x", "wg-work", 7)];
+        let p = profile(vec![route("10.7.0.99/24", 5), route("fd00::1/64", 5)]);
+        let planned = plan_profile_routes(&p, &interfaces).unwrap();
+        assert_eq!(planned[0].destination.to_string(), "10.7.0.0/24");
+        assert_eq!(planned[1].destination.to_string(), "fd00::/64");
     }
 
     #[test]
@@ -552,6 +697,8 @@ mod tests {
             destination: "10.7.0.99/24".parse().unwrap(),
             interface_index: 42,
             metric: 5,
+            gateway: None,
+            table: None,
         };
         let mut row = unsafe { std::mem::zeroed::<MIB_IPFORWARD_ROW2>() };
         populate_forward_row(&mut row, &applied);
@@ -578,11 +725,34 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn forward_row_ipv4_next_hop_from_gateway() {
+        let applied = AppliedRoute {
+            destination: "10.7.0.0/24".parse().unwrap(),
+            interface_index: 42,
+            metric: 5,
+            gateway: Some("192.168.1.1".parse().unwrap()),
+            table: None,
+        };
+        let mut row = unsafe { std::mem::zeroed::<MIB_IPFORWARD_ROW2>() };
+        populate_forward_row(&mut row, &applied);
+        unsafe {
+            assert_eq!(row.NextHop.Ipv4.sin_family, AF_INET);
+            assert_eq!(
+                row.NextHop.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes(),
+                [192, 168, 1, 1]
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn forward_row_ipv6_fields() {
         let applied = AppliedRoute {
             destination: "fd00::1/64".parse().unwrap(),
             interface_index: 13,
             metric: 7,
+            gateway: None,
+            table: None,
         };
         let mut row = unsafe { std::mem::zeroed::<MIB_IPFORWARD_ROW2>() };
         populate_forward_row(&mut row, &applied);
@@ -661,6 +831,8 @@ mod tests {
                     destination: "10.1.0.0/24".parse().unwrap(),
                     interface_index: 3,
                     metric: 9,
+                    gateway: None,
+                    table: None,
                 }],
             },
         ];
@@ -715,6 +887,8 @@ mod tests {
                     destination: "10.1.0.0/24".parse().unwrap(),
                     interface_index: 3,
                     metric: 9,
+                    gateway: None,
+                    table: None,
                 }],
             },
         ])
