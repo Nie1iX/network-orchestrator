@@ -9,7 +9,7 @@ use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::fs::{self, DirBuilder, OpenOptions};
 #[cfg(target_os = "linux")]
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
@@ -31,11 +31,35 @@ const BINARY_ROOT: &str = "/usr/lib/network-orchestrator/xray";
 const LINK_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bounded slice of `xray.log` surfaced in errors / the daemon journal.
+#[cfg(target_os = "linux")]
+const LOG_TAIL_BYTES: u64 = 4 * 1024;
+#[cfg(target_os = "linux")]
+const LOG_JOURNAL_LINES: usize = 20;
 
 pub trait XrayProcessRunner: Send {
     fn verify_binary(&self) -> io::Result<()>;
     fn link_index(&self, name: &str) -> io::Result<Option<u32>>;
-    fn start(&mut self, uid: u32, name: &str, config: &str) -> io::Result<()>;
+    /// `geo_assets` optionally carries caller-provided `geoip.dat`/
+    /// `geosite.dat` contents (base64); they are staged into the root-owned
+    /// runtime directory before spawn.
+    fn start(
+        &mut self,
+        uid: u32,
+        name: &str,
+        config: &str,
+        geo_assets: Option<&net_manager_core::daemon_protocol::XrayGeoAssets>,
+    ) -> io::Result<()>;
+    /// Restart the child in place, reusing the already staged config and geo
+    /// assets. Runners without respawn support keep the default failure, and
+    /// the reconciler then tears the tunnel down as before.
+    fn respawn(&mut self, uid: u32, name: &str) -> io::Result<()> {
+        let _ = (uid, name);
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "Xray respawn is unsupported",
+        ))
+    }
     fn health(&mut self, name: &str) -> io::Result<bool>;
     fn stop(&mut self, name: &str) -> io::Result<()>;
     fn cleanup(&mut self, uid: u32, name: &str) -> io::Result<()>;
@@ -53,66 +77,39 @@ impl TrustedXrayProcess {
             children: HashMap::new(),
         }
     }
-}
 
-#[cfg(target_os = "linux")]
-impl Default for TrustedXrayProcess {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl XrayProcessRunner for TrustedXrayProcess {
-    fn verify_binary(&self) -> io::Result<()> {
-        trusted_binary().map(|_| ())
-    }
-
-    fn link_index(&self, name: &str) -> io::Result<Option<u32>> {
-        if !valid_tun_name(name) {
-            return Err(invalid_input());
-        }
-        let name = CString::new(name).map_err(|_| invalid_input())?;
-        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-        Ok((index != 0).then_some(index))
-    }
-
-    fn start(&mut self, uid: u32, name: &str, config: &str) -> io::Result<()> {
-        if !valid_tun_name(name) || config.len() > MAX_XRAY_CONFIG_BYTES {
-            return Err(invalid_input());
-        }
-        if self.children.contains_key(name) || self.link_index(name)?.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "Xray interface exists",
-            ));
-        }
-        let binary = trusted_binary()?;
-        ensure_runtime_root()?;
-        let directory = stage_config_at(Path::new(RUNTIME_ROOT), uid, name, config)?;
-        let config_path = directory.join("config.json");
-        let mut child = match Command::new(&binary)
-            .args(xray_args(&config_path))
+    /// Spawn the managed binary against `config_path`, redirect both output
+    /// streams to `xray.log` (`fresh` truncates/creates, append mode
+    /// otherwise), then wait for the TUN link and record `pid starttime`.
+    fn spawn_xray_child(
+        &self,
+        binary: &Path,
+        directory: &Path,
+        config_path: &Path,
+        asset_dir: &Path,
+        name: &str,
+        fresh_log: bool,
+    ) -> io::Result<Child> {
+        let log_path = directory.join("xray.log");
+        let log = open_log_file(&log_path, fresh_log)?;
+        let log_stdout = log
+            .try_clone()
+            .map_err(|_| io::Error::other("Xray log creation failed"))?;
+        let mut child = Command::new(binary)
+            .args(xray_args(config_path))
             .env_clear()
-            .env(
-                "XRAY_LOCATION_ASSET",
-                binary.parent().expect("fixed managed binary"),
-            )
+            .env("XRAY_LOCATION_ASSET", asset_dir)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .current_dir(&directory)
+            // Xray logs to stdout and panic/trace output lands on stderr;
+            // keep both so failures are diagnosable after the fact.
+            .stdout(Stdio::from(log_stdout))
+            .stderr(Stdio::from(log))
+            .current_dir(directory)
             .spawn()
-        {
-            Ok(child) => child,
-            Err(_) => {
-                let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
-                return Err(io::Error::other("Xray launch failed"));
-            }
-        };
+            .map_err(|_| io::Error::other("Xray launch failed"))?;
         let started = (|| {
             let starttime = read_starttime(child.id())?;
-            write_private_file(
+            rewrite_private_file(
                 &directory.join("process"),
                 format!("{} {starttime}\n", child.id()).as_bytes(),
             )?;
@@ -142,9 +139,138 @@ impl XrayProcessRunner for TrustedXrayProcess {
         })();
         if let Err(error) = started {
             let _ = terminate_child(&mut child);
-            let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
-            return Err(error);
+            let tail = log_tail(&log_path);
+            return Err(if tail.is_empty() {
+                error
+            } else {
+                io::Error::new(error.kind(), format!("{error}; xray log: {tail}"))
+            });
         }
+        Ok(child)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Default for TrustedXrayProcess {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl XrayProcessRunner for TrustedXrayProcess {
+    fn verify_binary(&self) -> io::Result<()> {
+        trusted_binary().map(|_| ())
+    }
+
+    fn link_index(&self, name: &str) -> io::Result<Option<u32>> {
+        if !valid_tun_name(name) {
+            return Err(invalid_input());
+        }
+        let name = CString::new(name).map_err(|_| invalid_input())?;
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        Ok((index != 0).then_some(index))
+    }
+
+    fn start(
+        &mut self,
+        uid: u32,
+        name: &str,
+        config: &str,
+        geo_assets: Option<&net_manager_core::daemon_protocol::XrayGeoAssets>,
+    ) -> io::Result<()> {
+        if !valid_tun_name(name) || config.len() > MAX_XRAY_CONFIG_BYTES {
+            return Err(invalid_input());
+        }
+        if self.children.contains_key(name) || self.link_index(name)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Xray interface exists",
+            ));
+        }
+        let binary = trusted_binary()?;
+        ensure_runtime_root()?;
+        let directory = stage_config_at(Path::new(RUNTIME_ROOT), uid, name, config)?;
+        let managed_dir = binary.parent().expect("fixed managed binary");
+        let asset_dir = match geo_assets {
+            Some(assets) => {
+                if let Err(err) = stage_geo_assets(assets, &directory, managed_dir) {
+                    let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
+                    return Err(err);
+                }
+                directory.as_path()
+            }
+            None => managed_dir,
+        };
+        let config_path = directory.join("config.json");
+        match self.spawn_xray_child(&binary, &directory, &config_path, asset_dir, name, true) {
+            Ok(child) => {
+                self.children.insert(name.to_owned(), (uid, child));
+                Ok(())
+            }
+            Err(error) => {
+                let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
+                Err(error)
+            }
+        }
+    }
+
+    /// Respawn the child on its existing staging directory: the config and
+    /// staged geo assets are reused, the log keeps appending, and a stale
+    /// recorded process is terminated first. The caller re-applies
+    /// link-scoped resources once the TUN reappears.
+    fn respawn(&mut self, uid: u32, name: &str) -> io::Result<()> {
+        if !valid_tun_name(name) {
+            return Err(invalid_input());
+        }
+        ensure_runtime_root()?;
+        let directory = Path::new(RUNTIME_ROOT).join(uid.to_string()).join(name);
+        for path in [
+            directory.parent().expect("fixed runtime path"),
+            directory.as_path(),
+        ] {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|_| io::Error::other("Xray staging directory unavailable"))?;
+            if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Xray staging directory is unsafe",
+                ));
+            }
+        }
+        if let Some((owner, _)) = self.children.get(name) {
+            if *owner != uid {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Xray process ownership mismatch",
+                ));
+            }
+            let _ = self.stop(name);
+        }
+        // Kill a recorded process that outlived our tracking, keeping the
+        // staging directory itself.
+        recover_child(uid, name)?;
+        let config_path = directory.join("config.json");
+        let config_metadata = fs::symlink_metadata(&config_path)
+            .map_err(|_| io::Error::other("Xray staged config unavailable"))?;
+        if !config_metadata.is_file()
+            || config_metadata.uid() != 0
+            || config_metadata.mode() & 0o077 != 0
+            || config_metadata.len() as usize > MAX_XRAY_CONFIG_BYTES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Xray staged config is unsafe",
+            ));
+        }
+        let binary = trusted_binary()?;
+        let asset_dir = if directory.join("geoip.dat").is_file() {
+            directory.as_path()
+        } else {
+            binary.parent().expect("fixed managed binary")
+        };
+        let child =
+            self.spawn_xray_child(&binary, &directory, &config_path, asset_dir, name, false)?;
         self.children.insert(name.to_owned(), (uid, child));
         Ok(())
     }
@@ -187,6 +313,15 @@ impl XrayProcessRunner for TrustedXrayProcess {
             recover_child(uid, name)?;
         }
         ensure_runtime_root()?;
+        // Preserve the last log lines in the daemon journal before the
+        // staging directory (and its xray.log) is removed.
+        let log_path = Path::new(RUNTIME_ROOT)
+            .join(uid.to_string())
+            .join(name)
+            .join("xray.log");
+        for line in log_tail(&log_path).lines().take(LOG_JOURNAL_LINES) {
+            eprintln!("network-orchestrator-daemon: xray[{name}] {line}");
+        }
         cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name)
     }
 }
@@ -335,6 +470,54 @@ fn stage_config_at(root: &Path, uid: u32, name: &str, config: &str) -> io::Resul
     Ok(directory)
 }
 
+/// Geo asset files are data parsed by Xray; a generous cap keeps a hostile or
+/// corrupt caller file from blowing up memory.
+#[cfg(target_os = "linux")]
+const MAX_GEO_ASSET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Stage caller-provided dat contents (or the managed file for absent
+/// fields) into the root-owned staging dir so `XRAY_LOCATION_ASSET` can
+/// point at a single directory containing both files.
+#[cfg(target_os = "linux")]
+fn stage_geo_assets(
+    assets: &net_manager_core::daemon_protocol::XrayGeoAssets,
+    staging: &Path,
+    managed_dir: &Path,
+) -> io::Result<()> {
+    use base64::Engine;
+    for (name, encoded) in [
+        ("geoip.dat", assets.geoip_dat_b64.as_deref()),
+        ("geosite.dat", assets.geosite_dat_b64.as_deref()),
+    ] {
+        let bytes = match encoded {
+            Some(data) => {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|_| invalid_input())?;
+                if decoded.is_empty() || decoded.len() as u64 > MAX_GEO_ASSET_BYTES {
+                    return Err(invalid_input());
+                }
+                decoded
+            }
+            None => {
+                let input = fs::File::open(managed_dir.join(name))
+                    .map_err(|_| io::Error::other("geo asset file is unreadable"))?;
+                let mut bytes = Vec::new();
+                input
+                    .take(MAX_GEO_ASSET_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| io::Error::other("geo asset file is unreadable"))?;
+                if bytes.is_empty() || bytes.len() as u64 > MAX_GEO_ASSET_BYTES {
+                    return Err(io::Error::other("geo asset file is invalid"));
+                }
+                bytes
+            }
+        };
+        write_private_file(&staging.join(name), &bytes)?;
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
@@ -347,6 +530,92 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .map_err(|_| io::Error::other("Xray staging file write failed"))?;
     file.sync_all()
         .map_err(|_| io::Error::other("Xray staging file sync failed"))
+}
+
+/// Open `xray.log` for child output. `fresh` creates the file exclusively
+/// (first spawn); the append path verifies the existing file is still
+/// owner-only and regular before reusing it (respawn).
+#[cfg(target_os = "linux")]
+fn open_log_file(path: &Path, fresh: bool) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if fresh {
+        options.create_new(true).mode(0o600);
+    } else {
+        options.append(true);
+        let metadata =
+            fs::symlink_metadata(path).map_err(|_| io::Error::other("Xray log check failed"))?;
+        if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Xray log is unsafe",
+            ));
+        }
+    }
+    options
+        .open(path)
+        .map_err(|_| io::Error::other("Xray log open failed"))
+}
+
+/// Like `write_private_file`, but an existing file is kept if it is still
+/// owner-only and regular — used when respawning rewrites `process`.
+#[cfg(target_os = "linux")]
+fn rewrite_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Xray staging file is unsafe",
+                ));
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(io::Error::other("Xray staging file check failed")),
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|_| io::Error::other("Xray staging file creation failed"))?;
+    file.write_all(bytes)
+        .map_err(|_| io::Error::other("Xray staging file write failed"))?;
+    file.sync_all()
+        .map_err(|_| io::Error::other("Xray staging file sync failed"))
+}
+
+/// Last `LOG_TAIL_BYTES` of the child log, starting on a line boundary.
+/// Missing/oversized/unreadable logs yield an empty string — diagnostics
+/// must never break process lifecycle handling.
+#[cfg(target_os = "linux")]
+fn log_tail(path: &Path) -> String {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.mode() & 0o077 == 0 => metadata,
+        _ => return String::new(),
+    };
+    if metadata.len() == 0 || metadata.len() > 8 * 1024 * 1024 {
+        return String::new();
+    }
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return String::new(),
+    };
+    let start = metadata.len().saturating_sub(LOG_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.take(LOG_TAIL_BYTES).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    match text.split_once('\n') {
+        // Drop a leading partial line when the tail window cut mid-line.
+        Some((_, rest)) if start > 0 => rest.trim().to_owned(),
+        _ => text.trim().to_owned(),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -386,7 +655,12 @@ fn cleanup_stage_at(root: &Path, uid: u32, name: &str) -> io::Result<()> {
     {
         let entry = entry.map_err(|_| io::Error::other("Xray staging cleanup failed"))?;
         let filename = entry.file_name();
-        if filename != "config.json" && filename != "process" {
+        if filename != "config.json"
+            && filename != "process"
+            && filename != "geoip.dat"
+            && filename != "geosite.dat"
+            && filename != "xray.log"
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "Xray staging contains unknown file",
@@ -662,6 +936,42 @@ mod tests {
     }
 
     #[test]
+    fn log_tail_returns_bounded_tail_and_tolerates_missing_files() {
+        let root = temp_root();
+        let log = root.join("xray.log");
+        assert!(log_tail(&log).is_empty());
+
+        fs::write(&log, "first\nsecond\nlast\n").unwrap();
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(log_tail(&log), "first\nsecond\nlast");
+
+        // Windowed tail drops the truncated leading line.
+        let filler = "x".repeat(LOG_TAIL_BYTES as usize + 64);
+        fs::write(&log, format!("{filler}\nkept-line-1\nkept-line-2\n")).unwrap();
+        let tail = log_tail(&log);
+        assert!(tail.ends_with("kept-line-1\nkept-line-2"));
+        assert!(!tail.contains(&"x".repeat(64)));
+
+        // Group/world-readable files are rejected by the safety check.
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(log_tail(&log).is_empty());
+        fs::remove_file(&log).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_accepts_log_and_geo_files() {
+        let root = temp_root();
+        let uid = unsafe { libc::getuid() };
+        let dir = stage_config_at(&root, uid, "xray-abcd", "{}").unwrap();
+        fs::write(dir.join("xray.log"), b"log").unwrap();
+        fs::set_permissions(dir.join("xray.log"), fs::Permissions::from_mode(0o600)).unwrap();
+        cleanup_stage_at(&root, uid, "xray-abcd").unwrap();
+        assert!(!dir.exists());
+        fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
     fn cleanup_refuses_unexpected_file() {
         let root = temp_root();
         let uid = unsafe { libc::getuid() };
@@ -673,6 +983,100 @@ mod tests {
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn geo_assets(
+        geoip: Option<&str>,
+        geosite: Option<&str>,
+    ) -> net_manager_core::daemon_protocol::XrayGeoAssets {
+        net_manager_core::daemon_protocol::XrayGeoAssets {
+            geoip_dat_b64: geoip.map(str::to_owned),
+            geosite_dat_b64: geosite.map(str::to_owned),
+        }
+    }
+
+    fn staged_fixture() -> (PathBuf, PathBuf, PathBuf) {
+        let root = temp_root();
+        let staging = root.join("staging");
+        let managed = root.join("managed");
+        for dir in [&staging, &managed] {
+            fs::create_dir(dir).unwrap();
+        }
+        fs::write(managed.join("geoip.dat"), b"managed-ip").unwrap();
+        fs::write(managed.join("geosite.dat"), b"managed-site").unwrap();
+        (root, staging, managed)
+    }
+
+    #[test]
+    fn stage_geo_assets_prefers_caller_files_and_falls_back_per_file() {
+        use base64::Engine;
+        let (root, staging, managed) = staged_fixture();
+        let assets = geo_assets(
+            None,
+            Some(&base64::engine::general_purpose::STANDARD.encode(b"caller-site".as_slice())),
+        );
+        stage_geo_assets(&assets, &staging, &managed).unwrap();
+        assert_eq!(fs::read(staging.join("geoip.dat")).unwrap(), b"managed-ip");
+        assert_eq!(
+            fs::read(staging.join("geosite.dat")).unwrap(),
+            b"caller-site"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stage_geo_assets_stages_both_caller_files() {
+        use base64::Engine;
+        let (root, staging, managed) = staged_fixture();
+        let encode = base64::engine::general_purpose::STANDARD;
+        let assets = geo_assets(
+            Some(&encode.encode(b"caller-ip".as_slice())),
+            Some(&encode.encode(b"caller-site".as_slice())),
+        );
+        stage_geo_assets(&assets, &staging, &managed).unwrap();
+        assert_eq!(fs::read(staging.join("geoip.dat")).unwrap(), b"caller-ip");
+        assert_eq!(
+            fs::read(staging.join("geosite.dat")).unwrap(),
+            b"caller-site"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stage_geo_assets_rejects_malformed_base64() {
+        let (root, staging, managed) = staged_fixture();
+        assert!(stage_geo_assets(
+            &geo_assets(Some("!!!not-base64!!!"), None),
+            &staging,
+            &managed
+        )
+        .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stage_geo_assets_rejects_oversized_and_empty() {
+        use base64::Engine;
+        let (root, staging, managed) = staged_fixture();
+        let encode = base64::engine::general_purpose::STANDARD;
+        let empty = encode.encode(b"".as_slice());
+        assert!(stage_geo_assets(&geo_assets(Some(&empty), None), &staging, &managed).is_err());
+        let oversized = encode.encode(vec![0u8; MAX_GEO_ASSET_BYTES as usize + 1]);
+        assert!(stage_geo_assets(&geo_assets(Some(&oversized), None), &staging, &managed).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_stage_at_removes_staged_geo_files() {
+        let uid = unsafe { libc::getuid() };
+        let root = temp_root();
+        let dir = stage_config_at(&root, uid, "xray-geo01", "{}").unwrap();
+        for name in ["geoip.dat", "geosite.dat"] {
+            write_private_file(&dir.join(name), b"dat").unwrap();
+        }
+        cleanup_stage_at(&root, uid, "xray-geo01").unwrap();
+        assert!(!dir.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

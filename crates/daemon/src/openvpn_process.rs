@@ -24,6 +24,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 pub trait OpenVpnProcessRunner: Send {
     fn verify_binary(&self) -> io::Result<()>;
     fn link_index(&self, name: &str) -> io::Result<Option<u32>>;
+    /// Whether a staging directory already exists for (uid, name) — an
+    /// untracked leftover would make `start` fail inside stage_config_at.
+    fn staging_exists(&self, uid: u32, name: &str) -> io::Result<bool>;
     fn start(
         &mut self,
         uid: u32,
@@ -75,6 +78,17 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
         let name = CString::new(name).map_err(|_| invalid_input("invalid OpenVPN link name"))?;
         let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
         Ok((index != 0).then_some(index))
+    }
+
+    fn staging_exists(&self, uid: u32, name: &str) -> io::Result<bool> {
+        if !valid_tun_name(name) {
+            return Err(invalid_input("invalid OpenVPN link name"));
+        }
+        match std::fs::symlink_metadata(stage_dir(uid, name)) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     fn start(
@@ -425,6 +439,11 @@ fn stage_config_at(
         return Err(error);
     }
     Ok(directory)
+}
+
+/// The deterministic runtime staging directory for a (uid, name) pair.
+pub fn stage_dir(uid: u32, name: &str) -> PathBuf {
+    Path::new(RUNTIME_ROOT).join(uid.to_string()).join(name)
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {

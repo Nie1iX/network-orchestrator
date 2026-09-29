@@ -954,6 +954,7 @@ pub(crate) async fn diagnose_profile(
                 profile_id: profile.id.clone(),
                 state: TunnelState::Failed,
                 message: Some(err.clone()),
+                interface_name: None,
             },
             ProtocolHealth {
                 state: ProtocolHealthState::Failed,
@@ -978,6 +979,7 @@ pub(crate) async fn diagnose_profile(
                     profile_id: profile.id.clone(),
                     state: TunnelState::Failed,
                     message: Some(err.clone()),
+                    interface_name: None,
                 },
                 ProtocolHealth {
                     state: ProtocolHealthState::Failed,
@@ -1007,6 +1009,7 @@ pub(crate) async fn diagnose_profile(
                         profile_id: profile.id.clone(),
                         state: TunnelState::Failed,
                         message: Some(err.clone()),
+                        interface_name: None,
                     },
                     ProtocolHealth {
                         state: ProtocolHealthState::Failed,

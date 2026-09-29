@@ -7,14 +7,32 @@ use net_manager_core::openvpn_management::validate_openvpn_credentials;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::io;
-use std::path::PathBuf;
 
 pub struct OpenVpnPlan {
     pub profile_id: String,
+    /// Preferred link/staging name — human-readable when a hint was supplied.
     pub name: String,
-    pub config: SanitizedOpenVpnConfig,
+    /// Deterministic collision fallback tried when `name` is occupied.
+    pub fallback_name: String,
+    /// Validated config text and decoded assets. Re-sanitized against the
+    /// resolved staging dir at start time so a fallback name rebinds the
+    /// embedded `asset-N` paths.
+    config_text: String,
+    asset_bytes: BTreeMap<String, Vec<u8>>,
     pub credentials: Option<OpenVpnCredentials>,
     pub routes: Vec<PolicyRoute>,
+}
+
+impl OpenVpnPlan {
+    /// Re-sanitizes the config for the staging dir belonging to `name`.
+    /// Validation already ran in `prepare_openvpn`; this only rebinds paths.
+    pub fn sanitized_config(
+        &self,
+        staging: &std::path::Path,
+    ) -> io::Result<SanitizedOpenVpnConfig> {
+        sanitize_openvpn_config(&self.config_text, &self.asset_bytes, staging)
+            .map_err(|_| rejected())
+    }
 }
 
 /// Validate everything available before polkit and before any process or file mutation.
@@ -52,20 +70,26 @@ pub fn prepare_openvpn(
     {
         return Err(rejected());
     }
-    let name = openvpn_name(uid, &params.profile_id);
-    let staging = PathBuf::from(format!("/run/network-orchestrator/{uid}/{name}"));
-    let mut assets = BTreeMap::new();
+    let (name, fallback_name) = crate::core::tunnel_link_names(
+        "ovpn-",
+        uid,
+        &params.profile_id,
+        params.interface_name.as_deref(),
+    );
+    let staging = crate::openvpn_process::stage_dir(uid, &name);
     if params.assets.len() > 32 {
         return Err(rejected());
     }
+    let mut asset_bytes = BTreeMap::new();
     for (path, encoded) in params.assets {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded.as_bytes())
             .map_err(|_| rejected())?;
-        assets.insert(path, bytes);
+        asset_bytes.insert(path, bytes);
     }
+    let config_text = params.config;
     let config =
-        sanitize_openvpn_config(&params.config, &assets, &staging).map_err(|_| rejected())?;
+        sanitize_openvpn_config(&config_text, &asset_bytes, &staging).map_err(|_| rejected())?;
     let has_auth = config.config.lines().any(|line| line == "auth-user-pass");
     let has_askpass = config.config.lines().any(|line| line == "askpass");
     let has_key = config.config.lines().any(|line| {
@@ -97,19 +121,12 @@ pub fn prepare_openvpn(
     Ok(OpenVpnPlan {
         profile_id: params.profile_id,
         name,
-        config,
+        fallback_name,
+        config_text,
+        asset_bytes,
         credentials,
         routes: params.routes,
     })
-}
-
-fn openvpn_name(uid: u32, profile_id: &str) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in uid.to_le_bytes().iter().chain(profile_id.as_bytes()) {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("ovpn-{:010x}", hash & 0xffffffffff)
 }
 
 fn encrypted_key(bytes: &[u8]) -> bool {
@@ -141,6 +158,7 @@ mod tests {
             config: config.into(),
             assets: BTreeMap::new(),
             routes: vec![],
+            interface_name: None,
         }
     }
 
@@ -154,13 +172,15 @@ mod tests {
         let first = prepare_openvpn(1000, input.clone()).unwrap();
         let second = prepare_openvpn(1000, input).unwrap();
         assert_eq!(first.name, second.name);
+        assert_eq!(first.fallback_name, second.fallback_name);
         assert!(first.name.starts_with("ovpn-"));
         assert!(first.name.len() <= 15);
-        assert!(first.config.config.contains(&format!(
-            "/run/network-orchestrator/1000/{}/asset-0",
-            first.name
-        )));
-        assert_eq!(first.config.assets[0].bytes, b"CERT");
+        let staged = crate::openvpn_process::stage_dir(1000, &first.name);
+        let sanitized = first.sanitized_config(&staged).unwrap();
+        assert!(sanitized
+            .config
+            .contains(&format!("{}/asset-0", staged.display())));
+        assert_eq!(sanitized.assets[0].bytes, b"CERT");
         assert_ne!(
             first.name,
             prepare_openvpn(1001, params("client\nremote vpn.example\n"))
@@ -226,10 +246,12 @@ mod tests {
             private_key_passphrase: Some("SECRET-KEY".into()),
         });
         let plan = prepare_openvpn(1000, request).unwrap();
-        assert!(plan.config.config.contains("auth-user-pass\n"));
-        assert!(!plan.config.config.contains("SECRET-AUTH"));
-        assert!(!plan.config.config.contains("SECRET-KEY"));
-        assert_eq!(plan.config.assets.len(), 1);
+        let staged = crate::openvpn_process::stage_dir(1000, &plan.name);
+        let sanitized = plan.sanitized_config(&staged).unwrap();
+        assert!(sanitized.config.contains("auth-user-pass\n"));
+        assert!(!sanitized.config.contains("SECRET-AUTH"));
+        assert!(!sanitized.config.contains("SECRET-KEY"));
+        assert_eq!(sanitized.assets.len(), 1);
         assert!(plan.credentials.is_some());
     }
 
@@ -266,10 +288,11 @@ mod tests {
         };
         let encoded = encode_line(&frame).unwrap().len();
         prepare_openvpn(1000, input.clone()).expect("request is at the validation limits");
-        // Credentials (bounded to a few KiB) and asset names must still fit,
-        // while 64 connections x MAX_FRAME_BYTES stays a small memory budget.
+        // Credentials (bounded to a few KiB) and asset names must still fit.
         assert!(encoded + 64 * 1024 <= MAX_FRAME_BYTES, "{encoded}");
-        assert!(MAX_FRAME_BYTES - encoded <= 1536 * 1024, "{encoded}");
+        // The frame cap is sized for `xray.connect` inline geo assets; the
+        // OpenVPN worst case must stay a small fraction of that budget.
+        assert!(encoded * 4 <= MAX_FRAME_BYTES, "{encoded}");
         // The asset budget is really exhausted: one more byte is rejected.
         input.assets.insert(
             "assets/b".into(),

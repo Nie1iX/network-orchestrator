@@ -4,6 +4,8 @@ mod commands;
 #[cfg(target_os = "linux")]
 mod daemon_client;
 mod elevation;
+#[cfg(target_os = "linux")]
+mod geo_assets;
 mod lifecycle;
 #[cfg(target_os = "linux")]
 mod openvpn_credentials;
@@ -113,11 +115,16 @@ pub fn run() {
             connect_profile,
             connect_openvpn_with_credentials,
             disconnect_profile,
+            openvpn_plan,
             probe_openvpn_routes,
             inspect_profile_by_id,
             inspect_profiles,
             diagnose_profile,
+            check_exit_ips,
             get_tunnel_statuses,
+            get_logs,
+            clear_logs,
+            daemon_log_tail,
             get_recovery_report,
             cleanup_recovery,
             is_elevated,

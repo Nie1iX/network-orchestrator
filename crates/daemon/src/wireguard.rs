@@ -33,6 +33,10 @@ pub struct WireGuardPlan {
     pub full_ipv4: bool,
     pub full_ipv6: bool,
     pub warnings: Vec<WireGuardPlanWarning>,
+    /// Optional kernel interface-name hint supplied by the client (the profile
+    /// name). Sanitized in `DaemonCore::connect_wireguard`; a deterministic
+    /// hash name is used when this is `None` or sanitizes to nothing.
+    pub interface_name: Option<String>,
 }
 
 impl fmt::Debug for WireGuardPlan {
@@ -47,6 +51,7 @@ impl fmt::Debug for WireGuardPlan {
             .field("full_ipv4", &self.full_ipv4)
             .field("full_ipv6", &self.full_ipv6)
             .field("warnings", &self.warnings)
+            .field("interface_name", &self.interface_name)
             .finish()
     }
 }
@@ -103,6 +108,7 @@ pub fn parse_wireguard_config(
         full_ipv4: false,
         full_ipv6: false,
         warnings: Vec::new(),
+        interface_name: None,
     };
     let mut section = Section::None;
     let mut seen_interface = false;

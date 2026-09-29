@@ -78,6 +78,7 @@ fn build_definition(
                 profile_id: profile.id.clone(),
                 config,
                 routes: profile.routes.clone(),
+                interface_name: super::tunnels::link_name_hint(profile),
             }))
         }
         TunnelBackend::None => {

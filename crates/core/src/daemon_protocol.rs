@@ -19,11 +19,11 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_SOCKET_PATH: &str = "/run/network-orchestrator/daemon.sock";
 pub const SOCKET_ENV: &str = "NETWORK_ORCHESTRATOR_SOCKET";
-/// Hard cap for one frame. The largest valid `openvpn.connect` (1 MiB of
-/// assets as base64, a fully JSON-escaped 256 KiB config, routes and
-/// credentials) is about 2.9 MiB; anything above the cap is `frameTooLarge`.
-/// With `MAX_CONNECTIONS` readers this bounds buffers to 256 MiB.
-pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// Hard cap for one frame; read buffers grow with actual bytes, the cap is
+/// only an abort threshold. `xray.connect` may carry inline base64 geo
+/// assets (two ~10 MiB dat files → ~27 MiB frame), so the limit is sized
+/// for that plus the generated config; anything above is `frameTooLarge`.
+pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_ROUTES_PER_REQUEST: usize = 8192;
 pub const MAX_OWNER_BYTES: usize = 128;
 pub const HELLO_TIMEOUT_SECS: u64 = 5;
@@ -44,6 +44,7 @@ pub mod method {
     pub const OPENVPN_DISCONNECT: &str = "openvpn.disconnect";
     pub const OPENVPN_STATUS: &str = "openvpn.status";
     pub const OPENVPN_PROBE: &str = "openvpn.probe";
+    pub const OPENVPN_PLAN: &str = "openvpn.plan";
     pub const XRAY_CONNECT: &str = "xray.connect";
     pub const XRAY_DISCONNECT: &str = "xray.disconnect";
     pub const XRAY_STATUS: &str = "xray.status";
@@ -55,7 +56,7 @@ pub mod method {
     pub const SETTINGS_SET: &str = "settings.set";
 
     /// Methods implemented by the daemon and reported in `hello.capabilities`.
-    pub const CAPABILITIES: [&str; 22] = [
+    pub const CAPABILITIES: [&str; 23] = [
         ROUTES_APPLY,
         ROUTES_REMOVE,
         LINK_SET_STATE,
@@ -69,6 +70,7 @@ pub mod method {
         OPENVPN_DISCONNECT,
         OPENVPN_STATUS,
         OPENVPN_PROBE,
+        OPENVPN_PLAN,
         XRAY_CONNECT,
         XRAY_DISCONNECT,
         XRAY_STATUS,
@@ -285,6 +287,11 @@ pub struct WireGuardConnectParams {
     pub config: String,
     #[serde(default)]
     pub routes: Vec<PolicyRoute>,
+    /// Optional kernel interface-name hint (e.g. the profile name). The daemon
+    /// sanitizes it and falls back to the deterministic hash name when absent,
+    /// unusable, or (in a shortened form) already taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_name: Option<String>,
 }
 
 impl std::fmt::Debug for WireGuardConnectParams {
@@ -293,6 +300,7 @@ impl std::fmt::Debug for WireGuardConnectParams {
             .field("profile_id", &self.profile_id)
             .field("config", &"[REDACTED]")
             .field("routes", &self.routes)
+            .field("interface_name", &self.interface_name)
             .finish()
     }
 }
@@ -347,6 +355,10 @@ pub struct OpenVpnConnectParams {
     pub assets: BTreeMap<String, String>,
     #[serde(default)]
     pub routes: Vec<PolicyRoute>,
+    /// Human-readable interface-name hint (display name or explicit setting).
+    /// The daemon sanitizes it and falls back to the deterministic name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_name: Option<String>,
 }
 
 impl std::fmt::Debug for OpenVpnConnectParams {
@@ -356,6 +368,7 @@ impl std::fmt::Debug for OpenVpnConnectParams {
             .field("config", &"[REDACTED]")
             .field("assets", &"[REDACTED]")
             .field("routes", &self.routes)
+            .field("interface_name", &self.interface_name)
             .finish()
     }
 }
@@ -486,6 +499,40 @@ pub struct OpenVpnProbeResult {
     pub routes: Vec<AnalyzedRoute>,
 }
 
+/// A resource the predicted OpenVPN connection would collide with.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum OpenVpnPlanConflict {
+    /// The same profile already has a live connection.
+    ActiveConnection,
+    /// A route probe for the same profile is in flight.
+    ActiveProbe,
+    /// A candidate TUN name is taken; when set, `interface_name` already
+    /// reflects the fallback (connect still fails if no candidate is free).
+    InterfaceOccupied,
+    /// A leftover staging directory exists under the runtime root.
+    StagingLeftover,
+}
+
+/// Deterministic paths/names a profile would use at connect time, plus the
+/// conflicts it would hit. Purely predictive — nothing is created or removed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenVpnPlanResult {
+    pub profile_id: String,
+    pub owner: String,
+    /// The name a connect would pick: the human-readable primary when free,
+    /// otherwise the hash-suffixed fallback.
+    pub interface_name: String,
+    /// Deterministic collision fallback (identical to `interface_name` when no
+    /// usable hint was supplied).
+    pub fallback_interface_name: String,
+    pub staging_dir: String,
+    pub config_path: String,
+    pub management_socket: String,
+    pub conflicts: Vec<OpenVpnPlanConflict>,
+}
+
 /// Managed generated Xray JSON from the app's vault; never a user path.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -498,6 +545,28 @@ pub struct XrayConnectParams {
     pub dns_servers: Vec<std::net::IpAddr>,
     #[serde(default)]
     pub dns_domains: Vec<String>,
+    /// Optional kernel interface-name hint; sanitized by the daemon, which
+    /// falls back to the deterministic hash name when absent or unusable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_name: Option<String>,
+    /// Optional `geoip.dat`/`geosite.dat` overrides sent inline (base64);
+    /// the daemon cannot read caller paths — its unit runs with
+    /// `ProtectHome=yes`/`PrivateTmp=yes`, so paths would be invisible.
+    /// Decoded bytes land in the root-owned staging dir which becomes
+    /// `XRAY_LOCATION_ASSET`; absent fields fall back to managed assets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geo_assets: Option<XrayGeoAssets>,
+}
+
+/// Inline geo asset overrides for [`XrayConnectParams`]; base64-encoded dat
+/// file contents. Size is bounded by the frame cap.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayGeoAssets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geoip_dat_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geosite_dat_b64: Option<String>,
 }
 
 impl std::fmt::Debug for XrayConnectParams {
@@ -508,6 +577,13 @@ impl std::fmt::Debug for XrayConnectParams {
             .field("routes", &self.routes)
             .field("dns_servers", &self.dns_servers)
             .field("dns_domains", &self.dns_domains)
+            .field("interface_name", &self.interface_name)
+            .field(
+                "geo_assets",
+                &self.geo_assets.as_ref().map(|assets| {
+                    assets.geoip_dat_b64.is_some() || assets.geosite_dat_b64.is_some()
+                }),
+            )
             .finish()
     }
 }
@@ -895,7 +971,7 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","xray.connect","xray.disconnect","xray.status","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set"]}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set"]}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);
@@ -1151,6 +1227,28 @@ mod tests {
         let (_, result): (_, XrayDisconnectResult) =
             ok_response(r#"{"id":23,"ok":true,"result":{"stopped":true}}"#);
         assert!(result.stopped);
+    }
+
+    #[test]
+    fn xray_geo_assets_round_trip_and_stay_out_of_debug() {
+        let (frame, params): (_, XrayConnectParams) = request(
+            r#"{"id":24,"method":"xray.connect","params":{"profileId":"office","config":"{}","routes":[],"dnsServers":[],"dnsDomains":[],"geoAssets":{"geoipDatB64":"QUJD","geositeDatB64":"REVG"}}}"#,
+        );
+        assert_eq!(frame.method, method::XRAY_CONNECT);
+        let assets = params.geo_assets.as_ref().expect("geo assets");
+        assert_eq!(assets.geoip_dat_b64.as_deref(), Some("QUJD"));
+        assert_eq!(assets.geosite_dat_b64.as_deref(), Some("REVG"));
+        let debug = format!("{params:?}");
+        assert!(!debug.contains("QUJD") && !debug.contains("REVG"));
+
+        let encoded = serde_json::to_value(&params).unwrap();
+        assert_eq!(encoded["geoAssets"]["geoipDatB64"], "QUJD");
+        assert_eq!(encoded["geoAssets"]["geositeDatB64"], "REVG");
+
+        let (_, absent): (_, XrayConnectParams) = request(
+            r#"{"id":25,"method":"xray.connect","params":{"profileId":"office","config":"{}","routes":[],"dnsServers":[],"dnsDomains":[]}}"#,
+        );
+        assert!(absent.geo_assets.is_none());
     }
 
     #[test]

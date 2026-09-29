@@ -108,6 +108,7 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
         config_vault: ConfigVault::new(dir.join("configs")),
         backend_settings: BackendSettingsStore::new(dir.join("backend-settings.json")),
         managed_xray_root: dir.join("backends").join("xray"),
+        geo_assets_root: dir.join("geoassets"),
         backend_install_lock: tokio::sync::Mutex::new(()),
         backend_install_cancel: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
@@ -124,6 +125,7 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
             )
             .unwrap(),
         }),
+        log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         #[cfg(target_os = "linux")]
         openvpn_credentials: crate::openvpn_credentials::OpenVpnCredentialStore::new(Box::new(
             crate::openvpn_credentials::tests::FakeKeyring::default(),
@@ -166,6 +168,7 @@ pub(crate) fn diag_input(p: &Profile) -> DiagnosticsInput {
             profile_id: p.id.clone(),
             state: TunnelState::Running,
             message: None,
+            interface_name: None,
         },
         managed: true,
         inspection: Some(inspection_for(p, true)),

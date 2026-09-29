@@ -261,6 +261,7 @@ async fn collect(state: &AppState) -> Result<(RecoveryReport, Vec<String>), Stri
                 profile_id: profile_id.clone(),
                 state: TunnelState::Failed,
                 message: Some(err),
+                interface_name: None,
             });
             (profile_id, status)
         })
@@ -309,6 +310,16 @@ pub(crate) async fn cleanup_recovery(
         if failed > 0 {
             return Err(format!("daemon could not clean up {failed} owner(s)"));
         }
+        if !leftovers.is_empty() {
+            crate::commands::logs::record_log(
+                &state,
+                crate::commands::logs::LogLevel::Warn,
+                format!(
+                    "recovery cleanup removed {} leftover owner(s)",
+                    leftovers.len()
+                ),
+            );
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -343,6 +354,7 @@ mod tests {
                 profile_id: profile_id.into(),
                 state,
                 message: None,
+                interface_name: None,
             },
         )
     }

@@ -1,7 +1,10 @@
 use crate::models::{DomainPolicy, DomainRouteTarget};
+use ipnet::IpNet;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::net::IpAddr;
+use std::str::FromStr;
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,8 +460,13 @@ pub fn validate_routing_policy_selectors(policies: &[DomainPolicy]) -> io::Resul
     Ok(())
 }
 
-fn classify_routing_selector(selector: &str) -> io::Result<(&'static str, String)> {
+/// Returns `Ok(None)` for comments (`# …`) and blank selectors so the UI can
+/// keep annotation lines inside routing lists.
+fn classify_routing_selector(selector: &str) -> io::Result<Option<(&'static str, String)>> {
     let selector = selector.trim();
+    if selector.is_empty() || selector.starts_with('#') {
+        return Ok(None);
+    }
     if let Some(category) = selector.strip_prefix("geosite:") {
         if category.is_empty()
             || category.len() > 64
@@ -468,20 +476,29 @@ fn classify_routing_selector(selector: &str) -> io::Result<(&'static str, String
         {
             return Err(invalid_input("invalid geosite category"));
         }
-        return Ok(("domain", selector.to_string()));
+        return Ok(Some(("domain", selector.to_string())));
     }
-    if let Some(country) = selector.strip_prefix("geoip:") {
-        if !(country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_alphabetic())
-            || country == "private")
+    if let Some(code) = selector.strip_prefix("geoip:") {
+        // Countries are the common case, but profiles may ship custom
+        // geoip.dat files defining arbitrary categories (e.g. `direct`) —
+        // Xray resolves the code against the actually loaded asset.
+        if code.is_empty()
+            || code.len() > 64
+            || !code
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         {
-            return Err(invalid_input("invalid geoip country"));
+            return Err(invalid_input("invalid geoip code"));
         }
-        return Ok(("ip", selector.to_string()));
+        return Ok(Some(("ip", selector.to_string())));
     }
-    if selector.is_empty() {
-        return Err(invalid_input("routing selector must not be blank"));
+    if let Ok(ip) = selector.parse::<IpAddr>() {
+        return Ok(Some(("ip", ip.to_string())));
     }
-    Ok(("domain", selector.to_string()))
+    if let Ok(net) = IpNet::from_str(selector) {
+        return Ok(Some(("ip", net.to_string())));
+    }
+    Ok(Some(("domain", selector.to_string())))
 }
 
 pub fn apply_profile_routing(
@@ -606,7 +623,9 @@ pub fn apply_profile_routing(
         let mut domains = Vec::new();
         let mut ips = Vec::new();
         for selector in &policy.domains {
-            let (kind, value) = classify_routing_selector(selector)?;
+            let Some((kind, value)) = classify_routing_selector(selector)? else {
+                continue;
+            };
             if kind == "ip" {
                 ips.push(value);
             } else {
@@ -663,6 +682,12 @@ pub fn apply_tun_inbound(
             "interfaceName": interface_name.unwrap_or("xray-tun"),
             "ip": ip.unwrap_or("172.19.0.1/30"),
             "mtu": 1500,
+        },
+        // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
+        // SNI / HTTP Host so domain and geosite routing rules can match.
+        "sniffing": {
+            "enabled": true,
+            "destOverride": ["http", "tls", "quic"],
         },
     });
     inbounds.insert(0, tun_inbound);
@@ -1148,10 +1173,64 @@ mod tests {
     }
 
     #[test]
+    fn comments_and_blank_selectors_are_ignored() {
+        let policies = [DomainPolicy {
+            domains: vec![
+                "# custom".into(),
+                "".into(),
+                "   ".into(),
+                "domain:example.com".into(),
+            ],
+            target: DomainRouteTarget::Direct,
+        }];
+        let result = apply_domain_policies(&base_config(), &policies).unwrap();
+        let rules = result["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["domain"], json!(["domain:example.com"]));
+        assert_eq!(rules[0]["outboundTag"], "direct");
+    }
+
+    #[test]
+    fn comment_only_policy_emits_no_rule() {
+        let policies = [DomainPolicy {
+            domains: vec!["# just a note".into()],
+            target: DomainRouteTarget::Direct,
+        }];
+        let result = apply_domain_policies(&base_config(), &policies).unwrap();
+        let rules = result["routing"]["rules"].as_array().unwrap();
+        assert!(rules.iter().all(|rule| rule["domain"]
+            .as_array()
+            .map(|d| !d.iter().any(|v| v == "# just a note"))
+            .unwrap_or(true)));
+    }
+
+    #[test]
+    fn bare_ip_and_cidr_selectors_go_to_ip_rules() {
+        let policies = [DomainPolicy {
+            domains: vec![
+                "203.0.113.10".into(),
+                "198.51.100.0/24".into(),
+                "2001:db8::/32".into(),
+            ],
+            target: DomainRouteTarget::Direct,
+        }];
+        let result = apply_domain_policies(&base_config(), &policies).unwrap();
+        let rules = result["routing"]["rules"].as_array().unwrap();
+        let ip_rule = rules
+            .iter()
+            .find(|rule| rule.get("ip").is_some())
+            .expect("ip rule emitted");
+        assert_eq!(
+            ip_rule["ip"],
+            json!(["203.0.113.10", "198.51.100.0/24", "2001:db8::/32"])
+        );
+        assert_eq!(ip_rule["outboundTag"], "direct");
+    }
+
+    #[test]
     fn invalid_geo_selectors_do_not_leak_input() {
         for selector in [
             "geosite:secret/../cn",
-            "geoip:secret-country",
+            "geoip:secret/../cn",
             "geoip:",
             "geosite:",
         ] {
@@ -1396,6 +1475,19 @@ mod tests {
         assert_eq!(result["inbounds"][0]["settings"]["mtu"], 1500);
         // Outbounds preserved.
         assert_eq!(result["outbounds"][0]["tag"], "proxy");
+    }
+
+    #[test]
+    fn apply_tun_inbound_enables_traffic_sniffing() {
+        let base = json!({"outbounds": [{"tag": "proxy", "protocol": "vless"}]});
+        let result = apply_tun_inbound(&base, None, None).unwrap();
+        // Without sniffing, TUN traffic only carries destination IPs and
+        // domain/geosite routing rules can never match.
+        assert_eq!(result["inbounds"][0]["sniffing"]["enabled"], true);
+        assert_eq!(
+            result["inbounds"][0]["sniffing"]["destOverride"],
+            json!(["http", "tls", "quic"])
+        );
     }
 
     #[test]

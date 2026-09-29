@@ -617,6 +617,7 @@ fn status_for(profile_id: &str, state: TunnelState, message: Option<String>) -> 
         profile_id: profile_id.to_string(),
         state,
         message,
+        interface_name: None,
     }
 }
 

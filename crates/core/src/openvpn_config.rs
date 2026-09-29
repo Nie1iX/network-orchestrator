@@ -113,14 +113,10 @@ pub fn sanitize_openvpn_config(
         let args = &tokens[1..];
         match directive.as_str() {
             "client" | "tls-client" | "nobind" | "persist-key" | "persist-tun"
-            | "remote-random" | "auth-nocache" => require_args(args, 0, 0)?,
+            | "remote-random" | "auth-nocache" | "pull" | "float" | "route-nopull"
+            | "ping-timer-rem" => require_args(args, 0, 0)?,
             "dev" if args == ["tun"] => {}
-            "proto"
-                if args.len() == 1
-                    && matches!(
-                        args[0].as_str(),
-                        "udp" | "udp4" | "udp6" | "tcp-client" | "tcp4-client" | "tcp6-client"
-                    ) => {}
+            "proto" if args.len() == 1 && is_client_proto(&args[0]) => {}
             "remote-cert-tls" if args == ["server"] => {}
             "auth-user-pass" | "askpass" => require_args(args, 0, 0)?,
             "remote" => validate_remote(args)?,
@@ -128,15 +124,31 @@ pub fn sanitize_openvpn_config(
                 if args.len() == 1 && (args[0] == "infinite" || positive_number(&args[0])) => {}
             "connect-retry"
                 if (1..=2).contains(&args.len()) && args.iter().all(|a| positive_number(a)) => {}
-            "ping" | "ping-restart" | "tun-mtu" if args.len() == 1 && positive_number(&args[0]) => {
-            }
+            "keepalive" if args.len() == 2 && args.iter().all(|a| positive_number(a)) => {}
+            "inactive"
+                if (1..=2).contains(&args.len()) && args.iter().all(|a| positive_number(a)) => {}
+            "explicit-exit-notify"
+                if args.len() <= 1 && args.iter().all(|a| positive_number(a)) => {}
+            "ping" | "ping-restart" | "tun-mtu" | "verb" | "mute" | "connect-timeout"
+            | "connect-retry-max" | "ping-exit" | "reneg-sec" | "reneg-bytes" | "reneg-pkts"
+            | "hand-window" | "sndbuf" | "rcvbuf" | "mssfix" | "fragment" | "link-mtu"
+                if args.len() == 1 && positive_number(&args[0]) => {}
             "key-direction" if args.len() == 1 && matches!(args[0].as_str(), "0" | "1") => {}
+            "topology"
+                if args.len() == 1 && matches!(args[0].as_str(), "subnet" | "net30" | "p2p") => {}
+            "auth-retry"
+                if args.len() == 1
+                    && matches!(args[0].as_str(), "none" | "nointeract" | "interact") => {}
             "auth"
             | "cipher"
             | "data-ciphers"
             | "data-ciphers-fallback"
+            | "ncp-ciphers"
             | "tls-version-min"
+            | "tls-version-max"
             | "tls-cipher"
+            | "tls-ciphersuites"
+            | "peer-fingerprint"
                 if args.len() == 1 && safe_option_value(&args[0]) => {}
             "verify-x509-name"
                 if (1..=2).contains(&args.len()) && args.iter().all(|a| safe_option_value(a)) => {}
@@ -170,16 +182,39 @@ pub fn sanitize_openvpn_config(
             | "remote-cert-tls"
             | "resolv-retry"
             | "connect-retry"
+            | "keepalive"
+            | "inactive"
+            | "explicit-exit-notify"
             | "ping"
             | "ping-restart"
             | "tun-mtu"
+            | "verb"
+            | "mute"
+            | "connect-timeout"
+            | "connect-retry-max"
+            | "ping-exit"
+            | "reneg-sec"
+            | "reneg-bytes"
+            | "reneg-pkts"
+            | "hand-window"
+            | "sndbuf"
+            | "rcvbuf"
+            | "mssfix"
+            | "fragment"
+            | "link-mtu"
             | "key-direction"
+            | "topology"
+            | "auth-retry"
             | "auth"
             | "cipher"
             | "data-ciphers"
             | "data-ciphers-fallback"
+            | "ncp-ciphers"
             | "tls-version-min"
+            | "tls-version-max"
             | "tls-cipher"
+            | "tls-ciphersuites"
+            | "peer-fingerprint"
             | "verify-x509-name"
             | "ca"
             | "cert"
@@ -256,15 +291,29 @@ fn validate_remote(args: &[String]) -> Result<(), OpenVpnConfigError> {
     if args.len() >= 2 && !positive_number(&args[1]) {
         return Err(OpenVpnConfigError::InvalidConfig);
     }
-    if args.len() == 3
-        && !matches!(
-            args[2].as_str(),
-            "udp" | "udp4" | "udp6" | "tcp-client" | "tcp4-client" | "tcp6-client"
-        )
-    {
+    if args.len() == 3 && !is_client_proto(&args[2]) {
         return Err(OpenVpnConfigError::InvalidConfig);
     }
     Ok(())
+}
+
+/// OpenVPN accepts `tcp`, `tcp4` and `tcp6` as client-side aliases on
+/// `proto` and on `remote` lines (`tcp` resolves to `tcp4-client` when the
+/// config is a client profile). Server-side `*-server` variants are never
+/// valid in a client profile and stay rejected.
+fn is_client_proto(proto: &str) -> bool {
+    matches!(
+        proto,
+        "udp"
+            | "udp4"
+            | "udp6"
+            | "tcp"
+            | "tcp4"
+            | "tcp6"
+            | "tcp-client"
+            | "tcp4-client"
+            | "tcp6-client"
+    )
 }
 
 fn staged_asset_line(
@@ -384,6 +433,83 @@ mod tests {
         assert!(config.config.contains("remote vpn.example 1194\n"));
         assert!(config.config.contains("<key>\nPRIVATE SECRET\n</key>\n"));
         assert!(config.assets.is_empty());
+    }
+
+    #[test]
+    fn accepts_openvpn_client_protocol_aliases() {
+        for proto in [
+            "udp",
+            "udp4",
+            "udp6",
+            "tcp",
+            "tcp4",
+            "tcp6",
+            "tcp-client",
+            "tcp4-client",
+            "tcp6-client",
+        ] {
+            assert!(
+                sanitize(&format!("client\nremote vpn.example 1194 {proto}\n")).is_ok(),
+                "remote … {proto}"
+            );
+            assert!(
+                sanitize(&format!("client\nremote vpn.example\nproto {proto}\n")).is_ok(),
+                "proto {proto}"
+            );
+        }
+        for proto in ["tcp-server", "tcp4-server", "tcp6-server"] {
+            assert!(
+                sanitize(&format!("client\nremote vpn.example 1194 {proto}\n")).is_err(),
+                "remote … {proto}"
+            );
+            assert!(
+                sanitize(&format!("client\nremote vpn.example\nproto {proto}\n")).is_err(),
+                "proto {proto}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_common_client_options_and_still_rejects_bad_arguments() {
+        for lines in [
+            "verb 4\n",
+            "explicit-exit-notify\n",
+            "explicit-exit-notify 3\n",
+            "keepalive 10 60\n",
+            "mute 20\n",
+            "connect-timeout 30\nconnect-retry-max 3\n",
+            "ping-exit 60\nping-timer-rem\n",
+            "reneg-sec 0\n",
+            "sndbuf 393216\nrcvbuf 393216\n",
+            "mssfix 1400\nfragment 1300\nlink-mtu 1500\n",
+            "ncp-ciphers AES-256-GCM:AES-128-GCM\n",
+            "tls-version-max 1.3\ntls-ciphersuites TLS_AES_256_GCM_SHA384\n",
+            "peer-fingerprint AA:BB:CC\n",
+            "topology subnet\n",
+            "auth-retry nointeract\n",
+            "pull\nfloat\nroute-nopull\n",
+            "inactive 3600\ninactive 3600 1000000\n",
+        ] {
+            assert!(
+                sanitize(&format!("client\nremote vpn.example 1194 udp\n{lines}")).is_ok(),
+                "{lines:?}"
+            );
+        }
+        for lines in [
+            "verb\n",
+            "verb debug\n",
+            "keepalive 10\n",
+            "topology p2p extra\n",
+            "topology evil\n",
+            "auth-retry always\n",
+            "peer-fingerprint\n",
+            "explicit-exit-notify 1 2\n",
+        ] {
+            assert!(
+                sanitize(&format!("client\nremote vpn.example 1194 udp\n{lines}")).is_err(),
+                "{lines:?}"
+            );
+        }
     }
 
     #[test]

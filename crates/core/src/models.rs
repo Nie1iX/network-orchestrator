@@ -204,6 +204,15 @@ pub struct Profile {
     /// in SOCKS mode.
     #[serde(default)]
     pub xray_tun_ip: Option<String>,
+    /// Optional HTTPS URL overriding the bundled geoip.dat. Downloaded by the
+    /// app into a per-profile cache and staged by the daemon next to the
+    /// generated config. Ignored in SOCKS mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_geoip_url: Option<String>,
+    /// Optional HTTPS URL overriding the bundled geosite.dat. Same staging
+    /// rules as `xray_geoip_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_geosite_url: Option<String>,
 }
 
 impl Default for Profile {
@@ -226,6 +235,8 @@ impl Default for Profile {
             xray_mode: XrayMode::default(),
             xray_tun_interface: None,
             xray_tun_ip: None,
+            xray_geoip_url: None,
+            xray_geosite_url: None,
         }
     }
 }
@@ -293,6 +304,10 @@ pub struct TunnelStatus {
     pub profile_id: String,
     pub state: TunnelState,
     pub message: Option<String>,
+    /// Live interface name assigned by the network daemon (e.g.
+    /// `wg-44c5d5827e76`), when the profile is daemon-managed and running.
+    #[serde(default)]
+    pub interface_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

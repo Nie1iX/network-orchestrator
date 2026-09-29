@@ -32,6 +32,19 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Mode assigned to freshly created/imported Xray profiles. On Linux a SOCKS
+/// listener captures no system traffic (no system-proxy consumer exists), so
+/// TUN via the network daemon is the only mode that actually tunnels.
+#[cfg(target_os = "linux")]
+pub(crate) fn default_xray_mode() -> XrayMode {
+    XrayMode::Tun
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn default_xray_mode() -> XrayMode {
+    XrayMode::Socks
+}
+
 pub(crate) fn subscription_refresh_due(subscription: &SubscriptionMeta, now: u64) -> bool {
     let Some(minutes) = subscription.refresh_interval_minutes else {
         return false;
@@ -222,6 +235,17 @@ fn validate_xray_routing(profile: &Profile) -> Result<(), String> {
     if profile.backend == TunnelBackend::Xray {
         net_manager_core::xray::validate_routing_policy_selectors(&profile.domain_policies)
             .map_err(|err| format!("invalid Xray routing rule: {err}"))?;
+        #[cfg(target_os = "linux")]
+        for url in [
+            profile.xray_geoip_url.as_deref(),
+            profile.xray_geosite_url.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            crate::geo_assets::validate_geo_asset_url(url)
+                .map_err(|err| format!("invalid Xray geo data URL: {err}"))?;
+        }
     }
     Ok(())
 }
@@ -697,6 +721,7 @@ pub(crate) fn import_configs_into(
             name,
             backend,
             config_path,
+            xray_mode: default_xray_mode(),
             ..Default::default()
         };
         if let Err(err) = store.upsert(profile) {
@@ -937,6 +962,7 @@ fn import_subscription_body_into_with_metadata(
         config_path: config_path.clone(),
         xray_socks_port: Some(socks_port),
         xray_http_port: Some(http_port),
+        xray_mode: default_xray_mode(),
         subscription: Some(SubscriptionMeta {
             url: url.to_string(),
             hwid: hwid.to_string(),
@@ -1555,6 +1581,14 @@ mod tests {
     use crate::test_support::*;
     use base64::Engine;
     use std::fs;
+
+    #[test]
+    fn default_xray_mode_matches_platform() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(default_xray_mode(), XrayMode::Tun);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(default_xray_mode(), XrayMode::Socks);
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

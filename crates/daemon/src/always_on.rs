@@ -113,8 +113,9 @@ pub fn apply_definition(
     }
     match definition {
         AlwaysOnDefinition::WireGuard(profile) => {
-            let plan = parse_wireguard_config(&profile.config, &profile.routes)
+            let mut plan = parse_wireguard_config(&profile.config, &profile.routes)
                 .map_err(|_| invalid_data())?;
+            plan.interface_name = profile.interface_name.clone();
             core.connect_wireguard(uid, &profile.profile_id, plan)?;
         }
         AlwaysOnDefinition::StaticRoutes(profile) => {
@@ -418,6 +419,7 @@ mod tests {
             profile_id: id.into(),
             config: "PrivateKey = secret-marker".into(),
             routes: Vec::new(),
+            interface_name: None,
         })
     }
 

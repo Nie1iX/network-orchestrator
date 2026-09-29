@@ -436,8 +436,9 @@ async fn handle<A: Authorizer>(
         method::WIREGUARD_CONNECT => {
             let params: WireGuardConnectParams = params(request.params)?;
             validate_owner(&params.profile_id).map_err(invalid)?;
-            let plan = parse_wireguard_config(&params.config, &params.routes)
+            let mut plan = parse_wireguard_config(&params.config, &params.routes)
                 .map_err(|err| invalid(err.to_string()))?;
+            plan.interface_name = params.interface_name.clone();
             let broad = plan.full_ipv4 || plan.full_ipv6;
             authorize(ctx, peer, connect_action(ctx.vpn_auth_mode(), broad)).await?;
             let profile_id = params.profile_id.clone();
@@ -504,6 +505,13 @@ async fn handle<A: Authorizer>(
             .await
             .map_err(|_| (ErrorCode::Internal, "OpenVPN probe task failed".into()))??;
             to_value(&probe)
+        }
+        method::OPENVPN_PLAN => {
+            let request: OpenVpnConnectRequest = from_value(request.params)
+                .map_err(|_| invalid("invalid OpenVPN plan parameters".into()))?;
+            let plan = prepare_openvpn(uid, request).map_err(|err| invalid(err.to_string()))?;
+            let result = with_core(ctx, move |core| core.plan_openvpn(uid, &plan)).await?;
+            to_value(&result)
         }
         method::OPENVPN_DISCONNECT => {
             let params: OpenVpnProfileParams = params(request.params)?;
@@ -953,6 +961,10 @@ mod tests {
 
         fn link_index(&self, _name: &str) -> io::Result<Option<u32>> {
             Ok(None)
+        }
+
+        fn staging_exists(&self, _uid: u32, _name: &str) -> io::Result<bool> {
+            Ok(false)
         }
 
         fn start(

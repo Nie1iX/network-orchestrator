@@ -20,6 +20,14 @@ pub struct XrayPlan {
     pub full_ipv4: bool,
     pub full_ipv6: bool,
     pub mark: u32,
+    /// Upstream host of the first outbound (literal IP or hostname). Kernel
+    /// must keep a direct route to it outside the tunnel, otherwise the
+    /// tunnel would try to carry its own server traffic.
+    pub server_host: Option<String>,
+    /// Inline caller-provided `geoip.dat`/`geosite.dat` contents; decoded
+    /// into the root-owned staging dir before spawn (the sandboxed unit
+    /// cannot see caller paths).
+    pub geo_assets: Option<net_manager_core::daemon_protocol::XrayGeoAssets>,
 }
 
 impl std::fmt::Debug for XrayPlan {
@@ -36,6 +44,8 @@ impl std::fmt::Debug for XrayPlan {
             .field("full_ipv4", &self.full_ipv4)
             .field("full_ipv6", &self.full_ipv6)
             .field("mark", &self.mark)
+            .field("server_host", &self.server_host)
+            .field("geo_assets", &self.geo_assets.is_some())
             .finish()
     }
 }
@@ -202,10 +212,15 @@ fn validate_generated(config: &Value) -> io::Result<()> {
 fn routing_selector(key: &str, item: &str) -> io::Result<()> {
     let valid = if key == "ip" {
         match item.strip_prefix("geoip:") {
-            Some(country) => {
-                country == "private"
-                    || (country.len() == 2
-                        && country.bytes().all(|byte| byte.is_ascii_alphabetic()))
+            // Country codes dominate, but profiles may load a custom geoip.dat
+            // defining arbitrary categories (e.g. `direct`); Xray resolves the
+            // code against the staged asset at start and fails loudly if absent.
+            Some(code) => {
+                !code.is_empty()
+                    && code.len() <= 64
+                    && code
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
             }
             None => item.parse::<IpAddr>().is_ok() || item.parse::<ipnet::IpNet>().is_ok(),
         }
@@ -398,12 +413,26 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
     }
     let mut config: Value = serde_json::from_str(&params.config).map_err(|_| rejected())?;
     validate_generated(&config)?;
+    // `validate_generated` guarantees the shape of outbounds[0]; extracting
+    // the upstream host here lets the daemon install a direct bypass route
+    // before any tunnel routes land.
+    let server_host = match config["outbounds"][0]["protocol"].as_str() {
+        Some("vless") => config["outbounds"][0]["settings"]["vnext"][0]["address"].as_str(),
+        Some("hysteria") => config["outbounds"][0]["settings"]["address"].as_str(),
+        _ => None,
+    }
+    .map(str::to_owned);
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in uid.to_le_bytes().iter().chain(params.profile_id.as_bytes()) {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let name = format!("xray-{:010x}", hash & 0xffffffffff);
+    let (name, _) = crate::core::tunnel_link_names(
+        "xray-",
+        uid,
+        &params.profile_id,
+        params.interface_name.as_deref(),
+    );
     // Build an address within 198.18.0.0/15 without accepting a caller IP.
     let host = (hash as u32) & 0x1ffff;
     let address: ipnet::IpNet = format!(
@@ -415,8 +444,14 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
     .parse()
     .map_err(|_| rejected())?;
     let mtu = 1500;
-    config["inbounds"] =
-        json!([{ "tag": "tun-in", "protocol": "tun", "settings": { "name": name, "mtu": mtu } }]);
+    config["inbounds"] = json!([{
+        "tag": "tun-in",
+        "protocol": "tun",
+        "settings": { "name": name, "mtu": mtu },
+        // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
+        // SNI / HTTP Host so domain and geosite routing rules can match.
+        "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
+    }]);
     config["log"] = json!({"loglevel":"warning"});
     for outbound in config["outbounds"].as_array_mut().ok_or_else(rejected)? {
         if outbound["protocol"] != "blackhole" {
@@ -438,7 +473,25 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         full_ipv4,
         full_ipv6,
         mark,
+        server_host,
+        geo_assets: params.geo_assets,
     })
+}
+
+/// DNS resolvers whose family is fully captured by the tunnel need a direct
+/// host route through the physical gateway: without it, resolver queries
+/// (e.g. systemd-resolved resolving the VPN server host) re-enter the TUN
+/// and loop. Split-tunnel profiles intentionally resolve those servers
+/// *inside* the tunnel, so they are bypassed only under full coverage.
+pub fn dns_bypass_addrs(dns_servers: &[IpAddr], full_ipv4: bool, full_ipv6: bool) -> Vec<IpAddr> {
+    dns_servers
+        .iter()
+        .copied()
+        .filter(|ip| match ip {
+            IpAddr::V4(_) => full_ipv4,
+            IpAddr::V6(_) => full_ipv6,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -467,6 +520,8 @@ mod tests {
             }],
             dns_servers: vec![],
             dns_domains: vec![],
+            interface_name: None,
+            geo_assets: None,
         }
     }
 
@@ -475,6 +530,9 @@ mod tests {
         let plan = prepare_xray(1000, params(), 51820).unwrap();
         assert!(plan.name.starts_with("xray-"));
         assert!(plan.name.len() <= 15);
+        // The deterministic hash name is hex-only and stable per (uid, profile).
+        assert!(plan.name[5..].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(plan.name, prepare_xray(1000, params(), 51820).unwrap().name);
         let config: Value = serde_json::from_str(&plan.config).unwrap();
         assert_eq!(config["inbounds"].as_array().unwrap().len(), 1);
         assert_eq!(config["inbounds"][0]["protocol"], "tun");
@@ -489,6 +547,62 @@ mod tests {
         assert!(config["outbounds"][2]["streamSettings"].is_null());
         assert!(!plan.config.contains("\"protocol\":\"socks\""));
         assert!(!format!("{plan:?}").contains("SECRET-UUID"));
+    }
+
+    #[test]
+    fn plan_extracts_server_host_for_bypass_routes() {
+        let plan = prepare_xray(1000, params(), 51820).unwrap();
+        assert_eq!(plan.server_host.as_deref(), Some("example.test"));
+
+        let mut hysteria = params();
+        hysteria.config = json!({
+            "inbounds": [{"tag":"socks-in", "protocol": "socks", "listen": "127.0.0.1", "port": 1080, "settings":{"udp":true}}],
+            "outbounds": [
+                {"tag": "proxy", "protocol": "hysteria", "settings": {"version": 2, "address": "hy.example.test", "port": 443}, "streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"serverName":"hy.example.test"},"hysteriaSettings":{"version":2,"auth":"SECRET-PASS"}}},
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "blocked", "protocol": "blackhole"}
+            ],
+            "routing": {"rules": []}
+        })
+        .to_string();
+        let plan = prepare_xray(1000, hysteria, 51820).unwrap();
+        assert_eq!(plan.server_host.as_deref(), Some("hy.example.test"));
+        assert!(!format!("{plan:?}").contains("SECRET-PASS"));
+    }
+
+    #[test]
+    fn dns_bypass_addrs_keeps_only_fully_captured_families() {
+        let dns: Vec<IpAddr> = vec![
+            "1.1.1.1".parse().unwrap(),
+            "2606:4700:4700::1111".parse().unwrap(),
+        ];
+        assert_eq!(
+            dns_bypass_addrs(&dns, true, false),
+            vec!["1.1.1.1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(dns_bypass_addrs(&dns, true, true).len(), 2);
+        assert!(dns_bypass_addrs(&dns, false, false).is_empty());
+    }
+
+    #[test]
+    fn plan_names_tun_after_sanitized_interface_hint() {
+        let mut hinted = params();
+        hinted.interface_name = Some("NL Home!".into());
+        let plan = prepare_xray(1000, hinted, 51820).unwrap();
+        assert_eq!(plan.name, "xray-nl-home");
+        let config: Value = serde_json::from_str(&plan.config).unwrap();
+        assert_eq!(config["inbounds"][0]["settings"]["name"], "xray-nl-home");
+    }
+
+    #[test]
+    fn plan_enables_traffic_sniffing_on_the_tun_inbound() {
+        let plan = prepare_xray(1000, params(), 51820).unwrap();
+        let config: Value = serde_json::from_str(&plan.config).unwrap();
+        let sniffing = &config["inbounds"][0]["sniffing"];
+        // TUN traffic arrives as bare IP packets; sniffing exposes the TLS/HTTP
+        // hostname so domain/geosite routing rules can match.
+        assert_eq!(sniffing["enabled"], true);
+        assert_eq!(sniffing["destOverride"], json!(["http", "tls", "quic"]));
     }
 
     #[test]
@@ -541,7 +655,7 @@ mod tests {
         }
         for rule in [
             json!({"type":"field","domain":["example.com","domain:a.test","full:b.test","keyword:ads","regexp:^c\\.test$","geosite:category-ads_all"],"outboundTag":"proxy"}),
-            json!({"type":"field","ip":["geoip:private","geoip:us","10.0.0.0/8","::1/128","192.0.2.1"],"outboundTag":"direct"}),
+            json!({"type":"field","ip":["geoip:private","geoip:us","geoip:direct","geoip:custom_cat","10.0.0.0/8","::1/128","192.0.2.1"],"outboundTag":"direct"}),
         ] {
             assert!(with_rule(rule.clone()).is_ok(), "{rule}");
         }

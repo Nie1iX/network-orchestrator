@@ -12,10 +12,11 @@ use crate::xray::prepare_xray;
 use crate::xray_process::XrayProcessRunner;
 use ipnet::IpNet;
 use net_manager_core::daemon_protocol::{
-    CleanupResult, IpFamily, OpenVpnConnectionState, OpenVpnProbeResult, OpenVpnProcessResource,
-    OpenVpnStatusResult, OpenVpnWarning, OwnedEntry, OwnedResource, OwnedRuleResource, OwnedState,
-    WireGuardAddressResource, WireGuardFullResource, WireGuardLinkResource, WireGuardStatusResult,
-    WireGuardWarning, XrayConnectParams, XrayProcessResource, XrayStatusResult,
+    CleanupResult, IpFamily, OpenVpnConnectionState, OpenVpnPlanConflict, OpenVpnPlanResult,
+    OpenVpnProbeResult, OpenVpnProcessResource, OpenVpnStatusResult, OpenVpnWarning, OwnedEntry,
+    OwnedResource, OwnedRuleResource, OwnedState, WireGuardAddressResource, WireGuardFullResource,
+    WireGuardLinkResource, WireGuardStatusResult, WireGuardWarning, XrayConnectParams,
+    XrayProcessResource, XrayStatusResult,
 };
 use net_manager_core::models::TunnelState;
 use net_manager_core::models::{AnalyzedRoute, AppliedRoute};
@@ -51,6 +52,8 @@ mod openvpn_tests {
         pending: Arc<Mutex<VecDeque<Vec<ManagementEvent>>>>,
         journal_path: Arc<Mutex<Option<std::path::PathBuf>>>,
         link_missing: Arc<Mutex<bool>>,
+        staged: Arc<Mutex<Vec<String>>>,
+        busy_links: Arc<Mutex<Vec<String>>>,
     }
 
     #[derive(Clone, Default)]
@@ -130,7 +133,18 @@ mod openvpn_tests {
             let started = calls.iter().any(|call| call == &format!("start:{name}"));
             let stopped = calls.iter().any(|call| call == &format!("stop:{name}"));
             calls.push(format!("lookup:{name}"));
-            Ok((started && !stopped && !*self.link_missing.lock().unwrap()).then_some(42))
+            let foreign = self.busy_links.lock().unwrap().iter().any(|n| n == name);
+            Ok(
+                (((started && !stopped) || foreign) && !*self.link_missing.lock().unwrap())
+                    .then_some(42),
+            )
+        }
+        fn staging_exists(&self, uid: u32, name: &str) -> io::Result<bool> {
+            Ok(self
+                .staged
+                .lock()
+                .unwrap()
+                .contains(&format!("{uid}/{name}")))
         }
         fn start(
             &mut self,
@@ -190,6 +204,7 @@ mod openvpn_tests {
                 config: "client\nremote vpn.example 1194\n".into(),
                 assets: BTreeMap::new(),
                 routes: vec![],
+                interface_name: None,
             },
         )
         .unwrap()
@@ -231,6 +246,125 @@ mod openvpn_tests {
             .unwrap()
             .iter()
             .any(|call| call.starts_with("cleanup:")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plan_predicts_paths_and_reports_conflicts_without_mutating() {
+        let dir = unique_dir("plan");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut daemon = core(&dir, &process, &routes);
+        let name = plan().name;
+        let predicted = daemon.plan_openvpn(1000, &plan()).unwrap();
+        assert_eq!(predicted.profile_id, "home");
+        assert_eq!(predicted.owner, "ovpn:home");
+        assert_eq!(predicted.interface_name, name);
+        assert_eq!(predicted.fallback_interface_name, name);
+        assert!(predicted.interface_name.starts_with("ovpn-"));
+        assert_eq!(
+            predicted.staging_dir,
+            format!("/run/network-orchestrator/1000/{name}")
+        );
+        assert!(predicted.config_path.ends_with("/config.ovpn"));
+        assert!(predicted.management_socket.ends_with("/management.sock"));
+        assert!(predicted.conflicts.is_empty());
+        assert!(daemon.journal.entries.is_empty());
+        assert!(process
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|call| { !call.starts_with("start:") && !call.starts_with("cleanup:") }));
+
+        daemon.connect_openvpn(1000, plan()).unwrap();
+        let predicted = daemon.plan_openvpn(1000, &plan()).unwrap();
+        assert!(predicted
+            .conflicts
+            .contains(&OpenVpnPlanConflict::ActiveConnection));
+        // The fake reports the started link as present.
+        assert!(predicted
+            .conflicts
+            .contains(&OpenVpnPlanConflict::InterfaceOccupied));
+        daemon.disconnect_openvpn(1000, "home").unwrap();
+
+        daemon.start_openvpn_probe(1000, plan()).unwrap();
+        let predicted = daemon.plan_openvpn(1000, &plan()).unwrap();
+        assert!(predicted
+            .conflicts
+            .contains(&OpenVpnPlanConflict::ActiveProbe));
+        daemon.finish_openvpn_probe(1000, "home").unwrap();
+
+        process.staged.lock().unwrap().push(format!("1000/{name}"));
+        let predicted = daemon.plan_openvpn(1000, &plan()).unwrap();
+        assert!(predicted
+            .conflicts
+            .contains(&OpenVpnPlanConflict::StagingLeftover));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hinted_names_fall_back_when_the_readable_name_is_occupied() {
+        let dir = unique_dir("hinted");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut daemon = core(&dir, &process, &routes);
+        let hinted = prepare_openvpn(
+            1000,
+            OpenVpnConnectParams {
+                profile_id: "home".into(),
+                config: "client\nremote vpn.example 1194\n".into(),
+                assets: BTreeMap::new(),
+                routes: vec![],
+                interface_name: Some("Home VPN".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(hinted.name, "ovpn-home-vpn");
+        assert_ne!(hinted.fallback_name, hinted.name);
+        assert!(hinted.fallback_name.starts_with("ovpn-home-"));
+        assert!(hinted.fallback_name.len() <= 15);
+
+        // Free primary: prediction and connect both take the readable name.
+        let predicted = daemon.plan_openvpn(1000, &hinted).unwrap();
+        assert_eq!(predicted.interface_name, "ovpn-home-vpn");
+        assert!(predicted.conflicts.is_empty());
+        daemon.connect_openvpn(1000, hinted).unwrap();
+        assert_eq!(
+            daemon
+                .openvpn_status(1000, "home")
+                .interface_name
+                .as_deref(),
+            Some("ovpn-home-vpn")
+        );
+        daemon.disconnect_openvpn(1000, "home").unwrap();
+
+        // Foreign link squatting on the readable name → fallback is predicted
+        // and used instead of failing the connect.
+        process
+            .busy_links
+            .lock()
+            .unwrap()
+            .push("ovpn-home-vpn".into());
+        let hinted = prepare_openvpn(
+            1000,
+            OpenVpnConnectParams {
+                profile_id: "home".into(),
+                config: "client\nremote vpn.example 1194\n".into(),
+                assets: BTreeMap::new(),
+                routes: vec![],
+                interface_name: Some("Home VPN".into()),
+            },
+        )
+        .unwrap();
+        let predicted = daemon.plan_openvpn(1000, &hinted).unwrap();
+        assert_eq!(predicted.interface_name, hinted.fallback_name);
+        assert!(predicted
+            .conflicts
+            .contains(&OpenVpnPlanConflict::InterfaceOccupied));
+        let fallback = hinted.fallback_name.clone();
+        let status = daemon.connect_openvpn(1000, hinted).unwrap();
+        assert_eq!(status.interface_name.as_deref(), Some(fallback.as_str()));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -296,6 +430,7 @@ mod openvpn_tests {
             config: "client\nremote vpn.example\nauth-user-pass\n".into(),
             assets: BTreeMap::new(),
             routes: vec![],
+            interface_name: None,
         });
         request.credentials = Some(OpenVpnCredentials {
             auth_user_pass: Some(OpenVpnUserPass {
@@ -389,6 +524,7 @@ mod openvpn_tests {
                 config: "client\nremote vpn.example 1194\n".into(),
                 assets: BTreeMap::new(),
                 routes: vec![],
+                interface_name: None,
             },
         )
         .unwrap();
@@ -616,6 +752,7 @@ mod openvpn_tests {
                 config: "client\nremote vpn.example\n".into(),
                 assets: BTreeMap::new(),
                 routes: vec![],
+                interface_name: None,
             },
         )
         .unwrap();
@@ -789,6 +926,7 @@ mod openvpn_tests {
                 config: "client\nremote vpn.example\n".into(),
                 assets: BTreeMap::new(),
                 routes: vec![],
+                interface_name: None,
             },
         )
         .unwrap();
@@ -1053,6 +1191,7 @@ mod openvpn_tests {
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
+            xray_restarts: HashMap::new(),
             policy: Some(Box::new(policy.clone())),
             dns: Some(Box::new(dns.clone())),
         };
@@ -1289,6 +1428,9 @@ pub struct DaemonCore {
     /// WireGuard/Xray owners torn down by network reconcile; reported
     /// `failed` until the user reconnects or disconnects.
     tunnel_failed: HashSet<(u32, String)>,
+    /// In-place respawn budget per xray owner: a child crash gets a few
+    /// restarts before reconcile gives up and fails the tunnel.
+    xray_restarts: HashMap<(u32, String), u32>,
     #[cfg(target_os = "linux")]
     policy: Option<Box<dyn PolicyRuleExecutor>>,
     #[cfg(target_os = "linux")]
@@ -1422,6 +1564,7 @@ impl DaemonCore {
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
+            xray_restarts: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1461,6 +1604,7 @@ impl DaemonCore {
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
+            xray_restarts: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1498,6 +1642,7 @@ impl DaemonCore {
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
+            xray_restarts: HashMap::new(),
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -1529,6 +1674,7 @@ impl DaemonCore {
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
+            xray_restarts: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1564,6 +1710,7 @@ impl DaemonCore {
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
+            xray_restarts: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1604,6 +1751,7 @@ impl DaemonCore {
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
+            xray_restarts: HashMap::new(),
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -1715,6 +1863,7 @@ impl DaemonCore {
             self.persist();
             return Err(xray_stage("journal_commit", err));
         }
+        self.xray_restarts.remove(&(uid, owner.clone()));
         self.tunnel_failed.remove(&(uid, owner));
         Ok(self.xray_status(uid, &plan.profile_id))
     }
@@ -1729,7 +1878,7 @@ impl DaemonCore {
         self.xray
             .as_mut()
             .unwrap()
-            .start(uid, &plan.name, &plan.config)
+            .start(uid, &plan.name, &plan.config, plan.geo_assets.as_ref())
             .map_err(|err| {
                 let stage = if matches!(
                     err.kind(),
@@ -1787,6 +1936,7 @@ impl DaemonCore {
             .unwrap()
             .set_state(link_index, true)
             .map_err(|err| xray_stage("link_up", err))?;
+        self.add_xray_bypass_routes(index, plan)?;
         for route in &plan.routes {
             let mut applied = AppliedRoute::on_link(route.destination, link_index, route.metric);
             if route.destination.prefix_len() == 0 {
@@ -1862,6 +2012,63 @@ impl DaemonCore {
         Ok(())
     }
 
+    /// Direct host routes through the physical gateway for the tunnel's own
+    /// upstream: the proxy server (the tunnel cannot carry its own server
+    /// traffic) and DNS resolvers whose family is fully captured (otherwise
+    /// resolver queries re-enter the TUN and loop). These live in the main
+    /// table, so host routes stay reachable under `suppress_prefix_length 0`.
+    fn add_xray_bypass_routes(
+        &mut self,
+        index: usize,
+        plan: &crate::xray::XrayPlan,
+    ) -> io::Result<()> {
+        let mut targets = resolve_host_addrs(plan.server_host.as_deref());
+        for ip in crate::xray::dns_bypass_addrs(&plan.dns_servers, plan.full_ipv4, plan.full_ipv6) {
+            if !targets.contains(&ip) {
+                targets.push(ip);
+            }
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let gateways = self.routes.default_gateways().unwrap_or_default();
+        for ip in targets {
+            let Some((gateway, oif)) = gateways
+                .iter()
+                .copied()
+                .find(|(gateway, _)| gateway.is_ipv4() == ip.is_ipv4())
+            else {
+                eprintln!("network-orchestrator-daemon: no uplink gateway for an xray bypass route, skipping");
+                continue;
+            };
+            let prefix = if ip.is_ipv4() { 32 } else { 128 };
+            let applied = AppliedRoute {
+                destination: IpNet::new(ip, prefix)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad bypass"))?,
+                interface_index: oif,
+                metric: 5,
+                gateway: Some(gateway),
+                table: None,
+            };
+            self.journal.entries[index]
+                .resources
+                .push(OwnedResource::Route(applied.clone()));
+            self.store
+                .save(&self.journal)
+                .map_err(|err| xray_stage("journal_bypass", err))?;
+            match self.routes.add_route(&applied) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    // Another owner (e.g. a foreign tunnel) already holds a
+                    // matching host route; do not journal what we did not add.
+                    self.journal.entries[index].resources.pop();
+                }
+                Err(err) => return Err(xray_stage("bypass_route_add", err)),
+            }
+        }
+        Ok(())
+    }
+
     pub fn disconnect_xray(&mut self, uid: u32, profile_id: &str) -> io::Result<()> {
         let owner = format!("xray:{profile_id}");
         let Some(index) = self.position(uid, &owner) else {
@@ -1874,6 +2081,7 @@ impl DaemonCore {
             ));
         };
         let result = self.teardown_entry(index);
+        self.xray_restarts.remove(&(uid, owner));
         self.store.save(&self.journal)?;
         result
     }
@@ -1924,6 +2132,70 @@ impl DaemonCore {
         }
     }
 
+    /// Predicts the deterministic resources an OpenVPN connect would use and
+    /// reports which of them already collide. Nothing is created or removed —
+    /// the same checks run again inside `connect_openvpn` before mutation.
+    pub fn plan_openvpn(&self, uid: u32, plan: &OpenVpnPlan) -> io::Result<OpenVpnPlanResult> {
+        let runner = self.openvpn.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "OpenVPN executor is unavailable",
+            )
+        })?;
+        let owner = format!("ovpn:{}", plan.profile_id);
+        let mut conflicts = Vec::new();
+        if self.position(uid, &owner).is_some() {
+            conflicts.push(OpenVpnPlanConflict::ActiveConnection);
+        }
+        if self
+            .position(uid, &format!("ovpn-probe:{}", plan.profile_id))
+            .is_some()
+        {
+            conflicts.push(OpenVpnPlanConflict::ActiveProbe);
+        }
+        // Mirror `resolve_openvpn_name`: the readable primary wins unless its
+        // link or staging dir is taken, then the hash-suffixed fallback does.
+        // Conflicts describe the primary name being displaced or the resolved
+        // name remaining occupied — both connect-blocking signals.
+        let mut name = plan.name.clone();
+        if runner.link_index(&plan.name)?.is_some() {
+            conflicts.push(OpenVpnPlanConflict::InterfaceOccupied);
+        }
+        if runner.staging_exists(uid, &plan.name)? {
+            conflicts.push(OpenVpnPlanConflict::StagingLeftover);
+        }
+        if conflicts.iter().any(|c| {
+            matches!(
+                c,
+                OpenVpnPlanConflict::InterfaceOccupied | OpenVpnPlanConflict::StagingLeftover
+            )
+        }) && plan.fallback_name != plan.name
+        {
+            name = plan.fallback_name.clone();
+            if runner.link_index(&name)?.is_some()
+                && !conflicts.contains(&OpenVpnPlanConflict::InterfaceOccupied)
+            {
+                conflicts.push(OpenVpnPlanConflict::InterfaceOccupied);
+            }
+            if runner.staging_exists(uid, &name)?
+                && !conflicts.contains(&OpenVpnPlanConflict::StagingLeftover)
+            {
+                conflicts.push(OpenVpnPlanConflict::StagingLeftover);
+            }
+        }
+        let staging = crate::openvpn_process::stage_dir(uid, &name);
+        Ok(OpenVpnPlanResult {
+            profile_id: plan.profile_id.clone(),
+            owner,
+            interface_name: name,
+            fallback_interface_name: plan.fallback_name.clone(),
+            staging_dir: staging.display().to_string(),
+            config_path: staging.join("config.ovpn").display().to_string(),
+            management_socket: staging.join("management.sock").display().to_string(),
+            conflicts,
+        })
+    }
+
     pub fn connect_openvpn(
         &mut self,
         uid: u32,
@@ -1949,18 +2221,13 @@ impl DaemonCore {
             )
         })?;
         runner.verify_binary()?;
-        if runner.link_index(&plan.name)?.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "OpenVPN link name is occupied",
-            ));
-        }
+        let name = resolve_openvpn_name(&**runner, uid, &plan)?;
         self.journal.entries.push(JournalEntry {
             uid,
             owner: owner.clone(),
             state: OwnedState::Applying,
             resources: vec![OwnedResource::OpenVpnProcess(OpenVpnProcessResource {
-                name: plan.name.clone(),
+                name: name.clone(),
                 owner_marker: format!("network-orchestrator:{uid}:{owner}"),
                 transport_mark: Some(mark),
                 full: None,
@@ -1971,13 +2238,14 @@ impl DaemonCore {
             return Err(err);
         }
         let index = self.journal.entries.len() - 1;
-        if let Err(err) = self.openvpn.as_mut().unwrap().start(
-            uid,
-            &plan.name,
-            &plan.config,
-            plan.credentials,
-            mark,
-        ) {
+        let staging = crate::openvpn_process::stage_dir(uid, &name);
+        let started = plan.sanitized_config(&staging).and_then(|config| {
+            self.openvpn
+                .as_mut()
+                .unwrap()
+                .start(uid, &name, &config, plan.credentials, mark)
+        });
+        if let Err(err) = started {
             let _ = self.teardown_openvpn_entry(index);
             self.persist();
             return Err(err);
@@ -2019,18 +2287,13 @@ impl DaemonCore {
             )
         })?;
         runner.verify_binary()?;
-        if runner.link_index(&plan.name)?.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "OpenVPN link name is occupied",
-            ));
-        }
+        let name = resolve_openvpn_name(&**runner, uid, &plan)?;
         self.journal.entries.push(JournalEntry {
             uid,
             owner: owner.clone(),
             state: OwnedState::Applying,
             resources: vec![OwnedResource::OpenVpnProcess(OpenVpnProcessResource {
-                name: plan.name.clone(),
+                name: name.clone(),
                 owner_marker: format!("network-orchestrator:{uid}:{owner}"),
                 transport_mark: Some(mark),
                 full: None,
@@ -2041,13 +2304,14 @@ impl DaemonCore {
             return Err(error);
         }
         let index = self.journal.entries.len() - 1;
-        if let Err(error) = self.openvpn.as_mut().unwrap().start(
-            uid,
-            &plan.name,
-            &plan.config,
-            plan.credentials,
-            mark,
-        ) {
+        let staging = crate::openvpn_process::stage_dir(uid, &name);
+        let started = plan.sanitized_config(&staging).and_then(|config| {
+            self.openvpn
+                .as_mut()
+                .unwrap()
+                .start(uid, &name, &config, plan.credentials, mark)
+        });
+        if let Err(error) = started {
             let _ = self.teardown_openvpn_entry(index);
             self.persist();
             return Err(error);
@@ -2705,7 +2969,7 @@ impl DaemonCore {
         let full = self.allocate_full(&plan)?;
         #[cfg(not(target_os = "linux"))]
         let full: Option<WireGuardFullResource> = None;
-        let name = wireguard_name(uid, profile_id);
+        let (name, fallback_name) = wireguard_name(uid, profile_id, plan.interface_name.as_deref());
         let marker = format!("network-orchestrator:{uid}:{owner}");
         let mut warnings: Vec<_> = plan
             .warnings
@@ -2737,11 +3001,27 @@ impl DaemonCore {
             return Err(err);
         }
         let result = (|| -> io::Result<()> {
-            let ifindex = self.wg.as_mut().unwrap().create_link(&name, &marker)?;
+            // When the requested name is taken by a foreign interface, retry
+            // once with the deterministic `wg-<slug>-<hash>` fallback instead
+            // of claiming or deleting the foreign link.
+            let (ifindex, name) = match self.wg.as_mut().unwrap().create_link(&name, &marker) {
+                Ok(ifindex) => (ifindex, name.clone()),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists && fallback_name != name => {
+                    (
+                        self.wg
+                            .as_mut()
+                            .unwrap()
+                            .create_link(&fallback_name, &marker)?,
+                        fallback_name.clone(),
+                    )
+                }
+                Err(err) => return Err(err),
+            };
             if let OwnedResource::WireGuardLink(link) =
                 &mut self.journal.entries[index].resources[0]
             {
                 link.index = ifindex;
+                link.name = name.clone();
             }
             self.store.save(&self.journal)?;
             self.wg_config
@@ -3185,7 +3465,19 @@ impl DaemonCore {
             let key = (entry.uid, entry.owner.clone());
             let restored = match self.tunnel_alive(index) {
                 None => continue,
-                Some(false) => Err(io::Error::other("tunnel transport is gone")),
+                Some(false) => {
+                    // A dead xray child first gets an in-place respawn; only
+                    // an exhausted budget or a respawn failure tears the
+                    // tunnel down.
+                    if key.1.starts_with("xray:") {
+                        match self.heal_xray(index) {
+                            Ok(true) => self.restore_owned_network(index, observed),
+                            Ok(false) | Err(_) => Err(io::Error::other("tunnel transport is gone")),
+                        }
+                    } else {
+                        Err(io::Error::other("tunnel transport is gone"))
+                    }
+                }
                 Some(true) => self.restore_owned_network(index, observed),
             };
             match restored {
@@ -3248,6 +3540,135 @@ impl DaemonCore {
         })
     }
 
+    /// Resurrect a dead Xray tunnel in place: respawn the child on its
+    /// staged config, re-point every link-scoped journal resource at the new
+    /// ifindex, and re-apply the address, TUN routes, and DNS. Returns false
+    /// once the restart budget is spent — the caller then tears the owner
+    /// down. Errors are treated the same as exhaustion.
+    #[cfg(target_os = "linux")]
+    fn heal_xray(&mut self, index: usize) -> io::Result<bool> {
+        const MAX_XRAY_RESPAWNS: u32 = 3;
+        let entry = &self.journal.entries[index];
+        let key = (entry.uid, entry.owner.clone());
+        let process = entry
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) => Some(process.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing Xray process marker")
+            })?;
+        let attempts = self.xray_restarts.get(&key).copied().unwrap_or(0);
+        if attempts >= MAX_XRAY_RESPAWNS {
+            return Ok(false);
+        }
+        // The attempt counts even when the respawn itself fails: a flapping
+        // child must not loop forever.
+        let uid = key.0;
+        self.xray_restarts.insert(key, attempts + 1);
+        self.xray
+            .as_mut()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
+            })?
+            .respawn(uid, &process.name)?;
+        let new_index = self
+            .xray
+            .as_ref()
+            .unwrap()
+            .link_index(&process.name)?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "Xray TUN link is unavailable")
+            })?;
+        let old_index = process.index;
+        for resource in &mut self.journal.entries[index].resources {
+            match resource {
+                OwnedResource::XrayProcess(process) => process.index = new_index,
+                OwnedResource::Route(route) if route.interface_index == old_index => {
+                    route.interface_index = new_index;
+                }
+                OwnedResource::Address(address) if address.interface_index == old_index => {
+                    address.interface_index = new_index;
+                }
+                OwnedResource::Dns(dns) if dns.interface_index == old_index => {
+                    dns.interface_index = new_index;
+                }
+                _ => {}
+            }
+        }
+        self.store.save(&self.journal)?;
+        let resources = self.journal.entries[index].resources.clone();
+        for resource in &resources {
+            if let OwnedResource::Address(address) = resource {
+                self.wg
+                    .as_mut()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotConnected, "TUN executor is unavailable")
+                    })?
+                    .add_address(new_index, address.address)?;
+            }
+        }
+        self.wg.as_mut().unwrap().set_state(new_index, true)?;
+        for resource in &resources {
+            if let OwnedResource::Route(route) = resource {
+                // Bypass routes keep their physical oif/gateway; the generic
+                // restore pass right after this refresh handles those.
+                if route.interface_index == new_index && route.gateway.is_none() {
+                    match self.routes.add_route(route) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        }
+        if let Some(dns) = resources.iter().find_map(|resource| match resource {
+            OwnedResource::Dns(dns) => Some(dns.clone()),
+            _ => None,
+        }) {
+            if let Some(executor) = self.dns.as_mut() {
+                let applied = matches!(
+                    executor.apply(&dns.name, &dns.servers, &dns.domains, dns.full),
+                    Ok(DnsApply::Applied)
+                );
+                if let Some(OwnedResource::Dns(resource)) = self.journal.entries[index]
+                    .resources
+                    .iter_mut()
+                    .find(|resource| matches!(resource, OwnedResource::Dns(_)))
+                {
+                    resource.applied = applied;
+                }
+                self.store.save(&self.journal)?;
+            }
+        }
+        eprintln!(
+            "network-orchestrator-daemon: respawned xray child for {}",
+            self.journal.entries[index].owner
+        );
+        Ok(true)
+    }
+
+    /// A bypass host route pointing at the *current* physical default
+    /// gateway for its address family, or `None` when no such gateway
+    /// exists right now.
+    #[cfg(target_os = "linux")]
+    fn fresh_bypass_route(&self, route: &AppliedRoute) -> Option<AppliedRoute> {
+        let (gateway, oif) = self
+            .routes
+            .default_gateways()
+            .ok()?
+            .iter()
+            .copied()
+            .find(|(gateway, _)| gateway.is_ipv4() == route.destination.addr().is_ipv4())?;
+        Some(AppliedRoute {
+            interface_index: oif,
+            gateway: Some(gateway),
+            ..route.clone()
+        })
+    }
+
     /// Install owned routes, then owned rules, that are missing. A foreign
     /// route with the same key counts as present; a rule priority taken by a
     /// foreign rule is an error, so it is never claimed.
@@ -3269,9 +3690,42 @@ impl DaemonCore {
             {
                 continue;
             }
-            match self.routes.add_route(route) {
+            // Bypass host routes point at a physical gateway that can vanish
+            // on roam/DHCP renew/suspend — re-point at the live default
+            // gateway and update the journal instead of re-adding a stale
+            // route. No gateway at all is transient: skip and retry next pass.
+            let mut desired = route.clone();
+            if route.gateway.is_some() {
+                match self.fresh_bypass_route(route) {
+                    Some(fresh) => {
+                        if fresh != *route {
+                            if let Some(slot) = self.journal.entries[index]
+                                .resources
+                                .iter_mut()
+                                .find(|res| {
+                                    matches!(res, OwnedResource::Route(existing) if existing == route)
+                                })
+                            {
+                                *slot = OwnedResource::Route(fresh.clone());
+                            }
+                            let _ = self.store.save(&self.journal);
+                        }
+                        desired = fresh;
+                    }
+                    None => continue,
+                }
+            }
+            match self.routes.add_route(&desired) {
                 Ok(()) => restored = true,
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                // A bypass add failing while the uplink is flaky must not
+                // kill the tunnel; the next reconcile pass retries.
+                Err(err) if route.gateway.is_some() => {
+                    eprintln!(
+                        "network-orchestrator-daemon: bypass route re-add deferred: {}",
+                        err.kind()
+                    );
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -3922,6 +4376,37 @@ mod xray_core_tests {
             Ok(())
         }
     }
+    struct GatewayRoutes {
+        events: Events,
+        gateways: Arc<Mutex<Vec<(std::net::IpAddr, u32)>>>,
+    }
+    impl GatewayRoutes {
+        fn new(events: Events) -> Self {
+            Self {
+                events,
+                gateways: Arc::new(Mutex::new(vec![
+                    ("192.0.2.1".parse().unwrap(), 3),
+                    ("fe80::abcd".parse().unwrap(), 3),
+                ])),
+            }
+        }
+        fn shared_gateways(&self) -> Arc<Mutex<Vec<(std::net::IpAddr, u32)>>> {
+            self.gateways.clone()
+        }
+    }
+    impl RouteExecutor for GatewayRoutes {
+        fn add_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+            self.events.push(format!("route-add:{}", route.destination));
+            Ok(())
+        }
+        fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+            self.events.push(format!("route-del:{}", route.destination));
+            Ok(())
+        }
+        fn default_gateways(&self) -> io::Result<Vec<(std::net::IpAddr, u32)>> {
+            Ok(self.gateways.lock().unwrap().clone())
+        }
+    }
     struct Links;
     impl LinkExecutor for Links {
         fn set_link_state(&mut self, _: &str, _: bool) -> io::Result<()> {
@@ -3962,7 +4447,13 @@ mod xray_core_tests {
         fn link_index(&self, _: &str) -> io::Result<Option<u32>> {
             Ok(self.0.list().contains(&"spawn".to_owned()).then_some(42))
         }
-        fn start(&mut self, _: u32, _: &str, _: &str) -> io::Result<()> {
+        fn start(
+            &mut self,
+            _: u32,
+            _: &str,
+            _: &str,
+            _: Option<&net_manager_core::daemon_protocol::XrayGeoAssets>,
+        ) -> io::Result<()> {
             self.0.push("spawn");
             Ok(())
         }
@@ -3990,6 +4481,8 @@ mod xray_core_tests {
             }).to_string(),
             routes: vec![PolicyRoute { destination: "10.20.0.0/16".parse().unwrap(), metric: 5, via: None }],
             dns_servers: vec![], dns_domains: vec![],
+            interface_name: None,
+            geo_assets: None,
         }
     }
 
@@ -4040,7 +4533,13 @@ mod xray_core_tests {
                     .then_some(42),
             )
         }
-        fn start(&mut self, _: u32, _: &str, _: &str) -> io::Result<()> {
+        fn start(
+            &mut self,
+            _: u32,
+            _: &str,
+            _: &str,
+            _: Option<&net_manager_core::daemon_protocol::XrayGeoAssets>,
+        ) -> io::Result<()> {
             self.0.push("spawn");
             Ok(())
         }
@@ -4088,6 +4587,200 @@ mod xray_core_tests {
         assert_eq!(core.xray_status(1000, "home").state, TunnelState::Failed);
         core.disconnect_xray(1000, "home").unwrap();
         assert_eq!(core.xray_status(1000, "home").state, TunnelState::Stopped);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A process runner whose child dies on demand and revives on `respawn`
+    /// with a fresh TUN ifindex — the suspend/roam scenario in miniature.
+    struct Flaky {
+        events: Events,
+        state: Arc<Mutex<(bool, u32)>>,
+    }
+    impl Flaky {
+        fn new(events: Events) -> Self {
+            Self {
+                events,
+                state: Arc::new(Mutex::new((true, 0))),
+            }
+        }
+        fn handle(&self) -> Arc<Mutex<(bool, u32)>> {
+            self.state.clone()
+        }
+    }
+    impl XrayProcessRunner for Flaky {
+        fn verify_binary(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn link_index(&self, _: &str) -> io::Result<Option<u32>> {
+            let (dead, index) = *self.state.lock().unwrap();
+            Ok((!dead).then_some(index))
+        }
+        fn start(
+            &mut self,
+            _: u32,
+            _: &str,
+            _: &str,
+            _: Option<&net_manager_core::daemon_protocol::XrayGeoAssets>,
+        ) -> io::Result<()> {
+            self.events.push("spawn");
+            *self.state.lock().unwrap() = (false, 42);
+            Ok(())
+        }
+        fn respawn(&mut self, _: u32, _: &str) -> io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            self.events.push("respawn");
+            state.0 = false;
+            state.1 += 1;
+            Ok(())
+        }
+        fn health(&mut self, _: &str) -> io::Result<bool> {
+            Ok(!self.state.lock().unwrap().0)
+        }
+        fn stop(&mut self, _: &str) -> io::Result<()> {
+            self.events.push("stop");
+            Ok(())
+        }
+        fn cleanup(&mut self, _: u32, _: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn network_reconcile_respawns_dead_xray_and_reapplies_link_state() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-heal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = Flaky::new(events.clone());
+        let state = runner.handle();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(runner),
+        )
+        .unwrap();
+        core.connect_xray(1000, params()).unwrap();
+        // Suspend/resume miniature: the child died and the TUN vanished.
+        state.lock().unwrap().0 = true;
+        assert_eq!(
+            core.reconcile_network(&[]),
+            vec![(1000, "xray:home".to_string())]
+        );
+        // The child was respawned in place and every link-scoped resource
+        // moved to the fresh ifindex (43) and was re-applied.
+        assert_eq!(events.list().iter().filter(|e| *e == "respawn").count(), 1);
+        let owned = core.owned(1000);
+        assert_eq!(owned.len(), 1);
+        let process_index = owned[0]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) => Some(process.index),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(process_index, 43);
+        assert!(owned[0].resources.iter().all(|resource| match resource {
+            OwnedResource::Route(route) => route.interface_index == 43,
+            OwnedResource::Address(address) => address.interface_index == 43,
+            OwnedResource::Dns(dns) => dns.interface_index == 43,
+            _ => true,
+        }));
+        assert!(events.list().iter().any(|e| e == "route-add:10.20.0.0/16"));
+        assert_eq!(core.xray_status(1000, "home").state, TunnelState::Running);
+        core.disconnect_xray(1000, "home").unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn network_reconcile_teardown_after_xray_respawn_budget_is_spent() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-healcap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = Flaky::new(events.clone());
+        let state = runner.handle();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(runner),
+        )
+        .unwrap();
+        core.connect_xray(1000, params()).unwrap();
+        for _ in 0..3 {
+            state.lock().unwrap().0 = true;
+            core.reconcile_network(&[]);
+        }
+        assert_eq!(events.list().iter().filter(|e| *e == "respawn").count(), 3);
+        assert_eq!(core.xray_status(1000, "home").state, TunnelState::Running);
+        // Fourth death exhausts the budget: the owner is torn down and
+        // marked failed instead of restarting forever.
+        state.lock().unwrap().0 = true;
+        core.reconcile_network(&[]);
+        assert_eq!(events.list().iter().filter(|e| *e == "respawn").count(), 3);
+        assert!(core.owned(1000).is_empty());
+        assert_eq!(core.xray_status(1000, "home").state, TunnelState::Failed);
+        // A fresh connect gets a fresh budget.
+        core.connect_xray(1000, params()).unwrap();
+        assert_eq!(core.xray_status(1000, "home").state, TunnelState::Running);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn network_reconcile_retargets_bypass_route_to_new_gateway() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-roam-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let routes = GatewayRoutes::new(events.clone());
+        let gateways = routes.shared_gateways();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(routes),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Process(events.clone())),
+        )
+        .unwrap();
+        core.policy = Some(Box::new(Policy(events.clone())));
+        let mut input = params();
+        input.config = json!({
+            "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[
+                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"203.0.113.10","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                {"tag":"direct","protocol":"freedom"}
+            ],
+            "routing":{"domainStrategy":"AsIs","rules":[]}
+        })
+        .to_string();
+        core.connect_xray(1000, input).unwrap();
+        // Wi-Fi roam/DHCP renew: the physical default gateway moved.
+        gateways.lock().unwrap().clear();
+        gateways
+            .lock()
+            .unwrap()
+            .push(("198.51.100.1".parse().unwrap(), 7));
+        // The bypass route is missing from the kernel snapshot, so reconcile
+        // must re-add it against the *new* gateway, not the journaled one.
+        core.reconcile_network(&[]);
+        let owned = core.owned(1000);
+        let bypass = owned[0]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::Route(route) if route.gateway.is_some() => Some(route),
+                _ => None,
+            })
+            .expect("bypass route");
+        assert_eq!(bypass.gateway, Some("198.51.100.1".parse().unwrap()));
+        assert_eq!(bypass.interface_index, 7);
+        // Uplink entirely gone (e.g. mid-suspend): the bypass is deferred,
+        // the tunnel stays up.
+        gateways.lock().unwrap().clear();
+        core.reconcile_network(&[]);
+        assert_eq!(core.xray_status(1000, "home").state, TunnelState::Running);
+        core.disconnect_xray(1000, "home").unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4193,6 +4886,117 @@ mod xray_core_tests {
     }
 
     #[test]
+    fn full_xray_bypasses_server_and_captured_dns_via_physical_gateway() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-bypass-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(GatewayRoutes::new(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Process(events.clone())),
+        )
+        .unwrap();
+        core.policy = Some(Box::new(Policy(events.clone())));
+        core.dns = Some(Box::new(Dns(events.clone())));
+        let mut input = params();
+        input.config = json!({
+            "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[
+                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"203.0.113.10","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                {"tag":"direct","protocol":"freedom"}
+            ],
+            "routing":{"domainStrategy":"AsIs","rules":[]}
+        })
+        .to_string();
+        input.routes = vec![PolicyRoute {
+            destination: "0.0.0.0/0".parse().unwrap(),
+            metric: 5,
+            via: None,
+        }];
+        input.dns_servers = vec!["1.1.1.1".parse().unwrap()];
+        core.connect_xray(1000, input).unwrap();
+        let applied = events.list();
+        // Bypass host routes land before the policy rules that would send
+        // those destinations into the tunnel table.
+        let first_rule = applied
+            .iter()
+            .position(|e| e.starts_with("rule-add:"))
+            .unwrap();
+        for bypass in ["route-add:203.0.113.10/32", "route-add:1.1.1.1/32"] {
+            let position = applied
+                .iter()
+                .position(|e| e == bypass)
+                .unwrap_or_else(|| panic!("missing {bypass}"));
+            assert!(position < first_rule, "{bypass} after policy rules");
+        }
+        // Bypasses are journaled as owned routes on the physical gateway and
+        // in the main table, so teardown and recovery both remove them.
+        let owned = core.owned(1000);
+        let bypass: Vec<_> = owned[0]
+            .resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) if route.gateway.is_some() => Some(route),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bypass.len(), 2);
+        for route in bypass {
+            assert_eq!(route.gateway, Some("192.0.2.1".parse().unwrap()));
+            assert_eq!(route.interface_index, 3);
+            assert_eq!(route.table, None);
+        }
+        core.disconnect_xray(1000, "home").unwrap();
+        let teardown = events.list();
+        assert!(teardown.iter().any(|e| e == "route-del:203.0.113.10/32"));
+        assert!(teardown.iter().any(|e| e == "route-del:1.1.1.1/32"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn split_xray_bypasses_server_but_keeps_dns_inside_tunnel() {
+        let events = Events::default();
+        let dir =
+            std::env::temp_dir().join(format!("netmgr-xray-splitbypass-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(GatewayRoutes::new(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Process(events.clone())),
+        )
+        .unwrap();
+        let mut input = params();
+        input.config = json!({
+            "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[
+                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"203.0.113.10","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                {"tag":"direct","protocol":"freedom"}
+            ],
+            "routing":{"domainStrategy":"AsIs","rules":[]}
+        })
+        .to_string();
+        // Split profile: DNS server is intentionally resolved through the
+        // tunnel, so only the upstream server gets a bypass route.
+        input.routes = vec![PolicyRoute {
+            destination: "1.0.0.0/8".parse().unwrap(),
+            metric: 5,
+            via: None,
+        }];
+        input.dns_servers = vec!["1.1.1.1".parse().unwrap()];
+        core.dns = Some(Box::new(Dns(events.clone())));
+        core.connect_xray(1000, input).unwrap();
+        let events = events.list();
+        assert!(events.iter().any(|e| e == "route-add:203.0.113.10/32"));
+        assert!(!events.iter().any(|e| e == "route-add:1.1.1.1/32"));
+        core.disconnect_xray(1000, "home").unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn failed_xray_route_rolls_back_owned_address_and_process() {
         let events = Events::default();
         let dir = std::env::temp_dir().join(format!("netmgr-xray-rollback-{}", std::process::id()));
@@ -4287,18 +5091,129 @@ fn xray_stage(stage: &'static str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("Xray {stage} failed"))
 }
 
+/// Literal IPs pass through; hostnames resolve best-effort through the
+/// system resolver while the physical uplink is still intact. Resolution
+/// failure skips the bypass rather than failing the connect — the tunnel's
+/// own dial would break identically either way.
+fn resolve_host_addrs(host: Option<&str>) -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    let Some(host) = host else {
+        return Vec::new();
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return vec![ip];
+    }
+    (host, 443)
+        .to_socket_addrs()
+        .map(|iter| iter.map(|addr| addr.ip()).collect())
+        .unwrap_or_default()
+}
+
 fn wireguard_owner(profile_id: &str) -> io::Result<String> {
     validate_owner(profile_id).map_err(invalid_input)?;
     Ok(format!("wg:{profile_id}"))
 }
 
-fn wireguard_name(uid: u32, profile_id: &str) -> String {
+fn link_name_seed(uid: u32, profile_id: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in uid.to_le_bytes().iter().chain(profile_id.as_bytes()) {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    format!("wg-{:012x}", hash & 0xffffffffffff)
+    hash
+}
+
+/// Sanitize a caller-supplied hint into a lowercase kernel-safe slug: ASCII
+/// alphanumerics are kept, every other character collapses into a single `-`.
+fn link_name_slug(hint: &str, budget: usize) -> Option<String> {
+    let mut slug = String::with_capacity(budget.min(hint.len()));
+    for ch in hint.chars().flat_map(char::to_lowercase) {
+        if slug.len() >= budget {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+        } else if !(slug.is_empty() || slug.ends_with('-')) {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    (!slug.is_empty()).then(|| slug.to_string())
+}
+
+/// Resolve the kernel interface name and a collision fallback. The hint is
+/// preferred verbatim when it already reads as a prefixed name ("wg-kzn2",
+/// "wg0"), else it gets the prefix ("kzn2" -> "wg-kzn2"). When the hint is
+/// missing or unusable, the deterministic hash name is used for both slots.
+/// All results fit IFNAMSIZ-1 (15) bytes of pure ASCII.
+pub(crate) fn tunnel_link_names(
+    prefix: &str,
+    uid: u32,
+    profile_id: &str,
+    hint: Option<&str>,
+) -> (String, String) {
+    const MAX_LEN: usize = 15;
+    let hex_digits = MAX_LEN - prefix.len();
+    let seed = link_name_seed(uid, profile_id);
+    let hashed = format!(
+        "{prefix}{:0width$x}",
+        seed & ((1u64 << (4 * hex_digits)) - 1),
+        width = hex_digits
+    );
+    let Some(slug) = hint.and_then(|hint| link_name_slug(hint, MAX_LEN)) else {
+        return (hashed.clone(), hashed);
+    };
+    let bare = prefix.trim_end_matches('-');
+    if slug == bare {
+        return (hashed.clone(), hashed);
+    }
+    // The hint is used verbatim when it already carries our prefix
+    // ("wg-kzn2") or is a "<bare><digits>" name like "wg0"; otherwise it is
+    // slugged under the prefix ("KZN2 uplink" -> "wg-kzn2-uplink"). This also
+    // keeps every result matching validators like `valid_tun_name`.
+    let verbatim = slug.starts_with(prefix)
+        || (slug.starts_with(bare)
+            && slug.len() > bare.len()
+            && slug.as_bytes()[bare.len()].is_ascii_digit());
+    let primary = if verbatim {
+        slug[..slug.len().min(MAX_LEN)].to_string()
+    } else {
+        let room = MAX_LEN - prefix.len();
+        format!("{prefix}{}", &slug[..slug.len().min(room)])
+    };
+    let short = primary[..primary.len().min(MAX_LEN - 5)].trim_end_matches('-');
+    let fallback = if short.len() <= prefix.len() {
+        hashed.clone()
+    } else {
+        format!("{short}-{:04x}", seed & 0xffff)
+    };
+    (primary, fallback)
+}
+
+fn wireguard_name(uid: u32, profile_id: &str, hint: Option<&str>) -> (String, String) {
+    tunnel_link_names("wg-", uid, profile_id, hint)
+}
+
+/// Resolves the link/staging name for an OpenVPN plan: the readable primary
+/// unless its link or staging dir is occupied, else the deterministic
+/// fallback. Errors when both are taken.
+fn resolve_openvpn_name(
+    runner: &dyn OpenVpnProcessRunner,
+    uid: u32,
+    plan: &OpenVpnPlan,
+) -> io::Result<String> {
+    for name in [&plan.name, &plan.fallback_name] {
+        if runner.link_index(name)?.is_none() && !runner.staging_exists(uid, name)? {
+            return Ok(name.clone());
+        }
+        if name == &plan.fallback_name {
+            break;
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "OpenVPN link name is occupied",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -4753,6 +5668,7 @@ mod tests {
         events: Arc<Mutex<Vec<String>>>,
         fail_remove_address: bool,
         before_create: Option<PathBuf>,
+        occupied: Vec<String>,
     }
 
     impl WgSystem for FakeWg {
@@ -4763,6 +5679,10 @@ mod tests {
                 assert!(
                     matches!(&journal.entries[0].resources[0], OwnedResource::WireGuardLink(link) if link.name == name && link.index == 0)
                 );
+            }
+            if self.occupied.iter().any(|taken| taken == name) {
+                self.events.lock().unwrap().push(format!("exists:{name}"));
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "name taken"));
             }
             self.events.lock().unwrap().push(format!("create:{name}"));
             Ok(42)
@@ -4903,6 +5823,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: false,
                 before_create: Some(journal_path.clone()),
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig {
                 events: events.clone(),
@@ -4977,6 +5898,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: false,
                 before_create: None,
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig {
                 events: events.clone(),
@@ -5039,6 +5961,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: false,
                 before_create: None,
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig {
                 events: events.clone(),
@@ -5184,6 +6107,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: false,
                 before_create: None,
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig {
                 events: events.clone(),
@@ -5235,6 +6159,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: false,
                 before_create: None,
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig {
                 events: events.clone(),
@@ -5306,6 +6231,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: false,
                 before_create: None,
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig {
                 events: events.clone(),
@@ -5357,6 +6283,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: false,
                 before_create: None,
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig {
                 events: events.clone(),
@@ -5414,6 +6341,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: false,
                 before_create: Some(journal_path.clone()),
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig {
                 events: events.clone(),
@@ -5479,6 +6407,7 @@ mod tests {
                     events: events.clone(),
                     fail_remove_address: false,
                     before_create: None,
+                    occupied: Vec::new(),
                 }),
                 Box::new(EndpointWgConfig("192.0.2.1".parse().unwrap())),
             )
@@ -5517,6 +6446,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: false,
                 before_create: None,
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig {
                 events: events.clone(),
@@ -5571,6 +6501,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: true,
                 before_create: None,
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig {
                 events: events.clone(),
@@ -5593,6 +6524,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: false,
                 before_create: None,
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig { events }),
         )
@@ -5845,6 +6777,7 @@ mod tests {
                 events: Arc::new(Mutex::new(Vec::new())),
                 fail_remove_address: false,
                 before_create: None,
+                occupied: Vec::new(),
             }),
             Box::new(DumpWgConfig(dump.clone())),
         )
@@ -5942,6 +6875,7 @@ mod tests {
                 events: events.clone(),
                 fail_remove_address: false,
                 before_create: None,
+                occupied: Vec::new(),
             }),
             Box::new(FakeWgConfig {
                 events: events.clone(),
@@ -6433,5 +7367,114 @@ mod tests {
         core.set_link_state("enp0s3", false).unwrap();
         assert_eq!(recorder.ops(), vec![Op::Link("enp0s3".into(), false)]);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn link_names_prefer_sanitized_hint() {
+        let (name, fallback) = wireguard_name(1000, "home", Some("KZN2 uplink"));
+        assert_eq!(name, "wg-kzn2-uplink");
+        assert!(fallback.starts_with("wg-kzn2-"));
+        assert!(fallback.len() <= 15);
+        assert_ne!(name, fallback);
+
+        // Hints that already look like interface names stay verbatim.
+        assert_eq!(wireguard_name(1000, "home", Some("wg-kzn2")).0, "wg-kzn2");
+        assert_eq!(wireguard_name(1000, "home", Some("wg0")).0, "wg0");
+
+        let (name, fallback) =
+            wireguard_name(1000, "home", Some("a very long interface name indeed"));
+        assert!(name.len() <= 15);
+        assert!(name.starts_with("wg-"));
+        assert!(fallback.len() <= 15);
+    }
+
+    #[test]
+    fn link_names_fall_back_to_deterministic_hash() {
+        let (name, fallback) = wireguard_name(1000, "home", None);
+        assert_eq!(name, fallback);
+        assert_eq!(name.len(), 15);
+        assert!(name[3..].chars().all(|c| c.is_ascii_hexdigit()));
+        // Empty or fully unsanitizable hints produce the same hash name.
+        assert_eq!(name, wireguard_name(1000, "home", Some("")).0);
+        assert_eq!(name, wireguard_name(1000, "home", Some("!!!")).0);
+        assert_eq!(name, wireguard_name(1000, "home", Some("🇳🇱 Нидерланды")).0);
+        // Deterministic per (uid, profile_id).
+        assert_ne!(name, wireguard_name(1000, "other", None).0);
+        assert_ne!(name, wireguard_name(1001, "home", None).0);
+    }
+
+    #[test]
+    fn wireguard_connect_uses_hinted_name_and_retries_on_collision() {
+        let dir = unique_dir("wireguard-name");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let mut core = DaemonCore::open_with_wireguard(
+            JournalStore::new(dir.join(JOURNAL_FILE)),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: None,
+                occupied: vec!["wg-kzn2".into()],
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
+        let mut plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        plan.interface_name = Some("wg-kzn2".into());
+        let status = core.connect_wireguard(1000, "home", plan).unwrap();
+        let name = status.interface_name.expect("interface name");
+        assert!(
+            name.starts_with("wg-kzn2-") && name.len() <= 15,
+            "expected shortened fallback, got {name}"
+        );
+        let events = events.lock().unwrap();
+        let exists = events.iter().position(|e| e == "exists:wg-kzn2");
+        let created = events.iter().position(|e| e == &format!("create:{name}"));
+        assert!(exists.is_some() && created.is_some() && exists < created);
+    }
+
+    #[test]
+    fn wireguard_connect_uses_hinted_name_verbatim_when_free() {
+        let dir = unique_dir("wireguard-name-free");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder::default();
+        let mut core = DaemonCore::open_with_wireguard(
+            JournalStore::new(dir.join(JOURNAL_FILE)),
+            Box::new(FakeRoutes::new(&recorder)),
+            Box::new(FakeLinks(recorder.clone())),
+            Box::new(FakeWg {
+                events: events.clone(),
+                fail_remove_address: false,
+                before_create: None,
+                occupied: Vec::new(),
+            }),
+            Box::new(FakeWgConfig {
+                events: events.clone(),
+            }),
+        )
+        .unwrap();
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let config = format!("[Interface]\nPrivateKey={key}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={key}\nEndpoint=192.0.2.1:51820\nAllowedIPs=10.77.0.0/24\n");
+        let mut plan = crate::wireguard::parse_wireguard_config(&config, &[]).unwrap();
+        plan.interface_name = Some("wg-kzn2".into());
+        let status = core.connect_wireguard(1000, "home", plan).unwrap();
+        assert_eq!(status.interface_name.as_deref(), Some("wg-kzn2"));
+        // The journal stores the effective name so teardown/recovery target it.
+        let owned = core.owned(1000);
+        assert!(
+            matches!(&owned[0].resources[0], OwnedResource::WireGuardLink(link) if link.name == "wg-kzn2")
+        );
+        core.disconnect_wireguard(1000, "home").unwrap();
+        assert!(events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "delete:wg-kzn2"));
     }
 }

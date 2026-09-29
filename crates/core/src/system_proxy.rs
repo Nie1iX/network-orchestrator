@@ -33,6 +33,12 @@ pub trait ProxyAdapter: Send {
     fn snapshot(&mut self) -> io::Result<ProxySnapshot>;
     fn apply(&mut self, server: &str, bypass: &str) -> io::Result<()>;
     fn restore(&mut self, snapshot: &ProxySnapshot) -> io::Result<()>;
+    /// Platform bypass entries that are always prepended to the profile's
+    /// custom list — loopback and LAN destinations must never be proxied.
+    /// Entries are expressed in the adapter's own syntax.
+    fn default_bypass(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub struct SystemProxyManager {
@@ -93,7 +99,13 @@ impl SystemProxyManager {
         }
         let snapshot = self.adapter.snapshot()?;
         let server = format!("socks=127.0.0.1:{port}");
-        let applied_override = bypass.join(";");
+        let mut entries = self.adapter.default_bypass();
+        for entry in bypass {
+            if !entries.iter().any(|existing| existing == entry) {
+                entries.push(entry.clone());
+            }
+        }
+        let applied_override = entries.join(";");
         self.ownership = Some(ProxyOwnership {
             profile_id: profile_id.to_string(),
             snapshot: snapshot.clone(),
@@ -486,6 +498,33 @@ mod windows_proxy {
         broadcast_settings_change();
         Ok(())
     }
+
+    /// Loopback/LAN bypass in Windows ProxyOverride syntax. `172.16.0.0/12`
+    /// cannot be expressed as one wildcard, so it is spelled out per octet.
+    pub fn default_bypass() -> Vec<String> {
+        let mut entries: Vec<String> = ["<local>", "localhost", "127.*", "::1", "10.*"]
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect();
+        for octet in 16u8..=31 {
+            entries.push(format!("172.{octet}.*"));
+        }
+        entries.extend(
+            [
+                "192.168.*",
+                "169.254.*",
+                "fe80::*",
+                "fc00::*",
+                "*.local",
+                "*.lan",
+                "*.internal",
+                "*.home",
+            ]
+            .iter()
+            .map(|entry| entry.to_string()),
+        );
+        entries
+    }
 }
 
 #[cfg(windows)]
@@ -498,6 +537,9 @@ impl ProxyAdapter for WindowsProxyAdapter {
     }
     fn restore(&mut self, snapshot: &ProxySnapshot) -> io::Result<()> {
         windows_proxy::restore(snapshot)
+    }
+    fn default_bypass(&self) -> Vec<String> {
+        windows_proxy::default_bypass()
     }
 }
 
@@ -533,9 +575,13 @@ mod tests {
         calls: Vec<String>,
         store_path: Option<PathBuf>,
         ownership_seen_during_apply: Option<bool>,
+        defaults: Vec<String>,
     }
 
     impl ProxyAdapter for FakeAdapter {
+        fn default_bypass(&self) -> Vec<String> {
+            self.defaults.clone()
+        }
         fn snapshot(&mut self) -> io::Result<ProxySnapshot> {
             Ok(self.snapshot.clone())
         }
@@ -593,6 +639,32 @@ mod tests {
         fn restore(&mut self, snapshot: &ProxySnapshot) -> io::Result<()> {
             self.0.lock().unwrap().restore(snapshot)
         }
+        fn default_bypass(&self) -> Vec<String> {
+            self.0.lock().unwrap().default_bypass()
+        }
+    }
+
+    #[test]
+    fn apply_prepends_adapter_default_bypass_and_dedupes_user_entries() {
+        let dir = unique_dir("default-bypass");
+        let adapter = FakeAdapter {
+            defaults: vec!["<local>".into(), "localhost".into(), "10.*".into()],
+            ..Default::default()
+        };
+        let (mut mgr, adapter) = manager(&dir, adapter);
+        mgr.apply("p1", 10808, &["10.*".into(), "*.corp.internal".into()])
+            .unwrap();
+
+        let calls = &adapter.lock().unwrap().calls;
+        assert_eq!(
+            calls,
+            &["apply:socks=127.0.0.1:10808|<local>;localhost;10.*;*.corp.internal"]
+        );
+        assert_eq!(
+            mgr.ownership().unwrap().applied_override,
+            "<local>;localhost;10.*;*.corp.internal"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

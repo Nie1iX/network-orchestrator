@@ -4,7 +4,7 @@
   "identifier": "com.netmanager.app",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://127.0.0.1:1420",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
@@ -45,8 +45,16 @@
     ],
     "linux": {
       "deb": {
-        "depends": ["systemd", "polkitd", "iproute2"],
-        "recommends": ["systemd-resolved", "wireguard-tools", "openvpn"],
+        "depends": [
+          "systemd",
+          "polkitd",
+          "iproute2"
+        ],
+        "recommends": [
+          "systemd-resolved",
+          "wireguard-tools",
+          "openvpn"
+        ],
         "files": {
           "/usr/bin/network-orchestrator-daemon": "../target/release/network-orchestrator-daemon",
           "/usr/lib/network-orchestrator/xray/v26.3.27/xray": "../target/release/xray-package/v26.3.27/xray",
@@ -63,8 +71,17 @@
         "postRemoveScript": "../packaging/linux/postrm"
       },
       "rpm": {
-        "depends": ["systemd", "polkit", "iproute", "libayatana-appindicator-gtk3"],
-        "recommends": ["systemd-resolved", "wireguard-tools", "openvpn"],
+        "depends": [
+          "systemd",
+          "polkit",
+          "iproute",
+          "libayatana-appindicator-gtk3"
+        ],
+        "recommends": [
+          "systemd-resolved",
+          "wireguard-tools",
+          "openvpn"
+        ],
         "files": {
           "/usr/bin/network-orchestrator-daemon": "../target/release/network-orchestrator-daemon",
           "/usr/lib/network-orchestrator/xray/v26.3.27/xray": "../target/release/xray-package/v26.3.27/xray",

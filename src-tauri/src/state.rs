@@ -28,11 +28,17 @@ pub(crate) struct AppState {
     pub(crate) config_vault: ConfigVault,
     pub(crate) backend_settings: BackendSettingsStore,
     pub(crate) managed_xray_root: PathBuf,
+    /// Per-profile downloaded geoip.dat/geosite.dat overrides
+    /// (`geoassets/<profile-id>/`).
+    pub(crate) geo_assets_root: PathBuf,
     pub(crate) backend_install_lock: tokio::sync::Mutex<()>,
     pub(crate) backend_install_cancel: AtomicBool,
     pub(crate) shutting_down: AtomicBool,
     pub(crate) cleanup_complete: AtomicBool,
     pub(crate) runtime: tokio::sync::Mutex<RuntimeState>,
+    /// Bounded app-side event log for the Logs view (connect/disconnect,
+    /// errors). Never persisted — ring buffer, newest last.
+    pub(crate) log: std::sync::Mutex<std::collections::VecDeque<crate::commands::logs::LogEvent>>,
     #[cfg(target_os = "linux")]
     pub(crate) openvpn_credentials: crate::openvpn_credentials::OpenVpnCredentialStore,
 }
@@ -116,6 +122,7 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
         config_vault,
         backend_settings,
         managed_xray_root: data_dir.join("backends").join("xray"),
+        geo_assets_root: data_dir.join("geoassets"),
         backend_install_lock: tokio::sync::Mutex::new(()),
         backend_install_cancel: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
@@ -130,6 +137,7 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
             routes,
             proxy: SystemProxyManager::new(data_dir.join("proxy-state.json"))?,
         }),
+        log: std::sync::Mutex::new(std::collections::VecDeque::new()),
         #[cfg(target_os = "linux")]
         openvpn_credentials: crate::openvpn_credentials::OpenVpnCredentialStore::new(Box::new(
             crate::openvpn_credentials::SecretServiceStore,

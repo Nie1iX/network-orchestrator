@@ -1,7 +1,9 @@
 pub(crate) mod always_on;
 pub(crate) mod bulk_routes;
 pub(crate) mod diagnostics;
+pub(crate) mod exit_ips;
 pub(crate) mod explorer;
+pub(crate) mod logs;
 pub(crate) mod profiles;
 pub(crate) mod recovery;
 pub(crate) mod route_map;
@@ -13,7 +15,9 @@ pub(crate) use always_on::{
 };
 pub(crate) use bulk_routes::parse_bulk_cidrs;
 pub(crate) use diagnostics::{diagnose_profile, inspect_profile_by_id, inspect_profiles};
+pub(crate) use exit_ips::check_exit_ips;
 pub(crate) use explorer::{get_interfaces, get_routes, lookup_destination, set_interface_state};
+pub(crate) use logs::{clear_logs, daemon_log_tail, get_logs};
 pub(crate) use profiles::{
     delete_profile, get_profiles, get_subscription_endpoints, import_configs_batch,
     import_subscription, measure_subscription_endpoint_delay, refresh_subscription, save_profile,
@@ -30,5 +34,5 @@ pub(crate) use system::{
 };
 pub(crate) use tunnels::{
     connect_openvpn_with_credentials, connect_profile, disconnect_profile, get_tunnel_statuses,
-    probe_openvpn_routes,
+    openvpn_plan, probe_openvpn_routes,
 };

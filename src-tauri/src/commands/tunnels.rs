@@ -184,11 +184,22 @@ fn prepare_linux_xray_tun_params(
             Vec::new()
         },
         dns_domains: Vec::new(),
+        interface_name: link_name_hint(profile),
+        geo_assets: None,
     };
+    check_xray_frame_size(&params)?;
+    Ok(params)
+}
+
+/// Rejects `xray.connect` payloads that would exceed the daemon frame cap.
+/// Runs once in `prepare_linux_xray_tun_params` (config-only) and again in
+/// `linux_xray_connect` after inline geo assets are attached.
+#[cfg(target_os = "linux")]
+fn check_xray_frame_size(params: &XrayConnectParams) -> Result<(), String> {
     let frame = net_manager_core::daemon_protocol::RequestFrame {
         id: 2,
         method: method::XRAY_CONNECT.into(),
-        params: serde_json::to_value(&params)
+        params: serde_json::to_value(params)
             .map_err(|_| "cannot encode Xray TUN config".to_string())?,
     };
     if net_manager_core::daemon_protocol::encode_line(&frame)
@@ -198,7 +209,7 @@ fn prepare_linux_xray_tun_params(
     {
         return Err("Xray TUN config is too large for daemon protocol".into());
     }
-    Ok(params)
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -224,16 +235,36 @@ pub(crate) fn linux_xray_tunnel_status(
         profile_id: status.profile_id,
         state: status.state,
         message: (!notices.is_empty()).then(|| notices.join("; ")),
+        interface_name: status.interface_name,
     }
+}
+
+/// Kernel interface-name hint for daemon-managed tunnels: an explicit
+/// per-profile `interface_name` wins, otherwise the display name is offered
+/// (the daemon sanitizes it and falls back to its deterministic name).
+#[cfg(target_os = "linux")]
+pub(crate) fn link_name_hint(profile: &Profile) -> Option<String> {
+    let hint = if profile.interface_name.trim().is_empty() {
+        &profile.name
+    } else {
+        &profile.interface_name
+    };
+    (!hint.trim().is_empty()).then(|| hint.trim().to_string())
 }
 
 #[cfg(target_os = "linux")]
 async fn linux_xray_connect(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
+    state: &AppState,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
-    let params = prepare_linux_xray_tun_params(vault, profile)?;
+    let mut params = prepare_linux_xray_tun_params(vault, profile)?;
+    if let Some(dir) = crate::geo_assets::ensure_geo_assets(state, profile).await? {
+        params.geo_assets = Some(crate::geo_assets::protocol_geo_assets(&dir)?);
+        check_xray_frame_size(&params)
+            .map_err(|_| "geo assets are too large for daemon protocol".to_string())?;
+    }
     let result: XrayConnectResult = client
         .request(method::XRAY_CONNECT, params)
         .await
@@ -279,6 +310,7 @@ async fn linux_xray_disconnect(
         profile_id: profile.id.clone(),
         state: TunnelState::Stopped,
         message: None,
+        interface_name: None,
     })
 }
 
@@ -319,6 +351,7 @@ pub(crate) fn linux_openvpn_tunnel_status(status: OpenVpnStatusResult) -> Tunnel
         profile_id: status.profile_id,
         state,
         message: (!notices.is_empty()).then(|| notices.join("; ")),
+        interface_name: status.interface_name,
     }
 }
 
@@ -483,6 +516,7 @@ fn prepare_linux_openvpn_request(
         config,
         assets,
         routes,
+        interface_name: link_name_hint(profile),
     };
     let request = OpenVpnConnectRequest {
         profile: params,
@@ -573,6 +607,7 @@ async fn linux_openvpn_disconnect(
         profile_id: profile.id.clone(),
         state: TunnelState::Stopped,
         message: None,
+        interface_name: None,
     })
 }
 
@@ -598,6 +633,7 @@ pub(crate) fn linux_wireguard_tunnel_status(status: WireGuardStatusResult) -> Tu
         profile_id: status.profile_id,
         state: status.state,
         message: (!notices.is_empty()).then(|| notices.join("; ")),
+        interface_name: status.interface_name,
     }
 }
 
@@ -622,6 +658,7 @@ async fn linux_wireguard_connect(
                 profile_id: profile.id.clone(),
                 config,
                 routes: profile.routes.clone(),
+                interface_name: link_name_hint(profile),
             },
         )
         .await
@@ -677,6 +714,7 @@ async fn linux_wireguard_disconnect(
         profile_id: profile.id.clone(),
         state: TunnelState::Stopped,
         message: None,
+        interface_name: None,
     })
 }
 
@@ -867,6 +905,17 @@ pub(crate) async fn connect_profile(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<TunnelStatus, String> {
+    let result = connect_profile_inner(id.clone(), state.inner(), &app).await;
+    let label = super::logs::profile_label(&state, &id);
+    super::logs::record_tunnel_result(&state, "connect", &label, &result);
+    result
+}
+
+async fn connect_profile_inner(
+    id: String,
+    state: &AppState,
+    app: &tauri::AppHandle,
+) -> Result<TunnelStatus, String> {
     let mut profile = find_profile(&state.profiles, &id)?;
     #[cfg(target_os = "linux")]
     if profile.backend == TunnelBackend::WireGuard {
@@ -896,6 +945,7 @@ pub(crate) async fn connect_profile(
         let status = linux_xray_connect(
             &crate::daemon_client::DaemonClient::system(),
             &state.config_vault,
+            state,
             &profile,
         )
         .await?;
@@ -1134,6 +1184,21 @@ pub(crate) async fn connect_openvpn_with_credentials(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<TunnelStatus, String> {
+    let result =
+        connect_openvpn_with_credentials_inner(id.clone(), credentials, remember, &state, &app)
+            .await;
+    let label = super::logs::profile_label(&state, &id);
+    super::logs::record_tunnel_result(&state, "connect", &label, &result);
+    result
+}
+
+async fn connect_openvpn_with_credentials_inner(
+    id: String,
+    credentials: net_manager_core::daemon_protocol::OpenVpnCredentials,
+    remember: bool,
+    state: &AppState,
+    app: &tauri::AppHandle,
+) -> Result<TunnelStatus, String> {
     #[cfg(target_os = "linux")]
     {
         let profile = find_profile(&state.profiles, &id)?;
@@ -1164,6 +1229,17 @@ pub(crate) async fn disconnect_profile(
     id: String,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
+) -> Result<TunnelStatus, String> {
+    let result = disconnect_profile_inner(id.clone(), state.inner(), &app).await;
+    let label = super::logs::profile_label(&state, &id);
+    super::logs::record_tunnel_result(&state, "disconnect", &label, &result);
+    result
+}
+
+async fn disconnect_profile_inner(
+    id: String,
+    state: &AppState,
+    app: &tauri::AppHandle,
 ) -> Result<TunnelStatus, String> {
     let profile = find_profile(&state.profiles, &id)?;
     #[cfg(target_os = "linux")]
@@ -1214,16 +1290,20 @@ pub(crate) async fn disconnect_profile(
     }
 }
 
-#[tauri::command]
-pub(crate) async fn get_tunnel_statuses(
-    state: State<'_, AppState>,
+/// Authoritative per-profile status: on Linux the network daemon owns WG,
+/// OpenVPN, and Xray-TUN tunnels, so those are queried over the daemon socket;
+/// everything else falls back to the in-process tunnel manager. Used by both
+/// `get_tunnel_statuses` and `get_route_map` so the UI never disagrees with
+/// the daemon about what is running.
+pub(crate) async fn collect_tunnel_statuses(
+    state: &AppState,
+    profiles: &[Profile],
 ) -> Result<Vec<TunnelStatus>, String> {
-    let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     #[cfg(target_os = "linux")]
     {
         let mut statuses = Vec::with_capacity(profiles.len());
         let client = crate::daemon_client::DaemonClient::system();
-        for profile in &profiles {
+        for profile in profiles {
             if profile.backend == TunnelBackend::WireGuard {
                 statuses.push(
                     linux_wireguard_status(&client, profile)
@@ -1232,6 +1312,7 @@ pub(crate) async fn get_tunnel_statuses(
                             profile_id: profile.id.clone(),
                             state: TunnelState::Failed,
                             message: Some(err),
+                            interface_name: None,
                         }),
                 );
             } else if profile.backend == TunnelBackend::OpenVpn {
@@ -1242,6 +1323,7 @@ pub(crate) async fn get_tunnel_statuses(
                             profile_id: profile.id.clone(),
                             state: TunnelState::Failed,
                             message: Some(err),
+                            interface_name: None,
                         }),
                 );
             } else if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
@@ -1252,6 +1334,7 @@ pub(crate) async fn get_tunnel_statuses(
                             profile_id: profile.id.clone(),
                             state: TunnelState::Failed,
                             message: Some(err),
+                            interface_name: None,
                         }),
                 );
             } else {
@@ -1261,12 +1344,55 @@ pub(crate) async fn get_tunnel_statuses(
         Ok(statuses)
     }
     #[cfg(not(target_os = "linux"))]
-    let mut runtime = state.runtime.lock().await;
+    {
+        let runtime = state.runtime.lock().await;
+        Ok(profiles
+            .iter()
+            .map(|profile| runtime.tunnels.status(profile))
+            .collect())
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn get_tunnel_statuses(
+    state: State<'_, AppState>,
+) -> Result<Vec<TunnelStatus>, String> {
+    let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+    collect_tunnel_statuses(state.inner(), &profiles).await
+}
+
+/// Predicts the deterministic daemon resources an OpenVPN profile would use —
+/// interface name, staging directory, config and management socket paths —
+/// and reports which of them already collide. Read-only: nothing is staged,
+/// spawned, or authorized on Linux.
+#[tauri::command]
+pub(crate) async fn openvpn_plan(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<net_manager_core::daemon_protocol::OpenVpnPlanResult, String> {
+    let profile = find_profile(&state.profiles, &id)?;
+    if profile.backend != TunnelBackend::OpenVpn {
+        return Err("plan is only supported for OpenVPN profiles".into());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let (request, _) = prepare_linux_openvpn_request(
+            &state.config_vault,
+            &state.openvpn_credentials,
+            &profile,
+            None,
+            profile.routes.clone(),
+            method::OPENVPN_PLAN,
+        )?;
+        crate::daemon_client::DaemonClient::system()
+            .request(method::OPENVPN_PLAN, request)
+            .await
+            .map_err(|err| crate::daemon_client::user_message(&err))
+    }
     #[cfg(not(target_os = "linux"))]
-    Ok(profiles
-        .iter()
-        .map(|profile| runtime.tunnels.status(profile))
-        .collect())
+    {
+        Err("OpenVPN plan is only available on Linux".into())
+    }
 }
 
 /// Probe server-pushed routes for a disconnected managed OpenVPN profile.
@@ -2221,7 +2347,10 @@ mod tests {
             }
         });
         let client = crate::daemon_client::DaemonClient::new(socket.clone());
-        let connected = linux_xray_connect(&client, &vault, &p).await.unwrap();
+        let state = app_state(&dir);
+        let connected = linux_xray_connect(&client, &vault, &state, &p)
+            .await
+            .unwrap();
         assert_eq!(connected.state, TunnelState::Running);
         assert!(connected.message.unwrap().contains("IPv6 is not covered"));
         let restarted_client = crate::daemon_client::DaemonClient::new(socket);

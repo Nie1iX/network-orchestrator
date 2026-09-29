@@ -20,6 +20,13 @@ use windows::Win32::Networking::WinSock::{
 pub trait RouteExecutor: Send {
     fn add_route(&mut self, route: &AppliedRoute) -> io::Result<()>;
     fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()>;
+    /// Physical default gateways present in the main table, as
+    /// `(gateway, output interface)`. Used to install host bypass routes for
+    /// a tunnel's own upstream traffic (proxy server, captured DNS). An
+    /// executor that cannot inspect the host table returns an empty list.
+    fn default_gateways(&self) -> io::Result<Vec<(IpAddr, u32)>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Add `routes` in order; on the first failure remove the ones already

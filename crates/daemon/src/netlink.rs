@@ -160,6 +160,35 @@ fn owned_route_snapshot(message: &RouteMessage) -> Option<AppliedRoute> {
     })
 }
 
+/// A main-table default route carrying a gateway and an output interface —
+/// i.e. the physical uplink. Tunnel-carrying routes live in policy tables or
+/// lack a gateway, so they are naturally excluded.
+fn default_gateway(message: &RouteMessage) -> Option<(IpAddr, u32)> {
+    if message.header.destination_prefix_length != 0
+        || message.header.kind != RouteType::Unicast
+        || message.header.protocol == RouteProtocol::from(RTPROT_NETWORK_ORCHESTRATOR)
+        || route_table(message) != RouteHeader::RT_TABLE_MAIN as u32
+    {
+        return None;
+    }
+    let gateway = message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Gateway(RouteAddress::Inet(address)) => Some(IpAddr::V4(*address)),
+            RouteAttribute::Gateway(RouteAddress::Inet6(address)) => Some(IpAddr::V6(*address)),
+            _ => None,
+        })?;
+    let interface = message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Oif(index) => Some(*index),
+            _ => None,
+        })?;
+    Some((gateway, interface))
+}
+
 fn rule_family(family: IpFamily) -> AddressFamily {
     match family {
         IpFamily::Ipv4 => AddressFamily::Inet,
@@ -406,6 +435,9 @@ enum Command {
     OwnedRoutesSnapshot {
         reply: mpsc::Sender<io::Result<Vec<AppliedRoute>>>,
     },
+    DefaultGateways {
+        reply: mpsc::Sender<io::Result<Vec<(IpAddr, u32)>>>,
+    },
     RulesSnapshot {
         reply: mpsc::Sender<io::Result<Vec<OwnedRuleResource>>>,
     },
@@ -575,6 +607,24 @@ async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedRecei
                     RouteOp::Delete => handle.route().del(message).execute().await,
                 };
                 let _ = reply.send(result.map_err(netlink_error_to_io));
+            }
+            Command::DefaultGateways { reply } => {
+                let result = async {
+                    let mut gateways = Vec::new();
+                    for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+                        let mut stream = handle.route().get(version).execute();
+                        while let Some(message) =
+                            stream.try_next().await.map_err(netlink_error_to_io)?
+                        {
+                            if let Some(gateway) = default_gateway(&message) {
+                                gateways.push(gateway);
+                            }
+                        }
+                    }
+                    Ok(gateways)
+                }
+                .await;
+                let _ = reply.send(result);
             }
             Command::OwnedRoutesSnapshot { reply } => {
                 let result = async {
@@ -900,6 +950,10 @@ impl RouteExecutor for NetlinkExecutor {
             reply,
         })
     }
+
+    fn default_gateways(&self) -> io::Result<Vec<(IpAddr, u32)>> {
+        self.call_with(|reply| Command::DefaultGateways { reply })
+    }
 }
 
 impl PolicyRuleExecutor for NetlinkExecutor {
@@ -1191,6 +1245,65 @@ mod tests {
             )))
         );
         assert!(attrs(&message).contains(&RouteAttribute::Oif(3)));
+    }
+
+    #[test]
+    fn default_gateway_accepts_main_table_default_with_gateway() {
+        let mut message = RouteMessage::default();
+        message.header.address_family = AddressFamily::Inet;
+        message.header.kind = RouteType::Unicast;
+        message.header.table = RouteHeader::RT_TABLE_MAIN;
+        message.attributes = vec![
+            RouteAttribute::Gateway(RouteAddress::Inet("192.168.1.1".parse().unwrap())),
+            RouteAttribute::Oif(3),
+        ];
+        assert_eq!(
+            default_gateway(&message),
+            Some(("192.168.1.1".parse::<IpAddr>().unwrap(), 3))
+        );
+
+        let mut v6 = RouteMessage::default();
+        v6.header.address_family = AddressFamily::Inet6;
+        v6.header.kind = RouteType::Unicast;
+        v6.header.table = RouteHeader::RT_TABLE_MAIN;
+        v6.attributes = vec![
+            RouteAttribute::Gateway(RouteAddress::Inet6("fe80::1".parse().unwrap())),
+            RouteAttribute::Oif(4),
+        ];
+        assert_eq!(
+            default_gateway(&v6),
+            Some(("fe80::1".parse::<IpAddr>().unwrap(), 4))
+        );
+    }
+
+    #[test]
+    fn default_gateway_rejects_non_uplink_routes() {
+        let mut base = RouteMessage::default();
+        base.header.address_family = AddressFamily::Inet;
+        base.header.kind = RouteType::Unicast;
+        base.header.table = RouteHeader::RT_TABLE_MAIN;
+        base.attributes = vec![
+            RouteAttribute::Gateway(RouteAddress::Inet("192.168.1.1".parse().unwrap())),
+            RouteAttribute::Oif(3),
+        ];
+        // Non-default prefix.
+        let mut prefixed = base.clone();
+        prefixed.header.destination_prefix_length = 24;
+        assert_eq!(default_gateway(&prefixed), None);
+        // Our own tunnel-carrying routes never offer an uplink gateway.
+        let mut owned = base.clone();
+        owned.header.protocol = RouteProtocol::from(RTPROT_NETWORK_ORCHESTRATOR);
+        assert_eq!(default_gateway(&owned), None);
+        // Policy-table routes are not the physical uplink.
+        let mut table = base.clone();
+        table.attributes.push(RouteAttribute::Table(51820));
+        assert_eq!(default_gateway(&table), None);
+        // On-link defaults (e.g. point-to-point) carry no gateway.
+        let mut on_link = base.clone();
+        on_link
+            .attributes
+            .retain(|attr| !matches!(attr, RouteAttribute::Gateway(_)));
+        assert_eq!(default_gateway(&on_link), None);
     }
 
     #[test]
