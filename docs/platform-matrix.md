@@ -69,7 +69,8 @@ branches assume Linux.
 - macOS, Android, iOS — out of scope.
 
 Notes:
-- `TailscalePanel.tsx` exists (Linux-only) but is not mounted anywhere —
-  wire it into a page or remove it.
+- Tailscale integration is surfaced on Profiles under a "Services" group —
+  `TailscalePanel.tsx` renders the detail view for the service row
+  (Linux-only; the row is hidden on other platforms).
 - Every ✅ in this matrix should stay honest: when a row drifts, fix the
   code gate (`PlatformCapabilities` / `cfg!`) and this table together.

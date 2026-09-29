@@ -1261,7 +1261,17 @@ a:focus-visible,
   background: var(--bg-elev);
   padding: 1px 7px;
   border-radius: var(--r-full);
-  font-variant-numeric: tabular-nums;
+}
+
+.profile-group-label {
+  display: flex;
+  align-items: center;
+  margin-bottom: var(--sp-3);
+  padding: 5px 12px;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-strong);
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
 }
 
 .backend-icon {
@@ -1408,6 +1418,7 @@ a:focus-visible,
 .backend-avatar-openVpn { color: var(--ovpn-color); background: var(--ovpn-bg); }
 .backend-avatar-xray { color: var(--xray-color); background: var(--xray-bg); }
 .backend-avatar-none { color: var(--none-color); background: var(--none-bg); }
+.backend-avatar-service { color: var(--info); background: var(--info-bg); }
 
 .connection-card-info {
   display: flex;

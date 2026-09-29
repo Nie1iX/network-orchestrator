@@ -8,6 +8,7 @@ import {
   backendIcon,
   ChevronIcon,
   PlusIcon,
+  TailscaleIcon,
 } from "../icons";
 import AddConnectionMenu from "./AddConnectionMenu";
 import DiagnosticsModal from "./DiagnosticsModal";
@@ -25,6 +26,8 @@ import {
   storeSnippets,
 } from "./profiles/sets";
 import Skeleton from "./ui/Skeleton";
+import TailscalePanel from "./TailscalePanel";
+import ToggleSwitch from "./ui/ToggleSwitch";
 import { useToast } from "./ui/Toast";
 import ProfileFormModal, {
   editFormState,
@@ -43,6 +46,7 @@ import {
   SubscriptionEndpointInfo,
   SubscriptionDelayResult,
   SubscriptionRefreshResult,
+  TailscaleStatusResult,
   TunnelBackend,
   TunnelStatus,
 } from "../types";
@@ -173,6 +177,9 @@ export default function ProfileManager() {
     profileId: string;
     before: boolean;
   } | null>(null);
+  const [tailscale, setTailscale] = useState<TailscaleStatusResult | null>(null);
+  const [tailscaleBusy, setTailscaleBusy] = useState(false);
+  const [serviceSelected, setServiceSelected] = useState(false);
 
   useEffect(() => {
     try {
@@ -329,6 +336,45 @@ export default function ProfileManager() {
     const interval = setInterval(refreshStatuses, 2000);
     return () => clearInterval(interval);
   }, [refreshStatuses]);
+
+  const refreshTailscale = useCallback(async () => {
+    if (caps?.os !== "linux") return;
+    try {
+      setTailscale(
+        await invoke<TailscaleStatusResult>("tailscale_status"),
+      );
+    } catch {
+      setTailscale(null);
+    }
+  }, [caps?.os]);
+
+  useEffect(() => {
+    void refreshTailscale();
+    const onChanged = () => void refreshTailscale();
+    window.addEventListener("route-changed", onChanged);
+    const interval = setInterval(() => void refreshTailscale(), 15000);
+    return () => {
+      window.removeEventListener("route-changed", onChanged);
+      clearInterval(interval);
+    };
+  }, [refreshTailscale]);
+
+  const onToggleTailscale = async () => {
+    if (!tailscale?.available) return;
+    const running = tailscale.backendState === "Running";
+    setTailscaleBusy(true);
+    try {
+      setTailscale(
+        await invoke<TailscaleStatusResult>("tailscale_set_running", {
+          running: !running,
+        }),
+      );
+    } catch (err) {
+      toast("error", String(err));
+    } finally {
+      setTailscaleBusy(false);
+    }
+  };
 
   useEffect(() => {
     const subProfiles = profiles.filter((p) => p.subscription !== null);
@@ -956,6 +1002,17 @@ export default function ProfileManager() {
     profiles[0] ??
     null;
 
+  const tsRunning =
+    tailscale !== null &&
+    tailscale.available &&
+    tailscale.backendState === "Running";
+  const tsNeedsLogin = tailscale?.backendState === "NeedsLogin";
+  const tsMeta = !tailscale?.available
+    ? "tailscaled unavailable"
+    : tailscale.selfIps.length > 0
+      ? tailscale.selfIps.join(", ")
+      : tailscale.backendState;
+
   const selGroup = selected
     ? groups.find((g) => g.backend === selected.backend)
     : undefined;
@@ -1028,7 +1085,10 @@ export default function ProfileManager() {
           dropTarget?.profileId === profile.id && !dropTarget.before
         }
         canReorder={canReorder}
-        onSelect={() => setSelectedId(profile.id)}
+        onSelect={() => {
+          setServiceSelected(false);
+          setSelectedId(profile.id);
+        }}
         onToggle={() =>
           status.state === "running"
             ? void onDisconnect(profile)
@@ -1209,10 +1269,70 @@ export default function ProfileManager() {
           );
         })
       )}
+
+      {tailscale !== null && (
+        <div className="profile-group">
+          <div className="profile-group-label">Services</div>
+          <div className="profile-rows">
+            <div
+              role="button"
+              tabIndex={0}
+              className={`profile-row${serviceSelected ? " selected" : ""}`}
+              onClick={() => setServiceSelected(true)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  setServiceSelected(true);
+                }
+              }}
+            >
+              <span
+                className={`status-dot state-${
+                  tsRunning
+                    ? "running"
+                    : tailscale.available
+                      ? "stopped"
+                      : "unknown"
+                }`}
+              />
+              <span className="backend-avatar backend-avatar-service">
+                <TailscaleIcon size={18} />
+              </span>
+              <div className="profile-row-info">
+                <span className="profile-row-name">Tailscale</span>
+                <span className="profile-row-meta">{tsMeta}</span>
+              </div>
+              <ToggleSwitch
+                checked={tsRunning}
+                onChange={() => void onToggleTailscale()}
+                disabled={
+                  !tailscale.available || tsNeedsLogin || tailscaleBusy
+                }
+                busy={tailscaleBusy}
+                title={
+                  !tailscale.available
+                    ? "tailscaled is not installed or not running"
+                    : tsNeedsLogin
+                      ? "Log in first: tailscale login"
+                      : tsRunning
+                        ? "tailscale down"
+                        : "tailscale up"
+                }
+              />
+            </div>
+          </div>
+        </div>
+      )}
         </div>
 
         <div className="profiles-detail-pane">
-          {selected ? (
+          {serviceSelected && tailscale ? (
+            <TailscalePanel
+              status={tailscale}
+              busy={tailscaleBusy}
+              onToggle={() => void onToggleTailscale()}
+            />
+          ) : selected ? (
             <ProfileDetail
               profile={selected}
               status={statusFor(selected.id)}
