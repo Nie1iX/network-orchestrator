@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
+import CondRules from "./components/CondRules";
 import Home from "./components/Home";
 import InterfaceList from "./components/InterfaceList";
 import Logs from "./components/Logs";
@@ -58,6 +59,7 @@ function App() {
           {tab === "connections" && <ProfileManager />}
           {tab === "network" && <InterfaceList />}
           {tab === "routes" && <RouteView />}
+          {tab === "conditions" && <CondRules />}
           {tab === "logs" && <Logs />}
           {tab === "settings" && <Settings />}
         </main>

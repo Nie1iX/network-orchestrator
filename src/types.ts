@@ -432,3 +432,48 @@ export interface ExitIpEntry {
   country: string | null;
   error: string | null;
 }
+
+// ── Conditional rules (Linux daemon) ──────────────────────────────────
+
+/** When a conditional rule's routes may be installed. */
+export type RouteCondition = {
+  kind: "interfaceAddressIn";
+  /** Active while a physical uplink holds a global address inside this. */
+  prefix: string;
+};
+
+export interface ConditionalRouteRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  condition: RouteCondition;
+  routes: PolicyRoute[];
+}
+
+export type ConditionalRuleState = "disabled" | "inactive" | "active" | "error";
+
+export interface ConditionalRuleStatus {
+  state: ConditionalRuleState;
+  /** Interface that satisfied the condition during the last evaluation. */
+  matchedInterface?: string | null;
+  appliedRoutes: number;
+  detail?: string | null;
+}
+
+export interface ConditionalRuleEntry {
+  rule: ConditionalRouteRule;
+  status: ConditionalRuleStatus;
+}
+
+export interface CondRulesListResult {
+  rules: ConditionalRuleEntry[];
+}
+
+export interface CondRulesPutResult {
+  stored: boolean;
+  status: ConditionalRuleStatus;
+}
+
+export interface CondRulesRemoveResult {
+  removed: boolean;
+}

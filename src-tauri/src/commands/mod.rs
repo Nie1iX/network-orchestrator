@@ -1,5 +1,6 @@
 pub(crate) mod always_on;
 pub(crate) mod bulk_routes;
+pub(crate) mod cond_rules;
 pub(crate) mod diagnostics;
 pub(crate) mod exit_ips;
 pub(crate) mod explorer;
@@ -14,6 +15,9 @@ pub(crate) use always_on::{
     get_always_on_profiles, remove_always_on_profile, resume_always_on, set_always_on_profile,
 };
 pub(crate) use bulk_routes::parse_bulk_cidrs;
+pub(crate) use cond_rules::{
+    list_conditional_rules, put_conditional_rule, remove_conditional_rule,
+};
 pub(crate) use diagnostics::{diagnose_profile, inspect_profile_by_id, inspect_profiles};
 pub(crate) use exit_ips::check_exit_ips;
 pub(crate) use explorer::{get_interfaces, get_routes, lookup_destination, set_interface_state};

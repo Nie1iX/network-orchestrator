@@ -218,6 +218,18 @@ export function HomeIcon({ size = 18, className }: IconProps) {
   );
 }
 
+export function ConditionsIcon({ size = 18, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <circle cx="6" cy="6" r="3" />
+      <circle cx="6" cy="18" r="3" />
+      <circle cx="18" cy="8" r="3" />
+      <path d="M6 9v6" />
+      <path d="M15.5 9.7 8 16" />
+    </svg>
+  );
+}
+
 export function LogsIcon({ size = 18, className }: IconProps) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>

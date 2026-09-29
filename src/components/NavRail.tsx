@@ -1,6 +1,6 @@
-import { HomeIcon, ProfileIcon, NetworkIcon, RouteIcon, LogsIcon, SettingsIcon } from "../icons";
+import { HomeIcon, ConditionsIcon, ProfileIcon, NetworkIcon, RouteIcon, LogsIcon, SettingsIcon } from "../icons";
 
-export type Tab = "home" | "connections" | "network" | "routes" | "logs" | "settings";
+export type Tab = "home" | "connections" | "conditions" | "network" | "routes" | "logs" | "settings";
 
 interface NavItem {
   id: Tab;
@@ -14,6 +14,7 @@ const PRIMARY: NavItem[] = [
 ];
 
 const ADVANCED: NavItem[] = [
+  { id: "conditions", label: "Conditions", icon: <ConditionsIcon size={20} /> },
   { id: "network", label: "Network", icon: <NetworkIcon size={20} /> },
   { id: "routes", label: "Routes", icon: <RouteIcon size={20} /> },
   { id: "logs", label: "Logs", icon: <LogsIcon size={20} /> },
