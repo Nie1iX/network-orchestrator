@@ -38,5 +38,6 @@ pub(crate) use system::{
 };
 pub(crate) use tunnels::{
     connect_openvpn_with_credentials, connect_profile, disconnect_profile, get_tunnel_statuses,
-    openvpn_plan, probe_openvpn_routes, reload_xray_profile,
+    openvpn_plan, probe_openvpn_routes, reload_xray_profile, tailscale_set_running,
+    tailscale_status,
 };

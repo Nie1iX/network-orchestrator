@@ -119,6 +119,8 @@ pub fn run() {
             openvpn_plan,
             probe_openvpn_routes,
             reload_xray_profile,
+            tailscale_status,
+            tailscale_set_running,
             inspect_profile_by_id,
             inspect_profiles,
             diagnose_profile,

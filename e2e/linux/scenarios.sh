@@ -82,6 +82,11 @@ EOF
 )
 expect_eq "$uid" 0 "hello uid for root"
 
+step "tailscale.status: absent daemon reports unavailable, not an RPC error"
+ts=$(python3 "$CLIENT" tailscale.status)
+python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["available"] is False and r["backendState"]=="Unavailable" and r["peers"]==[], r' "$ts" \
+    && ok "tailscale.status available:false" || fail "tailscale.status: $ts"
+
 step "routes.apply: on-link v4, via v4, via v6"
 python3 "$CLIENT" routes.apply "{\"owner\":\"static\",\"routes\":[
   {\"destination\":\"203.0.113.0/24\",\"interfaceIndex\":$IDX,\"metric\":5},

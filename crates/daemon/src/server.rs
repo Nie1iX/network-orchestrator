@@ -621,6 +621,29 @@ async fn handle<A: Authorizer>(
             notify(ctx, uid, owner);
             to_value(&XrayConnectResult { status })
         }
+        method::TAILSCALE_STATUS => {
+            // tailscaled is a foreign daemon — a read-only status proxy with
+            // nothing journaled, so no authorization is required.
+            let status = crate::tailscale::status(&crate::tailscale::socket_path())
+                .map_err(|_| (ErrorCode::Internal, "tailscaled status failed".into()))?;
+            to_value(&status)
+        }
+        method::TAILSCALE_UP | method::TAILSCALE_DOWN => {
+            authorize(ctx, peer, Action::ConnectProfile).await?;
+            let want_running = request.method == method::TAILSCALE_UP;
+            crate::tailscale::set_running(&crate::tailscale::socket_path(), want_running).map_err(
+                |err| match err.kind() {
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                        (ErrorCode::NotFound, "tailscaled is not available".into())
+                    }
+                    _ => (ErrorCode::Internal, "tailscaled request failed".into()),
+                },
+            )?;
+            let status = crate::tailscale::status(&crate::tailscale::socket_path())
+                .map_err(|_| (ErrorCode::Internal, "tailscaled status failed".into()))?;
+            notify(ctx, uid, "tailscale".to_string());
+            to_value(&status)
+        }
         method::ROUTES_APPLY => {
             let params: RoutesApplyParams = params(request.params)?;
             validate_owner(&params.owner).map_err(invalid)?;
@@ -1472,6 +1495,92 @@ mod tests {
         assert_eq!(reply["result"]["state"], "stopped");
         assert!(reply["result"]["interfaceName"].is_null());
         assert_eq!(harness.auth_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn tailscale_status_and_control_proxy_the_localapi() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let status_json = r#"{
+            "BackendState": "Running",
+            "CurrentTailnet": "tailnet-test.ts.net",
+            "MagicDNSSuffix": "tailnet-test.ts.net",
+            "Self": {"HostName": "fedora", "TailscaleIPs": ["100.78.82.81"]},
+            "Peer": {
+                "nodekey:peer1": {
+                    "HostName": "kzn1", "Online": true,
+                    "TailscaleIPs": ["100.99.99.99"],
+                    "AllowedIPs": ["100.99.99.99/32", "192.168.30.0/24"]
+                }
+            }
+        }"#;
+
+        // A fake `tailscaled`: every accepted connection gets one request, the
+        // raw request is reported over the channel, and it is answered with
+        // `{}` for PATCH or the status fixture for anything else.
+        let dir = std::env::temp_dir().join(format!("netmgr-ts-srv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("tailscaled.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            while let Ok((mut conn, _)) = listener.accept() {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match conn.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let _ = tx.send(request.clone());
+                let body = if request.starts_with("PATCH") {
+                    "{}".to_string()
+                } else {
+                    status_json.to_string()
+                };
+                let _ = conn.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        // The override only affects this test process.
+        std::env::set_var(crate::tailscale::SOCKET_ENV, sock.to_str().unwrap());
+
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+
+        // Status is a read: the LocalAPI payload is mapped without any polkit.
+        let reply = client.call(2, method::TAILSCALE_STATUS, json!({})).await;
+        assert_eq!(reply["result"]["available"], true);
+        assert_eq!(reply["result"]["backendState"], "Running");
+        assert_eq!(reply["result"]["tailnet"], "tailnet-test.ts.net");
+        assert_eq!(reply["result"]["selfIps"][0], "100.78.82.81");
+        assert_eq!(reply["result"]["peers"][0]["routes"][0], "192.168.30.0/24");
+        assert_eq!(harness.auth_calls(), 0);
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .starts_with("GET /localapi/v0/status"));
+
+        // Down authorizes like a tunnel action and patches WantRunning off.
+        let reply = client.call(3, method::TAILSCALE_DOWN, json!({})).await;
+        assert_eq!(reply["result"]["backendState"], "Running");
+        assert_eq!(harness.auth_calls(), 1);
+        let patch = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(patch.starts_with("PATCH /localapi/v0/prefs"));
+        assert!(patch.contains("\"WantRunning\":false"));
+
+        std::env::remove_var(crate::tailscale::SOCKET_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

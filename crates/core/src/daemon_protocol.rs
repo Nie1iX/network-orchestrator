@@ -49,6 +49,9 @@ pub mod method {
     pub const XRAY_DISCONNECT: &str = "xray.disconnect";
     pub const XRAY_STATUS: &str = "xray.status";
     pub const XRAY_RELOAD: &str = "xray.reload";
+    pub const TAILSCALE_STATUS: &str = "tailscale.status";
+    pub const TAILSCALE_UP: &str = "tailscale.up";
+    pub const TAILSCALE_DOWN: &str = "tailscale.down";
     pub const ALWAYS_ON_SET: &str = "alwaysOn.set";
     pub const ALWAYS_ON_LIST: &str = "alwaysOn.list";
     pub const ALWAYS_ON_REMOVE: &str = "alwaysOn.remove";
@@ -60,7 +63,7 @@ pub mod method {
     pub const COND_RULES_REMOVE: &str = "condRules.remove";
 
     /// Methods implemented by the daemon and reported in `hello.capabilities`.
-    pub const CAPABILITIES: [&str; 27] = [
+    pub const CAPABILITIES: [&str; 30] = [
         ROUTES_APPLY,
         ROUTES_REMOVE,
         LINK_SET_STATE,
@@ -79,6 +82,9 @@ pub mod method {
         XRAY_DISCONNECT,
         XRAY_STATUS,
         XRAY_RELOAD,
+        TAILSCALE_STATUS,
+        TAILSCALE_UP,
+        TAILSCALE_DOWN,
         ALWAYS_ON_SET,
         ALWAYS_ON_LIST,
         ALWAYS_ON_REMOVE,
@@ -625,6 +631,57 @@ pub struct XrayDisconnectResult {
     pub stopped: bool,
 }
 
+/// The system `tailscaled` is a *foreign* daemon: it owns its own process,
+/// TUN and policy routing, so nothing here is journaled. These methods just
+/// proxy the LocalAPI status and the WantRunning pref (`tailscale up/down`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscalePeer {
+    pub host_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_name: Option<String>,
+    #[serde(default)]
+    pub tailscale_ips: Vec<String>,
+    /// Advertised routes for subnet routers (`AllowedIPs` minus the node's
+    /// own /32 and /128 addresses), e.g. `192.168.1.0/24`.
+    #[serde(default)]
+    pub routes: Vec<String>,
+    /// This peer currently is our exit node.
+    #[serde(default)]
+    pub exit_node: bool,
+    /// This peer offers itself as an exit node.
+    #[serde(default)]
+    pub exit_node_option: bool,
+    #[serde(default)]
+    pub online: bool,
+    #[serde(default)]
+    pub os: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleStatusResult {
+    /// `false` when `tailscaled` is absent or its socket is unreachable —
+    /// an absent daemon is a state, not an RPC error.
+    pub available: bool,
+    /// `ipnstate` BackendState verbatim: "Running", "Stopped", "NeedsLogin"…
+    pub backend_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailnet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magic_dns_suffix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_host_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_dns_name: Option<String>,
+    #[serde(default)]
+    pub self_ips: Vec<String>,
+    #[serde(default)]
+    pub exit_node_active: bool,
+    #[serde(default)]
+    pub peers: Vec<TailscalePeer>,
+}
+
 /// Only these backends support pre-login replay. OpenVPN credentials and Xray
 /// plaintext need a separate persistence/security review before enrollment.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1068,7 +1125,7 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove"]}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove"]}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);
@@ -1079,6 +1136,33 @@ mod tests {
             r#"{"id":1,"ok":false,"error":{"code":"protocolMismatch","message":"daemon speaks protocol 1, client 2"}}"#,
         );
         assert_eq!(error.code, ErrorCode::ProtocolMismatch);
+    }
+
+    #[test]
+    fn golden_tailscale() {
+        let (frame, _): (_, serde_json::Value) =
+            request(r#"{"id":40,"method":"tailscale.status","params":{}}"#);
+        assert_eq!(frame.method, method::TAILSCALE_STATUS);
+
+        let (_, result): (_, TailscaleStatusResult) = ok_response(
+            r#"{"id":41,"ok":true,"result":{"available":true,"backendState":"Running",
+              "tailnet":"tailnet.test","selfIps":["100.78.82.81"],
+              "exitNodeActive":false,
+              "peers":[{"hostName":"kzn1","tailscaleIps":["100.85.160.64"],
+                "routes":["192.168.9.0/24"],"exitNode":false,
+                "exitNodeOption":false,"online":true,"os":"linux"}]}}"#,
+        );
+        assert!(result.available);
+        assert_eq!(result.backend_state, "Running");
+        assert_eq!(result.peers[0].routes, ["192.168.9.0/24"]);
+        // Round-trip keeps camelCase on the wire.
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("backendState").is_some());
+        assert!(json.get("backend_state").is_none());
+        let (_, empty): (_, TailscaleStatusResult) = ok_response(
+            r#"{"id":42,"ok":true,"result":{"available":false,"backendState":"Unavailable","selfIps":[],"exitNodeActive":false,"peers":[]}}"#,
+        );
+        assert!(!empty.available);
     }
 
     #[test]

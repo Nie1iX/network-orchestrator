@@ -433,6 +433,32 @@ export interface ExitIpEntry {
   error: string | null;
 }
 
+export interface TailscalePeer {
+  hostName: string;
+  dnsName?: string | null;
+  tailscaleIps: string[];
+  /** Subnet routes this peer advertises (its own /32,/128 addresses excluded). */
+  routes: string[];
+  exitNode: boolean;
+  exitNodeOption: boolean;
+  online: boolean;
+  os: string;
+}
+
+export interface TailscaleStatusResult {
+  /** False when tailscaled is absent or unreachable — a state, not an error. */
+  available: boolean;
+  /** ipnstate BackendState verbatim: "Running", "Stopped", "NeedsLogin"… */
+  backendState: string;
+  tailnet?: string | null;
+  magicDnsSuffix?: string | null;
+  selfHostName?: string | null;
+  selfDnsName?: string | null;
+  selfIps: string[];
+  exitNodeActive: boolean;
+  peers: TailscalePeer[];
+}
+
 // ── Conditional rules (Linux daemon) ──────────────────────────────────
 
 /** When a conditional rule's routes may be installed. */

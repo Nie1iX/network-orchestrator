@@ -28,10 +28,10 @@ fn select_replacement_socks_port(
 use net_manager_core::daemon_protocol::{
     method, OpenVpnConnectParams, OpenVpnConnectRequest, OpenVpnConnectResult,
     OpenVpnConnectionState, OpenVpnCredentials, OpenVpnDisconnectResult, OpenVpnProbeResult,
-    OpenVpnProfileParams, OpenVpnStatusResult, OpenVpnWarning, WireGuardConnectParams,
-    WireGuardConnectResult, WireGuardDisconnectResult, WireGuardProfileParams,
-    WireGuardStatusResult, WireGuardWarning, XrayConnectParams, XrayConnectResult,
-    XrayDisconnectResult, XrayProfileParams, XrayStatusResult,
+    OpenVpnProfileParams, OpenVpnStatusResult, OpenVpnWarning, TailscaleStatusResult,
+    WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
+    WireGuardProfileParams, WireGuardStatusResult, WireGuardWarning, XrayConnectParams,
+    XrayConnectResult, XrayDisconnectResult, XrayProfileParams, XrayStatusResult,
 };
 
 #[cfg(target_os = "linux")]
@@ -1446,6 +1446,49 @@ pub(crate) async fn reload_xray_profile(
     #[cfg(not(target_os = "linux"))]
     {
         Err("Xray reload is only available on Linux".into())
+    }
+}
+
+/// Read-only view of the system `tailscaled`: backend state, tailnet, our
+/// addresses and the routes peers advertise. `available:false` when the
+/// daemon is absent — that is a state, not an error.
+#[tauri::command]
+pub(crate) async fn tailscale_status() -> Result<TailscaleStatusResult, String> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::daemon_client::DaemonClient::system()
+            .request(method::TAILSCALE_STATUS, serde_json::Value::Null)
+            .await
+            .map_err(|err| crate::daemon_client::user_message(&err))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("Tailscale status is only available on Linux".into())
+    }
+}
+
+/// `tailscale up`/`down` as seen from the daemon: flips tailscaled's
+/// WantRunning pref via LocalAPI and returns the fresh status.
+#[tauri::command]
+pub(crate) async fn tailscale_set_running(running: bool) -> Result<TailscaleStatusResult, String> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::daemon_client::DaemonClient::system()
+            .request(
+                if running {
+                    method::TAILSCALE_UP
+                } else {
+                    method::TAILSCALE_DOWN
+                },
+                serde_json::Value::Null,
+            )
+            .await
+            .map_err(|err| crate::daemon_client::user_message(&err))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = running;
+        Err("Tailscale control is only available on Linux".into())
     }
 }
 
