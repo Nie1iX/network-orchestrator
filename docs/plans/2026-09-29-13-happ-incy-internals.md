@@ -1,0 +1,153 @@
+# Разбор Happ 4.3.0 и INCY 3.8.8 — архитектура и что стоит перенять (2026-09-29)
+
+**Статус:** статический анализ установленных артефактов на этом хосте.
+Happ — rpm `/opt/happ` (Qt6/QML GUI + root-демон + бандлированные ядра).
+INCY — Compose Multiplatform (Kotlin/JVM) JAR, декомпилирован CFR 0.152
+(`/tmp/incy-src` — временно); Linux-установка на хосте удалена, анализ по
+Windows-пакету `Program Files/INCY` + легacy-конфигам в `~/.config/incy`.
+
+## Happ (`happ-4.3.0-318`)
+
+### Состав
+- `bin/Happ` — Qt6/QML GUI (13 МБ, stripped). QML-импорты в `lib/qml`.
+  Диплинки `happ://connect|disconnect|toggle|routing|routing/add/…` и
+  `happ://crypt/`…`crypt5/` — **пять уровней шифрованных подписочных
+  ссылок** для провайдеров.
+- `bin/happd` — root-демон (не stripped, символы читаются), systemd
+  `Restart=always`. IPC — unix-сокет `/tmp/happd.sock`.
+- `bin/core/xray` 26.7.28 + geoip/geosite + `routing/` (каталоги профилей
+  роутинга: `~/.local/share/Happ/routing/<subId>/<name>/{geoip,geosite}.dat` —
+  per-profile geo-ассеты, как у нас).
+- `bin/tun/sing-box` 1.12.12 и `bin/tun2/{libtun2proxy.so,tun2proxy-bin,
+  udpgw-server}` — **несколько TUN-движков**: `tun-type` meta-параметр
+  принимает `singbox|tun2proxy|default|xray` (xray tun inbound тоже есть).
+- `bin/antifilter` — вендорный **byedpi** (CLI-сигнатура `-K proto,
+  -H hosts, -j ipset, -V ports, -M mod-http hcsmix/dcsmix/rmspace`) —
+  DPI-desync без VPN вообще.
+- `happ-diag`, `happ-tcping` — диагностика и TCP-ping (не прокси-ping).
+
+### Демон `happd` (символы)
+- `CommunicationServer`/`ClientConnection` — мультиклиентский сокет.
+- `HappDaemon`: `onSystemSuspend/onSystemResume`, `isInWakeGrace`
+  (grace-окно после пробуждения), `armPendingSessionCleanup`
+  (отложенная уборка при смерти GUI — туннель не падает мгновенно),
+  `broadcastProcessEvent`.
+- `ManagedProcess`/`ProcessManager`: спавнит xray/sing-box по JSON-спеке
+  от GUI (`setupProcess`, `buildEnvironment`, `parseArguments`),
+  `attemptRestart`, stdout/stderr назад клиенту.
+- `ProcessExplorerService/Worker` — **per-app разведка**: список процессов
+  + кэш иконок (`pruneIconCache`) → сплит-туннелирование по приложениям.
+- `PushService` + `McsClient` + `mcs_proto` (protobuf) — живой FCM/MCS-канал
+  к `mtalk.google.com:5228`, heartbeat + reconnect, `HappStateStore`
+  (sqlite `/var/lib/happd/state.db`) — пуши от Happ-инфраструктуры.
+- `Components::ApplyProxySettings/ClearProxySettings` — системный прокси.
+- pkexec-фолбэк: полиси `com.happ.singbox.policy`,
+  `com.happ.tun2proxy.policy`, хелперы `happ-kill-singbox`,
+  `happ-tun2proxy-wrapper` в `/usr/local/bin`.
+
+### Модель данных
+- GUI собирает конфиги сам (`[CONFIG BUILDER] Building VLESS_gRPC_*`),
+  демон лишь запускает процессы — **демон = тонкий привилегированный
+  process-manager**, вся логика в GUI.
+- `routing.json`: профили привязаны к `subscriptionId`
+  (`subConfigs[].subscriptionId`, `providerRoutingDisabled`,
+  `ignoreProfile`) — отсюда наш баг с неприменённым профилем.
+- Подписки: `subs.db` + HWID-параметры (`subsSendHWID`,
+  `subsAlternativeHWID`, `subsReadOnlyHWID`), `heartbeat-%1` —
+  heartbeat-воркер к провайдеру, `subscription-userinfo` парсинг.
+- `happ::TDnsttClient`/`DnsttStats` + `dnstt-probe.json` — **DNSTT**
+  (DNS-туннель) клиент для глухих блокировок.
+- `premium-fallback.bin` — офлайн-фолбэк премиум-проверки.
+
+## INCY (`incy-desktop-3.8.8.jar`)
+
+### Стек
+- Kotlin/JVM + Compose Desktop (JBR), Koin DI, kotlinx-serialization,
+  sqlite (`~/.local/share/incy/incy.db`: `servers`, `subscriptions`),
+  JNA для libc (`LinuxTun` — прямой `ioctl(TUNSETIFF)`), JBR-runtime в
+  комплекте. URL-схемы `incy:`, `awg:`, `amneziawg:` (AmneziaWG!).
+- `SingleInstance` — unix-socket IPC: второй запуск форвардит URL в живое
+  окно + file-lock.
+- `linux/incy-tray.py` — AppIndicator/StatusNotifier мост (stdin/stdout
+  JSON) — java.awt.SystemTray мёртв на Wayland, они притащили Python-
+  хелпер. Аккуратное решение той же проблемы, что у нас.
+
+### Привилегии и TUN
+- `platform/f` — эскалатор: `pkexec --disable-internal-agent` → sudo →
+  doas; учитывает `FLATPAK_ID`/`APPIMAGE`, `/etc/os-release` (SteamOS!).
+- `service/H` (`XrayHelperRuntime`): ставит `incy-helper-linux.sh` в
+  `/usr/lib/incy/` + polkit-экшн `cc.incy.vpn.policy`. Команды хелпера:
+  `standalone-up <tun> <uid> <mtu>`, `standalone-apply <cidr> <dnsCsv>
+  <routesCsv>`, `standalone-down`, `dns-restore`, `route-cleanup`,
+  `stop-xray-tun`. xray под `/var/tmp/incy-xray/` (pid, xray.log,
+  config.json), geo-ассеты стейджатся (`stageGeoAssets`).
+- macOS-вариант хелпера (`incy-helper.sh`, whitelist команд): TUN через
+  **hev-socks5-tunnel** (не xray!), поиск `utun*` по адресу, и главное —
+  `route-setup` явно обходит `8.8.8.8/1.1.1.1/9.9.9.9…` через физический
+  шлюз: «иначе DNS xray попадает в TUN → петля резолва → CPU storm».
+- Windows (`service/D`, WinTun): ждёт регистрации адаптера 30с, ставит
+  `0.0.0.0/1`+`128.0.0.0/1` через gw `198.18.0.1` (split-default, не
+  трогает дефолт), `Set-NetConnectionProfile Private`, DNS snapshot через
+  netsh → restore, `/32`-маршрут сервера через физшлюз, `ipconfig
+  /flushdns`, orphan-sweep на останове.
+- Kill switch Linux (`platform/o`): iptables-цепь `INCY_KILLSWITCH` —
+  RETURN для lo/127/8, `mark 8888` (fwmark самого xray!), `198.18.0.0/15`
+  (FakeDNS), multicast/broadcast, dport 53 → `REJECT
+  icmp-admin-prohibited`; вешается `iptables -I OUTPUT 1`.
+
+### Движок и фичи
+- Движок **только xray** (`tun_incy`, `xray_ping_*.json`). Пинг —
+  `pingProtocol: incy`: на каждый сервер поднимается реальный xray с
+  временным конфигом и меряется HTTP-задержка через локальный SOCKS —
+  честный e2e-ping вместо tcping.
+- `xray api statsquery --server=127.0.0.1:10813` — счётчики трафика
+  через встроенный API xray.
+- preferences.json: `useMux`/`muxConcurrency`/`muxXudpConcurrency`
+  (XUDP!), `useFragmentation` (`tlshello`, длина/интервал пакетов),
+  `useNoises` (rand-паддинг), `enableFakeDNS` (198.18/15), `remoteDNS`
+  DoH `https://1.1.1.1/dns-query` + `domesticDNS`, `captureSystemDns`,
+  `killSwitch`, `allowLanConnections/Hotspot/ViaProxy`,
+  `bypassPrivateIPs`, `geoTrimEnabled` (тримминг dat под выбранные
+  категории!), `routingProfilesEnabled`, `providerTheme`, sendHWID,
+  `customUserAgent`, `preferredIPType`.
+- Модели (`domain/model`, не обфусцированы): `XrayFullConfig`,
+  `RoutingConfig`, `DnsConfig`, `InboundConfig`, `OutboundConfig`,
+  `NoiseConfig`, `SniffingConfig`, `SubscriptionConfig.PremiumSettings`,
+  `XrayRoutingRule`, `BurstObservatory` (xray observatory для
+  url-test/balancer), `ProfileDnsTransport` (per-profile DNS-транспорт).
+
+## Что перенять нам (приоритеты)
+
+1. **Bypass-маршрут сервера `/32` через физический шлюз** — есть и у Happ,
+   и у Incy; у нас server-IP без явного маршрута (заложник чужих
+   туннелей — реальный инцидент с happ-xray).
+2. **Bypass-маршруты публичных DNS** (8.8.8.8/1.1.1.1/9.9.9.9 + custom
+   remoteDNS) через физшлюз — Incy прямо называет причину: DNS-петля в
+   TUN → CPU storm. У нас DNS на линке — проверить этот сценарий.
+3. **Split-default `0.0.0.0/1`+`128.0.0.0/1`** вместо/рядом с `0.0.0.0/0` —
+   альтернатива нашему `suppress_prefix_length`-подходу, совместимее с
+   чужими туннелями.
+4. **Grace-очистка при смерти клиента** (`armPendingSessionCleanup`) и
+   wake-grace (`onSystemResume`) — у нас disconnect жёсткий; suspend/resume
+   в AGENTS-мишени ещё не покрыт.
+5. **stderr xray в лог** — Incy/Happ пишут `xray.log`; у нас `Stdio::null`
+   (реальный провал диагностики в этом инциденте).
+6. **`xray api statsquery`** для live-счётчиков rx/tx — проще, чем парсинг
+   /proc/net/dev по интерфейсу.
+7. **E2E-ping через временный xray** (`xray_ping_*.json` + SOCKS на
+   loopback) — точнее tcping; переиспользует уже генерируемый конфиг.
+8. **Kill switch** — готовый паттерн iptables-цепи (mark-исключение +
+   FakeDNS-диапазон + DNS-исключение + REJECT).
+9. **FCM/MCS push и DNSTT** — провайдер-фичи, нам не нужны сейчас.
+10. **fwmark 8888** у Incy — аналог нашего `transportMark`; проверить, что
+    kill-switch/правила учитывают нашу метку так же.
+11. Tray на Linux через AppIndicator-пайтон — альтернатива, если статусный
+    значок понадобится до поддержки в Tauri.
+
+## Прочие находки
+
+- Happ `tun-type` принимает meta-параметр из подписки — провайдер может
+  выбирать движок TUN клиенту (singbox/tun2proxy/xray/default).
+- `happ://cryptN/` — шифрованные ссылки подписок; формат не раскрыт
+  (строки показывают только схему).
+- INCY хранит серверы/подписки в sqlite; Happ — `subs.db` + JSON-конфиги.

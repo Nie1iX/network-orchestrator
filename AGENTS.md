@@ -88,3 +88,20 @@ npm run build
   root `Cargo.toml`; do not duplicate it in `package.json` or `tauri.conf.json`.
 - Store files are versioned documents written atomically (temp + rename)
   and ACL-protected via `config_security::protect_path`.
+
+## Design system
+
+- All colors come from the OKLCH design tokens at the top of `src/App.css`
+  (neutral surfaces, indigo accent, `--up/--down/--warn/--info` semantics,
+  `--cat-*` categorical scale). No hardcoded hex/`rgba()` colors in CSS or
+  TSX — JS-rendered visuals import from `src/palette.ts` (keep in sync with
+  the `--cat-*` tokens).
+- One primary CTA per screen: `btn-primary`. Default `<button>` is the
+  secondary style; `btn-danger`, `btn-ghost`, `btn-sm`, `btn-with-icon` are
+  the other sanctioned variants.
+- Icons live in `src/icons.tsx` (24×24, stroke-based). No Unicode glyphs as
+  UI icons; `…` is allowed only in placeholders/loading labels.
+- Right-align numeric table cells with `.num`; use `formatBytes`/`formatRate`
+  from `src/format.ts` and `<RateText>` for rx/tx readouts.
+- Transient feedback uses `useToast()` (`ToastProvider` wraps the app in
+  `src/App.tsx`); persistent banners keep `.runtime-notice`/`.save-notice`.
