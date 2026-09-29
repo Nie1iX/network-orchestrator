@@ -582,6 +582,21 @@ async fn handle<A: Authorizer>(
             .await?;
             to_value(&status)
         }
+        method::XRAY_RELOAD => {
+            let params: XrayConnectParams = from_value(request.params)
+                .map_err(|_| invalid("invalid Xray reload parameters".into()))?;
+            prepare_xray(uid, params.clone(), 1)
+                .map_err(|_| invalid("unsupported generated Xray TUN config".into()))?;
+            let broad = params
+                .routes
+                .iter()
+                .any(|route| captures_all_traffic(route.destination));
+            authorize(ctx, peer, connect_action(ctx.vpn_auth_mode(), broad)).await?;
+            let owner = format!("xray:{}", params.profile_id);
+            let status = with_core(ctx, move |core| core.reload_xray(uid, params)).await?;
+            notify(ctx, uid, owner);
+            to_value(&XrayConnectResult { status })
+        }
         method::ROUTES_APPLY => {
             let params: RoutesApplyParams = params(request.params)?;
             validate_owner(&params.owner).map_err(invalid)?;

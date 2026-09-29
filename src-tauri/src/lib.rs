@@ -117,6 +117,7 @@ pub fn run() {
             disconnect_profile,
             openvpn_plan,
             probe_openvpn_routes,
+            reload_xray_profile,
             inspect_profile_by_id,
             inspect_profiles,
             diagnose_profile,

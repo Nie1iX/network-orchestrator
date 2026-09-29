@@ -48,6 +48,7 @@ pub mod method {
     pub const XRAY_CONNECT: &str = "xray.connect";
     pub const XRAY_DISCONNECT: &str = "xray.disconnect";
     pub const XRAY_STATUS: &str = "xray.status";
+    pub const XRAY_RELOAD: &str = "xray.reload";
     pub const ALWAYS_ON_SET: &str = "alwaysOn.set";
     pub const ALWAYS_ON_LIST: &str = "alwaysOn.list";
     pub const ALWAYS_ON_REMOVE: &str = "alwaysOn.remove";
@@ -56,7 +57,7 @@ pub mod method {
     pub const SETTINGS_SET: &str = "settings.set";
 
     /// Methods implemented by the daemon and reported in `hello.capabilities`.
-    pub const CAPABILITIES: [&str; 23] = [
+    pub const CAPABILITIES: [&str; 24] = [
         ROUTES_APPLY,
         ROUTES_REMOVE,
         LINK_SET_STATE,
@@ -74,6 +75,7 @@ pub mod method {
         XRAY_CONNECT,
         XRAY_DISCONNECT,
         XRAY_STATUS,
+        XRAY_RELOAD,
         ALWAYS_ON_SET,
         ALWAYS_ON_LIST,
         ALWAYS_ON_REMOVE,
@@ -971,7 +973,7 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set"]}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set"]}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);
@@ -1227,6 +1229,14 @@ mod tests {
         let (_, result): (_, XrayDisconnectResult) =
             ok_response(r#"{"id":23,"ok":true,"result":{"stopped":true}}"#);
         assert!(result.stopped);
+        // xray.reload carries the same connect params — the daemon validates
+        // them against the live tunnel before restarting the child in place.
+        let (frame, params): (_, XrayConnectParams) = request(
+            r#"{"id":24,"method":"xray.reload","params":{"profileId":"office","config":"{\"outbounds\":[]}","routes":[],"dnsServers":[],"dnsDomains":[]}}"#,
+        );
+        assert_eq!(frame.method, method::XRAY_RELOAD);
+        assert_eq!(params.profile_id, "office");
+        assert!(!format!("{params:?}").contains("outbounds"));
     }
 
     #[test]

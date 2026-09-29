@@ -272,6 +272,31 @@ async fn linux_xray_connect(
     Ok(linux_xray_tunnel_status(result.status, profile))
 }
 
+/// Re-send the profile's current generated config to the running Xray tunnel:
+/// the daemon swaps the staged config and restarts the child in place,
+/// keeping routes, DNS and the ownership journal. Network-level changes
+/// (routes, DNS, interface name, full capture) are rejected by the daemon —
+/// the caller is expected to reconnect in that case.
+#[cfg(target_os = "linux")]
+async fn linux_xray_reload(
+    client: &crate::daemon_client::DaemonClient,
+    vault: &net_manager_core::config_vault::ConfigVault,
+    state: &AppState,
+    profile: &Profile,
+) -> Result<TunnelStatus, String> {
+    let mut params = prepare_linux_xray_tun_params(vault, profile)?;
+    if let Some(dir) = crate::geo_assets::ensure_geo_assets(state, profile).await? {
+        params.geo_assets = Some(crate::geo_assets::protocol_geo_assets(&dir)?);
+        check_xray_frame_size(&params)
+            .map_err(|_| "geo assets are too large for daemon protocol".to_string())?;
+    }
+    let result: XrayConnectResult = client
+        .request(method::XRAY_RELOAD, params)
+        .await
+        .map_err(|err| crate::daemon_client::user_message(&err))?;
+    Ok(linux_xray_tunnel_status(result.status, profile))
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) async fn linux_xray_status(
     client: &crate::daemon_client::DaemonClient,
@@ -1392,6 +1417,35 @@ pub(crate) async fn openvpn_plan(
     #[cfg(not(target_os = "linux"))]
     {
         Err("OpenVPN plan is only available on Linux".into())
+    }
+}
+
+/// Hot-reload a running Xray TUN tunnel: the daemon swaps the staged config
+/// and restarts the child in place, keeping routes, DNS and the ownership
+/// journal. Rejected when kernel-level parameters changed — the caller
+/// should disconnect/connect instead.
+#[tauri::command]
+pub(crate) async fn reload_xray_profile(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<TunnelStatus, String> {
+    let profile = find_profile(&state.profiles, &id)?;
+    if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Tun {
+        return Err("reload is only supported for Xray TUN profiles".into());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_xray_reload(
+            &crate::daemon_client::DaemonClient::system(),
+            &state.config_vault,
+            &state,
+            &profile,
+        )
+        .await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err("Xray reload is only available on Linux".into())
     }
 }
 

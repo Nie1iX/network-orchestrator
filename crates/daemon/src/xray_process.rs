@@ -60,6 +60,23 @@ pub trait XrayProcessRunner: Send {
             "Xray respawn is unsupported",
         ))
     }
+    /// Swap the staged `config.json` (and staged geo assets when supplied) and
+    /// restart the child on the same staging directory. The TUN link briefly
+    /// disappears and comes back with a fresh ifindex; the caller re-applies
+    /// link-scoped resources once it reappears.
+    fn reload(
+        &mut self,
+        uid: u32,
+        name: &str,
+        config: &str,
+        geo_assets: Option<&net_manager_core::daemon_protocol::XrayGeoAssets>,
+    ) -> io::Result<()> {
+        let _ = (uid, name, config, geo_assets);
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "Xray reload is unsupported",
+        ))
+    }
     fn health(&mut self, name: &str) -> io::Result<bool>;
     fn stop(&mut self, name: &str) -> io::Result<()>;
     fn cleanup(&mut self, uid: u32, name: &str) -> io::Result<()>;
@@ -224,20 +241,7 @@ impl XrayProcessRunner for TrustedXrayProcess {
             return Err(invalid_input());
         }
         ensure_runtime_root()?;
-        let directory = Path::new(RUNTIME_ROOT).join(uid.to_string()).join(name);
-        for path in [
-            directory.parent().expect("fixed runtime path"),
-            directory.as_path(),
-        ] {
-            let metadata = fs::symlink_metadata(path)
-                .map_err(|_| io::Error::other("Xray staging directory unavailable"))?;
-            if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Xray staging directory is unsafe",
-                ));
-            }
-        }
+        let directory = assert_staging_dir(uid, name)?;
         if let Some((owner, _)) = self.children.get(name) {
             if *owner != uid {
                 return Err(io::Error::new(
@@ -268,6 +272,66 @@ impl XrayProcessRunner for TrustedXrayProcess {
             directory.as_path()
         } else {
             binary.parent().expect("fixed managed binary")
+        };
+        let child =
+            self.spawn_xray_child(&binary, &directory, &config_path, asset_dir, name, false)?;
+        self.children.insert(name.to_owned(), (uid, child));
+        Ok(())
+    }
+
+    /// Swap the staged config (and geo assets) while the old child is still
+    /// running — it only reads them at spawn, so a failed write leaves the
+    /// live tunnel untouched — then restart the child on the same staging
+    /// directory with the log appending.
+    fn reload(
+        &mut self,
+        uid: u32,
+        name: &str,
+        config: &str,
+        geo_assets: Option<&net_manager_core::daemon_protocol::XrayGeoAssets>,
+    ) -> io::Result<()> {
+        if !valid_tun_name(name) || config.len() > MAX_XRAY_CONFIG_BYTES {
+            return Err(invalid_input());
+        }
+        ensure_runtime_root()?;
+        let directory = assert_staging_dir(uid, name)?;
+        if let Some((owner, _)) = self.children.get(name) {
+            if *owner != uid {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Xray process ownership mismatch",
+                ));
+            }
+        }
+        rewrite_private_file(&directory.join("config.json"), config.as_bytes())?;
+        let binary = trusted_binary()?;
+        let managed_dir = binary.parent().expect("fixed managed binary");
+        match geo_assets {
+            Some(assets) => stage_geo_assets(assets, &directory, managed_dir)?,
+            None => {
+                // Mirrors `start`: absent caller assets mean the managed
+                // files, so any previously staged copies must go or they
+                // would shadow them.
+                for file in ["geoip.dat", "geosite.dat"] {
+                    match fs::remove_file(directory.join(file)) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(_) => {
+                            return Err(io::Error::other("Xray geo asset cleanup failed"));
+                        }
+                    }
+                }
+            }
+        }
+        if self.children.contains_key(name) {
+            let _ = self.stop(name);
+        }
+        recover_child(uid, name)?;
+        let config_path = directory.join("config.json");
+        let asset_dir = if directory.join("geoip.dat").is_file() {
+            directory.as_path()
+        } else {
+            managed_dir
         };
         let child =
             self.spawn_xray_child(&binary, &directory, &config_path, asset_dir, name, false)?;
@@ -466,6 +530,27 @@ fn stage_config_at(root: &Path, uid: u32, name: &str, config: &str) -> io::Resul
     if let Err(error) = write_private_file(&directory.join("config.json"), config.as_bytes()) {
         let _ = cleanup_stage_at(root, uid, name);
         return Err(error);
+    }
+    Ok(directory)
+}
+
+/// Verify the staged directory for `uid`/`name` exists and is still
+/// root-owned and private before reusing it (respawn/reload).
+#[cfg(target_os = "linux")]
+fn assert_staging_dir(uid: u32, name: &str) -> io::Result<PathBuf> {
+    let directory = Path::new(RUNTIME_ROOT).join(uid.to_string()).join(name);
+    for path in [
+        directory.parent().expect("fixed runtime path"),
+        directory.as_path(),
+    ] {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| io::Error::other("Xray staging directory unavailable"))?;
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Xray staging directory is unsafe",
+            ));
+        }
     }
     Ok(directory)
 }

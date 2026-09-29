@@ -1868,6 +1868,163 @@ impl DaemonCore {
         Ok(self.xray_status(uid, &plan.profile_id))
     }
 
+    /// Hot-reload the staged Xray config of an already connected profile:
+    /// kernel-level settings (routes, DNS, link name, full capture) must be
+    /// identical to the running tunnel — changing those requires a reconnect.
+    /// The child is restarted on the same staging directory; the journal
+    /// entry, ownership and restart bookkeeping stay in place.
+    pub fn reload_xray(
+        &mut self,
+        uid: u32,
+        params: XrayConnectParams,
+    ) -> io::Result<XrayStatusResult> {
+        let owner = format!("xray:{}", params.profile_id);
+        validate_owner(&owner).map_err(invalid_input)?;
+        let index = self.position(uid, &owner).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Xray profile is not connected")
+        })?;
+        if self.journal.entries[index].state != OwnedState::Applied {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Xray tunnel is not fully applied",
+            ));
+        }
+        let process = self.journal.entries[index]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) => Some(process.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing Xray process marker")
+            })?;
+        let plan = prepare_xray(uid, params, process.transport_mark)?;
+        self.ensure_xray_reload_compatible(index, &plan, &process)?;
+        let runner = self.xray.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
+        })?;
+        runner
+            .reload(uid, &plan.name, &plan.config, plan.geo_assets.as_ref())
+            .map_err(|err| xray_stage("reload", err))?;
+        let new_index = self
+            .xray
+            .as_ref()
+            .unwrap()
+            .link_index(&plan.name)
+            .map_err(|err| xray_stage("tun_lookup", err))?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "Xray TUN link is unavailable")
+            })?;
+        self.rebind_xray_link(index, process.index, new_index)
+            .map_err(|err| xray_stage("rebind", err))?;
+        // A successful reload hands the child a fresh restart budget.
+        self.xray_restarts.remove(&(uid, owner.clone()));
+        self.tunnel_failed.remove(&(uid, owner));
+        Ok(self.xray_status(uid, &plan.profile_id))
+    }
+
+    /// Rejects a reload whose plan would silently change kernel state: a
+    /// different link name, address, DNS set, route set (explicit or bypass)
+    /// or full-capture flags all require a disconnect/connect cycle.
+    fn ensure_xray_reload_compatible(
+        &self,
+        index: usize,
+        plan: &crate::xray::XrayPlan,
+        process: &XrayProcessResource,
+    ) -> io::Result<()> {
+        let incompatible = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Xray network parameters changed; disconnect and reconnect to apply",
+            )
+        };
+        if plan.name != process.name
+            || plan.full_ipv4 != process.full.as_ref().is_some_and(|full| full.ipv4)
+            || plan.full_ipv6 != process.full.as_ref().is_some_and(|full| full.ipv6)
+        {
+            return Err(incompatible());
+        }
+        let resources = &self.journal.entries[index].resources;
+        let mut addresses = resources.iter().filter_map(|resource| match resource {
+            OwnedResource::Address(address) => Some(address.address),
+            _ => None,
+        });
+        if addresses.next() != Some(plan.address) || addresses.next().is_some() {
+            return Err(incompatible());
+        }
+        let dns = resources.iter().find_map(|resource| match resource {
+            OwnedResource::Dns(dns) => Some(dns),
+            _ => None,
+        });
+        match (dns, plan.dns_servers.is_empty()) {
+            (Some(dns), false)
+                if dns.servers == plan.dns_servers && dns.domains == plan.dns_domains => {}
+            (None, true) => {}
+            _ => return Err(incompatible()),
+        }
+        // Tunnel routes: the journaled gateway-less Route resources must match
+        // the plan's explicit routes (a default route's table is derived from
+        // the recorded full-capture slot).
+        let mut journaled: Vec<_> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) if route.gateway.is_none() => {
+                    Some((route.destination, route.metric, route.table))
+                }
+                _ => None,
+            })
+            .collect();
+        journaled.sort();
+        let mut desired: Vec<_> = plan
+            .routes
+            .iter()
+            .map(|route| {
+                (
+                    route.destination,
+                    route.metric,
+                    if route.destination.prefix_len() == 0 {
+                        process.full.as_ref().map(|full| full.table)
+                    } else {
+                        None
+                    },
+                )
+            })
+            .collect();
+        desired.sort();
+        if journaled != desired {
+            return Err(incompatible());
+        }
+        // Bypass host routes (journaled with a physical gateway) must cover
+        // the same upstream/DNS destinations the plan would install.
+        let mut bypassed: Vec<_> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) if route.gateway.is_some() => Some(route.destination),
+                _ => None,
+            })
+            .collect();
+        bypassed.sort();
+        let mut targets = resolve_host_addrs(plan.server_host.as_deref());
+        for ip in crate::xray::dns_bypass_addrs(&plan.dns_servers, plan.full_ipv4, plan.full_ipv6) {
+            if !targets.contains(&ip) {
+                targets.push(ip);
+            }
+        }
+        let mut wanted: Vec<_> = targets
+            .iter()
+            .filter_map(|ip| {
+                let prefix = if ip.is_ipv4() { 32 } else { 128 };
+                IpNet::new(*ip, prefix).ok()
+            })
+            .collect();
+        wanted.sort();
+        if bypassed != wanted {
+            return Err(incompatible());
+        }
+        Ok(())
+    }
+
     fn apply_xray_plan(
         &mut self,
         index: usize,
@@ -3582,7 +3739,18 @@ impl DaemonCore {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "Xray TUN link is unavailable")
             })?;
-        let old_index = process.index;
+        self.rebind_xray_link(index, process.index, new_index)?;
+        eprintln!(
+            "network-orchestrator-daemon: respawned xray child for {}",
+            self.journal.entries[index].owner
+        );
+        Ok(true)
+    }
+
+    /// The Xray child restarted and its TUN reappeared under `new_index`:
+    /// re-point every link-scoped journal resource at it and re-apply
+    /// addresses, tunnel routes and DNS to the fresh link.
+    fn rebind_xray_link(&mut self, index: usize, old_index: u32, new_index: u32) -> io::Result<()> {
         for resource in &mut self.journal.entries[index].resources {
             match resource {
                 OwnedResource::XrayProcess(process) => process.index = new_index,
@@ -3643,11 +3811,7 @@ impl DaemonCore {
                 self.store.save(&self.journal)?;
             }
         }
-        eprintln!(
-            "network-orchestrator-daemon: respawned xray child for {}",
-            self.journal.entries[index].owner
-        );
-        Ok(true)
+        Ok(())
     }
 
     /// A bypass host route pointing at the *current* physical default
@@ -4633,6 +4797,19 @@ mod xray_core_tests {
             state.1 += 1;
             Ok(())
         }
+        fn reload(
+            &mut self,
+            _: u32,
+            _: &str,
+            config: &str,
+            _: Option<&net_manager_core::daemon_protocol::XrayGeoAssets>,
+        ) -> io::Result<()> {
+            let mut state = self.state.lock().unwrap();
+            self.events.push(format!("reload:{}", config.len()));
+            state.0 = false;
+            state.1 += 1;
+            Ok(())
+        }
         fn health(&mut self, _: &str) -> io::Result<bool> {
             Ok(!self.state.lock().unwrap().0)
         }
@@ -4781,6 +4958,117 @@ mod xray_core_tests {
         core.reconcile_network(&[]);
         assert_eq!(core.xray_status(1000, "home").state, TunnelState::Running);
         core.disconnect_xray(1000, "home").unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn reload_params() -> XrayConnectParams {
+        let mut updated = params();
+        updated.config = json!({
+            "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[
+                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"proxy.test","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                {"tag":"direct","protocol":"freedom"}
+            ],
+            "routing":{"domainStrategy":"AsIs","rules":[{"type":"field","domain":["example.test"],"outboundTag":"direct"}]}
+        })
+        .to_string();
+        updated
+    }
+
+    #[test]
+    fn reload_swaps_the_staged_config_and_rebinds_link_resources() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = Flaky::new(events.clone());
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(runner),
+        )
+        .unwrap();
+        core.connect_xray(1000, params()).unwrap();
+        let status = core.reload_xray(1000, reload_params()).unwrap();
+        assert_eq!(status.state, TunnelState::Running);
+        let events = events.list();
+        assert_eq!(
+            events.iter().filter(|e| e.starts_with("reload:")).count(),
+            1
+        );
+        // The child restarted onto a fresh TUN ifindex and every link-scoped
+        // journal resource followed it.
+        let owned = core.owned(1000);
+        assert_eq!(owned.len(), 1);
+        let process_index = owned[0]
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) => Some(process.index),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(process_index, 43);
+        assert!(owned[0].resources.iter().all(|resource| match resource {
+            OwnedResource::Route(route) => route.interface_index == 43,
+            OwnedResource::Address(address) => address.interface_index == 43,
+            OwnedResource::Dns(dns) => dns.interface_index == 43,
+            _ => true,
+        }));
+        core.disconnect_xray(1000, "home").unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reload_rejects_network_changes_and_keeps_the_running_tunnel() {
+        let events = Events::default();
+        let dir =
+            std::env::temp_dir().join(format!("netmgr-xray-reloadnet-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = Flaky::new(events.clone());
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(runner),
+        )
+        .unwrap();
+        core.connect_xray(1000, params()).unwrap();
+        for mutate in [
+            |params: &mut XrayConnectParams| params.routes.clear(),
+            |params: &mut XrayConnectParams| params.dns_servers = vec!["1.1.1.1".parse().unwrap()],
+            |params: &mut XrayConnectParams| params.interface_name = Some("xray-other".into()),
+        ] {
+            let mut changed = params();
+            mutate(&mut changed);
+            let err = core.reload_xray(1000, changed).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
+        // No reload happened and the tunnel still runs.
+        assert!(!events.list().iter().any(|e| e.starts_with("reload:")));
+        assert_eq!(core.xray_status(1000, "home").state, TunnelState::Running);
+        core.disconnect_xray(1000, "home").unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reload_without_a_connected_profile_is_not_found() {
+        let events = Events::default();
+        let dir =
+            std::env::temp_dir().join(format!("netmgr-xray-reload404-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Flaky::new(events.clone())),
+        )
+        .unwrap();
+        let err = core.reload_xray(1000, params()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

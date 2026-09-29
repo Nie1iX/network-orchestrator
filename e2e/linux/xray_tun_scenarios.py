@@ -151,6 +151,45 @@ try:
         assert docker_exec(client_name, "python3", "-c", probe) == "netorch-e2e-server"
         print("ok   HTTP reached peer through Xray TUN", flush=True)
 
+        pid_before = docker_exec(client_name, "pgrep", "-x", "xray")
+        reload_config = json.loads(config)
+        reload_config["routing"]["rules"].append(
+            {"type": "field", "domain": ["reload-sentinel.test"], "outboundTag": "direct"}
+        )
+        reloaded = rpc("xray.reload", {**params, "config": json.dumps(reload_config)})["status"]
+        assert reloaded["state"] == "running", "xray.reload dropped the tunnel"
+        assert reloaded["interfaceName"] == interface, "xray.reload renamed the TUN"
+        pid_after = docker_exec(client_name, "pgrep", "-x", "xray")
+        assert pid_after != pid_before, "xray.reload did not restart the child"
+        assert docker_exec(client_name, "python3", "-c", probe) == "netorch-e2e-server"
+        print("ok   xray.reload swapped config and kept the tunnel", flush=True)
+
+        try:
+            rpc(
+                "xray.reload",
+                {
+                    **params,
+                    "routes": [
+                        {"destination": "10.75.0.0/24", "metric": 5},
+                        {"destination": "192.168.88.0/24", "metric": 5},
+                    ],
+                },
+            )
+        except RuntimeError as error:
+            assert "invalidParams" in str(error), "route-changing reload had wrong error"
+        else:
+            raise RuntimeError("daemon accepted a network-changing Xray reload")
+        assert rpc("xray.status", {"profileId": "xray-tun-e2e"})["state"] == "running"
+        print("ok   xray.reload rejected network changes and kept running", flush=True)
+
+        try:
+            rpc("xray.reload", {**params, "profileId": "xray-absent"})
+        except RuntimeError as error:
+            assert "notFound" in str(error), "reload of a missing profile had wrong error"
+        else:
+            raise RuntimeError("daemon reloaded a profile that is not connected")
+        print("ok   xray.reload is scoped to the live tunnel", flush=True)
+
         assert rpc("xray.disconnect", {"profileId": "xray-tun-e2e"}) == {"stopped": True}
         assert rpc("xray.status", {"profileId": "xray-tun-e2e"})["state"] == "stopped"
         try:

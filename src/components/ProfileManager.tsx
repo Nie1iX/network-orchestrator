@@ -807,6 +807,31 @@ export default function ProfileManager() {
     setEditing(null);
     setError(null);
     void refreshAll();
+    // A running Xray TUN profile picks up its new rules in place; the daemon
+    // rejects reload when kernel-level fields changed, and a manual reconnect
+    // stays as the fallback.
+    if (
+      editing &&
+      !editing.isNew &&
+      editing.backend === "xray" &&
+      editing.xrayMode === "tun" &&
+      statusFor(editing.id).state === "running"
+    ) {
+      invoke<TunnelStatus>("reload_xray_profile", { id: editing.id })
+        .then((status) => {
+          setStatuses((current) => [
+            ...current.filter((entry) => entry.profileId !== status.profileId),
+            status,
+          ]);
+          toast(
+            status.message ? "info" : "success",
+            status.message ?? `Reloaded ${editing.name || editing.id}`,
+          );
+        })
+        .catch((err) =>
+          toast("info", `Reconnect the profile to apply changes (${String(err)})`),
+        );
+    }
     if (inspection && editing) {
       const notes = [
         ...inspection.analysis.warnings,
