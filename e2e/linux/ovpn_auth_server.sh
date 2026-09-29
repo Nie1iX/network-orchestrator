@@ -24,7 +24,7 @@ script-security 2
 auth-user-pass-verify /opt/netorch/e2e/ovpn_auth_verify.sh via-file
 keepalive 2 10
 persist-tun
-push "route 10.89.0.0 255.255.255.0"
+push "route 192.168.77.0 255.255.255.0"
 verb 3
 EOF
 

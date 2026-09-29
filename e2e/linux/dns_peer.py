@@ -54,7 +54,7 @@ def main():
         if len(sys.argv) == 5
         else (
             "10.77.0.1",
-            "10.88.0.1",
+            "10.76.0.1",
             "/run/wg-e2e-dns-count",
             "/run/wg-e2e-dns-ready",
         )

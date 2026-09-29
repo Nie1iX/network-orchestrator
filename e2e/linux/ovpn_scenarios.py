@@ -107,12 +107,12 @@ probe = rpc(
     "openvpn.probe",
     {"profileId": "ovpn-probe-e2e", "config": config, "assets": {}, "routes": []},
 )
-assert any(route["destination"] == "10.89.0.0/24" for route in probe["routes"])
+assert any(route["destination"] == "192.168.77.0/24" for route in probe["routes"])
 assert not any(
     entry["owner"] == "ovpn-probe:ovpn-probe-e2e"
     for entry in rpc("owned.list", None)["owners"]
 )
-assert "10.89.0.0/24" not in docker_exec(client_name, "ip", "route", "show", "proto", "79")
+assert "192.168.77.0/24" not in docker_exec(client_name, "ip", "route", "show", "proto", "79")
 try:
     docker_exec(client_name, "pgrep", "-x", "openvpn")
 except RuntimeError:
@@ -175,13 +175,13 @@ print("ok   another uid cannot see the OpenVPN client", flush=True)
 
 for _ in range(20):
     status = rpc("openvpn.status", {"profileId": "ovpn-e2e"})
-    if "10.89.0.0/24" in status["appliedRoutes"]:
+    if "192.168.77.0/24" in status["appliedRoutes"]:
         break
     time.sleep(0.5)
 else:
     raise RuntimeError("OpenVPN pushed split route was not applied")
 for _ in range(10):
-    route = docker_exec(client_name, "ip", "-4", "route", "get", "10.89.0.1")
+    route = docker_exec(client_name, "ip", "-4", "route", "get", "192.168.77.1")
     if f"dev {interface}" in route:
         break
     time.sleep(0.5)
@@ -191,7 +191,7 @@ print("ok   pushed split route selects the OpenVPN link", flush=True)
 
 probe = (
     'from urllib.request import urlopen; '
-    'print(urlopen("http://10.89.0.1:8765/server-health.txt", timeout=3).read().decode().strip())'
+    'print(urlopen("http://192.168.77.1:8765/server-health.txt", timeout=3).read().decode().strip())'
 )
 assert docker_exec(client_name, "python3", "-c", probe) == "netorch-e2e-server"
 print("ok   HTTP reached the peer over OpenVPN", flush=True)
@@ -203,7 +203,7 @@ assert not any(
     for entry in rpc("owned.list", None)["owners"]
 )
 route = docker_exec(client_name, "ip", "-4", "route", "show", "proto", "79")
-assert "10.89.0.0/24" not in route, "OpenVPN route survived disconnect"
+assert "192.168.77.0/24" not in route, "OpenVPN route survived disconnect"
 print("ok   disconnect removed the OpenVPN route and ownership", flush=True)
 
 again = rpc("openvpn.connect", params)["status"]
@@ -245,7 +245,7 @@ except RuntimeError:
 else:
     raise RuntimeError("OpenVPN link survived daemon crash")
 route = docker_exec(client_name, "ip", "-4", "route", "show", "proto", "79")
-assert "10.89.0.0/24" not in route, "OpenVPN route survived daemon crash"
+assert "192.168.77.0/24" not in route, "OpenVPN route survived daemon crash"
 try:
     docker_exec(client_name, "pgrep", "openvpn")
 except RuntimeError:
@@ -322,7 +322,7 @@ marked_endpoint = docker_exec(
     client_name, "ip", "-4", "route", "get", "198.18.0.2", "mark", mark
 )
 plain_endpoint = docker_exec(client_name, "ip", "-4", "route", "get", "198.18.0.2")
-payload_route = docker_exec(client_name, "ip", "-4", "route", "get", "10.89.0.1")
+payload_route = docker_exec(client_name, "ip", "-4", "route", "get", "192.168.77.1")
 assert f"via {server_ip}" in marked_endpoint and "dev eth0" in marked_endpoint
 assert f"dev {full_interface}" in plain_endpoint
 assert f"dev {full_interface}" in payload_route
@@ -330,7 +330,7 @@ print("ok   marked transport uses underlay, payload uses OpenVPN", flush=True)
 
 payload_probe = (
     'from urllib.request import urlopen; '
-    'print(urlopen("http://10.89.0.1:8765/server-health.txt", timeout=3).read().decode().strip())'
+    'print(urlopen("http://192.168.77.1:8765/server-health.txt", timeout=3).read().decode().strip())'
 )
 assert docker_exec(client_name, "python3", "-c", payload_probe) == "netorch-e2e-server"
 print("ok   HTTP crossed OpenVPN full tunnel", flush=True)
@@ -343,7 +343,7 @@ run(
     "python3",
     "/opt/netorch/e2e/dns_peer.py",
     "10.79.0.1",
-    "10.89.0.1",
+    "192.168.77.1",
     "/run/ovpn-e2e-dns-count",
     "/run/ovpn-e2e-dns-ready",
 )
@@ -363,7 +363,7 @@ for _ in range(20):
 resolved = docker_exec(client_name, "resolvectl", "status", full_interface)
 assert "10.79.0.1" in resolved and "~." in resolved
 answer = docker_exec(client_name, "resolvectl", "query", "ovpn-e2e.test")
-assert "10.89.0.1" in answer
+assert "192.168.77.1" in answer
 assert int(docker_exec(server_name, "cat", "/run/ovpn-e2e-dns-count")) > 0
 print("ok   pushed DNS query reached peer through OpenVPN", flush=True)
 

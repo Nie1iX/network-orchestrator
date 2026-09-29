@@ -193,7 +193,7 @@ print("ALL 8 WIREGUARD SPLIT CHECKS PASSED", flush=True)
 
 print("\n=== WireGuard full tunnel keeps its endpoint on underlay", flush=True)
 docker_exec(server_name, "ip", "addr", "add", "198.18.0.1/32", "dev", "lo")
-docker_exec(server_name, "ip", "addr", "add", "10.88.0.1/32", "dev", "lo")
+docker_exec(server_name, "ip", "addr", "add", "10.76.0.1/32", "dev", "lo")
 original_default = docker_exec(
     client_name, "ip", "-4", "route", "show", "default"
 ).splitlines()[0].split()
@@ -247,7 +247,7 @@ marked_endpoint = docker_exec(
     client_name, "ip", "-4", "route", "get", "198.18.0.1", "mark", mark
 )
 plain_endpoint = docker_exec(client_name, "ip", "-4", "route", "get", "198.18.0.1")
-payload_route = docker_exec(client_name, "ip", "-4", "route", "get", "10.88.0.1")
+payload_route = docker_exec(client_name, "ip", "-4", "route", "get", "10.76.0.1")
 assert "dev eth0" in marked_endpoint and f"via {server_ip}" in marked_endpoint
 assert f"dev {full_interface}" in plain_endpoint
 assert f"dev {full_interface}" in payload_route
@@ -255,7 +255,7 @@ print("ok   marked endpoint uses underlay while unmarked traffic uses WG", flush
 
 payload_probe = (
     'from urllib.request import urlopen; '
-    'print(urlopen("http://10.88.0.1:8765/server-health.txt", timeout=3).read().decode().strip())'
+    'print(urlopen("http://10.76.0.1:8765/server-health.txt", timeout=3).read().decode().strip())'
 )
 assert docker_exec(client_name, "python3", "-c", payload_probe) == "netorch-e2e-server"
 full_status = rpc("wireguard.status", {"profileId": "wg-full"})
@@ -374,7 +374,7 @@ assert "10.77.0.1" in resolved and "~." in resolved
 print("ok   resolved routes all DNS to the WG link", flush=True)
 
 answer = docker_exec(client_name, "resolvectl", "query", "wg-e2e.test")
-assert "10.88.0.1" in answer, "resolved did not return the tunnel DNS answer"
+assert "10.76.0.1" in answer, "resolved did not return the tunnel DNS answer"
 query_count = int(docker_exec(server_name, "cat", "/run/wg-e2e-dns-count"))
 assert query_count > 0, "test DNS peer did not receive a query"
 print("ok   DNS query reached the peer through WG", flush=True)
@@ -391,7 +391,7 @@ for _ in range(30):
 else:
     raise RuntimeError("daemon did not restore per-link DNS after resolved restart")
 answer = docker_exec(client_name, "resolvectl", "query", "wg-e2e.test")
-assert "10.88.0.1" in answer
+assert "10.76.0.1" in answer
 restored_count = int(docker_exec(server_name, "cat", "/run/wg-e2e-dns-count"))
 assert restored_count > query_count, "restored DNS did not reach the WG peer"
 print("ok   per-link DNS recovered after resolved restart", flush=True)

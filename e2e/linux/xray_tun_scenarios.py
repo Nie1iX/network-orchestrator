@@ -76,8 +76,8 @@ server_ip = docker_exec(
     "-c",
     'import socket; print(socket.gethostbyname("wg-server"))',
 )
-if "10.99.0.1" not in docker_exec(server_name, "ip", "-4", "addr", "show", "lo"):
-    docker_exec(server_name, "ip", "addr", "add", "10.99.0.1/32", "dev", "lo")
+if "10.75.0.1" not in docker_exec(server_name, "ip", "-4", "addr", "show", "lo"):
+    docker_exec(server_name, "ip", "addr", "add", "10.75.0.1/32", "dev", "lo")
 vless_id = str(uuid.uuid4())
 server_config = {
     "log": {"loglevel": "warning"},
@@ -116,7 +116,7 @@ try:
         params = {
             "profileId": "xray-tun-e2e",
             "config": config,
-            "routes": [{"destination": "10.99.0.0/24", "metric": 5}],
+            "routes": [{"destination": "10.75.0.0/24", "metric": 5}],
             "dnsServers": [],
             "dnsDomains": [],
         }
@@ -142,11 +142,11 @@ try:
         assert alice_status["state"] == "stopped", "another uid saw the Xray tunnel"
         print("ok   another uid cannot see the Xray TUN", flush=True)
 
-        route = docker_exec(client_name, "ip", "-4", "route", "get", "10.99.0.1")
+        route = docker_exec(client_name, "ip", "-4", "route", "get", "10.75.0.1")
         assert f"dev {interface}" in route, "test traffic bypasses Xray TUN"
         probe = (
             'from urllib.request import urlopen; '
-            'print(urlopen("http://10.99.0.1:8765/server-health.txt", timeout=5).read().decode().strip())'
+            'print(urlopen("http://10.75.0.1:8765/server-health.txt", timeout=5).read().decode().strip())'
         )
         assert docker_exec(client_name, "python3", "-c", probe) == "netorch-e2e-server"
         print("ok   HTTP reached peer through Xray TUN", flush=True)
@@ -190,7 +190,7 @@ try:
         else:
             raise RuntimeError("Xray TUN link survived daemon crash")
         routes = docker_exec(client_name, "ip", "-4", "route", "show", "proto", "79")
-        assert "10.99.0.0/24" not in routes, "Xray route survived daemon crash"
+        assert "10.75.0.0/24" not in routes, "Xray route survived daemon crash"
         try:
             docker_exec(client_name, "pgrep", "-x", "xray")
         except RuntimeError:
@@ -247,7 +247,7 @@ try:
             client_name, "ip", "-4", "route", "get", "198.18.0.3", "mark", mark
         )
         plain = docker_exec(client_name, "ip", "-4", "route", "get", "198.18.0.3")
-        payload = docker_exec(client_name, "ip", "-4", "route", "get", "10.99.0.1")
+        payload = docker_exec(client_name, "ip", "-4", "route", "get", "10.75.0.1")
         assert f"via {server_ip}" in marked and "dev eth0" in marked
         assert f"via {server_ip}" in plain and "dev eth0" in plain
         assert f"dev {full_interface}" in payload
@@ -272,8 +272,8 @@ try:
             server_name,
             "python3",
             "/opt/netorch/e2e/dns_peer.py",
-            "10.99.0.1",
-            "10.99.0.1",
+            "10.75.0.1",
+            "10.75.0.1",
             "/run/xray-e2e-dns-count",
             "/run/xray-e2e-dns-ready",
         )
@@ -300,17 +300,17 @@ try:
         dns_params = {
             **full_params,
             "profileId": "xray-dns",
-            "dnsServers": ["10.99.0.1"],
+            "dnsServers": ["10.75.0.1"],
         }
         dns_status = rpc("xray.connect", dns_params)["status"]
         assert dns_status["state"] == "running" and dns_status["dnsApplied"]
         dns_interface = dns_status["interfaceName"]
         resolved = docker_exec(client_name, "resolvectl", "status", dns_interface)
-        assert "10.99.0.1" in resolved and "~." in resolved
+        assert "10.75.0.1" in resolved and "~." in resolved
         print("ok   daemon applied Xray per-link DNS", flush=True)
 
         answer = docker_exec(client_name, "resolvectl", "query", "xray-e2e.test")
-        assert "10.99.0.1" in answer
+        assert "10.75.0.1" in answer
         assert int(docker_exec(server_name, "cat", "/run/xray-e2e-dns-count")) > 0
         print("ok   DNS query reached peer through Xray TUN", flush=True)
 

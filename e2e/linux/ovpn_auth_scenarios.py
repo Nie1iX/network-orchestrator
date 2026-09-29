@@ -97,7 +97,7 @@ params = {
 probe_params = dict(params)
 probe_params["profileId"] = "ovpn-auth-probe"
 probe = rpc("openvpn.probe", probe_params)
-assert any(route["destination"] == "10.89.0.0/24" for route in probe["routes"])
+assert any(route["destination"] == "192.168.77.0/24" for route in probe["routes"])
 assert not any(
     entry["owner"] == "ovpn-probe:ovpn-auth-probe"
     for entry in rpc("owned.list", None)["owners"]

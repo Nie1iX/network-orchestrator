@@ -34,9 +34,9 @@ dh none
 data-ciphers AES-256-GCM
 keepalive 2 10
 persist-tun
-push "route 10.89.0.0 255.255.255.0"
+push "route 192.168.77.0 255.255.255.0"
 verb 3
 EOF
 
-ip addr add 10.89.0.1/32 dev lo
+ip addr add 192.168.77.1/32 dev lo
 openvpn --config server.conf --disable-dco --log /run/ovpn-e2e/server.log --daemon
