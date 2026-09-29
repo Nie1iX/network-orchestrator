@@ -55,9 +55,12 @@ pub mod method {
     pub const ALWAYS_ON_RESUME: &str = "alwaysOn.resume";
     pub const SETTINGS_GET: &str = "settings.get";
     pub const SETTINGS_SET: &str = "settings.set";
+    pub const COND_RULES_LIST: &str = "condRules.list";
+    pub const COND_RULES_PUT: &str = "condRules.put";
+    pub const COND_RULES_REMOVE: &str = "condRules.remove";
 
     /// Methods implemented by the daemon and reported in `hello.capabilities`.
-    pub const CAPABILITIES: [&str; 24] = [
+    pub const CAPABILITIES: [&str; 27] = [
         ROUTES_APPLY,
         ROUTES_REMOVE,
         LINK_SET_STATE,
@@ -82,6 +85,9 @@ pub mod method {
         ALWAYS_ON_RESUME,
         SETTINGS_GET,
         SETTINGS_SET,
+        COND_RULES_LIST,
+        COND_RULES_PUT,
+        COND_RULES_REMOVE,
     ];
 }
 
@@ -725,6 +731,95 @@ pub struct AlwaysOnResumeResult {
     pub resumed: bool,
 }
 
+/// When a conditional rule's routes may be installed. The daemon evaluates
+/// conditions against kernel state (local addresses, interfaces) — never a
+/// probe through the tunnel the condition controls.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RouteCondition {
+    /// Active while a non-tunnel interface holds a global-scope address
+    /// inside `prefix` — e.g. "this machine is on the office LAN".
+    InterfaceAddressIn { prefix: IpNet },
+}
+
+/// A named conditional route set, persisted per uid in the daemon. While
+/// `condition` holds (and `enabled`), `routes` are installed on the matched
+/// interface; when it stops holding they are removed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalRouteRule {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub condition: RouteCondition,
+    pub routes: Vec<PolicyRoute>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ConditionalRuleState {
+    /// `enabled` is false; no routes are wanted.
+    Disabled,
+    /// The condition does not currently hold; nothing is installed.
+    Inactive,
+    /// The condition holds and the routes are installed.
+    Active,
+    /// The last apply/remove failed; `detail` carries the error.
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalRuleStatus {
+    pub state: ConditionalRuleState,
+    /// Interface that satisfied the condition during the last evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_interface: Option<String>,
+    /// Routes currently installed for this rule.
+    pub applied_routes: usize,
+    /// Error detail for `state == error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalRuleEntry {
+    pub rule: ConditionalRouteRule,
+    pub status: ConditionalRuleStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CondRulesListResult {
+    pub rules: Vec<ConditionalRuleEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CondRulesPutParams {
+    pub rule: ConditionalRouteRule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CondRulesPutResult {
+    pub stored: bool,
+    pub status: ConditionalRuleStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CondRulesRemoveParams {
+    pub rule_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CondRulesRemoveResult {
+    pub removed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkSetStateParams {
@@ -973,7 +1068,7 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set"]}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove"]}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);
@@ -1041,6 +1136,48 @@ mod tests {
         assert_eq!(method::ALWAYS_ON_SET, "alwaysOn.set");
         assert_eq!(method::ALWAYS_ON_REMOVE, "alwaysOn.remove");
         assert_eq!(method::ALWAYS_ON_RESUME, "alwaysOn.resume");
+    }
+
+    #[test]
+    fn golden_cond_rules() {
+        let (frame, params): (_, CondRulesPutParams) = request(
+            r#"{"id":30,"method":"condRules.put","params":{"rule":{
+              "id":"office-lan","name":"Office LAN direct","enabled":true,
+              "condition":{"kind":"interfaceAddressIn","prefix":"10.228.32.0/21"},
+              "routes":[{"destination":"10.99.0.0/24","metric":5,"via":"10.228.32.1"}]}}}"#,
+        );
+        assert_eq!(frame.method, method::COND_RULES_PUT);
+        assert_eq!(
+            params.rule.condition,
+            RouteCondition::InterfaceAddressIn {
+                prefix: "10.228.32.0/21".parse().unwrap()
+            }
+        );
+        assert_eq!(
+            params.rule.routes[0].destination.to_string(),
+            "10.99.0.0/24"
+        );
+
+        let (_, status): (_, CondRulesPutResult) = ok_response(
+            r#"{"id":30,"ok":true,"result":{"stored":true,"status":{"state":"active","matchedInterface":"enp1s0","appliedRoutes":1}}}"#,
+        );
+        assert_eq!(status.status.state, ConditionalRuleState::Active);
+        assert_eq!(status.status.matched_interface.as_deref(), Some("enp1s0"));
+
+        let (_, list): (_, CondRulesListResult) = ok_response(
+            r#"{"id":31,"ok":true,"result":{"rules":[{"rule":{"id":"office-lan","name":"Office LAN direct","enabled":false,
+              "condition":{"kind":"interfaceAddressIn","prefix":"10.228.32.0/21"},"routes":[]},
+              "status":{"state":"disabled","appliedRoutes":0}}]}}"#,
+        );
+        assert_eq!(list.rules[0].status.state, ConditionalRuleState::Disabled);
+
+        let (frame, params): (_, CondRulesRemoveParams) =
+            request(r#"{"id":32,"method":"condRules.remove","params":{"ruleId":"office-lan"}}"#);
+        assert_eq!(frame.method, method::COND_RULES_REMOVE);
+        assert_eq!(params.rule_id, "office-lan");
+        let (_, result): (_, CondRulesRemoveResult) =
+            ok_response(r#"{"id":32,"ok":true,"result":{"removed":true}}"#);
+        assert!(result.removed);
     }
 
     #[test]

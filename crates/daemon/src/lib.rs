@@ -5,6 +5,8 @@
 #[cfg(target_os = "linux")]
 pub mod always_on;
 pub mod auth;
+#[cfg(target_os = "linux")]
+pub mod cond_rules;
 pub mod core;
 #[cfg(target_os = "linux")]
 pub mod dns;

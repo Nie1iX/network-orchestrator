@@ -361,7 +361,7 @@ impl AlwaysOnStore {
     }
 }
 
-fn check_private_dir(path: &Path, create: bool) -> io::Result<bool> {
+pub(crate) fn check_private_dir(path: &Path, create: bool) -> io::Result<bool> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound && create => {
@@ -381,12 +381,12 @@ fn check_private_dir(path: &Path, create: bool) -> io::Result<bool> {
     Ok(true)
 }
 
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     // SAFETY: geteuid has no failure mode.
     unsafe { libc::geteuid() }
 }
 
-fn invalid_data() -> io::Error {
+pub(crate) fn invalid_data() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         "always-on definitions are not safe to load",

@@ -2,6 +2,8 @@
 //! Synchronous by design; the server calls it from `spawn_blocking`.
 
 #[cfg(target_os = "linux")]
+use crate::cond_rules::{match_interface, plan_routes, IfaceAddr, OWNER_PREFIX};
+#[cfg(target_os = "linux")]
 use crate::dns::{DnsApply, DnsExecutor};
 use crate::journal::{JournalDocument, JournalEntry, JournalStore};
 use crate::openvpn::OpenVpnPlan;
@@ -12,9 +14,10 @@ use crate::xray::prepare_xray;
 use crate::xray_process::XrayProcessRunner;
 use ipnet::IpNet;
 use net_manager_core::daemon_protocol::{
-    CleanupResult, IpFamily, OpenVpnConnectionState, OpenVpnPlanConflict, OpenVpnPlanResult,
-    OpenVpnProbeResult, OpenVpnProcessResource, OpenVpnStatusResult, OpenVpnWarning, OwnedEntry,
-    OwnedResource, OwnedRuleResource, OwnedState, WireGuardAddressResource, WireGuardFullResource,
+    CleanupResult, ConditionalRouteRule, ConditionalRuleState, ConditionalRuleStatus, IpFamily,
+    OpenVpnConnectionState, OpenVpnPlanConflict, OpenVpnPlanResult, OpenVpnProbeResult,
+    OpenVpnProcessResource, OpenVpnStatusResult, OpenVpnWarning, OwnedEntry, OwnedResource,
+    OwnedRuleResource, OwnedState, RouteCondition, WireGuardAddressResource, WireGuardFullResource,
     WireGuardLinkResource, WireGuardStatusResult, WireGuardWarning, XrayConnectParams,
     XrayProcessResource, XrayStatusResult,
 };
@@ -1192,6 +1195,7 @@ mod openvpn_tests {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            cond_eval: HashMap::new(),
             policy: Some(Box::new(policy.clone())),
             dns: Some(Box::new(dns.clone())),
         };
@@ -1375,6 +1379,15 @@ struct HandshakeWatch {
     sending_since: Option<u64>,
 }
 
+/// Outcome of the last [`DaemonCore::reconcile_conditional`] pass over one
+/// rule. `matched_interface` is `Some` when the rule's condition currently
+/// holds; `error` captures the apply/remove failure, if any.
+#[derive(Debug, Clone, Default)]
+pub struct CondRuleEval {
+    pub matched_interface: Option<String>,
+    pub error: Option<String>,
+}
+
 /// WireGuard only handshakes when it has something to send, so a missing or
 /// expired handshake alone is normal for an idle tunnel. The tunnel is
 /// failed only when packets keep leaving (tx grows) without any handshake
@@ -1431,6 +1444,10 @@ pub struct DaemonCore {
     /// In-place respawn budget per xray owner: a child crash gets a few
     /// restarts before reconcile gives up and fails the tunnel.
     xray_restarts: HashMap<(u32, String), u32>,
+    /// Last evaluation of each conditional rule `(uid, rule id)`: which
+    /// interface matched, or why the apply failed. Not journaled — the
+    /// journal already records what was installed.
+    cond_eval: HashMap<(u32, String), CondRuleEval>,
     #[cfg(target_os = "linux")]
     policy: Option<Box<dyn PolicyRuleExecutor>>,
     #[cfg(target_os = "linux")]
@@ -1565,6 +1582,7 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            cond_eval: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1605,6 +1623,7 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            cond_eval: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1643,6 +1662,7 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            cond_eval: HashMap::new(),
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -1675,6 +1695,7 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            cond_eval: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1711,6 +1732,7 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            cond_eval: HashMap::new(),
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1752,6 +1774,7 @@ impl DaemonCore {
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
+            cond_eval: HashMap::new(),
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -3924,9 +3947,21 @@ impl DaemonCore {
             || owner.starts_with("ovpn:")
             || owner.starts_with("ovpn-probe:")
             || owner.starts_with("xray:")
+            || owner.starts_with("cond:")
         {
             return Err(invalid_input("reserved owner prefix".into()));
         }
+        self.apply_routes_inner(uid, owner, routes)
+    }
+
+    /// `apply_routes` for daemon-internal owners (`cond:*`): skips the
+    /// client-facing reserved-prefix check but still validates the routes.
+    fn apply_routes_inner(
+        &mut self,
+        uid: u32,
+        owner: &str,
+        routes: Vec<AppliedRoute>,
+    ) -> io::Result<usize> {
         validate_apply(&routes).map_err(invalid_input)?;
         if self.position(uid, owner).is_some() {
             return Err(io::Error::new(
@@ -3982,6 +4017,22 @@ impl DaemonCore {
                 "use the tunnel disconnect method for tunnel owners".into(),
             ));
         }
+        if owner.starts_with("cond:") {
+            return Err(invalid_input(
+                "conditional owners are managed by rule evaluation".into(),
+            ));
+        }
+        let count = self.journal.entries[index].resources.len();
+        let result = self.teardown_entry(index);
+        self.persist();
+        result.map(|()| count)
+    }
+
+    /// `remove_owner` for daemon-internal owners: no reserved-prefix checks.
+    fn remove_owner_inner(&mut self, uid: u32, owner: &str) -> io::Result<usize> {
+        let index = self
+            .position(uid, owner)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "owner has nothing applied"))?;
         let count = self.journal.entries[index].resources.len();
         let result = self.teardown_entry(index);
         self.persist();
@@ -4048,6 +4099,174 @@ impl DaemonCore {
             ))
         } else {
             Ok(removed)
+        }
+    }
+
+    /// Ifindices of links the daemon itself created (tunnels, addresses on
+    /// them). A self-made interface must never satisfy an "on this LAN"
+    /// condition, so these are excluded from address matching.
+    fn owned_ifindices(&self) -> HashSet<u32> {
+        self.journal
+            .entries
+            .iter()
+            .flat_map(|entry| entry.resources.iter())
+            .filter_map(|resource| match resource {
+                OwnedResource::WireGuardLink(link) => Some(link.index),
+                OwnedResource::XrayProcess(process) => Some(process.index),
+                OwnedResource::Address(address) => Some(address.interface_index),
+                _ => None,
+            })
+            .filter(|index| *index != 0)
+            .collect()
+    }
+
+    /// Evaluate every stored conditional rule against the address snapshot:
+    /// install a rule's routes while its condition holds, withdraw them when
+    /// it stops, re-install routes the kernel lost, and drop `cond:*`
+    /// journal entries whose rule was deleted. Returns changed owners for
+    /// `owned.changed` events.
+    ///
+    /// `observed` is the kernel snapshot of daemon-owned routes — the same
+    /// one [`Self::reconcile_network`] consumes.
+    #[cfg(target_os = "linux")]
+    pub fn reconcile_conditional(
+        &mut self,
+        addrs: &[IfaceAddr],
+        observed: &[AppliedRoute],
+        rules: &[(u32, ConditionalRouteRule)],
+    ) -> Vec<(u32, String)> {
+        let mut changed = Vec::new();
+        let live: HashSet<(u32, String)> = rules
+            .iter()
+            .map(|(uid, rule)| (*uid, format!("{OWNER_PREFIX}{}", rule.id)))
+            .collect();
+        // Orphans first: a rule deleted while the daemon was off still has
+        // its routes installed.
+        for index in (0..self.journal.entries.len()).rev() {
+            let entry = &self.journal.entries[index];
+            if !entry.owner.starts_with(OWNER_PREFIX)
+                || live.contains(&(entry.uid, entry.owner.clone()))
+            {
+                continue;
+            }
+            let key = (entry.uid, entry.owner.clone());
+            if self.remove_owner_inner(key.0, &key.1).is_err() {
+                eprintln!(
+                    "network-orchestrator-daemon: conditional route cleanup failed for {}",
+                    key.1
+                );
+            }
+            changed.push(key);
+        }
+        let owned = self.owned_ifindices();
+        for (uid, rule) in rules {
+            let owner = format!("{OWNER_PREFIX}{}", rule.id);
+            let matched = if rule.enabled {
+                match &rule.condition {
+                    RouteCondition::InterfaceAddressIn { prefix } => {
+                        match_interface(addrs, *prefix, &owned)
+                    }
+                }
+            } else {
+                None
+            };
+            let mut eval = CondRuleEval {
+                matched_interface: matched.as_ref().map(|(_, name)| name.clone()),
+                error: None,
+            };
+            let desired = matched.map(|(ifindex, _)| plan_routes(rule, ifindex));
+            match (self.position(*uid, &owner), desired) {
+                (None, None) => {}
+                (Some(_), None) => {
+                    if let Err(err) = self.remove_owner_inner(*uid, &owner) {
+                        eval.error = Some(err.to_string());
+                    } else {
+                        changed.push((*uid, owner.clone()));
+                    }
+                }
+                (None, Some(routes)) => match self.apply_routes_inner(*uid, &owner, routes) {
+                    Ok(_) => changed.push((*uid, owner.clone())),
+                    Err(err) => eval.error = Some(err.to_string()),
+                },
+                (Some(index), Some(routes)) => {
+                    let entry = &self.journal.entries[index];
+                    let journaled: Vec<&AppliedRoute> = entry
+                        .resources
+                        .iter()
+                        .filter_map(|resource| match resource {
+                            OwnedResource::Route(route) => Some(route),
+                            _ => None,
+                        })
+                        .collect();
+                    let in_sync = entry.state == OwnedState::Applied
+                        && journaled.len() == routes.len()
+                        && routes.iter().all(|route| journaled.contains(&route))
+                        && routes.iter().all(|route| {
+                            observed
+                                .iter()
+                                .any(|seen| kernel_route(seen) == kernel_route(route))
+                        });
+                    if !in_sync {
+                        match self
+                            .remove_owner_inner(*uid, &owner)
+                            .and_then(|_| self.apply_routes_inner(*uid, &owner, routes))
+                        {
+                            Ok(_) => changed.push((*uid, owner.clone())),
+                            Err(err) => eval.error = Some(err.to_string()),
+                        }
+                    }
+                }
+            }
+            self.cond_eval.insert((*uid, rule.id.clone()), eval);
+        }
+        // Drop eval entries for rules that no longer exist nor own anything.
+        let owned_cond: HashSet<(u32, String)> = self
+            .journal
+            .entries
+            .iter()
+            .filter(|entry| entry.owner.starts_with(OWNER_PREFIX))
+            .map(|entry| (entry.uid, entry.owner.clone()))
+            .collect();
+        self.cond_eval.retain(|(uid, id), _| {
+            rules
+                .iter()
+                .any(|(rule_uid, rule)| rule_uid == uid && rule.id == *id)
+                || owned_cond.contains(&(*uid, format!("{OWNER_PREFIX}{id}")))
+        });
+        changed
+    }
+
+    /// Status of one stored rule, for `condRules.list`. Journal state wins
+    /// over the last evaluation: an applied entry means the routes are out
+    /// there even before the first reconcile pass after a daemon restart.
+    pub fn cond_rule_status(&self, uid: u32, rule: &ConditionalRouteRule) -> ConditionalRuleStatus {
+        let eval = self.cond_eval.get(&(uid, rule.id.clone()));
+        let matched_interface = eval.and_then(|eval| eval.matched_interface.clone());
+        let applied = self
+            .position(uid, &format!("cond:{}", rule.id))
+            .map(|index| self.journal.entries[index].resources.len())
+            .unwrap_or(0);
+        let (state, detail) = if !rule.enabled {
+            (ConditionalRuleState::Disabled, None)
+        } else if let Some(error) = eval.and_then(|eval| eval.error.as_ref()) {
+            (ConditionalRuleState::Error, Some(error.clone()))
+        } else {
+            match self.position(uid, &format!("cond:{}", rule.id)) {
+                Some(index) if self.journal.entries[index].state == OwnedState::Applied => {
+                    (ConditionalRuleState::Active, None)
+                }
+                Some(_) => (
+                    ConditionalRuleState::Error,
+                    Some("route apply did not complete".into()),
+                ),
+                None => (ConditionalRuleState::Inactive, None),
+            }
+        };
+        ConditionalRuleStatus {
+            state,
+            matched_interface,
+            applied_routes: applied,
+            detail,
         }
     }
 
@@ -7764,5 +7983,272 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event == "delete:wg-kzn2"));
+    }
+
+    // ── Conditional rules ────────────────────────────────────────────
+
+    #[cfg(target_os = "linux")]
+    fn iface_addr(
+        ifindex: u32,
+        name: &str,
+        ip: &str,
+        prefix_len: u8,
+    ) -> crate::cond_rules::IfaceAddr {
+        crate::cond_rules::IfaceAddr {
+            ifindex,
+            name: name.into(),
+            address: IpNet::new(ip.parse().unwrap(), prefix_len).unwrap(),
+            scope: 0,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cond_rule(id: &str, dest: &str) -> ConditionalRouteRule {
+        use net_manager_core::models::PolicyRoute;
+        ConditionalRouteRule {
+            id: id.into(),
+            name: "Office LAN".into(),
+            enabled: true,
+            condition: RouteCondition::InterfaceAddressIn {
+                prefix: "10.228.32.0/21".parse().unwrap(),
+            },
+            routes: vec![PolicyRoute {
+                destination: dest.parse().unwrap(),
+                metric: 5,
+                via: None,
+            }],
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cond_status(
+        core: &DaemonCore,
+        uid: u32,
+        rule: &ConditionalRouteRule,
+    ) -> ConditionalRuleStatus {
+        core.cond_rule_status(uid, rule)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_rule_applies_routes_while_the_condition_holds() {
+        let dir = unique_dir("cond-apply");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        let rules = vec![(1000u32, cond_rule("office", "10.99.0.0/24"))];
+        let addrs = vec![iface_addr(2, "enp1s0", "10.228.33.5", 21)];
+
+        let changed = core.reconcile_conditional(&addrs, &[], &rules);
+
+        assert_eq!(changed, vec![(1000, "cond:office".to_string())]);
+        assert_eq!(recorder.ops(), vec![add("10.99.0.0/24")]);
+        let owned = core.owned(1000);
+        assert_eq!(owned[0].owner, "cond:office");
+        assert!(
+            matches!(&owned[0].resources[0], OwnedResource::Route(route) if route.interface_index == 2)
+        );
+        let status = cond_status(&core, 1000, &rules[0].1);
+        assert_eq!(status.state, ConditionalRuleState::Active);
+        assert_eq!(status.matched_interface.as_deref(), Some("enp1s0"));
+        assert_eq!(status.applied_routes, 1);
+        // A second pass over the same state is a no-op.
+        let observed = vec![route("10.99.0.0/24")];
+        assert!(core
+            .reconcile_conditional(&addrs, &observed, &rules)
+            .is_empty());
+        assert_eq!(recorder.ops(), vec![add("10.99.0.0/24")]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_rule_withdraws_routes_when_the_condition_drops() {
+        let dir = unique_dir("cond-withdraw");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        let rules = vec![(1000u32, cond_rule("office", "10.99.0.0/24"))];
+        let addrs = vec![iface_addr(2, "enp1s0", "10.228.33.5", 21)];
+        core.reconcile_conditional(&addrs, &[], &rules);
+
+        // Leaving the LAN: address replaced by a home-network one.
+        let away = vec![iface_addr(2, "enp1s0", "192.168.1.40", 24)];
+        let changed = core.reconcile_conditional(&away, &[], &rules);
+
+        assert_eq!(changed, vec![(1000, "cond:office".to_string())]);
+        assert_eq!(
+            recorder.ops(),
+            vec![add("10.99.0.0/24"), remove("10.99.0.0/24")]
+        );
+        assert!(core.owned(1000).is_empty());
+        let status = cond_status(&core, 1000, &rules[0].1);
+        assert_eq!(status.state, ConditionalRuleState::Inactive);
+        assert_eq!(status.applied_routes, 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_rule_reinstalls_routes_the_kernel_lost() {
+        let dir = unique_dir("cond-flap");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        let rules = vec![(1000u32, cond_rule("office", "10.99.0.0/24"))];
+        let addrs = vec![iface_addr(2, "enp1s0", "10.228.33.5", 21)];
+        core.reconcile_conditional(&addrs, &[], &rules);
+        recorder.ops.lock().unwrap().clear();
+
+        // Link flap wiped the route but kept the address: journal still
+        // says applied, `observed` no longer lists it.
+        let changed = core.reconcile_conditional(&addrs, &[], &rules);
+
+        assert_eq!(changed, vec![(1000, "cond:office".to_string())]);
+        assert_eq!(
+            recorder.ops(),
+            vec![remove("10.99.0.0/24"), add("10.99.0.0/24")]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_rule_rebinds_routes_when_the_matched_interface_changes() {
+        let dir = unique_dir("cond-rebind");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        let rules = vec![(1000u32, cond_rule("office", "10.99.0.0/24"))];
+        core.reconcile_conditional(&[iface_addr(2, "enp1s0", "10.228.33.5", 21)], &[], &rules);
+
+        // The office address moved to another interface (e.g. USB dock).
+        let moved = vec![iface_addr(7, "enp3s0", "10.228.33.5", 21)];
+        let changed = core.reconcile_conditional(&moved, &[], &rules);
+
+        assert_eq!(changed, vec![(1000, "cond:office".to_string())]);
+        let owned = core.owned(1000);
+        assert!(
+            matches!(&owned[0].resources[0], OwnedResource::Route(route) if route.interface_index == 7)
+        );
+        let status = cond_status(&core, 1000, &rules[0].1);
+        assert_eq!(status.matched_interface.as_deref(), Some("enp3s0"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_rule_removes_orphaned_journal_owner() {
+        let dir = unique_dir("cond-orphan");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        let rules = vec![(1000u32, cond_rule("office", "10.99.0.0/24"))];
+        core.reconcile_conditional(&[iface_addr(2, "enp1s0", "10.228.33.5", 21)], &[], &rules);
+        recorder.ops.lock().unwrap().clear();
+
+        // The rule was deleted while the daemon was off: no rules remain,
+        // the journal owner is orphaned and must be cleaned up.
+        let changed = core.reconcile_conditional(&[], &[], &[]);
+
+        assert_eq!(changed, vec![(1000, "cond:office".to_string())]);
+        assert_eq!(recorder.ops(), vec![remove("10.99.0.0/24")]);
+        assert!(core.owned(1000).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_rule_disabled_or_unmatched_applies_nothing() {
+        let dir = unique_dir("cond-off");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        let mut rule = cond_rule("office", "10.99.0.0/24");
+        rule.enabled = false;
+        let rules = vec![(1000u32, rule)];
+        let addrs = vec![iface_addr(2, "enp1s0", "10.228.33.5", 21)];
+
+        assert!(core.reconcile_conditional(&addrs, &[], &rules).is_empty());
+        assert!(recorder.ops().is_empty());
+        let status = cond_status(&core, 1000, &rules[0].1);
+        assert_eq!(status.state, ConditionalRuleState::Disabled);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_rule_surfaces_apply_errors_in_status() {
+        let dir = unique_dir("cond-error");
+        let recorder = Recorder::default();
+        recorder
+            .fail_add
+            .lock()
+            .unwrap()
+            .push("10.99.0.0/24".into());
+        let mut core = open_core(&dir, &recorder);
+        let rules = vec![(1000u32, cond_rule("office", "10.99.0.0/24"))];
+        let addrs = vec![iface_addr(2, "enp1s0", "10.228.33.5", 21)];
+
+        let changed = core.reconcile_conditional(&addrs, &[], &rules);
+
+        assert!(changed.is_empty());
+        let status = cond_status(&core, 1000, &rules[0].1);
+        assert_eq!(status.state, ConditionalRuleState::Error);
+        assert!(status.detail.is_some());
+        // Rollback left nothing owned.
+        assert!(core.owned(1000).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn conditional_rule_ignores_addresses_on_daemon_owned_interfaces() {
+        let dir = unique_dir("cond-owned");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        // Pretend a WireGuard link the daemon owns carries a matching
+        // address — the rule must not fire on it.
+        core.journal.entries.push(JournalEntry {
+            uid: 1000,
+            owner: "wg:home".into(),
+            state: OwnedState::Applied,
+            resources: vec![OwnedResource::WireGuardLink(WireGuardLinkResource {
+                name: "wg-deadbeef".into(),
+                index: 9,
+                owner_marker: "network-orchestrator:1000:wg:home".into(),
+                full: None,
+                warnings: Vec::new(),
+            })],
+        });
+        let rules = vec![(1000u32, cond_rule("office", "10.99.0.0/24"))];
+        // The address is on ifindex 9 — the daemon-owned link.
+        let addrs = vec![iface_addr(9, "wg-deadbeef", "10.228.33.5", 21)];
+
+        assert!(core.reconcile_conditional(&addrs, &[], &rules).is_empty());
+        assert!(recorder.ops().is_empty());
+        assert_eq!(
+            cond_status(&core, 1000, &rules[0].1).state,
+            ConditionalRuleState::Inactive
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn conditional_owner_prefix_is_reserved_for_clients() {
+        let dir = unique_dir("cond-reserved");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        assert_eq!(
+            core.apply_routes(1000, "cond:office", vec![route("10.1.0.0/16")])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // Removing an existing conditional owner is also refused.
+        #[cfg(target_os = "linux")]
+        {
+            let rules = vec![(1000u32, cond_rule("office", "10.99.0.0/24"))];
+            core.reconcile_conditional(&[iface_addr(2, "enp1s0", "10.228.33.5", 21)], &[], &rules);
+            let err = core.remove_owner(1000, "cond:office").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            // The journal entry survived — only rule evaluation may move it.
+            assert_eq!(core.owned(1000)[0].owner, "cond:office");
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

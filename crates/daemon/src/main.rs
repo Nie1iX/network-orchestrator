@@ -16,12 +16,15 @@ mod linux {
     use net_manager_core::daemon_protocol::{CleanupResult, DEFAULT_SOCKET_PATH, SOCKET_ENV};
     use network_orchestrator_daemon::always_on::{self, AlwaysOnStore};
     use network_orchestrator_daemon::auth::PolkitAuthorizer;
+    use network_orchestrator_daemon::cond_rules::CondRuleStore;
     use network_orchestrator_daemon::core::{DaemonCore, TrustedWgCommand};
     use network_orchestrator_daemon::dns::ResolvectlDnsExecutor;
     use network_orchestrator_daemon::journal::{JournalStore, JOURNAL_FILE};
     use network_orchestrator_daemon::netlink::{watch_network_changes, NetlinkExecutor};
     use network_orchestrator_daemon::openvpn_process::TrustedOpenVpnProcess;
-    use network_orchestrator_daemon::server::{bind_socket, serve, OwnerEvent, ServerContext};
+    use network_orchestrator_daemon::server::{
+        bind_socket, eval_conditional, serve, OwnerEvent, ServerContext,
+    };
     use network_orchestrator_daemon::settings::{SettingsStore, SETTINGS_FILE};
     use network_orchestrator_daemon::xray_process::TrustedXrayProcess;
     use std::io;
@@ -122,6 +125,10 @@ mod linux {
         let listener = bind_socket(&options.socket)?;
         let ctx = Arc::new(
             ServerContext::with_always_on_store(core, PolkitAuthorizer::default(), always_on)
+                .with_cond_rules(
+                    CondRuleStore::new(options.state_dir.join("cond-rules")),
+                    Arc::new(network_netlink.clone()),
+                )
                 .with_settings_store(SettingsStore::new(options.state_dir.join(SETTINGS_FILE))),
         );
         let mut sigterm = signal(SignalKind::terminate())?;
@@ -187,6 +194,7 @@ mod linux {
             .ok();
         let network_core = ctx.core.clone();
         let network_events = ctx.events.clone();
+        let network_ctx = ctx.clone();
         let network_reconcile = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
@@ -210,6 +218,9 @@ mod linux {
                         let _ = network_events.send(OwnerEvent { uid, owner });
                     }
                 }
+                // Conditional rules react to the same wake-up; failures are
+                // logged inside and never stop the reconcile loop.
+                eval_conditional(&network_ctx).await;
             }
         });
         eprintln!(

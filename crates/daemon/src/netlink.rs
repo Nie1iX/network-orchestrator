@@ -2,6 +2,7 @@
 //! unit-tested; the socket lives in a dedicated actor thread with its own
 //! `current_thread` runtime, so synchronous callers never nest `block_on`.
 
+use crate::cond_rules::{IfaceAddr, NetworkObservation};
 use crate::core::{LinkExecutor, PolicyRuleExecutor, WgSystem};
 use futures::TryStreamExt;
 use ipnet::IpNet;
@@ -15,6 +16,7 @@ use netlink_packet_route::route::{
 };
 use netlink_packet_route::rule::{RuleAction, RuleAttribute, RuleFlag, RuleMessage};
 use netlink_packet_route::AddressFamily;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
 use std::net::IpAddr;
@@ -459,6 +461,9 @@ enum Command {
         up: bool,
         reply: mpsc::Sender<io::Result<()>>,
     },
+    InterfaceAddrs {
+        reply: mpsc::Sender<io::Result<Vec<IfaceAddr>>>,
+    },
     WgCreate {
         name: String,
         owner_marker: String,
@@ -558,6 +563,65 @@ impl NetlinkExecutor {
     pub fn owned_routes_snapshot(&self) -> io::Result<Vec<AppliedRoute>> {
         self.call_with(|reply| Command::OwnedRoutesSnapshot { reply })
     }
+
+    /// Every interface address with its link name, for conditional rules.
+    pub fn interface_addrs(&self) -> io::Result<Vec<IfaceAddr>> {
+        self.call_with(|reply| Command::InterfaceAddrs { reply })
+    }
+}
+
+impl NetworkObservation for NetlinkExecutor {
+    fn interface_addrs(&self) -> io::Result<Vec<IfaceAddr>> {
+        NetlinkExecutor::interface_addrs(self)
+    }
+
+    fn owned_routes(&self) -> io::Result<Vec<AppliedRoute>> {
+        self.owned_routes_snapshot()
+    }
+}
+
+/// Dump links (index→name) and addresses (both families) in one pass.
+/// `IFA_LOCAL` is preferred over `IFA_ADDRESS`: on point-to-point links the
+/// latter is the peer's address, while the former is always ours.
+async fn get_interface_addrs(handle: &rtnetlink::Handle) -> io::Result<Vec<IfaceAddr>> {
+    let mut names: HashMap<u32, String> = HashMap::new();
+    let mut links = handle.link().get().execute();
+    while let Some(link) = links.try_next().await.map_err(netlink_error_to_io)? {
+        for attribute in &link.attributes {
+            if let LinkAttribute::IfName(name) = attribute {
+                names.insert(link.header.index, name.clone());
+            }
+        }
+    }
+    let mut addrs = Vec::new();
+    let mut stream = handle.address().get().execute();
+    while let Some(message) = stream.try_next().await.map_err(netlink_error_to_io)? {
+        let mut local = None;
+        let mut address = None;
+        for attribute in &message.attributes {
+            match attribute {
+                AddressAttribute::Local(ip) => local = Some(*ip),
+                AddressAttribute::Address(ip) => address = Some(*ip),
+                _ => {}
+            }
+        }
+        let Some(ip) = local.or(address) else {
+            continue;
+        };
+        let Ok(prefix) = IpNet::new(ip, message.header.prefix_len) else {
+            continue;
+        };
+        addrs.push(IfaceAddr {
+            ifindex: message.header.index,
+            name: names
+                .get(&message.header.index)
+                .cloned()
+                .unwrap_or_default(),
+            address: prefix,
+            scope: u8::from(message.header.scope),
+        });
+    }
+    Ok(addrs)
 }
 
 async fn get_link(
@@ -752,6 +816,9 @@ async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedRecei
                 let mut request = handle.link().set(index);
                 *request.message_mut() = link_request(index, up);
                 let _ = reply.send(request.execute().await.map_err(netlink_error_to_io));
+            }
+            Command::InterfaceAddrs { reply } => {
+                let _ = reply.send(get_interface_addrs(&handle).await);
             }
             Command::WgCreate {
                 name,

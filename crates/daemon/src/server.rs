@@ -5,6 +5,8 @@ use crate::always_on::{apply_definition, validate_definition, AlwaysOnStore};
 use crate::auth::{
     connect_action, required_action, Action, AuthDecision, Authorizer, PeerIdentity,
 };
+#[cfg(target_os = "linux")]
+use crate::cond_rules::{validate_rule, CondRuleStore, NetworkObservation, NoObservation};
 use crate::core::DaemonCore;
 use crate::openvpn::{prepare_openvpn, OpenVpnPlan};
 use crate::settings::{DaemonSettings, SettingsStore};
@@ -14,14 +16,15 @@ use crate::xray::prepare_xray;
 use net_manager_core::daemon_protocol::{
     encode_line, event, from_value, method, read_frame, AlwaysOnKind, AlwaysOnListResult,
     AlwaysOnProfileInfo, AlwaysOnRemoveParams, AlwaysOnRemoveResult, AlwaysOnResumeResult,
-    AlwaysOnSetParams, AlwaysOnSetResult, ErrorCode, EventFrame, HelloParams, HelloResult,
-    LinkSetStateParams, OpenVpnConnectRequest, OpenVpnConnectResult, OpenVpnDisconnectResult,
-    OpenVpnProbeResult, OpenVpnProfileParams, OwnedChanged, OwnedListResult, OwnerParams,
-    RequestFrame, ResponseFrame, RoutesApplyParams, RoutesApplyResult, RoutesRemoveResult,
-    SettingsResult, SettingsSetParams, VpnAuthMode, WireGuardConnectParams, WireGuardConnectResult,
-    WireGuardDisconnectResult, WireGuardProfileParams, XrayConnectParams, XrayConnectResult,
-    XrayDisconnectResult, XrayProfileParams, HELLO_TIMEOUT_SECS, MAX_CONNECTIONS, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION,
+    AlwaysOnSetParams, AlwaysOnSetResult, CondRulesListResult, CondRulesPutParams,
+    CondRulesPutResult, CondRulesRemoveParams, CondRulesRemoveResult, ConditionalRuleEntry,
+    ErrorCode, EventFrame, HelloParams, HelloResult, LinkSetStateParams, OpenVpnConnectRequest,
+    OpenVpnConnectResult, OpenVpnDisconnectResult, OpenVpnProbeResult, OpenVpnProfileParams,
+    OwnedChanged, OwnedListResult, OwnerParams, RequestFrame, ResponseFrame, RoutesApplyParams,
+    RoutesApplyResult, RoutesRemoveResult, SettingsResult, SettingsSetParams, VpnAuthMode,
+    WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
+    WireGuardProfileParams, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
+    XrayProfileParams, HELLO_TIMEOUT_SECS, MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -48,6 +51,12 @@ pub struct ServerContext<A> {
     pub connections: Arc<Semaphore>,
     pub hello_timeout: Duration,
     pub always_on: Option<Arc<Mutex<AlwaysOnStore>>>,
+    /// Conditional route rules; `None` in tests disables condRules.*.
+    #[cfg(target_os = "linux")]
+    pub cond_rules: Option<Arc<CondRuleStore>>,
+    /// Kernel state for conditional evaluation; `NoObservation` in tests.
+    #[cfg(target_os = "linux")]
+    pub observer: Arc<dyn NetworkObservation>,
     pub settings: Arc<Mutex<DaemonSettings>>,
     /// `None` keeps settings in memory only (tests).
     pub settings_store: Option<Arc<SettingsStore>>,
@@ -62,6 +71,10 @@ impl<A: Authorizer> ServerContext<A> {
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             hello_timeout: Duration::from_secs(HELLO_TIMEOUT_SECS),
             always_on: None,
+            #[cfg(target_os = "linux")]
+            cond_rules: None,
+            #[cfg(target_os = "linux")]
+            observer: Arc::new(NoObservation),
             settings: Arc::new(Mutex::new(DaemonSettings::default())),
             settings_store: None,
         }
@@ -71,6 +84,17 @@ impl<A: Authorizer> ServerContext<A> {
         let mut context = Self::new(core, authorizer);
         context.always_on = Some(Arc::new(Mutex::new(store)));
         context
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_cond_rules(
+        mut self,
+        store: CondRuleStore,
+        observer: Arc<dyn NetworkObservation>,
+    ) -> Self {
+        self.cond_rules = Some(Arc::new(store));
+        self.observer = observer;
+        self
     }
 
     pub fn with_settings_store(mut self, store: SettingsStore) -> Self {
@@ -627,6 +651,46 @@ async fn handle<A: Authorizer>(
             }
             to_value(&RoutesRemoveResult { removed: result? })
         }
+        #[cfg(target_os = "linux")]
+        method::COND_RULES_LIST => {
+            let rules = with_cond_store(ctx, move |store| {
+                store.load_uid(uid).map(|document| document.rules)
+            })
+            .await?;
+            let entries = with_core(ctx, move |core| {
+                Ok(rules
+                    .into_iter()
+                    .map(|rule| ConditionalRuleEntry {
+                        status: core.cond_rule_status(uid, &rule),
+                        rule,
+                    })
+                    .collect())
+            })
+            .await?;
+            to_value(&CondRulesListResult { rules: entries })
+        }
+        #[cfg(target_os = "linux")]
+        method::COND_RULES_PUT => {
+            let params: CondRulesPutParams = params(request.params)?;
+            validate_rule(&params.rule).map_err(|err| invalid(err.to_string()))?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let rule = params.rule;
+            let for_store = rule.clone();
+            let stored = with_cond_store(ctx, move |store| store.upsert(uid, for_store)).await?;
+            eval_conditional(ctx).await;
+            let status = with_core(ctx, move |core| Ok(core.cond_rule_status(uid, &rule))).await?;
+            to_value(&CondRulesPutResult { stored, status })
+        }
+        #[cfg(target_os = "linux")]
+        method::COND_RULES_REMOVE => {
+            let params: CondRulesRemoveParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let removed =
+                with_cond_store(ctx, move |store| store.remove(uid, &params.rule_id)).await?;
+            // Orphan cleanup inside evaluation withdraws the rule's routes.
+            eval_conditional(ctx).await;
+            to_value(&CondRulesRemoveResult { removed })
+        }
         method::LINK_SET_STATE => {
             let params: LinkSetStateParams = params(request.params)?;
             validate_iface_name(&params.name).map_err(invalid)?;
@@ -780,6 +844,61 @@ where
         )
     })?
     .map_err(|err| (error_code(&err), "always-on store operation failed".into()))
+}
+
+#[cfg(target_os = "linux")]
+async fn with_cond_store<A, T, F>(ctx: &ServerContext<A>, f: F) -> Result<T, Failure>
+where
+    T: Send + 'static,
+    F: FnOnce(&CondRuleStore) -> io::Result<T> + Send + 'static,
+{
+    let store = ctx.cond_rules.clone().ok_or((
+        ErrorCode::Unavailable,
+        "conditional rule store is unavailable".into(),
+    ))?;
+    tokio::task::spawn_blocking(move || f(&store))
+        .await
+        .map_err(|_| {
+            (
+                ErrorCode::Internal,
+                "conditional rule operation failed".into(),
+            )
+        })?
+        .map_err(|err| (error_code(&err), "conditional rule operation failed".into()))
+}
+
+/// Re-evaluate all stored conditional rules against live kernel state and
+/// notify the uids whose owners changed. Shared by the `condRules.*`
+/// handlers and the network-change reconcile loop; a store or observer
+/// failure is logged, never fatal.
+#[cfg(target_os = "linux")]
+pub async fn eval_conditional<A: Authorizer>(ctx: &ServerContext<A>) {
+    let Some(store) = ctx.cond_rules.clone() else {
+        return;
+    };
+    let observer = ctx.observer.clone();
+    let core = ctx.core.clone();
+    let changed = tokio::task::spawn_blocking(move || -> io::Result<Vec<(u32, String)>> {
+        let rules = store.load_all_rules()?;
+        let addrs = observer.interface_addrs()?;
+        let observed = observer.owned_routes()?;
+        let mut core = core.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(core.reconcile_conditional(&addrs, &observed, &rules))
+    })
+    .await;
+    match changed {
+        Ok(Ok(changed)) => {
+            for (uid, owner) in changed {
+                notify(ctx, uid, owner);
+            }
+        }
+        Ok(Err(err)) => {
+            eprintln!("network-orchestrator-daemon: conditional rule evaluation failed: {err}")
+        }
+        Err(err) => {
+            eprintln!("network-orchestrator-daemon: conditional rule evaluation task failed: {err}")
+        }
+    }
 }
 
 fn error_code(err: &io::Error) -> ErrorCode {
@@ -1973,5 +2092,204 @@ mod tests {
         client.call(4, method::ALWAYS_ON_RESUME, Value::Null).await;
         assert!(!store.load_uid(1000).unwrap().paused);
         assert_eq!(harness.ctx.core.lock().unwrap().owned(1000).len(), 1);
+    }
+
+    // ── Conditional rules ────────────────────────────────────────────
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Default)]
+    struct FakeObserver {
+        addrs: Arc<Mutex<Vec<crate::cond_rules::IfaceAddr>>>,
+        routes: Arc<Mutex<Vec<net_manager_core::models::AppliedRoute>>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl crate::cond_rules::NetworkObservation for FakeObserver {
+        fn interface_addrs(&self) -> io::Result<Vec<crate::cond_rules::IfaceAddr>> {
+            Ok(self.addrs.lock().unwrap().clone())
+        }
+        fn owned_routes(&self) -> io::Result<Vec<net_manager_core::models::AppliedRoute>> {
+            Ok(self.routes.lock().unwrap().clone())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cond_harness(
+        decision: AuthDecision,
+        addrs: Vec<crate::cond_rules::IfaceAddr>,
+    ) -> (Harness, Arc<Mutex<Vec<crate::cond_rules::IfaceAddr>>>) {
+        let mut harness = Harness::new(decision);
+        let observed_addrs = Arc::new(Mutex::new(addrs));
+        let ctx = Arc::get_mut(&mut harness.ctx).unwrap();
+        ctx.cond_rules = Some(Arc::new(crate::cond_rules::CondRuleStore::new(
+            harness.dir.join("cond-rules"),
+        )));
+        ctx.observer = Arc::new(FakeObserver {
+            addrs: observed_addrs.clone(),
+            routes: Arc::new(Mutex::new(Vec::new())),
+        });
+        (harness, observed_addrs)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cond_params(id: &str, prefix: &str, dest: &str) -> Value {
+        json!({"rule": {
+            "id": id,
+            "name": "Office LAN",
+            "enabled": true,
+            "condition": {"kind": "interfaceAddressIn", "prefix": prefix},
+            "routes": [{"destination": dest, "metric": 5}]
+        }})
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lan_addr() -> crate::cond_rules::IfaceAddr {
+        crate::cond_rules::IfaceAddr {
+            ifindex: 2,
+            name: "enp1s0".into(),
+            address: "10.228.33.5/21".parse().unwrap(),
+            scope: 0,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cond_rules_put_list_remove_roundtrip() {
+        let (harness, _) = cond_harness(AuthDecision::Authorized, Vec::new());
+        let mut client = harness.hello(1000).await;
+
+        // Outside the LAN: the rule stores but stays inactive.
+        let reply = client
+            .call(
+                2,
+                method::COND_RULES_PUT,
+                cond_params("office", "10.228.32.0/21", "10.99.0.0/24"),
+            )
+            .await;
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        assert_eq!(reply["result"]["stored"], json!(true));
+        assert_eq!(reply["result"]["status"]["state"], json!("inactive"));
+
+        let reply = client.call(3, method::COND_RULES_LIST, Value::Null).await;
+        assert_eq!(reply["result"]["rules"][0]["rule"]["id"], json!("office"));
+        assert_eq!(
+            reply["result"]["rules"][0]["status"]["state"],
+            json!("inactive")
+        );
+
+        let reply = client
+            .call(4, method::COND_RULES_REMOVE, json!({"ruleId": "office"}))
+            .await;
+        assert_eq!(reply["result"]["removed"], json!(true));
+        let reply = client.call(5, method::COND_RULES_LIST, Value::Null).await;
+        assert_eq!(reply["result"]["rules"], json!([]));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cond_rules_put_applies_and_remove_withdraws_routes() {
+        let (harness, _) = cond_harness(AuthDecision::Authorized, vec![lan_addr()]);
+        let mut client = harness.hello(1000).await;
+
+        let reply = client
+            .call(
+                2,
+                method::COND_RULES_PUT,
+                cond_params("office", "10.228.32.0/21", "10.99.0.0/24"),
+            )
+            .await;
+        assert_eq!(
+            reply["result"]["status"]["state"],
+            json!("active"),
+            "{reply}"
+        );
+        assert_eq!(
+            reply["result"]["status"]["matchedInterface"],
+            json!("enp1s0")
+        );
+        assert_eq!(
+            harness.recorder.ops(),
+            vec![crate::core::testing::Op::Add("10.99.0.0/24".into())]
+        );
+
+        let reply = client
+            .call(3, method::COND_RULES_REMOVE, json!({"ruleId": "office"}))
+            .await;
+        assert_eq!(reply["result"]["removed"], json!(true));
+        assert_eq!(
+            harness.recorder.ops(),
+            vec![
+                crate::core::testing::Op::Add("10.99.0.0/24".into()),
+                crate::core::testing::Op::Remove("10.99.0.0/24".into())
+            ]
+        );
+        assert!(harness.ctx.core.lock().unwrap().owned(1000).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cond_rules_require_authorization_and_valid_rules() {
+        let (denied, _) = cond_harness(AuthDecision::Denied, Vec::new());
+        let mut client = denied.hello(1000).await;
+        let reply = client
+            .call(
+                2,
+                method::COND_RULES_PUT,
+                cond_params("office", "10.228.32.0/21", "10.99.0.0/24"),
+            )
+            .await;
+        assert_eq!(error_code(&reply), "notAuthorized", "{reply}");
+        let reply = client
+            .call(3, method::COND_RULES_REMOVE, json!({"ruleId": "office"}))
+            .await;
+        assert_eq!(error_code(&reply), "notAuthorized", "{reply}");
+
+        // Validation failures do not reach the authorizer.
+        let (harness, _) = cond_harness(AuthDecision::Authorized, Vec::new());
+        let mut client = harness.hello(1000).await;
+        let mut bad = cond_params("bad id", "10.228.32.0/21", "10.99.0.0/24");
+        bad["rule"]["id"] = json!("has space");
+        let reply = client.call(2, method::COND_RULES_PUT, bad).await;
+        assert_eq!(error_code(&reply), "invalidParams", "{reply}");
+        assert_eq!(harness.auth_calls(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cond_rules_are_scoped_to_the_calling_uid() {
+        let (harness, _) = cond_harness(AuthDecision::Authorized, Vec::new());
+        let mut mine = harness.hello(1000).await;
+        let mut other = harness.hello(1001).await;
+        mine.call(
+            2,
+            method::COND_RULES_PUT,
+            cond_params("office", "10.228.32.0/21", "10.99.0.0/24"),
+        )
+        .await;
+        assert_eq!(
+            other.call(2, method::COND_RULES_LIST, Value::Null).await["result"]["rules"],
+            json!([])
+        );
+        // Another uid cannot remove the rule.
+        let reply = other
+            .call(3, method::COND_RULES_REMOVE, json!({"ruleId": "office"}))
+            .await;
+        assert_eq!(reply["result"]["removed"], json!(false));
+        assert_eq!(
+            mine.call(3, method::COND_RULES_LIST, Value::Null).await["result"]["rules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cond_rules_are_unavailable_without_a_store() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+        let reply = client.call(2, method::COND_RULES_LIST, Value::Null).await;
+        assert_eq!(error_code(&reply), "unavailable", "{reply}");
     }
 }
