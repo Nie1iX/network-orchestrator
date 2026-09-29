@@ -11,7 +11,6 @@ import {
 } from "../types";
 import { kindIcon, categoryIcon, ChevronIcon, ArrowDownIcon, ArrowUpIcon } from "../icons";
 import InterfaceDetail from "./InterfaceDetail";
-import ExitIpPanel from "./ExitIpPanel";
 import Page from "./Page";
 import Skeleton from "./ui/Skeleton";
 import RateText from "./ui/RateText";
@@ -207,7 +206,6 @@ export default function InterfaceList() {
     <Page width="wide">
     <section>
       <h2>Network</h2>
-      <ExitIpPanel />
       <div className="filter-bar">
         <input
           className="filter-search"

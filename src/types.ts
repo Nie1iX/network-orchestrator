@@ -238,6 +238,11 @@ export interface TunnelStatus {
   interfaceName?: string | null;
 }
 
+export interface AutoConnectResult {
+  failedCount: number;
+  startupFailed: boolean;
+}
+
 export type LogLevel = "info" | "warn" | "error";
 export type LogSource = "app" | "daemon";
 

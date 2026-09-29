@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { ensureElevation } from "../elevation";
 import { RecoveryReport } from "../types";
 
@@ -25,6 +25,7 @@ function RecoveryPrompt() {
   }, []);
 
   useEffect(() => {
+    if (!isTauri()) return;
     void loadReport();
   }, [loadReport]);
 

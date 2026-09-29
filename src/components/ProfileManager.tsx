@@ -1,14 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import { ensureElevation } from "../elevation";
+import { ensureElevation, requiresElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
+import { useProfileListMode } from "../prefs";
 import {
   backendIcon,
   ChevronIcon,
-  CloseIcon,
-  GripVerticalIcon,
   PlusIcon,
 } from "../icons";
 import AddConnectionMenu from "./AddConnectionMenu";
@@ -16,12 +14,18 @@ import DiagnosticsModal from "./DiagnosticsModal";
 import ImportModal from "./ImportModal";
 import Modal from "./Modal";
 import Page from "./Page";
+import ProfileDetail from "./profiles/ProfileDetail";
+import ProfileRow from "./profiles/ProfileRow";
+import SetsBar from "./profiles/SetsBar";
+import {
+  ConnectionSnippet,
+  loadSnippets,
+  newSnippetId,
+  sameIds,
+  storeSnippets,
+} from "./profiles/sets";
 import Skeleton from "./ui/Skeleton";
-import ToggleSwitch from "./ui/ToggleSwitch";
-import OverflowMenu from "./ui/OverflowMenu";
-import RateText from "./ui/RateText";
 import { useToast } from "./ui/Toast";
-import { formatBytes } from "../format";
 import ProfileFormModal, {
   editFormState,
   newFormState,
@@ -32,8 +36,6 @@ import {
   AlwaysOnListResult,
   AlwaysOnSetResult,
   BatchImportResult,
-  DomainPolicy,
-  DomainRouteTarget,
   NetworkInterface,
   Profile,
   ProfileDiagnostics,
@@ -42,7 +44,6 @@ import {
   SubscriptionDelayResult,
   SubscriptionRefreshResult,
   TunnelBackend,
-  TunnelState,
   TunnelStatus,
 } from "../types";
 
@@ -52,37 +53,6 @@ const BACKEND_LABELS: Record<TunnelBackend, string> = {
   openVpn: "OpenVPN",
   xray: "Xray",
 };
-
-interface AutoConnectResult {
-  failedCount: number;
-  startupFailed: boolean;
-}
-
-const DOMAIN_TARGET_LABELS: Record<DomainRouteTarget, string> = {
-  block: "Block",
-  proxy: "Proxy",
-  direct: "Direct",
-};
-
-/** Counts real selectors; `#` comment lines are stored in `domains` for
- * round-trip through the editor but are not rules. */
-function countPolicyRules(
-  policies: DomainPolicy[],
-  target?: DomainRouteTarget,
-): number {
-  return policies
-    .filter((p) => target === undefined || p.target === target)
-    .flatMap((p) => p.domains)
-    .filter((d) => !d.trimStart().startsWith("#")).length;
-}
-
-function requiresElevation(profile: Profile): boolean {
-  return (
-    profile.backend === "wireGuard" ||
-    profile.backend === "openVpn" ||
-    profile.routes.length > 0
-  );
-}
 
 const COLLAPSED_GROUPS_KEY = "netmanager.connections.collapsedGroups";
 
@@ -94,37 +64,6 @@ function loadCollapsedGroups(): Set<TunnelBackend> {
   } catch {
     return new Set();
   }
-}
-
-const SNIPPETS_KEY = "netmanager.connections.snippets";
-
-interface ConnectionSnippet {
-  id: string;
-  name: string;
-  profileIds: string[];
-}
-
-function newSnippetId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-function loadSnippets(): ConnectionSnippet[] {
-  try {
-    const raw = localStorage.getItem(SNIPPETS_KEY);
-    if (!raw) return [];
-    return JSON.parse(raw) as ConnectionSnippet[];
-  } catch {
-    return [];
-  }
-}
-
-function sameIds(a: string[], b: string[]): boolean {
-  if (a.length !== b.length) return false;
-  const setA = new Set(a);
-  return b.every((id) => setA.has(id));
 }
 
 interface ProfileGroup {
@@ -151,18 +90,15 @@ function applyGroupOrder(
   );
 }
 
-function ConnectionCardSkeleton() {
+function ProfileRowSkeleton() {
   return (
-    <div className="connection-card">
-      <div className="connection-card-main">
-        <Skeleton width="36px" height="36px" radius="50%" />
-        <div className="connection-card-info">
-          <Skeleton width="140px" height="0.95rem" />
-          <Skeleton width="90px" height="0.78rem" />
-        </div>
-        <Skeleton width="40px" height="24px" radius="999px" />
-        <Skeleton width="32px" height="32px" radius="8px" />
+    <div className="profile-row">
+      <Skeleton width="30px" height="30px" radius="50%" />
+      <div className="profile-row-info">
+        <Skeleton width="140px" height="0.9rem" />
+        <Skeleton width="90px" height="0.75rem" />
       </div>
+      <Skeleton width="40px" height="24px" radius="999px" />
     </div>
   );
 }
@@ -170,6 +106,7 @@ function ConnectionCardSkeleton() {
 export default function ProfileManager() {
   const caps = usePlatformCapabilities();
   const toast = useToast();
+  const listMode = useProfileListMode();
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [statuses, setStatuses] = useState<TunnelStatus[]>([]);
   const [alwaysOn, setAlwaysOn] = useState<AlwaysOnListResult | null>(null);
@@ -207,11 +144,14 @@ export default function ProfileManager() {
   const [rememberOpenVpnCredentials, setRememberOpenVpnCredentials] = useState(false);
   const [openVpnCredentialError, setOpenVpnCredentialError] = useState<string | null>(null);
   const [openVpnCredentialBusy, setOpenVpnCredentialBusy] = useState(false);
-  const [measuringDelay, setMeasuringDelay] = useState<string | null>(null);
+  const [measuringEndpoints, setMeasuringEndpoints] = useState<Set<string>>(
+    new Set(),
+  );
+  const [measuringAll, setMeasuringAll] = useState<Set<string>>(new Set());
   const [delayResults, setDelayResults] = useState<
-    Record<string, { index: number; result: SubscriptionDelayResult }>
+    Record<string, Record<number, SubscriptionDelayResult>>
   >({});
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<TunnelBackend>>(
     loadCollapsedGroups,
   );
@@ -225,7 +165,6 @@ export default function ProfileManager() {
     Record<number, { rxRate: number; txRate: number }>
   >({});
   const prevStats = useRef<Record<number, { rx: number; tx: number; time: number }>>({});
-  const prevTunnelStates = useRef<Record<string, TunnelState>>({});
   const [dragState, setDragState] = useState<{
     backend: TunnelBackend;
     profileId: string;
@@ -234,45 +173,6 @@ export default function ProfileManager() {
     profileId: string;
     before: boolean;
   } | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    let stopListening: (() => void) | null = null;
-    const showResult = (result: AutoConnectResult | null) => {
-      if (!active || !result) return;
-      if (result.startupFailed) {
-        toast(
-          "error",
-          "Auto-connect could not start. Check Network daemon in Settings and profile Diagnostics.",
-        );
-      } else if (result.failedCount > 0) {
-        toast(
-          "error",
-          `${result.failedCount} profile(s) could not connect automatically. Check Diagnostics and retry Connect manually.`,
-        );
-      }
-    };
-    void (async () => {
-      try {
-        const stop = await listen<AutoConnectResult>(
-          "auto-connect-result",
-          (event) => showResult(event.payload),
-        );
-        if (!active) {
-          stop();
-          return;
-        }
-        stopListening = stop;
-        showResult(await invoke<AutoConnectResult | null>("get_auto_connect_result"));
-      } catch {
-        // The profile list remains usable if the startup result is unavailable.
-      }
-    })();
-    return () => {
-      active = false;
-      stopListening?.();
-    };
-  }, []);
 
   useEffect(() => {
     try {
@@ -286,11 +186,7 @@ export default function ProfileManager() {
   }, [collapsedGroups]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(SNIPPETS_KEY, JSON.stringify(snippets));
-    } catch {
-      // ignore storage errors (e.g. storage disabled)
-    }
+    storeSnippets(snippets);
   }, [snippets]);
 
   useEffect(() => {
@@ -341,14 +237,6 @@ export default function ProfileManager() {
       const next = new Set(prev);
       if (next.has(backend)) next.delete(backend);
       else next.add(backend);
-      return next;
-    });
-
-  const toggleExpanded = (id: string) =>
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
       return next;
     });
 
@@ -443,27 +331,6 @@ export default function ProfileManager() {
   }, [refreshStatuses]);
 
   useEffect(() => {
-    const prev = prevTunnelStates.current;
-    const next: Record<string, TunnelState> = {};
-    for (const status of statuses) {
-      next[status.profileId] = status.state;
-      const before = prev[status.profileId];
-      if (before !== undefined && before !== "failed" && status.state === "failed") {
-        const name =
-          profiles.find((profile) => profile.id === status.profileId)?.name ??
-          "Profile";
-        toast(
-          "error",
-          status.message
-            ? `${name} failed to connect: ${status.message}`
-            : `${name} failed to connect. Run Diagnostics for details.`,
-        );
-      }
-    }
-    prevTunnelStates.current = next;
-  }, [statuses, profiles]);
-
-  useEffect(() => {
     const subProfiles = profiles.filter((p) => p.subscription !== null);
     if (subProfiles.length === 0) {
       if (Object.keys(endpoints).length > 0) setEndpoints({});
@@ -484,7 +351,10 @@ export default function ProfileManager() {
           // ignore — sidecar may be missing or unreadable
         }
       }
-      if (!cancelled) setEndpoints(next);
+      if (!cancelled) {
+        setEndpoints(next);
+        measureActiveEndpoints(next);
+      }
     })();
     return () => {
       cancelled = true;
@@ -756,11 +626,6 @@ export default function ProfileManager() {
         }
       }
       setEndpoints(next);
-      setDelayResults((current) => {
-        const updated = { ...current };
-        delete updated[profile.id];
-        return updated;
-      });
     } catch (err) {
       setError(String(err));
     } finally {
@@ -814,11 +679,9 @@ export default function ProfileManager() {
     }
   };
 
-  const onMeasureDelay = async (profile: Profile) => {
-    const index =
-      endpoints[profile.id]?.findIndex((endpoint) => endpoint.active) ?? -1;
-    if (index < 0) return;
-    setMeasuringDelay(profile.id);
+  const onMeasureEndpoint = async (profile: Profile, index: number) => {
+    const key = `${profile.id}:${index}`;
+    setMeasuringEndpoints((prev) => new Set(prev).add(key));
     try {
       const result = await invoke<SubscriptionDelayResult>(
         "measure_subscription_endpoint_delay",
@@ -826,18 +689,56 @@ export default function ProfileManager() {
       );
       setDelayResults((current) => ({
         ...current,
-        [profile.id]: { index, result },
+        [profile.id]: { ...(current[profile.id] ?? {}), [index]: result },
       }));
     } catch {
       setDelayResults((current) => ({
         ...current,
         [profile.id]: {
-          index,
-          result: { delayMs: null, error: "Delay check failed" },
+          ...(current[profile.id] ?? {}),
+          [index]: { delayMs: null, error: "Delay check failed" },
         },
       }));
     } finally {
-      setMeasuringDelay(null);
+      setMeasuringEndpoints((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }
+  };
+
+  const onMeasureAllEndpoints = async (profile: Profile) => {
+    const list = endpoints[profile.id] ?? [];
+    if (list.length === 0) return;
+    setMeasuringAll((prev) => new Set(prev).add(profile.id));
+    try {
+      const CHUNK = 4;
+      for (let i = 0; i < list.length; i += CHUNK) {
+        await Promise.all(
+          list
+            .slice(i, i + CHUNK)
+            .map((_, k) => onMeasureEndpoint(profile, i + k)),
+        );
+      }
+    } finally {
+      setMeasuringAll((prev) => {
+        const next = new Set(prev);
+        next.delete(profile.id);
+        return next;
+      });
+    }
+  };
+
+  const measureActiveEndpoints = (
+    endpointMap: Record<string, SubscriptionEndpointInfo[]>,
+  ) => {
+    for (const p of profiles) {
+      if (!p.subscription) continue;
+      const list = endpointMap[p.id];
+      const index = list?.findIndex((e) => e.active) ?? -1;
+      if (index < 0) continue;
+      void onMeasureEndpoint(p, index);
     }
   };
 
@@ -998,17 +899,18 @@ export default function ProfileManager() {
 
   if (loading) {
     return (
-      <Page width="narrow">
-        <section>
-          <div className="profiles-toolbar">
-            <h2>Connections</h2>
+      <Page width="full">
+        <div className="profiles-toolbar">
+          <h2>Profiles</h2>
+        </div>
+        <div className="profiles-layout">
+          <div className="profiles-list-pane">
+            <ProfileRowSkeleton />
+            <ProfileRowSkeleton />
+            <ProfileRowSkeleton />
           </div>
-          <div className="connection-list">
-            <ConnectionCardSkeleton />
-            <ConnectionCardSkeleton />
-            <ConnectionCardSkeleton />
-          </div>
-        </section>
+          <div className="profiles-detail-pane" />
+        </div>
       </Page>
     );
   }
@@ -1043,11 +945,134 @@ export default function ProfileManager() {
     }))
     .filter((g) => g.items.length > 0);
 
+  const failedCount = profiles.filter(
+    (p) => statusFor(p.id).state === "failed",
+  ).length;
+
+  const selected =
+    (selectedId ? profiles.find((p) => p.id === selectedId) : undefined) ??
+    runningProfiles[0] ??
+    filteredProfiles[0] ??
+    profiles[0] ??
+    null;
+
+  const selGroup = selected
+    ? groups.find((g) => g.backend === selected.backend)
+    : undefined;
+  const selIndex =
+    selGroup && selected
+      ? selGroup.items.findIndex((p) => p.id === selected.id)
+      : -1;
+  const canMove = Boolean(
+    listMode === "grouped" &&
+    !lowerSearch &&
+    selGroup &&
+    selIndex >= 0 &&
+    selGroup.items.length > 1,
+  );
+
+  const stateRank = (state: TunnelStatus["state"]) =>
+    state === "running" ? 0 : state === "failed" ? 1 : 2;
+  const flatList =
+    listMode === "flat"
+      ? [...filteredProfiles].sort(
+          (a, b) =>
+            stateRank(statusFor(a.id).state) -
+              stateRank(statusFor(b.id).state) ||
+            a.name.localeCompare(b.name),
+        )
+      : [];
+
+  const renderProfileRow = (
+    profile: Profile,
+    group: ProfileGroup | null,
+    canReorder: boolean,
+  ) => {
+    const status = statusFor(profile.id);
+    const isBusy = busy.has(profile.id);
+    const rate = status.state === "running" ? rateFor(profile) : null;
+    const endpointList = endpoints[profile.id];
+    const activeEndpointIdx =
+      endpointList?.findIndex((e) => e.active) ?? -1;
+    const delayRes =
+      activeEndpointIdx >= 0
+        ? delayResults[profile.id]?.[activeEndpointIdx]
+        : undefined;
+    return (
+      <ProfileRow
+        key={profile.id}
+        profile={profile}
+        status={status}
+        rate={rate}
+        delayText={
+          !profile.subscription
+            ? null
+            : activeEndpointIdx >= 0 &&
+                measuringEndpoints.has(
+                  `${profile.id}:${activeEndpointIdx}`,
+                )
+              ? "…"
+              : delayRes
+                ? delayRes.delayMs !== null
+                  ? `${delayRes.delayMs} ms`
+                  : "err"
+                : "—"
+        }
+        isBusy={isBusy}
+        selected={selected?.id === profile.id}
+        dragging={dragState?.profileId === profile.id}
+        dropBefore={
+          dropTarget?.profileId === profile.id && dropTarget.before
+        }
+        dropAfter={
+          dropTarget?.profileId === profile.id && !dropTarget.before
+        }
+        canReorder={canReorder}
+        onSelect={() => setSelectedId(profile.id)}
+        onToggle={() =>
+          status.state === "running"
+            ? void onDisconnect(profile)
+            : void onConnect(profile)
+        }
+        onDragStart={(event) => onCardDragStart(event, profile)}
+        onDragEnd={onCardDragEnd}
+        onDragOver={(event) =>
+          group && onCardDragOver(event, group, profile)
+        }
+        onDrop={(event) => group && onCardDrop(event, group, profile)}
+      />
+    );
+  };
+
   return (
-    <Page width="narrow">
-    <section>
+    <Page width="full">
       <div className="profiles-toolbar">
-        <h2>Connections</h2>
+        <h2>Profiles</h2>
+        <span className="profiles-status">
+          <span
+            className={`status-dot ${
+              runningProfiles.length > 0 ? "state-running" : "state-stopped"
+            }`}
+          />
+          {runningProfiles.length} of {profiles.length} running
+          {failedCount > 0 && (
+            <span className="profiles-status-failed">
+              {" "}
+              · {failedCount} failed
+            </span>
+          )}
+        </span>
+        {profiles.some((p) => p.subscription !== null) && (
+          <button
+            type="button"
+            className="btn-sm"
+            onClick={() => measureActiveEndpoints(endpoints)}
+            disabled={measuringEndpoints.size > 0}
+            title="Measure delay to the active endpoint of every subscription"
+          >
+            {measuringEndpoints.size > 0 ? "Testing…" : "Test delays"}
+          </button>
+        )}
         <button
           className="profile-new-btn btn-primary btn-with-icon"
           onClick={() => setAddMenuOpen(true)}
@@ -1080,70 +1105,6 @@ export default function ProfileManager() {
             {resumingAlwaysOn ? "Resuming…" : "Resume always-on"}
           </button>
         </div>
-      )}
-
-      {profiles.length > 0 && (
-        <div className="snippets-bar">
-          <span className="snippets-label">Snippets</span>
-          <div className="snippets-chips">
-            {snippets.map((snippet) => {
-              const isActive = snippet.id === activeSnippetId;
-              const isDirty = isActive && isActiveSnippetDirty;
-              return (
-                <div
-                  key={snippet.id}
-                  className={`snippet-chip ${isDirty ? "dirty" : isActive ? "active" : ""}`}
-                >
-                  <button
-                    type="button"
-                    className="snippet-chip-apply"
-                    onClick={() => applySnippet(snippet)}
-                    title={
-                      isDirty
-                        ? "Connections have changed since this snippet was saved"
-                        : `Switch to exactly these ${snippet.profileIds.length} connection${
-                            snippet.profileIds.length === 1 ? "" : "s"
-                          }`
-                    }
-                  >
-                    {snippet.name}
-                  </button>
-                  <button
-                    type="button"
-                    className="snippet-chip-delete"
-                    onClick={() => deleteSnippet(snippet.id)}
-                    title="Delete snippet"
-                  >
-                    <CloseIcon size={12} />
-                  </button>
-                </div>
-              );
-            })}
-            <button
-              type="button"
-              className="snippet-chip-add"
-              onClick={openSaveModal}
-              disabled={runningProfiles.length === 0}
-              title={
-                runningProfiles.length === 0
-                  ? "Connect something first"
-                  : "Save the currently running connections as a snippet"
-              }
-            >
-              <PlusIcon size={12} /> Save current
-            </button>
-          </div>
-        </div>
-      )}
-
-      {profiles.length > 0 && (
-        <input
-          className="filter-search connections-search"
-          type="text"
-          placeholder="Search connections…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
       )}
 
       {importErrors && (
@@ -1183,10 +1144,39 @@ export default function ProfileManager() {
         </div>
       )}
 
+      <div className="profiles-layout">
+        <div className="profiles-list-pane">
+          {profiles.length > 0 && (
+            <SetsBar
+              snippets={snippets}
+              activeSnippetId={activeSnippetId}
+              activeDirty={isActiveSnippetDirty}
+              runningCount={runningProfiles.length}
+              onApply={applySnippet}
+              onDelete={deleteSnippet}
+              onUpdateActive={overwriteActiveSnippet}
+              onSaveNew={openSaveModal}
+            />
+          )}
+
+      {profiles.length > 0 && (
+        <input
+          className="filter-search connections-search"
+          type="text"
+          placeholder="Search connections…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+      )}
+
       {profiles.length === 0 ? (
         <p className="empty-state">No profiles yet. Create one to get started.</p>
       ) : filteredProfiles.length === 0 ? (
         <p className="empty-state">No connections match "{search}".</p>
+      ) : listMode === "flat" ? (
+        <div className="profile-rows">
+          {flatList.map((profile) => renderProfileRow(profile, null, false))}
+        </div>
       ) : (
         groups.map((group) => {
           const isCollapsed = collapsedGroups.has(group.backend);
@@ -1209,378 +1199,89 @@ export default function ProfileManager() {
               </span>
             </button>
             {!isCollapsed && (
-            <div className="connection-list" onDragLeave={onListDragLeave}>
-              {group.items.map((profile, index) => {
-                const status = statusFor(profile.id);
-                const isBusy = busy.has(profile.id);
-                const alwaysOnKind: AlwaysOnKind | null =
-                  profile.backend === "wireGuard" ? "wireGuard" :
-                  profile.backend === "none" ? "staticRoutes" : null;
-                const alwaysOnEntry = alwaysOn?.profiles.find(
-                  (item) => item.profileId === profile.id && item.kind === alwaysOnKind,
-                );
-                const canEnableAlwaysOn = alwaysOnKind !== null &&
-                  alwaysOn?.supportedKinds.includes(alwaysOnKind) &&
-                  (alwaysOnKind === "wireGuard" ||
-                    (profile.interfaceName.length > 0 && profile.routes.length > 0));
-                const inspection = inspections[profile.id];
-                const isExpanded = expanded.has(profile.id);
-                const ruleCount = countPolicyRules(profile.domainPolicies);
-                const detailCount = profile.routes.length + ruleCount;
-                const rate = status.state === "running" ? rateFor(profile) : null;
-                return (
-                  <div
-                    key={profile.id}
-                    className={`connection-card ${
-                      status.state === "running" ? "state-active" : ""
-                    } ${status.state === "failed" ? "state-failed" : ""} ${
-                      dragState?.profileId === profile.id ? "drag-source" : ""
-                    } ${
-                      dropTarget?.profileId === profile.id
-                        ? dropTarget.before
-                          ? "drop-before"
-                          : "drop-after"
-                        : ""
-                    }`}
-                    onDragOver={(event) => onCardDragOver(event, group, profile)}
-                    onDrop={(event) => onCardDrop(event, group, profile)}
-                  >
-                    <div className="connection-card-main">
-                      <span
-                        className={`connection-drag-handle${
-                          canReorder ? "" : " disabled"
-                        }`}
-                        draggable={canReorder}
-                        onDragStart={(event) => onCardDragStart(event, profile)}
-                        onDragEnd={onCardDragEnd}
-                        title={canReorder ? "Drag to reorder" : undefined}
-                      >
-                        <GripVerticalIcon size={15} />
-                      </span>
-                      <span className={`backend-avatar backend-avatar-${profile.backend}`}>
-                        {backendIcon(profile.backend, 18)}
-                      </span>
-                      <div className="connection-card-info">
-                        <div className="connection-card-name-row">
-                          <span className="connection-card-name">{profile.name}</span>
-                          {inspection?.managedConfig === true && (
-                            <span className="badge badge-managed">Managed</span>
-                          )}
-                          {profile.useSystemProxy && (
-                            <span className="badge badge-managed">Proxy</span>
-                          )}
-                          {alwaysOnEntry && (
-                            <span className="badge badge-managed">
-                              {alwaysOnEntry.enabled
-                                ? alwaysOn?.paused ? "Always-on paused" : "Always-on"
-                                : "Always-on cleanup pending"}
-                            </span>
-                          )}
-                          {inspection?.managedConfig === false && (
-                            <span className="badge badge-external">External</span>
-                          )}
-                        </div>
-                        <span
-                          className="connection-card-meta"
-                          title={
-                            status.state === "failed" && status.message
-                              ? status.message
-                              : undefined
-                          }
-                        >
-                          {status.state === "failed" && status.message ? (
-                            status.message
-                          ) : rate ? (
-                            <RateText rx={rate.rxRate} tx={rate.txRate} live />
-                          ) : (
-                            profile.interfaceName || "No target interface"
-                          )}
-                        </span>
-                      </div>
-                      <ToggleSwitch
-                        checked={status.state === "running"}
-                        onChange={() =>
-                          status.state === "running"
-                            ? onDisconnect(profile)
-                            : onConnect(profile)
-                        }
-                        disabled={isBusy}
-                        busy={isBusy}
-                        title={status.state === "running" ? "Disconnect" : "Connect"}
-                      />
-                      <OverflowMenu
-                        title="Profile actions"
-                        items={[
-                          { label: "Edit", onClick: () => openEdit(profile), disabled: isBusy },
-                          {
-                            label: "Move up",
-                            onClick: () => moveProfileInGroup(group.items, profile.id, -1),
-                            disabled: isBusy || !canReorder || index === 0,
-                          },
-                          {
-                            label: "Move down",
-                            onClick: () => moveProfileInGroup(group.items, profile.id, 1),
-                            disabled: isBusy || !canReorder || index === group.items.length - 1,
-                          },
-                          ...(caps?.os === "linux" && alwaysOnKind && (alwaysOnEntry || canEnableAlwaysOn) ? [{
-                            label: alwaysOnEntry ? "Disable always-on" : "Enable always-on before sign-in",
-                            onClick: () => onToggleAlwaysOn(profile, alwaysOnKind, Boolean(alwaysOnEntry)),
-                            disabled: isBusy,
-                          }] : []),
-                          ...(caps?.os === "linux" && profile.backend === "openVpn" ? [{
-                            label: "Credentials…",
-                            onClick: () => {
-                              setOpenVpnCredentialProfile(profile);
-                              setOpenVpnCredentialError(null);
-                            },
-                            disabled: isBusy,
-                          }] : []),
-                          ...(profile.subscription && endpoints[profile.id] ? [
-                            {
-                              label: refreshingSubscription === profile.id ? "Refreshing…" : "Refresh subscription",
-                              onClick: () => onRefreshSubscription(profile),
-                              disabled:
-                                refreshingSubscription === profile.id ||
-                                switching === profile.id ||
-                                isBusy ||
-                                status.state === "running",
-                            },
-                            {
-                              label: measuringDelay === profile.id ? "Testing…" : "Test delay",
-                              onClick: () => onMeasureDelay(profile),
-                              disabled:
-                                measuringDelay === profile.id ||
-                                switching === profile.id ||
-                                refreshingSubscription === profile.id ||
-                                isBusy,
-                            },
-                          ] : []),
-                          {
-                            label: diagBusy === profile.id ? "Running diagnostics…" : "Diagnostics",
-                            onClick: () => onDiagnose(profile),
-                            disabled: isBusy || diagBusy === profile.id,
-                          },
-                          {
-                            label: "Delete",
-                            onClick: () => onDelete(profile),
-                            disabled: isBusy,
-                            danger: true,
-                          },
-                        ]}
-                      />
-                    </div>
-
-                    {profile.backend === "xray" &&
-                      profile.xrayMode === "socks" &&
-                      profile.xraySocksPort !== null && (
-                        <div className="interface-row">
-                          <span className="row-label">SOCKS5</span>
-                          <span className="row-value mono">
-                            127.0.0.1:{profile.xraySocksPort}
-                          </span>
-                        </div>
-                      )}
-                    {profile.backend === "xray" &&
-                      profile.xrayMode === "socks" &&
-                      profile.xrayHttpPort !== null && (
-                        <div className="interface-row">
-                          <span className="row-label">HTTP CONNECT</span>
-                          <span className="row-value mono">
-                            127.0.0.1:{profile.xrayHttpPort}
-                          </span>
-                        </div>
-                      )}
-                    {profile.subscription && endpoints[profile.id] && (
-                      <div className="interface-row">
-                        <span className="row-label">Endpoint</span>
-                        <span className="row-value endpoint-row">
-                          <select
-                            value={
-                              endpoints[profile.id].findIndex(
-                                (e) => e.active,
-                              )
-                            }
-                            onChange={(e) =>
-                              onSwitchEndpoint(
-                                profile,
-                                Number(e.target.value),
-                              )
-                            }
-                            disabled={
-                              switching === profile.id ||
-                              refreshingSubscription === profile.id ||
-                              isBusy ||
-                              status.state === "running"
-                            }
-                            title={
-                              status.state === "running"
-                                ? "Disconnect to switch endpoints"
-                                : undefined
-                            }
-                          >
-                            {endpoints[profile.id].map((ep, i) => (
-                              <option key={i} value={i}>
-                                {ep.name}
-                              </option>
-                            ))}
-                          </select>
-                          {switching === profile.id && (
-                            <span className="endpoint-note">switching…</span>
-                          )}
-                          {delayResults[profile.id]?.index ===
-                            endpoints[profile.id].findIndex((e) => e.active) && (
-                              <span className="badge badge-managed">
-                                {delayResults[profile.id].result.delayMs !== null
-                                  ? `${delayResults[profile.id].result.delayMs} ms`
-                                  : delayResults[profile.id].result.error}
-                              </span>
-                            )}
-                        </span>
-                      </div>
-                    )}
-                    {profile.subscription && (
-                      <div className="interface-row">
-                        <span className="row-label">Auto-refresh</span>
-                        <span className="row-value">
-                          <select
-                            value={profile.subscription.refreshIntervalMinutes ?? ""}
-                            onChange={(event) => onSetRefreshInterval(profile, event.target.value ? Number(event.target.value) : null)}
-                            disabled={settingRefreshInterval === profile.id || isBusy}
-                          >
-                            <option value="">Off</option>
-                            <option value="15">Every 15 minutes</option>
-                            <option value="60">Every hour</option>
-                            <option value="360">Every 6 hours</option>
-                          </select>
-                        </span>
-                      </div>
-                    )}
-
-                    {(detailCount > 0 ||
-                      profile.subscription !== null ||
-                      (profile.backend === "xray" && profile.privateLanDirect) ||
-                      profile.useSystemProxy) && (
-                      <div className="connection-card-details">
-                        <button
-                          type="button"
-                          className="connection-detail-toggle"
-                          onClick={() => toggleExpanded(profile.id)}
-                          aria-expanded={isExpanded}
-                        >
-                          <ChevronIcon size={13} collapsed={!isExpanded} />
-                          {detailCount > 0 ? (
-                            <>
-                              {profile.routes.length > 0 &&
-                                `${profile.routes.length} route${profile.routes.length === 1 ? "" : "s"}`}
-                              {profile.routes.length > 0 && ruleCount > 0 && " · "}
-                              {ruleCount > 0 &&
-                                `${ruleCount} routing rule${ruleCount === 1 ? "" : "s"}`}
-                            </>
-                          ) : (
-                            "Details"
-                          )}
-                        </button>
-                        {isExpanded && (
-                          <>
-                            {profile.subscription?.userInfo && (
-                              <div className="interface-row">
-                                <span className="row-label">Traffic</span>
-                                <span className="row-value">
-                                  {formatBytes(profile.subscription.userInfo.uploadBytes + profile.subscription.userInfo.downloadBytes)} used
-                                  {profile.subscription.userInfo.totalBytes !== null
-                                    ? ` / ${formatBytes(profile.subscription.userInfo.totalBytes)}`
-                                    : " / unlimited"}
-                                </span>
-                              </div>
-                            )}
-                            {profile.subscription?.userInfo?.expiresAtUnix != null && (
-                              <div className="interface-row">
-                                <span className="row-label">Expires</span>
-                                <span className="row-value">
-                                  {new Date(profile.subscription.userInfo.expiresAtUnix * 1000).toLocaleDateString()}
-                                </span>
-                              </div>
-                            )}
-                            {profile.subscription && profile.subscription.lastRefreshAtUnix !== null && (
-                              <div className="interface-row">
-                                <span className="row-label">Last checked</span>
-                                <span className="row-value">
-                                  {new Date(profile.subscription.lastRefreshAtUnix * 1000).toLocaleString()}
-                                </span>
-                              </div>
-                            )}
-                            {profile.subscription?.lastRefreshError && (
-                              <div className="interface-row">
-                                <span className="row-label">Refresh</span>
-                                <span className="row-value">{profile.subscription.lastRefreshError}</span>
-                              </div>
-                            )}
-                            {profile.backend === "xray" && profile.privateLanDirect && (
-                              <div className="interface-row">
-                                <span className="row-label">Private/LAN IPs</span>
-                                <span className="row-value">Direct after custom rules</span>
-                              </div>
-                            )}
-                            {profile.useSystemProxy && (
-                              <div className="interface-row">
-                                <span className="row-label">Proxy bypass</span>
-                                <span className="row-value mono">
-                                  {profile.proxyBypass.join("; ") ||
-                                    "LAN/localhost defaults"}
-                                </span>
-                              </div>
-                            )}
-                            {ruleCount > 0 && (
-                              <div className="interface-row">
-                                <span className="row-label">Domain/IP rules</span>
-                                <span className="row-value">
-                                  {(["block", "proxy", "direct"] as const)
-                                    .map((target) => ({
-                                      target,
-                                      count: countPolicyRules(
-                                        profile.domainPolicies,
-                                        target,
-                                      ),
-                                    }))
-                                    .filter((entry) => entry.count > 0)
-                                    .map(
-                                      (entry) =>
-                                        `${DOMAIN_TARGET_LABELS[entry.target]} ${entry.count}`,
-                                    )
-                                    .join(" · ")}
-                                </span>
-                              </div>
-                            )}
-                            {profile.routes.length > 0 && (
-                              <div className="interface-section">
-                                <span className="section-label">Routes</span>
-                                <ul className="profile-route-list">
-                                  {profile.routes.map((route, i) => (
-                                    <li key={i}>
-                                      <span className="mono">
-                                        {route.destination}
-                                      </span>
-                                      <span className="family-tag">
-                                        metric {route.metric}
-                                      </span>
-                                    </li>
-                                  ))}
-                                </ul>
-                              </div>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
+            <div className="profile-rows" onDragLeave={onListDragLeave}>
+              {group.items.map((profile) =>
+                renderProfileRow(profile, group, canReorder),
+              )}
             </div>
             )}
           </div>
           );
         })
       )}
+        </div>
+
+        <div className="profiles-detail-pane">
+          {selected ? (
+            <ProfileDetail
+              profile={selected}
+              status={statusFor(selected.id)}
+              rate={
+                statusFor(selected.id).state === "running"
+                  ? rateFor(selected)
+                  : null
+              }
+              isBusy={busy.has(selected.id)}
+              backendLabel={BACKEND_LABELS[selected.backend]}
+              managedConfig={inspections[selected.id]?.managedConfig}
+              alwaysOn={alwaysOn}
+              os={caps?.os}
+              endpoints={endpoints[selected.id]}
+              delayResults={delayResults[selected.id]}
+              measuringEndpoints={measuringEndpoints}
+              measuringAll={measuringAll.has(selected.id)}
+              switching={switching === selected.id}
+              refreshingSubscription={
+                refreshingSubscription === selected.id
+              }
+              settingRefreshInterval={settingRefreshInterval === selected.id}
+              diagBusy={diagBusy === selected.id}
+              canMoveUp={canMove && selIndex > 0}
+              canMoveDown={
+                canMove && selIndex < (selGroup?.items.length ?? 0) - 1
+              }
+              onConnect={() => void onConnect(selected)}
+              onDisconnect={() => void onDisconnect(selected)}
+              onEdit={() => openEdit(selected)}
+              onMoveUp={() =>
+                selGroup &&
+                moveProfileInGroup(selGroup.items, selected.id, -1)
+              }
+              onMoveDown={() =>
+                selGroup &&
+                moveProfileInGroup(selGroup.items, selected.id, 1)
+              }
+              onToggleAlwaysOn={(kind, enrolled) =>
+                onToggleAlwaysOn(selected, kind, enrolled)
+              }
+              onCredentials={() => {
+                setOpenVpnCredentialProfile(selected);
+                setOpenVpnCredentialError(null);
+              }}
+              onRefreshSubscription={() =>
+                void onRefreshSubscription(selected)
+              }
+              onDiagnose={() => void onDiagnose(selected)}
+              onDelete={() => void onDelete(selected)}
+              onSwitchEndpoint={(index) =>
+                void onSwitchEndpoint(selected, index)
+              }
+              onMeasureAllEndpoints={() =>
+                void onMeasureAllEndpoints(selected)
+              }
+              onSetRefreshInterval={(minutes) =>
+                void onSetRefreshInterval(selected, minutes)
+              }
+            />
+          ) : (
+            <div className="profile-detail-empty">
+              {profiles.length === 0
+                ? "Add a connection to get started."
+                : "Select a connection to see its details."}
+            </div>
+          )}
+        </div>
+      </div>
 
       <ProfileFormModal
         open={formOpen}
@@ -1658,7 +1359,7 @@ export default function ProfileManager() {
 
       <Modal
         open={saveModalOpen}
-        title="Save snippet"
+        title="Save set"
         onClose={() => setSaveModalOpen(false)}
         maxWidth="420px"
         footer={
@@ -1700,7 +1401,7 @@ export default function ProfileManager() {
         )}
 
         <label>
-          {activeSnippet ? "Or save as a new snippet" : "Name"}
+          {activeSnippet ? "Or save as a new set" : "Name"}
           <input
             type="text"
             value={newSnippetName}
@@ -1710,8 +1411,6 @@ export default function ProfileManager() {
           />
         </label>
       </Modal>
-
-    </section>
     </Page>
   );
 }

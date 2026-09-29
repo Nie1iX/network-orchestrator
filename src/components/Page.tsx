@@ -1,5 +1,5 @@
 interface PageProps {
-  width?: "narrow" | "wide";
+  width?: "narrow" | "wide" | "full";
   children: React.ReactNode;
 }
 

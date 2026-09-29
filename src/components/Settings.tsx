@@ -6,6 +6,7 @@ import UpdateChecker from "./UpdateChecker";
 import Page from "./Page";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import { usePlatformCapabilities } from "../platform";
+import { setProfileListMode, useProfileListMode } from "../prefs";
 import { VpnAuthMode } from "../types";
 
 const VPN_AUTH_MODES: { value: VpnAuthMode; label: string }[] = [
@@ -14,7 +15,16 @@ const VPN_AUTH_MODES: { value: VpnAuthMode; label: string }[] = [
   { value: "always", label: "Every connection" },
 ];
 
+type SettingsTab = "general" | "system" | "about";
+
+const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
+  { id: "general", label: "General" },
+  { id: "system", label: "System" },
+  { id: "about", label: "About" },
+];
+
 export default function Settings() {
+  const [tab, setTab] = useState<SettingsTab>("general");
   const [version, setVersion] = useState<string | null>(null);
   const [loginAutostart, setLoginAutostart] = useState<boolean | null>(null);
   const [autostartBusy, setAutostartBusy] = useState(false);
@@ -23,6 +33,7 @@ export default function Settings() {
   const [vpnAuthMode, setVpnAuthMode] = useState<VpnAuthMode | null>(null);
   const [vpnAuthBusy, setVpnAuthBusy] = useState(false);
   const [vpnAuthError, setVpnAuthError] = useState<string | null>(null);
+  const listMode = useProfileListMode();
 
   useEffect(() => {
     getVersion().then(setVersion).catch(() => setVersion(null));
@@ -92,98 +103,154 @@ export default function Settings() {
     <Page width="narrow">
       <h2>Settings</h2>
 
-      <div className="settings-group">
-        <div className="settings-group-title">Backend &amp; dependencies</div>
-        <div className="settings-group-body">
-          <BackendStatus />
-        </div>
-      </div>
+      <nav className="route-tabs" aria-label="Settings sections">
+        {SETTINGS_TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            className={`route-tab ${tab === t.id ? "active" : ""}`}
+            onClick={() => setTab(t.id)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </nav>
 
-      {caps?.os === "linux" && (
-        <div className="settings-group">
-          <div className="settings-group-title">Startup</div>
-          <div className="settings-group-body">
-            <div className="settings-row">
-              <div className="settings-row-main">
-                <span className="settings-row-label">Start at login</span>
-                <span className="settings-row-sub">
-                  Launch the app and connect profiles marked for auto-connect.
-                </span>
+      {tab === "general" && (
+        <>
+          <div className="settings-group">
+            <div className="settings-group-title">Profiles</div>
+            <div className="settings-group-body">
+              <div className="settings-row">
+                <div className="settings-row-main">
+                  <span className="settings-row-label">
+                    Group connections by backend
+                  </span>
+                  <span className="settings-row-sub">
+                    When off, the list is a single column sorted by state:
+                    running first, then failures, then stopped.
+                  </span>
+                </div>
+                <ToggleSwitch
+                  checked={listMode === "grouped"}
+                  onChange={() =>
+                    setProfileListMode(
+                      listMode === "grouped" ? "flat" : "grouped",
+                    )
+                  }
+                  title="Group connections by backend"
+                />
               </div>
-              <ToggleSwitch
-                checked={loginAutostart ?? false}
-                onChange={toggleLoginAutostart}
-                disabled={loginAutostart === null}
-                busy={autostartBusy}
-                title="Start at login"
-              />
             </div>
-            {autostartError && <p className="error">{autostartError}</p>}
           </div>
-        </div>
+
+          {caps?.os === "linux" && (
+            <div className="settings-group">
+              <div className="settings-group-title">Startup</div>
+              <div className="settings-group-body">
+                <div className="settings-row">
+                  <div className="settings-row-main">
+                    <span className="settings-row-label">Start at login</span>
+                    <span className="settings-row-sub">
+                      Launch the app and connect profiles marked for
+                      auto-connect.
+                    </span>
+                  </div>
+                  <ToggleSwitch
+                    checked={loginAutostart ?? false}
+                    onChange={toggleLoginAutostart}
+                    disabled={loginAutostart === null}
+                    busy={autostartBusy}
+                    title="Start at login"
+                  />
+                </div>
+                {autostartError && <p className="error">{autostartError}</p>}
+              </div>
+            </div>
+          )}
+        </>
       )}
 
-      {caps?.os === "linux" && (
-        <div className="settings-group">
-          <div className="settings-group-title">Security</div>
-          <div className="settings-group-body">
-            <div className="settings-row">
-              <div className="settings-row-main">
-                <span className="settings-row-label">
-                  Ask for administrator password when connecting VPN
-                </span>
-                <span className="settings-row-sub">
-                  Applies to every user of this computer. Changing it requires
-                  an administrator password.
-                </span>
-              </div>
-              <select
-                value={vpnAuthMode ?? ""}
-                disabled={vpnAuthMode === null || vpnAuthBusy}
-                onChange={(e) => changeVpnAuthMode(e.target.value as VpnAuthMode)}
-              >
-                {VPN_AUTH_MODES.map((mode) => (
-                  <option key={mode.value} value={mode.value}>
-                    {mode.label}
-                  </option>
-                ))}
-              </select>
+      {tab === "system" && (
+        <>
+          <div className="settings-group">
+            <div className="settings-group-title">Backend &amp; dependencies</div>
+            <div className="settings-group-body">
+              <BackendStatus />
             </div>
-            {vpnAuthError && <p className="error">{vpnAuthError}</p>}
           </div>
-        </div>
+
+          {caps?.os === "linux" && (
+            <div className="settings-group">
+              <div className="settings-group-title">Security</div>
+              <div className="settings-group-body">
+                <div className="settings-row">
+                  <div className="settings-row-main">
+                    <span className="settings-row-label">
+                      Ask for administrator password when connecting VPN
+                    </span>
+                    <span className="settings-row-sub">
+                      Applies to every user of this computer. Changing it
+                      requires an administrator password.
+                    </span>
+                  </div>
+                  <select
+                    value={vpnAuthMode ?? ""}
+                    disabled={vpnAuthMode === null || vpnAuthBusy}
+                    onChange={(e) =>
+                      changeVpnAuthMode(e.target.value as VpnAuthMode)
+                    }
+                  >
+                    {VPN_AUTH_MODES.map((mode) => (
+                      <option key={mode.value} value={mode.value}>
+                        {mode.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {vpnAuthError && <p className="error">{vpnAuthError}</p>}
+              </div>
+            </div>
+          )}
+        </>
       )}
 
-      {caps?.appUpdates && (
-        <div className="settings-group">
-          <div className="settings-group-title">Updates</div>
-          <div className="settings-group-body">
-            <div className="settings-row">
-              <div className="settings-row-main">
-                <span className="settings-row-label">App updates</span>
-                <span className="settings-row-sub">
-                  Check for and install new versions
-                </span>
+      {tab === "about" && (
+        <>
+          {caps?.appUpdates && (
+            <div className="settings-group">
+              <div className="settings-group-title">Updates</div>
+              <div className="settings-group-body">
+                <div className="settings-row">
+                  <div className="settings-row-main">
+                    <span className="settings-row-label">App updates</span>
+                    <span className="settings-row-sub">
+                      Check for and install new versions
+                    </span>
+                  </div>
+                  <UpdateChecker />
+                </div>
               </div>
-              <UpdateChecker />
             </div>
-          </div>
-        </div>
-      )}
+          )}
 
-      <div className="settings-group">
-        <div className="settings-group-title">About</div>
-        <div className="settings-group-body">
-          <div className="settings-row">
-            <div className="settings-row-main">
-              <span className="settings-row-label">Network Orchestrator</span>
-              <span className="settings-row-sub">
-                {version ? `Version ${version}` : "Loading version…"}
-              </span>
+          <div className="settings-group">
+            <div className="settings-group-title">About</div>
+            <div className="settings-group-body">
+              <div className="settings-row">
+                <div className="settings-row-main">
+                  <span className="settings-row-label">
+                    Network Orchestrator
+                  </span>
+                  <span className="settings-row-sub">
+                    {version ? `Version ${version}` : "Loading version…"}
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-      </div>
+        </>
+      )}
     </Page>
   );
 }

@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
+import AppEvents from "./components/AppEvents";
 import CondRules from "./components/CondRules";
-import Home from "./components/Home";
 import InterfaceList from "./components/InterfaceList";
 import Logs from "./components/Logs";
+import Monitor from "./components/Monitor";
 import NavRail, { type Tab } from "./components/NavRail";
 import ProfileManager from "./components/ProfileManager";
 import RecoveryPrompt from "./components/RecoveryPrompt";
@@ -16,10 +17,11 @@ import { TunnelStatus } from "./types";
 import "./App.css";
 
 function App() {
-  const [tab, setTab] = useState<Tab>("home");
+  const [tab, setTab] = useState<Tab>("profiles");
   const [activeCount, setActiveCount] = useState(0);
 
   useEffect(() => {
+    if (!isTauri()) return;
     const unlisten = listen("route-changed", () => {
       window.dispatchEvent(new CustomEvent("route-changed"));
     });
@@ -36,6 +38,7 @@ function App() {
   }, []);
 
   const pollActiveCount = useCallback(async () => {
+    if (!isTauri()) return;
     try {
       const statuses = await invoke<TunnelStatus[]>("get_tunnel_statuses");
       setActiveCount(statuses.filter((s) => s.state === "running").length);
@@ -52,14 +55,15 @@ function App() {
 
   return (
     <ToastProvider>
+      <AppEvents />
       <div className="app-layout">
         <NavRail tab={tab} setTab={setTab} activeCount={activeCount} />
         <main className="content">
-          {tab === "home" && <Home onNavigate={setTab} />}
-          {tab === "connections" && <ProfileManager />}
-          {tab === "network" && <InterfaceList />}
+          {tab === "profiles" && <ProfileManager />}
+          {tab === "monitor" && <Monitor />}
           {tab === "routes" && <RouteView />}
           {tab === "conditions" && <CondRules />}
+          {tab === "network" && <InterfaceList />}
           {tab === "logs" && <Logs />}
           {tab === "settings" && <Settings />}
         </main>

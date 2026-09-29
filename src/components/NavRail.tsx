@@ -1,6 +1,6 @@
-import { HomeIcon, ConditionsIcon, ProfileIcon, NetworkIcon, RouteIcon, LogsIcon, SettingsIcon } from "../icons";
+import { ActivityIcon, ConditionsIcon, ProfileIcon, NetworkIcon, RouteIcon, LogsIcon, SettingsIcon } from "../icons";
 
-export type Tab = "home" | "connections" | "conditions" | "network" | "routes" | "logs" | "settings";
+export type Tab = "profiles" | "monitor" | "routes" | "conditions" | "network" | "logs" | "settings";
 
 interface NavItem {
   id: Tab;
@@ -9,14 +9,14 @@ interface NavItem {
 }
 
 const PRIMARY: NavItem[] = [
-  { id: "home", label: "Home", icon: <HomeIcon size={20} /> },
-  { id: "connections", label: "Connections", icon: <ProfileIcon size={20} /> },
+  { id: "profiles", label: "Profiles", icon: <ProfileIcon size={20} /> },
+  { id: "monitor", label: "Monitor", icon: <ActivityIcon size={20} /> },
+  { id: "routes", label: "Routes", icon: <RouteIcon size={20} /> },
 ];
 
 const ADVANCED: NavItem[] = [
   { id: "conditions", label: "Conditions", icon: <ConditionsIcon size={20} /> },
   { id: "network", label: "Network", icon: <NetworkIcon size={20} /> },
-  { id: "routes", label: "Routes", icon: <RouteIcon size={20} /> },
   { id: "logs", label: "Logs", icon: <LogsIcon size={20} /> },
 ];
 
@@ -66,7 +66,7 @@ export default function NavRail({ tab, setTab, activeCount }: NavRailProps) {
             item={item}
             active={tab === item.id}
             onClick={() => setTab(item.id)}
-            badge={item.id === "connections" ? activeCount : undefined}
+            badge={item.id === "profiles" ? activeCount : undefined}
           />
         ))}
       </div>
