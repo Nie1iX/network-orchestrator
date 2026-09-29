@@ -16,7 +16,8 @@ Guidance for agents/contributors working in this repository.
   (camelCase).
 - `e2e/linux` — disposable Docker test harness for the Linux daemon.
 - `docs/plans` — per-stage implementation plans; `docs/testing.md` — Linux
-  Docker and Windows VM E2E contracts.
+  Docker and Windows VM E2E contracts; `docs/platform-matrix.md` — per-OS
+  feature support matrix (keep in sync with `PlatformCapabilities`).
 
 ## Setup
 
