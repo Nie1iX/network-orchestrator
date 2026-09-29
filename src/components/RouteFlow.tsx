@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { RouteMap as RouteMapData } from "../types";
+import { OWNER_COLORS, OWNER_FALLBACK, FLOW_NEUTRAL, FLOW_NEUTRAL_FAINT, FLOW_TEXT, FLOW_TEXT_DIM } from "../palette";
 
 // Simple Sankey-style flow: Profile → Interface → Destination prefix group.
 // Rendered as horizontal bands with SVG paths, no external library.
@@ -19,17 +20,6 @@ interface FlowLink {
   value: number;
   color: string;
 }
-
-const OWNER_COLORS = [
-  "#646cff",
-  "#34d399",
-  "#f59e0b",
-  "#f87171",
-  "#a78bfa",
-  "#22d3ee",
-  "#fb923c",
-  "#e879f9",
-];
 
 function destGroup(dest: string): string {
   if (dest === "0.0.0.0/0") return "0.0.0.0/0 (default)";
@@ -94,7 +84,7 @@ export default function RouteFlow() {
           label: pKey,
           type: "profile",
           value: 0,
-          color: colorMap.get(pKey) ?? "#9ca3af",
+          color: colorMap.get(pKey) ?? OWNER_FALLBACK,
         });
       }
       nodeList[profileNodes.get(pKey)!].value++;
@@ -106,7 +96,7 @@ export default function RouteFlow() {
           label: iKey,
           type: "interface",
           value: 0,
-          color: "#6a6a72",
+          color: FLOW_NEUTRAL,
         });
       }
       nodeList[ifaceNodes.get(iKey)!].value++;
@@ -118,7 +108,7 @@ export default function RouteFlow() {
           label: dKey,
           type: "dest",
           value: 0,
-          color: "#4a4a52",
+          color: FLOW_NEUTRAL_FAINT,
         });
       }
       nodeList[destNodes.get(dKey)!].value++;
@@ -134,7 +124,7 @@ export default function RouteFlow() {
           source: pIdx,
           target: iIdx,
           value: 1,
-          color: colorMap.get(pKey) ?? "#9ca3af",
+          color: colorMap.get(pKey) ?? OWNER_FALLBACK,
         });
       }
 
@@ -148,7 +138,7 @@ export default function RouteFlow() {
           source: iIdx,
           target: dIdx,
           value: 1,
-          color: "#6a6a72",
+          color: FLOW_NEUTRAL,
         });
       }
     }
@@ -256,7 +246,7 @@ export default function RouteFlow() {
                 x={n.x + n.w / 2}
                 y={n.y + n.h / 2 + 4}
                 textAnchor="middle"
-                fill="#fff"
+                fill={FLOW_TEXT}
                 fontSize={11}
                 fontWeight={n.type === "profile" ? 600 : 400}
               >
@@ -266,7 +256,7 @@ export default function RouteFlow() {
                 x={n.x + n.w - 6}
                 y={n.y + n.h / 2 + 4}
                 textAnchor="end"
-                fill="rgba(255,255,255,0.6)"
+                fill={FLOW_TEXT_DIM}
                 fontSize={9}
               >
                 {n.value}

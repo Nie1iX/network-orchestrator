@@ -146,7 +146,7 @@ export default function ImportModal({
           </p>
           <button
             type="button"
-            className="profile-import-btn"
+            className="btn-primary"
             onClick={onImportFiles}
             disabled={busy}
           >
@@ -193,7 +193,7 @@ export default function ImportModal({
           </label>
           <button
             type="button"
-            className="profile-import-btn"
+            className="btn-primary"
             onClick={onImportSubscription}
             disabled={busy || !subUrl.trim()}
           >
@@ -211,7 +211,7 @@ export default function ImportModal({
           </p>
           <button
             type="button"
-            className="profile-import-btn"
+            className="btn-primary"
             onClick={onImportWireGuardStandard}
             disabled={busy}
           >

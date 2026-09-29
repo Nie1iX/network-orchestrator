@@ -8,15 +8,12 @@ import ProfileFormModal, {
 } from "./ProfileFormModal";
 import ImportModal from "./ImportModal";
 import Skeleton from "./ui/Skeleton";
-import { backendIcon } from "../icons";
+import RateText from "./ui/RateText";
+import { useToast } from "./ui/Toast";
+import { backendIcon, ImportIcon, PlusIcon } from "../icons";
 import type { Tab } from "./NavRail";
 import { NetworkInterface, Profile, TunnelBackend, TunnelStatus } from "../types";
-
-function formatRate(bytesPerSec: number): string {
-  if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`;
-  if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
-  return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
-}
+import { usePlatformCapabilities } from "../platform";
 
 interface Throughput {
   rxRate: number;
@@ -38,7 +35,8 @@ export default function Home({ onNavigate }: HomeProps) {
   const [formOpen, setFormOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [addMenuOpen, setAddMenuOpen] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const toast = useToast();
+  const caps = usePlatformCapabilities();
   const prevStats = useRef<Record<number, { rx: number; tx: number; time: number }>>({});
 
   const refresh = useCallback(async () => {
@@ -135,7 +133,7 @@ export default function Home({ onNavigate }: HomeProps) {
       await invoke("disconnect_profile", { id: profile.id });
       await refresh();
     } catch (err) {
-      setNotice(String(err));
+      toast("error", String(err));
     } finally {
       setBusy((prev) => {
         const next = new Set(prev);
@@ -146,7 +144,7 @@ export default function Home({ onNavigate }: HomeProps) {
   };
 
   const openNew = (backend?: TunnelBackend) => {
-    setEditing(newFormState(backend));
+    setEditing(newFormState(backend, caps?.os));
     setFormOpen(true);
   };
 
@@ -197,20 +195,11 @@ export default function Home({ onNavigate }: HomeProps) {
           </span>
           {running.length > 0 && (
             <span className="status-strip-sub">
-              ↓ {formatRate(totalRate.rx)} · ↑ {formatRate(totalRate.tx)}
+              <RateText rx={totalRate.rx} tx={totalRate.tx} />
             </span>
           )}
         </div>
       </div>
-
-      {notice && (
-        <div className="runtime-notice">
-          <span>{notice}</span>
-          <button type="button" onClick={() => setNotice(null)}>
-            Dismiss
-          </button>
-        </div>
-      )}
 
       <section>
         <h2>Active now</h2>
@@ -234,14 +223,16 @@ export default function Home({ onNavigate }: HomeProps) {
                   <div className="active-now-info">
                     <span className="active-now-name">{profile.name}</span>
                     <span className="active-now-meta">
-                      {rate
-                        ? `↓ ${formatRate(rate.rxRate)} · ↑ ${formatRate(rate.txRate)}`
-                        : profile.interfaceName}
+                      {rate ? (
+                        <RateText rx={rate.rxRate} tx={rate.txRate} />
+                      ) : (
+                        profile.interfaceName
+                      )}
                     </span>
                   </div>
                   <button
                     type="button"
-                    className="active-now-disconnect"
+                    className="btn-sm"
                     onClick={() => onDisconnect(profile)}
                     disabled={busy.has(profile.id)}
                     title="Disconnect"
@@ -260,13 +251,13 @@ export default function Home({ onNavigate }: HomeProps) {
         <div className="quick-actions">
           <button
             type="button"
-            className="quick-action-btn"
+            className="btn-primary btn-with-icon"
             onClick={() => setAddMenuOpen(true)}
           >
-            + Add connection
+            <PlusIcon size={14} /> Add connection
           </button>
-          <button type="button" className="quick-action-btn" onClick={() => setImportOpen(true)}>
-            Import…
+          <button type="button" className="btn-with-icon" onClick={() => setImportOpen(true)}>
+            <ImportIcon size={14} /> Import…
           </button>
         </div>
       </section>
@@ -311,7 +302,7 @@ export default function Home({ onNavigate }: HomeProps) {
           void refresh();
           onNavigate("connections");
         }}
-        onError={(message) => setNotice(message)}
+        onError={(message) => toast("error", message)}
       />
 
       <ImportModal
@@ -322,7 +313,7 @@ export default function Home({ onNavigate }: HomeProps) {
           void refresh();
           onNavigate("connections");
         }}
-        onError={(message) => setNotice(message)}
+        onError={(message) => toast("error", message)}
       />
 
       <AddConnectionMenu

@@ -4,11 +4,13 @@ import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
 import Home from "./components/Home";
 import InterfaceList from "./components/InterfaceList";
+import Logs from "./components/Logs";
 import NavRail, { type Tab } from "./components/NavRail";
 import ProfileManager from "./components/ProfileManager";
 import RecoveryPrompt from "./components/RecoveryPrompt";
 import RouteView from "./components/RouteView";
 import Settings from "./components/Settings";
+import { ToastProvider } from "./components/ui/Toast";
 import { TunnelStatus } from "./types";
 import "./App.css";
 
@@ -48,17 +50,20 @@ function App() {
   }, [pollActiveCount]);
 
   return (
-    <div className="app-layout">
-      <NavRail tab={tab} setTab={setTab} activeCount={activeCount} />
-      <main className="content">
-        {tab === "home" && <Home onNavigate={setTab} />}
-        {tab === "connections" && <ProfileManager />}
-        {tab === "network" && <InterfaceList />}
-        {tab === "routes" && <RouteView />}
-        {tab === "settings" && <Settings />}
-      </main>
-      <RecoveryPrompt />
-    </div>
+    <ToastProvider>
+      <div className="app-layout">
+        <NavRail tab={tab} setTab={setTab} activeCount={activeCount} />
+        <main className="content">
+          {tab === "home" && <Home onNavigate={setTab} />}
+          {tab === "connections" && <ProfileManager />}
+          {tab === "network" && <InterfaceList />}
+          {tab === "routes" && <RouteView />}
+          {tab === "logs" && <Logs />}
+          {tab === "settings" && <Settings />}
+        </main>
+        <RecoveryPrompt />
+      </div>
+    </ToastProvider>
   );
 }
 

@@ -82,29 +82,38 @@ export default function RouteOverview() {
   return (
     <div className="route-overview">
       <div className="summary-cards">
-        <div className="summary-card" onClick={() => setDrill(drill === "owners" ? null : "owners")}>
+        <button
+          type="button"
+          className={`summary-card ${drill === "owners" ? "selected" : ""}`}
+          onClick={() => setDrill(drill === "owners" ? null : "owners")}
+        >
           <span className="summary-value">{s.activePredicted}</span>
           <span className="summary-label">Active routes</span>
           <span className="summary-sub">{s.totalPredicted} total predicted</span>
-        </div>
-        <div className="summary-card">
+        </button>
+        <div className="summary-card static">
           <span className="summary-value">{s.totalEffective}</span>
           <span className="summary-label">OS routes</span>
           <span className="summary-sub">in effective table</span>
         </div>
-        <div
-          className={`summary-card ${s.conflicts > 0 ? "summary-warn" : ""}`}
+        <button
+          type="button"
+          className={`summary-card ${s.conflicts > 0 ? "summary-warn" : ""} ${drill === "conflicts" ? "selected" : ""}`}
           onClick={() => setDrill(drill === "conflicts" ? null : "conflicts")}
         >
           <span className="summary-value">{s.conflicts}</span>
           <span className="summary-label">Conflicts</span>
           <span className="summary-sub">{s.warnings} warnings</span>
-        </div>
-        <div className="summary-card" onClick={() => setDrill(drill === "interfaces" ? null : "interfaces")}>
+        </button>
+        <button
+          type="button"
+          className={`summary-card ${drill === "interfaces" ? "selected" : ""}`}
+          onClick={() => setDrill(drill === "interfaces" ? null : "interfaces")}
+        >
           <span className="summary-value">{s.interfaces}</span>
           <span className="summary-label">Interfaces</span>
           <span className="summary-sub">{s.profiles} profiles</span>
-        </div>
+        </button>
       </div>
 
       {drill === "conflicts" && (

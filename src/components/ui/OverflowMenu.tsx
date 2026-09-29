@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { DotsVerticalIcon } from "../../icons";
 
 export interface OverflowMenuItem {
   label: string;
@@ -42,8 +43,10 @@ export default function OverflowMenu({ items, title = "More" }: OverflowMenuProp
           setOpen((v) => !v);
         }}
         title={title}
+        aria-haspopup="menu"
+        aria-expanded={open}
       >
-        ⋮
+        <DotsVerticalIcon size={16} />
       </button>
       {open && (
         <div className="overflow-menu-dropdown" onClick={(e) => e.stopPropagation()}>

@@ -223,6 +223,9 @@ export interface Profile {
   xrayMode: XrayMode;
   xrayTunInterface: string | null;
   xrayTunIp: string | null;
+  /** Optional HTTPS URLs overriding the bundled geoip.dat / geosite.dat. */
+  xrayGeoipUrl?: string | null;
+  xrayGeositeUrl?: string | null;
 }
 
 export type TunnelState = "stopped" | "running" | "failed";
@@ -231,11 +234,40 @@ export interface TunnelStatus {
   profileId: string;
   state: TunnelState;
   message: string | null;
+  /** Live kernel interface name reported by the daemon when running. */
+  interfaceName?: string | null;
+}
+
+export type LogLevel = "info" | "warn" | "error";
+export type LogSource = "app" | "daemon";
+
+export interface LogEvent {
+  tsUnix: number;
+  level: LogLevel;
+  source: LogSource;
+  message: string;
 }
 
 export interface AnalyzedRoute {
   destination: string;
   source: string;
+}
+
+export type OpenVpnPlanConflict =
+  | "activeConnection"
+  | "activeProbe"
+  | "interfaceOccupied"
+  | "stagingLeftover";
+
+export interface OpenVpnPlan {
+  profileId: string;
+  owner: string;
+  interfaceName: string;
+  fallbackInterfaceName: string;
+  stagingDir: string;
+  configPath: string;
+  managementSocket: string;
+  conflicts: OpenVpnPlanConflict[];
 }
 
 export interface LocalListener {
@@ -392,4 +424,11 @@ export interface BatchImportError {
 export interface BatchImportResult {
   profiles: Profile[];
   errors: BatchImportError[];
+}
+
+export interface ExitIpEntry {
+  name: string;
+  ip: string | null;
+  country: string | null;
+  error: string | null;
 }

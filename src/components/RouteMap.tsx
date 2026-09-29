@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PlannedRoute, RouteMap as RouteMapData } from "../types";
+import { ChevronIcon } from "../icons";
 
 function parseCidr(cidr: string): { bits: bigint; len: number; family: 4 | 6 } | null {
   const [addr, lenStr] = cidr.split("/");
@@ -184,7 +185,6 @@ export default function RouteMap() {
   return (
     <section className="route-map">
       <div className="route-map-header">
-        <h2>Route map</h2>
         <label className="route-map-toggle">
           <input
             type="checkbox"
@@ -238,8 +238,11 @@ export default function RouteMap() {
                       type="button"
                       className="route-map-group-header"
                       onClick={() => toggleGroup(key)}
+                      aria-expanded={!collapsed}
                     >
-                      <span className="route-map-caret">{collapsed ? "▸" : "▾"}</span>
+                      <span className="route-map-caret">
+                        <ChevronIcon size={12} collapsed={collapsed} />
+                      </span>
                       <span className="route-map-group-name">
                         {key === "auto" ? "auto interface" : key}
                       </span>
@@ -252,7 +255,7 @@ export default function RouteMap() {
                             <th>Destination</th>
                             <th>Owner</th>
                             <th>Source</th>
-                            <th>Metric</th>
+                            <th className="num">Metric</th>
                             <th>State</th>
                           </tr>
                         </thead>
@@ -285,7 +288,7 @@ export default function RouteMap() {
                                         onClick={() => toggleNode(key)}
                                         aria-label={isCollapsed ? "Expand" : "Collapse"}
                                       >
-                                        {isCollapsed ? "▸" : "▾"}
+                                        <ChevronIcon size={12} collapsed={isCollapsed} />
                                       </button>
                                     ) : depth > 0 ? (
                                       "↳ "
@@ -299,7 +302,7 @@ export default function RouteMap() {
                                   <span className="owner-badge">{route.ownerName}</span>
                                 </td>
                                 <td>{route.source}</td>
-                                <td>{route.metric ?? "auto"}</td>
+                                <td className="num">{route.metric ?? "auto"}</td>
                                 <td>{route.active ? "active" : "stopped"}</td>
                               </tr>
                             );
@@ -380,8 +383,11 @@ export default function RouteMap() {
                       type="button"
                       className="route-map-group-header"
                       onClick={() => toggleGroup(`eff::${key}`)}
+                      aria-expanded={!collapsed}
                     >
-                      <span className="route-map-caret">{collapsed ? "▸" : "▾"}</span>
+                      <span className="route-map-caret">
+                        <ChevronIcon size={12} collapsed={collapsed} />
+                      </span>
                       <span className="route-map-group-name">{key}</span>
                       <span className="route-map-group-count">{routes.length}</span>
                     </button>
@@ -390,16 +396,16 @@ export default function RouteMap() {
                         <thead>
                           <tr>
                             <th>Destination</th>
-                            <th>Metric</th>
+                            <th className="num">Metric</th>
                           </tr>
                         </thead>
                         <tbody>
                           {visible.map((route, i) => (
                             <tr key={i}>
-                              <td>
+                              <td className="mono">
                                 {route.destination}/{route.prefixLen}
                               </td>
-                              <td>{route.metric}</td>
+                              <td className="num">{route.metric}</td>
                             </tr>
                           ))}
                         </tbody>

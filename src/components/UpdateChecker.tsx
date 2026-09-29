@@ -71,6 +71,7 @@ export default function UpdateChecker() {
   return (
     <div className="update-checker">
       <button
+        className="btn-sm"
         onClick={checkForUpdates}
         disabled={checking || installing}
         title="Check for updates"

@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
-import { backendIcon, ChevronIcon } from "../icons";
+import { backendIcon, ChevronIcon, CloseIcon, PlusIcon } from "../icons";
 import AddConnectionMenu from "./AddConnectionMenu";
 import DiagnosticsModal from "./DiagnosticsModal";
 import ImportModal from "./ImportModal";
@@ -13,6 +13,9 @@ import Page from "./Page";
 import Skeleton from "./ui/Skeleton";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import OverflowMenu from "./ui/OverflowMenu";
+import RateText from "./ui/RateText";
+import { useToast } from "./ui/Toast";
+import { formatBytes } from "../format";
 import ProfileFormModal, {
   editFormState,
   newFormState,
@@ -23,6 +26,7 @@ import {
   AlwaysOnListResult,
   AlwaysOnSetResult,
   BatchImportResult,
+  DomainPolicy,
   DomainRouteTarget,
   NetworkInterface,
   Profile,
@@ -32,6 +36,7 @@ import {
   SubscriptionDelayResult,
   SubscriptionRefreshResult,
   TunnelBackend,
+  TunnelState,
   TunnelStatus,
 } from "../types";
 
@@ -48,10 +53,22 @@ interface AutoConnectResult {
 }
 
 const DOMAIN_TARGET_LABELS: Record<DomainRouteTarget, string> = {
-  proxy: "Through proxy",
-  direct: "Direct",
   block: "Block",
+  proxy: "Proxy",
+  direct: "Direct",
 };
+
+/** Counts real selectors; `#` comment lines are stored in `domains` for
+ * round-trip through the editor but are not rules. */
+function countPolicyRules(
+  policies: DomainPolicy[],
+  target?: DomainRouteTarget,
+): number {
+  return policies
+    .filter((p) => target === undefined || p.target === target)
+    .flatMap((p) => p.domains)
+    .filter((d) => !d.trimStart().startsWith("#")).length;
+}
 
 function requiresElevation(profile: Profile): boolean {
   return (
@@ -59,19 +76,6 @@ function requiresElevation(profile: Profile): boolean {
     profile.backend === "openVpn" ||
     profile.routes.length > 0
   );
-}
-
-function formatRate(bytesPerSec: number): string {
-  if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`;
-  if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
-  return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
 }
 
 const COLLAPSED_GROUPS_KEY = "netmanager.connections.collapsedGroups";
@@ -135,6 +139,7 @@ function ConnectionCardSkeleton() {
 
 export default function ProfileManager() {
   const caps = usePlatformCapabilities();
+  const toast = useToast();
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [statuses, setStatuses] = useState<TunnelStatus[]>([]);
   const [alwaysOn, setAlwaysOn] = useState<AlwaysOnListResult | null>(null);
@@ -157,7 +162,6 @@ export default function ProfileManager() {
   );
   const [diagOpen, setDiagOpen] = useState(false);
   const [diagBusy, setDiagBusy] = useState<string | null>(null);
-  const [runtimeNotice, setRuntimeNotice] = useState<string | null>(null);
   const [importErrors, setImportErrors] = useState<string[] | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [endpoints, setEndpoints] = useState<
@@ -191,6 +195,7 @@ export default function ProfileManager() {
     Record<number, { rxRate: number; txRate: number }>
   >({});
   const prevStats = useRef<Record<number, { rx: number; tx: number; time: number }>>({});
+  const prevTunnelStates = useRef<Record<string, TunnelState>>({});
 
   useEffect(() => {
     let active = true;
@@ -198,11 +203,13 @@ export default function ProfileManager() {
     const showResult = (result: AutoConnectResult | null) => {
       if (!active || !result) return;
       if (result.startupFailed) {
-        setRuntimeNotice(
+        toast(
+          "error",
           "Auto-connect could not start. Check Network daemon in Settings and profile Diagnostics.",
         );
       } else if (result.failedCount > 0) {
-        setRuntimeNotice(
+        toast(
+          "error",
           `${result.failedCount} profile(s) could not connect automatically. Check Diagnostics and retry Connect manually.`,
         );
       }
@@ -398,6 +405,27 @@ export default function ProfileManager() {
   }, [refreshStatuses]);
 
   useEffect(() => {
+    const prev = prevTunnelStates.current;
+    const next: Record<string, TunnelState> = {};
+    for (const status of statuses) {
+      next[status.profileId] = status.state;
+      const before = prev[status.profileId];
+      if (before !== undefined && before !== "failed" && status.state === "failed") {
+        const name =
+          profiles.find((profile) => profile.id === status.profileId)?.name ??
+          "Profile";
+        toast(
+          "error",
+          status.message
+            ? `${name} failed to connect: ${status.message}`
+            : `${name} failed to connect. Run Diagnostics for details.`,
+        );
+      }
+    }
+    prevTunnelStates.current = next;
+  }, [statuses, profiles]);
+
+  useEffect(() => {
     const subProfiles = profiles.filter((p) => p.subscription !== null);
     if (subProfiles.length === 0) {
       if (Object.keys(endpoints).length > 0) setEndpoints({});
@@ -452,7 +480,7 @@ export default function ProfileManager() {
       try {
         if (!(await ensureElevation(`Connecting ${profile.name}`))) return;
       } catch (err) {
-        setError(String(err));
+        toast("error", String(err));
         return;
       }
     }
@@ -460,14 +488,21 @@ export default function ProfileManager() {
       const status = await invoke<TunnelStatus>("connect_profile", {
         id: profile.id,
       });
-      if (status.message) setRuntimeNotice(status.message);
+      if (status.state === "failed") {
+        toast(
+          "error",
+          status.message ??
+            `${profile.name} failed to connect. Run Diagnostics for details.`,
+        );
+      } else if (status.message) {
+        toast("info", status.message);
+      }
     }, (err) => {
       if (caps?.os === "linux" && profile.backend === "openVpn" && String(err) === "OpenVPN credentials required") {
         setOpenVpnCredentialProfile(profile);
         setOpenVpnCredentialError(null);
-        setError(null);
       } else {
-        setError(String(err));
+        toast("error", String(err));
       }
     });
   };
@@ -503,15 +538,15 @@ export default function ProfileManager() {
         },
         remember: rememberOpenVpnCredentials,
       });
-      if (status.message) setRuntimeNotice(status.message);
+      if (status.message) toast("info", status.message);
       setOpenVpnCredentialProfile(null);
       setOpenVpnUsername("");
       setOpenVpnPassword("");
       setOpenVpnKeyPassphrase("");
       setRememberOpenVpnCredentials(false);
       await refreshAll();
-    } catch {
-      setOpenVpnCredentialError("OpenVPN connection failed. Check credentials and profile settings.");
+    } catch (err) {
+      setOpenVpnCredentialError(`OpenVPN connection failed: ${String(err)}`);
     } finally {
       setOpenVpnCredentialBusy(false);
     }
@@ -522,12 +557,13 @@ export default function ProfileManager() {
       try {
         if (!(await ensureElevation(`Disconnecting ${profile.name}`))) return;
       } catch (err) {
-        setError(String(err));
+        toast("error", String(err));
         return;
       }
     }
     withBusy(profile.id, () =>
       invoke("disconnect_profile", { id: profile.id }),
+      (err) => toast("error", String(err)),
     );
   };
 
@@ -616,7 +652,7 @@ export default function ProfileManager() {
       if (result.skippedCount > 0) details.push(`${result.skippedCount} skipped.`);
       if (result.fallbackUsed) details.push("Selected endpoint disappeared; first endpoint selected.");
       if (result.cleanupFailed) details.push("Previous config cleanup failed.");
-      setRuntimeNotice(details.join(" "));
+      toast("info", details.join(" "));
     } catch (err) {
       setError(String(err));
     } finally {
@@ -709,7 +745,7 @@ export default function ProfileManager() {
   };
 
   const openNew = (backend?: TunnelBackend) => {
-    setEditing(newFormState(backend));
+    setEditing(newFormState(backend, caps?.os));
     setFormOpen(true);
   };
 
@@ -745,7 +781,7 @@ export default function ProfileManager() {
         await invoke("remove_always_on_profile", { kind, profileId: profile.id });
       } else {
         const result = await invoke<AlwaysOnSetResult>("set_always_on_profile", { id: profile.id });
-        if (!result.active) setRuntimeNotice("Always-on saved. Resume always-on to activate it.");
+        if (!result.active) toast("info", "Always-on saved. Resume always-on to activate it.");
       }
     });
   };
@@ -848,11 +884,14 @@ export default function ProfileManager() {
     <section>
       <div className="profiles-toolbar">
         <h2>Connections</h2>
-        <button className="profile-new-btn" onClick={() => setAddMenuOpen(true)}>
-          + Add connection
+        <button
+          className="profile-new-btn btn-primary btn-with-icon"
+          onClick={() => setAddMenuOpen(true)}
+        >
+          <PlusIcon size={14} /> Add connection
         </button>
         <button
-          className="profile-import-btn"
+          className="btn-with-icon"
           onClick={() => setImportOpen(true)}
         >
           Import…
@@ -911,7 +950,7 @@ export default function ProfileManager() {
                     onClick={() => deleteSnippet(snippet.id)}
                     title="Delete snippet"
                   >
-                    ×
+                    <CloseIcon size={12} />
                   </button>
                 </div>
               );
@@ -927,7 +966,7 @@ export default function ProfileManager() {
                   : "Save the currently running connections as a snippet"
               }
             >
-              + Save current
+              <PlusIcon size={12} /> Save current
             </button>
           </div>
         </div>
@@ -960,15 +999,6 @@ export default function ProfileManager() {
       )}
 
       {error && <p className="error">{error}</p>}
-
-      {runtimeNotice && (
-        <div className="runtime-notice">
-          <span>{runtimeNotice}</span>
-          <button type="button" onClick={() => setRuntimeNotice(null)}>
-            Dismiss
-          </button>
-        </div>
-      )}
 
       {saveNotice && (
         <div className="save-notice">
@@ -1030,8 +1060,8 @@ export default function ProfileManager() {
                     (profile.interfaceName.length > 0 && profile.routes.length > 0));
                 const inspection = inspections[profile.id];
                 const isExpanded = expanded.has(profile.id);
-                const detailCount =
-                  profile.routes.length + profile.domainPolicies.length;
+                const ruleCount = countPolicyRules(profile.domainPolicies);
+                const detailCount = profile.routes.length + ruleCount;
                 const rate = status.state === "running" ? rateFor(profile) : null;
                 return (
                   <div
@@ -1064,12 +1094,21 @@ export default function ProfileManager() {
                             <span className="badge badge-external">External</span>
                           )}
                         </div>
-                        <span className="connection-card-meta">
-                          {status.state === "failed" && status.message
-                            ? status.message
-                            : rate
-                              ? `↓ ${formatRate(rate.rxRate)} · ↑ ${formatRate(rate.txRate)}`
-                              : profile.interfaceName || "No target interface"}
+                        <span
+                          className="connection-card-meta"
+                          title={
+                            status.state === "failed" && status.message
+                              ? status.message
+                              : undefined
+                          }
+                        >
+                          {status.state === "failed" && status.message ? (
+                            status.message
+                          ) : rate ? (
+                            <RateText rx={rate.rxRate} tx={rate.txRate} live />
+                          ) : (
+                            profile.interfaceName || "No target interface"
+                          )}
                         </span>
                       </div>
                       <ToggleSwitch
@@ -1100,6 +1139,26 @@ export default function ProfileManager() {
                             },
                             disabled: isBusy,
                           }] : []),
+                          ...(profile.subscription && endpoints[profile.id] ? [
+                            {
+                              label: refreshingSubscription === profile.id ? "Refreshing…" : "Refresh subscription",
+                              onClick: () => onRefreshSubscription(profile),
+                              disabled:
+                                refreshingSubscription === profile.id ||
+                                switching === profile.id ||
+                                isBusy ||
+                                status.state === "running",
+                            },
+                            {
+                              label: measuringDelay === profile.id ? "Testing…" : "Test delay",
+                              onClick: () => onMeasureDelay(profile),
+                              disabled:
+                                measuringDelay === profile.id ||
+                                switching === profile.id ||
+                                refreshingSubscription === profile.id ||
+                                isBusy,
+                            },
+                          ] : []),
                           {
                             label: diagBusy === profile.id ? "Running diagnostics…" : "Diagnostics",
                             onClick: () => onDiagnose(profile),
@@ -1138,7 +1197,7 @@ export default function ProfileManager() {
                     {profile.subscription && endpoints[profile.id] && (
                       <div className="interface-row">
                         <span className="row-label">Endpoint</span>
-                        <span className="row-value">
+                        <span className="row-value endpoint-row">
                           <select
                             value={
                               endpoints[profile.id].findIndex(
@@ -1157,6 +1216,11 @@ export default function ProfileManager() {
                               isBusy ||
                               status.state === "running"
                             }
+                            title={
+                              status.state === "running"
+                                ? "Disconnect to switch endpoints"
+                                : undefined
+                            }
                           >
                             {endpoints[profile.id].map((ep, i) => (
                               <option key={i} value={i}>
@@ -1164,142 +1228,131 @@ export default function ProfileManager() {
                               </option>
                             ))}
                           </select>
-                            {switching === profile.id && " switching…"}
-                            <button
-                              type="button"
-                              className="connection-detail-toggle"
-                              onClick={() => onRefreshSubscription(profile)}
-                              disabled={
-                                refreshingSubscription === profile.id ||
-                                switching === profile.id ||
-                                isBusy ||
-                                status.state === "running"
-                              }
-                            >
-                              {refreshingSubscription === profile.id ? "Refreshing…" : "Refresh"}
-                            </button>
-                            <button
-                              type="button"
-                              className="connection-detail-toggle"
-                              onClick={() => onMeasureDelay(profile)}
-                              disabled={
-                                measuringDelay === profile.id ||
-                                switching === profile.id ||
-                                refreshingSubscription === profile.id ||
-                                isBusy
-                              }
-                            >
-                              {measuringDelay === profile.id ? "Testing…" : "Test delay"}
-                            </button>
-                            {delayResults[profile.id]?.index ===
-                              endpoints[profile.id].findIndex((e) => e.active) && (
-                                <span>
-                                  {delayResults[profile.id].result.delayMs !== null
-                                    ? `${delayResults[profile.id].result.delayMs} ms`
-                                    : delayResults[profile.id].result.error}
-                                </span>
-                              )}
+                          {switching === profile.id && (
+                            <span className="endpoint-note">switching…</span>
+                          )}
+                          {delayResults[profile.id]?.index ===
+                            endpoints[profile.id].findIndex((e) => e.active) && (
+                              <span className="badge badge-managed">
+                                {delayResults[profile.id].result.delayMs !== null
+                                  ? `${delayResults[profile.id].result.delayMs} ms`
+                                  : delayResults[profile.id].result.error}
+                              </span>
+                            )}
                         </span>
                       </div>
                     )}
                     {profile.subscription && (
-                      <>
-                        <div className="interface-row">
-                          <span className="row-label">Auto-refresh</span>
-                          <span className="row-value">
-                            <select
-                              value={profile.subscription.refreshIntervalMinutes ?? ""}
-                              onChange={(event) => onSetRefreshInterval(profile, event.target.value ? Number(event.target.value) : null)}
-                              disabled={settingRefreshInterval === profile.id || isBusy}
-                            >
-                              <option value="">Off</option>
-                              <option value="15">Every 15 minutes</option>
-                              <option value="60">Every hour</option>
-                              <option value="360">Every 6 hours</option>
-                            </select>
-                          </span>
-                        </div>
-                        {profile.subscription.userInfo && (
-                          <div className="interface-row">
-                            <span className="row-label">Traffic</span>
-                            <span className="row-value">
-                              {formatBytes(profile.subscription.userInfo.uploadBytes + profile.subscription.userInfo.downloadBytes)} used
-                              {profile.subscription.userInfo.totalBytes !== null
-                                ? ` / ${formatBytes(profile.subscription.userInfo.totalBytes)}`
-                                : " / unlimited"}
-                            </span>
-                          </div>
-                        )}
-                        {profile.subscription.userInfo?.expiresAtUnix != null && (
-                          <div className="interface-row">
-                            <span className="row-label">Expires</span>
-                            <span className="row-value">
-                              {new Date(profile.subscription.userInfo.expiresAtUnix * 1000).toLocaleDateString()}
-                            </span>
-                          </div>
-                        )}
-                        {profile.subscription.lastRefreshAtUnix !== null && (
-                          <div className="interface-row">
-                            <span className="row-label">Last checked</span>
-                            <span className="row-value">
-                              {new Date(profile.subscription.lastRefreshAtUnix * 1000).toLocaleString()}
-                            </span>
-                          </div>
-                        )}
-                        {profile.subscription.lastRefreshError && (
-                          <div className="interface-row">
-                            <span className="row-label">Refresh</span>
-                            <span className="row-value">{profile.subscription.lastRefreshError}</span>
-                          </div>
-                        )}
-                      </>
-                    )}
-                    {profile.backend === "xray" && profile.privateLanDirect && (
                       <div className="interface-row">
-                        <span className="row-label">Private/LAN IPs</span>
-                        <span className="row-value">Direct after custom rules</span>
-                      </div>
-                    )}
-                    {profile.useSystemProxy && (
-                      <div className="interface-row">
-                        <span className="row-label">Proxy bypass</span>
-                        <span className="row-value mono">
-                          {profile.proxyBypass.join("; ") || "none"}
+                        <span className="row-label">Auto-refresh</span>
+                        <span className="row-value">
+                          <select
+                            value={profile.subscription.refreshIntervalMinutes ?? ""}
+                            onChange={(event) => onSetRefreshInterval(profile, event.target.value ? Number(event.target.value) : null)}
+                            disabled={settingRefreshInterval === profile.id || isBusy}
+                          >
+                            <option value="">Off</option>
+                            <option value="15">Every 15 minutes</option>
+                            <option value="60">Every hour</option>
+                            <option value="360">Every 6 hours</option>
+                          </select>
                         </span>
                       </div>
                     )}
 
-                    {detailCount > 0 && (
+                    {(detailCount > 0 ||
+                      profile.subscription !== null ||
+                      (profile.backend === "xray" && profile.privateLanDirect) ||
+                      profile.useSystemProxy) && (
                       <div className="connection-card-details">
                         <button
                           type="button"
                           className="connection-detail-toggle"
                           onClick={() => toggleExpanded(profile.id)}
+                          aria-expanded={isExpanded}
                         >
                           <ChevronIcon size={13} collapsed={!isExpanded} />
-                          {profile.routes.length > 0 &&
-                            `${profile.routes.length} route${profile.routes.length === 1 ? "" : "s"}`}
-                          {profile.routes.length > 0 && profile.domainPolicies.length > 0 && " · "}
-                            {profile.domainPolicies.length > 0 &&
-                              `${profile.domainPolicies.length} routing rule${profile.domainPolicies.length === 1 ? "" : "s"}`}
+                          {detailCount > 0 ? (
+                            <>
+                              {profile.routes.length > 0 &&
+                                `${profile.routes.length} route${profile.routes.length === 1 ? "" : "s"}`}
+                              {profile.routes.length > 0 && ruleCount > 0 && " · "}
+                              {ruleCount > 0 &&
+                                `${ruleCount} routing rule${ruleCount === 1 ? "" : "s"}`}
+                            </>
+                          ) : (
+                            "Details"
+                          )}
                         </button>
                         {isExpanded && (
                           <>
-                            {profile.domainPolicies.length > 0 && (
-                              <div className="interface-section">
-                                  <span className="section-label">Domain/IP rules</span>
-                                <ul className="profile-route-list">
-                                  {profile.domainPolicies.map((policy, i) => (
-                                    <li key={i}>
-                                      <span className="mono">
-                                        {policy.domains.join(", ")}
-                                      </span>
-                                      <span className="family-tag">
-                                        {DOMAIN_TARGET_LABELS[policy.target]}
-                                      </span>
-                                    </li>
-                                  ))}
-                                </ul>
+                            {profile.subscription?.userInfo && (
+                              <div className="interface-row">
+                                <span className="row-label">Traffic</span>
+                                <span className="row-value">
+                                  {formatBytes(profile.subscription.userInfo.uploadBytes + profile.subscription.userInfo.downloadBytes)} used
+                                  {profile.subscription.userInfo.totalBytes !== null
+                                    ? ` / ${formatBytes(profile.subscription.userInfo.totalBytes)}`
+                                    : " / unlimited"}
+                                </span>
+                              </div>
+                            )}
+                            {profile.subscription?.userInfo?.expiresAtUnix != null && (
+                              <div className="interface-row">
+                                <span className="row-label">Expires</span>
+                                <span className="row-value">
+                                  {new Date(profile.subscription.userInfo.expiresAtUnix * 1000).toLocaleDateString()}
+                                </span>
+                              </div>
+                            )}
+                            {profile.subscription && profile.subscription.lastRefreshAtUnix !== null && (
+                              <div className="interface-row">
+                                <span className="row-label">Last checked</span>
+                                <span className="row-value">
+                                  {new Date(profile.subscription.lastRefreshAtUnix * 1000).toLocaleString()}
+                                </span>
+                              </div>
+                            )}
+                            {profile.subscription?.lastRefreshError && (
+                              <div className="interface-row">
+                                <span className="row-label">Refresh</span>
+                                <span className="row-value">{profile.subscription.lastRefreshError}</span>
+                              </div>
+                            )}
+                            {profile.backend === "xray" && profile.privateLanDirect && (
+                              <div className="interface-row">
+                                <span className="row-label">Private/LAN IPs</span>
+                                <span className="row-value">Direct after custom rules</span>
+                              </div>
+                            )}
+                            {profile.useSystemProxy && (
+                              <div className="interface-row">
+                                <span className="row-label">Proxy bypass</span>
+                                <span className="row-value mono">
+                                  {profile.proxyBypass.join("; ") ||
+                                    "LAN/localhost defaults"}
+                                </span>
+                              </div>
+                            )}
+                            {ruleCount > 0 && (
+                              <div className="interface-row">
+                                <span className="row-label">Domain/IP rules</span>
+                                <span className="row-value">
+                                  {(["block", "proxy", "direct"] as const)
+                                    .map((target) => ({
+                                      target,
+                                      count: countPolicyRules(
+                                        profile.domainPolicies,
+                                        target,
+                                      ),
+                                    }))
+                                    .filter((entry) => entry.count > 0)
+                                    .map(
+                                      (entry) =>
+                                        `${DOMAIN_TARGET_LABELS[entry.target]} ${entry.count}`,
+                                    )
+                                    .join(" · ")}
+                                </span>
                               </div>
                             )}
                             {profile.routes.length > 0 && (
@@ -1379,7 +1432,7 @@ export default function ProfileManager() {
             <button type="button" onClick={closeOpenVpnCredentials} disabled={openVpnCredentialBusy}>
               Cancel
             </button>
-            <button type="button" className="profile-save-btn" onClick={submitOpenVpnCredentials} disabled={openVpnCredentialBusy}>
+            <button type="button" className="btn-primary" onClick={submitOpenVpnCredentials} disabled={openVpnCredentialBusy}>
               {openVpnCredentialBusy ? "Connecting…" : "Connect"}
             </button>
           </>
@@ -1419,7 +1472,7 @@ export default function ProfileManager() {
             </button>
             <button
               type="button"
-              className="profile-save-btn"
+              className="btn-primary"
               onClick={createSnippet}
               disabled={!newSnippetName.trim()}
             >

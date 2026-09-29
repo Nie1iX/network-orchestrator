@@ -32,8 +32,7 @@ export default function RouteLookup() {
   };
 
   return (
-    <section>
-      <h2>Route Lookup</h2>
+    <div className="route-lookup">
       <form className="lookup-input" onSubmit={onSubmit}>
         <input
           type="text"
@@ -42,7 +41,7 @@ export default function RouteLookup() {
           placeholder="Enter IP address or hostname..."
           autoFocus
         />
-        <button type="submit" disabled={loading || !dest.trim()}>
+        <button type="submit" className="btn-primary" disabled={loading || !dest.trim()}>
           {loading ? "Looking up..." : "Lookup"}
         </button>
       </form>
@@ -69,22 +68,22 @@ export default function RouteLookup() {
                   <th>Prefix</th>
                   <th>Gateway</th>
                   <th>Interface</th>
-                  <th>Metric</th>
+                  <th className="num">Metric</th>
                 </tr>
               </thead>
               <tbody>
                 <tr>
-                  <td>{result.matchedRoute.destination}</td>
-                  <td>/{result.matchedRoute.prefixLen}</td>
-                  <td>{result.matchedRoute.gateway ?? "—"}</td>
+                  <td className="mono">{result.matchedRoute.destination}</td>
+                  <td className="num">/{result.matchedRoute.prefixLen}</td>
+                  <td className="mono">{result.matchedRoute.gateway ?? "—"}</td>
                   <td>{result.matchedRoute.interfaceName}</td>
-                  <td>{result.matchedRoute.metric}</td>
+                  <td className="num">{result.matchedRoute.metric}</td>
                 </tr>
               </tbody>
             </table>
           </div>
         </div>
       )}
-    </section>
+    </div>
   );
 }

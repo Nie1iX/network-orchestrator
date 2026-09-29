@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PlannedRoute, RouteMap as RouteMapData } from "../types";
+import { colorForKey } from "../palette";
 
 interface InterfaceGroup {
   name: string;
@@ -24,21 +25,7 @@ function groupByInterface(routes: PlannedRoute[]): InterfaceGroup[] {
     .sort((a, b) => b.activeCount - a.activeCount || a.name.localeCompare(b.name));
 }
 
-const OWNER_COLORS = [
-  "#646cff",
-  "#34d399",
-  "#f59e0b",
-  "#f87171",
-  "#a78bfa",
-  "#22d3ee",
-  "#fb923c",
-  "#e879f9",
-];
-
-function colorForOwner(owner: string, owners: string[]): string {
-  const idx = owners.indexOf(owner);
-  return OWNER_COLORS[idx % OWNER_COLORS.length] ?? "#9ca3af";
-}
+const colorForOwner = colorForKey;
 
 export default function RouteByInterface() {
   const [map, setMap] = useState<RouteMapData | null>(null);

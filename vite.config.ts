@@ -16,7 +16,9 @@ export default defineConfig(() => ({
   server: {
     port: 1420,
     strictPort: true,
-    host: host || false,
+    // Bind IPv4 explicitly: resolving `localhost` may pick IPv6 (::1) while the
+    // Tauri webview tries 127.0.0.1 first and renders an empty page.
+    host: host || "127.0.0.1",
     hmr: host
       ? {
           protocol: "ws",

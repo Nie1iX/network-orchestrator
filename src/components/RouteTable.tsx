@@ -34,7 +34,6 @@ export default function RouteTable() {
 
   return (
     <section>
-      <h2>Routes</h2>
       {routes.length === 0 ? (
         <p>No routes found.</p>
       ) : (
@@ -45,17 +44,17 @@ export default function RouteTable() {
               <th>Prefix</th>
               <th>Gateway</th>
               <th>Interface</th>
-              <th>Metric</th>
+              <th className="num">Metric</th>
             </tr>
           </thead>
           <tbody>
             {routes.map((route, i) => (
               <tr key={i}>
-                <td>{route.destination}</td>
-                <td>/{route.prefixLen}</td>
-                <td>{route.gateway ?? "—"}</td>
+                <td className="mono">{route.destination}</td>
+                <td className="num">/{route.prefixLen}</td>
+                <td className="mono">{route.gateway ?? "—"}</td>
                 <td>{route.interfaceName}</td>
-                <td>{route.metric}</td>
+                <td className="num">{route.metric}</td>
               </tr>
             ))}
           </tbody>

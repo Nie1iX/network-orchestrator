@@ -9,23 +9,13 @@ import {
   CATEGORY_LABELS,
   CATEGORY_DESCRIPTIONS,
 } from "../types";
-import { kindIcon, categoryIcon, ChevronIcon } from "../icons";
+import { kindIcon, categoryIcon, ChevronIcon, ArrowDownIcon, ArrowUpIcon } from "../icons";
 import InterfaceDetail from "./InterfaceDetail";
+import ExitIpPanel from "./ExitIpPanel";
 import Page from "./Page";
 import Skeleton from "./ui/Skeleton";
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
-
-function formatRate(bytesPerSec: number): string {
-  if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`;
-  if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
-  return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
-}
+import RateText from "./ui/RateText";
+import { formatBytes } from "../format";
 
 interface Throughput {
   rxRate: number;
@@ -217,6 +207,7 @@ export default function InterfaceList() {
     <Page width="wide">
     <section>
       <h2>Network</h2>
+      <ExitIpPanel />
       <div className="filter-bar">
         <input
           className="filter-search"
@@ -285,23 +276,26 @@ export default function InterfaceList() {
             const isCollapsed = collapsed.has(cat);
             return (
               <div key={cat} className="interface-group">
-                <div
+                <button
+                  type="button"
                   className="group-header"
                   onClick={() => toggleCollapse(cat)}
+                  aria-expanded={!isCollapsed}
                 >
                   <ChevronIcon size={16} collapsed={isCollapsed} />
                   {categoryIcon(cat, 16)}
                   <span className="group-title">{CATEGORY_LABELS[cat]}</span>
                   <span className="group-count">{list.length}</span>
                   <span className="group-desc">{CATEGORY_DESCRIPTIONS[cat]}</span>
-                </div>
+                </button>
                 {!isCollapsed && (
                   <div className="interface-grid">
                     {list.map((iface) => {
                       const tp = throughput[iface.ifIndex];
                       return (
-                        <div
+                        <button
                           key={iface.ifIndex}
+                          type="button"
                           className="interface-card clickable"
                           onClick={() => setSelected(iface)}
                         >
@@ -390,22 +384,29 @@ export default function InterfaceList() {
                               <div className="interface-row">
                                 <span className="row-label">Total</span>
                                 <span className="row-value">
-                                  <span className="traffic">↓ {formatBytes(iface.rxBytes)}</span>
-                                  <span className="traffic">↑ {formatBytes(iface.txBytes)}</span>
+                                  <span className="rate-pair">
+                                    <span className="rate-dir">
+                                      <ArrowDownIcon size={12} />
+                                      {formatBytes(iface.rxBytes)}
+                                    </span>
+                                    <span className="rate-dir">
+                                      <ArrowUpIcon size={12} />
+                                      {formatBytes(iface.txBytes)}
+                                    </span>
+                                  </span>
                                 </span>
                               </div>
                               {tp && (
                                 <div className="interface-row">
                                   <span className="row-label">Rate</span>
                                   <span className="row-value">
-                                  <span className="traffic rate">↓ {formatRate(tp.rxRate)}</span>
-                                  <span className="traffic rate">↑ {formatRate(tp.txRate)}</span>
-                                </span>
+                                    <RateText rx={tp.rxRate} tx={tp.txRate} live />
+                                  </span>
                                 </div>
                               )}
                             </div>
                           )}
-                        </div>
+                        </button>
                       );
                     })}
                   </div>

@@ -40,7 +40,7 @@ function RecoveryPrompt() {
           {error && <p className="error">{error}</p>}
           <div className="recovery-actions">
             <button onClick={() => setDismissed(true)}>Keep for now</button>
-            <button className="recovery-cleanup-btn" onClick={loadReport}>
+            <button className="btn-primary" onClick={loadReport}>
               Retry
             </button>
           </div>
@@ -90,7 +90,7 @@ function RecoveryPrompt() {
             Keep for now
           </button>
           <button
-            className="recovery-cleanup-btn"
+            className="btn-primary"
             onClick={onCleanup}
             disabled={busy}
           >

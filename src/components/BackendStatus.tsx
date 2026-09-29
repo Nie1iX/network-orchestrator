@@ -35,6 +35,11 @@ function progressText(progress: BackendInstallProgress): string {
   return `${progress.stage} — ${mib.toFixed(1)} MiB`;
 }
 
+function installProgressPercent(progress: BackendInstallProgress): number {
+  if (!progress.total || progress.total <= 0) return 0;
+  return Math.min(100, Math.round((progress.downloaded / progress.total) * 100));
+}
+
 export default function BackendStatus() {
   const [items, setItems] = useState<BackendAvailability[]>([]);
   const caps = usePlatformCapabilities();
@@ -163,7 +168,7 @@ export default function BackendStatus() {
     <div className="backend-status">
       <div className="backend-status-head">
         <span className="section-label">Backend prerequisites</span>
-        <button type="button" onClick={load} disabled={loading || busy !== null}>
+        <button type="button" className="btn-sm" onClick={load} disabled={loading || busy !== null}>
           {loading ? "Checking…" : "Refresh"}
         </button>
       </div>
@@ -192,6 +197,7 @@ export default function BackendStatus() {
             {!(caps?.os === "linux" && (item.backend === "wireGuard" || item.backend === "openVpn")) && (
               <button
                 type="button"
+                className="btn-sm"
                 disabled={busy !== null || item.source === "managed"}
                 onClick={() => chooseExecutable(item)}
               >
@@ -201,6 +207,7 @@ export default function BackendStatus() {
             {item.source === "configured" && (
               <button
                 type="button"
+                className="btn-sm"
                 disabled={busy !== null}
                 onClick={() => resetExecutable(item)}
               >
@@ -213,6 +220,7 @@ export default function BackendStatus() {
               caps?.managedXrayInstall && (
               <button
                 type="button"
+                className="btn-sm"
                 disabled={busy !== null}
                 onClick={installManaged}
               >
@@ -222,6 +230,7 @@ export default function BackendStatus() {
             {item.backend === "xray" && item.source === "managed" && (
               <button
                 type="button"
+                className="btn-sm"
                 disabled={busy !== null}
                 onClick={removeManaged}
               >
@@ -233,10 +242,18 @@ export default function BackendStatus() {
       ))}
       {busy === "install-xray" && progress && (
         <div className="backend-install-progress">
-          <span className="row-value">{progressText(progress)}</span>
-          <button type="button" onClick={cancelInstall} disabled={cancelling}>
-            {cancelling ? "Cancelling…" : "Cancel"}
-          </button>
+          <div className="progress">
+            <div
+              className="progress-fill"
+              style={{ width: `${installProgressPercent(progress)}%` }}
+            />
+          </div>
+          <div className="backend-install-row">
+            <span className="row-value">{progressText(progress)}</span>
+            <button type="button" className="btn-sm" onClick={cancelInstall} disabled={cancelling}>
+              {cancelling ? "Cancelling…" : "Cancel"}
+            </button>
+          </div>
         </div>
       )}
     </div>

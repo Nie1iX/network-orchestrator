@@ -15,6 +15,7 @@ import {
   XrayMode,
 } from "../types";
 import { usePlatformCapabilities } from "../platform";
+import { ChevronIcon } from "../icons";
 
 const BACKEND_LABELS: Record<TunnelBackend, string> = {
   none: "Static routes",
@@ -30,7 +31,7 @@ const BACKEND_EXTENSIONS: Record<TunnelBackend, string[]> = {
   xray: ["json"],
 };
 
-const DEFAULT_PROXY_BYPASS = "<local>, localhost, 127.*, 10.*, 192.168.*";
+const PROXY_BYPASS_PLACEHOLDER = "10.*, *.corp.local";
 
 const EMPTY_WG_FIELDS: WireGuardFields = {
   privateKey: "",
@@ -76,7 +77,10 @@ export interface ProfileFormState {
   wgFields: WireGuardFields;
   xraySocksPort: number | null;
   xrayHttpPort: number | null;
-  domainPolicies: DomainPolicy[];
+  /** One selector per line per target; `#` lines are comments. */
+  rulesProxy: string;
+  rulesDirect: string;
+  rulesBlock: string;
   privateLanDirect: boolean;
   useSystemProxy: boolean;
   proxyBypass: string;
@@ -85,9 +89,46 @@ export interface ProfileFormState {
   xrayMode: XrayMode;
   xrayTunInterface: string;
   xrayTunIp: string;
+  xrayGeoipUrl: string;
+  xrayGeositeUrl: string;
 }
 
-export function newFormState(backend: TunnelBackend = "wireGuard"): ProfileFormState {
+/** Group a profile's policies into per-target text (comments preserved). */
+function policiesToText(policies: DomainPolicy[], target: DomainRouteTarget): string {
+  return policies
+    .filter((p) => p.target === target)
+    .flatMap((p) => p.domains)
+    .join("\n");
+}
+
+/** Build policies from textarea content; ordering matches Happ's
+ * block → proxy → direct precedence (first match wins in xray). */
+function textToPolicies(
+  rulesBlock: string,
+  rulesProxy: string,
+  rulesDirect: string,
+): DomainPolicy[] {
+  const parse = (text: string) =>
+    text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  const policies: DomainPolicy[] = [];
+  for (const [text, target] of [
+    [rulesBlock, "block"],
+    [rulesProxy, "proxy"],
+    [rulesDirect, "direct"],
+  ] as const) {
+    const domains = parse(text);
+    if (domains.length > 0) policies.push({ domains, target });
+  }
+  return policies;
+}
+
+export function newFormState(
+  backend: TunnelBackend = "wireGuard",
+  os?: string,
+): ProfileFormState {
   return {
     id: newProfileId(),
     name: "",
@@ -102,15 +143,21 @@ export function newFormState(backend: TunnelBackend = "wireGuard"): ProfileFormS
     wgFields: { ...EMPTY_WG_FIELDS },
     xraySocksPort: null,
     xrayHttpPort: null,
-    domainPolicies: [],
+    rulesProxy: "",
+    rulesDirect: "",
+    rulesBlock: "",
     privateLanDirect: false,
     useSystemProxy: false,
-    proxyBypass: DEFAULT_PROXY_BYPASS,
+    proxyBypass: "",
     isNew: true,
     subscription: null,
-    xrayMode: "socks",
+    // On Linux a SOCKS listener captures no system traffic, so TUN is the
+    // mode that actually tunnels; the backend import defaults match this.
+    xrayMode: os === "linux" ? "tun" : "socks",
     xrayTunInterface: "xray-tun",
     xrayTunIp: "172.19.0.1/30",
+    xrayGeoipUrl: "",
+    xrayGeositeUrl: "",
   };
 }
 
@@ -129,10 +176,9 @@ export function editFormState(profile: Profile): ProfileFormState {
     wgFields: { ...EMPTY_WG_FIELDS },
     xraySocksPort: profile.xraySocksPort,
     xrayHttpPort: profile.xrayHttpPort,
-    domainPolicies: profile.domainPolicies.map((p) => ({
-      domains: [...p.domains],
-      target: p.target,
-    })),
+    rulesProxy: policiesToText(profile.domainPolicies, "proxy"),
+    rulesDirect: policiesToText(profile.domainPolicies, "direct"),
+    rulesBlock: policiesToText(profile.domainPolicies, "block"),
     privateLanDirect: profile.privateLanDirect,
     useSystemProxy: profile.useSystemProxy,
     proxyBypass: profile.proxyBypass.join(", "),
@@ -141,6 +187,8 @@ export function editFormState(profile: Profile): ProfileFormState {
     xrayMode: profile.xrayMode ?? "socks",
     xrayTunInterface: profile.xrayTunInterface ?? "xray-tun",
     xrayTunIp: profile.xrayTunIp ?? "172.19.0.1/30",
+    xrayGeoipUrl: profile.xrayGeoipUrl ?? "",
+    xrayGeositeUrl: profile.xrayGeositeUrl ?? "",
   };
 }
 
@@ -152,6 +200,8 @@ interface ProfileFormModalProps {
   onSaved: (profiles: Profile[], inspection: ProfileInspection | null) => void;
   onError: (message: string) => void;
 }
+
+type FormTab = "general" | "connection" | "routing";
 
 export default function ProfileFormModal({
   open,
@@ -170,12 +220,18 @@ export default function ProfileFormModal({
   const [probeNotice, setProbeNotice] = useState<string | null>(null);
   const [bulkCidrs, setBulkCidrs] = useState("");
   const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [tab, setTab] = useState<FormTab>("general");
 
   useEffect(() => {
     if (open) {
       setForm(editing);
       setFormError(null);
       setBulkCidrs("");
+      setBulkOpen(false);
+      setTab("general");
+      setProbeResults(null);
+      setProbeNotice(null);
     }
   }, [open, editing?.id]);
 
@@ -195,6 +251,17 @@ export default function ProfileFormModal({
 
   const update = (patch: Partial<ProfileFormState>) =>
     setForm({ ...current, ...patch });
+
+  /** Show a validation error and jump to the tab that contains the field. */
+  const fail = (message: string, targetTab: FormTab) => {
+    setFormError(message);
+    setTab(targetTab);
+  };
+
+  const policyRuleCount =
+    textToPolicies(current.rulesBlock, current.rulesProxy, current.rulesDirect)
+      .reduce((n, p) => n + p.domains.length, 0);
+  const routingCount = current.routes.length + policyRuleCount;
 
   const browseConfig = async () => {
     try {
@@ -258,13 +325,6 @@ export default function ProfileFormModal({
     setProbeNotice(`Added ${toAdd.length} route(s) to policy routes.`);
   };
 
-  const updateDomainRule = (index: number, patch: Partial<DomainPolicy>) =>
-    update({
-      domainPolicies: current.domainPolicies.map((p, i) =>
-        i === index ? { ...p, ...patch } : p,
-      ),
-    });
-
   const updateRoute = (index: number, patch: Partial<PolicyRoute>) =>
     update({
       routes: current.routes.map((r, i) =>
@@ -300,17 +360,17 @@ export default function ProfileFormModal({
   const save = async () => {
     for (const route of current.routes) {
       if (!route.destination.trim()) {
-        setFormError("Route destination cannot be blank.");
+        fail("Route destination cannot be blank.", "routing");
         return;
       }
     }
     if (current.routes.length > 0 && !current.interfaceName.trim()
       && !daemonManagedInterface) {
-      setFormError("Target interface is required when policy routes are set.");
+      fail("Target interface is required when policy routes are set.", "routing");
       return;
     }
     if (current.backend === "none" && current.routes.length === 0) {
-      setFormError("Static-routes profile requires at least one policy route.");
+      fail("Static-routes profile requires at least one policy route.", "routing");
       return;
     }
     const isXray = current.backend === "xray";
@@ -324,26 +384,19 @@ export default function ProfileFormModal({
     if (isXray && current.useSystemProxy) {
       for (const entry of proxyBypass) {
         if (entry.includes(";")) {
-          setFormError("Proxy bypass entries must not contain ';'.");
+          fail("Proxy bypass entries must not contain ';'.", "connection");
           return;
         }
       }
     }
-    const domainPolicies = current.domainPolicies.map((p) => ({
-      domains: p.domains.map((d) => d.trim()).filter((d) => d.length > 0),
-      target: p.target,
-    }));
-    if (isXray) {
-      for (const policy of domainPolicies) {
-        if (policy.domains.length === 0) {
-          setFormError("Each routing rule must list at least one selector.");
-          return;
-        }
-      }
-    }
+    const domainPolicies = textToPolicies(
+      current.rulesBlock,
+      current.rulesProxy,
+      current.rulesDirect,
+    );
     if (isVlessImport) {
       if (!current.vlessUrl.trim()) {
-         setFormError("Share link is required.");
+        fail("Share link is required.", "connection");
         return;
       }
       if (
@@ -352,30 +405,30 @@ export default function ProfileFormModal({
           current.xraySocksPort < 1 ||
           current.xraySocksPort > 65535)
       ) {
-        setFormError("SOCKS port must be an integer between 1 and 65535.");
+        fail("SOCKS port must be an integer between 1 and 65535.", "connection");
         return;
       }
     }
     if (isWgFields) {
       const f = current.wgFields;
       if (!f.privateKey.trim()) {
-        setFormError("WireGuard private key is required.");
+        fail("WireGuard private key is required.", "connection");
         return;
       }
       if (!f.address.trim()) {
-        setFormError("WireGuard interface address is required.");
+        fail("WireGuard interface address is required.", "connection");
         return;
       }
       if (!f.peerPublicKey.trim()) {
-        setFormError("WireGuard peer public key is required.");
+        fail("WireGuard peer public key is required.", "connection");
         return;
       }
       if (!f.peerEndpoint.trim()) {
-        setFormError("WireGuard peer endpoint is required.");
+        fail("WireGuard peer endpoint is required.", "connection");
         return;
       }
       if (!f.allowedIps.trim()) {
-        setFormError("WireGuard allowed IPs are required.");
+        fail("WireGuard allowed IPs are required.", "connection");
         return;
       }
     }
@@ -407,6 +460,8 @@ export default function ProfileFormModal({
       xrayMode: isXray ? current.xrayMode : "socks",
       xrayTunInterface: isXray && current.xrayMode === "tun" && caps?.os === "windows" ? current.xrayTunInterface.trim() : null,
       xrayTunIp: isXray && current.xrayMode === "tun" && caps?.os === "windows" ? current.xrayTunIp.trim() : null,
+      xrayGeoipUrl: isXray && current.xrayMode === "tun" ? current.xrayGeoipUrl.trim() || null : null,
+      xrayGeositeUrl: isXray && current.xrayMode === "tun" ? current.xrayGeositeUrl.trim() || null : null,
     };
     setSaving(true);
     try {
@@ -455,7 +510,7 @@ export default function ProfileFormModal({
           </button>
           <button
             type="button"
-            className="profile-save-btn"
+            className="btn-primary"
             onClick={save}
             disabled={saving}
           >
@@ -464,9 +519,43 @@ export default function ProfileFormModal({
         </>
       }
     >
+      <div className="modal-tabs" role="tablist" aria-label="Profile sections">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "general"}
+          className={`modal-tab ${tab === "general" ? "active" : ""}`}
+          onClick={() => setTab("general")}
+        >
+          General
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "connection"}
+          className={`modal-tab ${tab === "connection" ? "active" : ""}`}
+          onClick={() => setTab("connection")}
+        >
+          Connection
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "routing"}
+          className={`modal-tab ${tab === "routing" ? "active" : ""}`}
+          onClick={() => setTab("routing")}
+        >
+          Routing
+          {routingCount > 0 && (
+            <span className="modal-tab-count">{routingCount}</span>
+          )}
+        </button>
+      </div>
+
       {formError && <p className="error">{formError}</p>}
-      <div className="form-section">
-      <span className="form-section-title">Identity</span>
+
+      {tab === "general" && (
+      <div className="modal-tab-body" role="tabpanel">
       <label>
         Name
         <input
@@ -474,6 +563,7 @@ export default function ProfileFormModal({
           value={current.name}
           onChange={(e) => update({ name: e.target.value })}
           placeholder="Work VPN"
+          autoFocus
         />
       </label>
       <label>
@@ -486,8 +576,9 @@ export default function ProfileFormModal({
             update({
               backend,
               configPath: "",
-              domainPolicies:
-                backend === "xray" ? current.domainPolicies : [],
+              rulesProxy: backend === "xray" ? current.rulesProxy : "",
+              rulesDirect: backend === "xray" ? current.rulesDirect : "",
+              rulesBlock: backend === "xray" ? current.rulesBlock : "",
               privateLanDirect: backend === "xray" && current.privateLanDirect,
               xraySource: "json",
               xraySocksPort:
@@ -517,9 +608,10 @@ export default function ProfileFormModal({
         </label>
       )}
       </div>
+      )}
 
-      <div className="form-section">
-      <span className="form-section-title">Configuration</span>
+      {tab === "connection" && (
+      <div className="modal-tab-body" role="tabpanel">
       {current.backend !== "none" && current.backend === "xray" && current.isNew && (
         <label>
           Config source
@@ -839,8 +931,6 @@ export default function ProfileFormModal({
             </span>
           </div>
         )}
-      </div>
-
       {current.backend === "xray" &&
         current.xrayMode === "socks" &&
         caps?.systemProxy && (
@@ -863,24 +953,28 @@ export default function ProfileFormModal({
             </span>
           ) : (
             <span className="profile-help">
-              Applies only to apps that honor Windows proxy settings.
+              Applies only to apps that honor Windows proxy settings. LAN and
+              localhost are always bypassed; add extra entries below.
             </span>
           )}
           {current.useSystemProxy && systemProxyAvailable && (
             <label>
-              Proxy bypass (comma-separated)
+              Extra proxy bypass (comma-separated)
               <input
                 type="text"
                 value={current.proxyBypass}
                 onChange={(e) => update({ proxyBypass: e.target.value })}
-                placeholder={DEFAULT_PROXY_BYPASS}
+                placeholder={PROXY_BYPASS_PLACEHOLDER}
               />
             </label>
           )}
         </div>
       )}
-      <div className="form-section">
-      <span className="form-section-title">Routing</span>
+      </div>
+      )}
+
+      {tab === "routing" && (
+      <div className="modal-tab-body" role="tabpanel">
       {!daemonManagedInterface && <label>
         Target interface (required for policy routes)
         <input
@@ -917,41 +1011,52 @@ export default function ProfileFormModal({
             Add route
           </button>
         </div>
-        <div className="profile-bulk-cidrs">
-          <label>
-            Paste CIDRs (one per line or comma-separated)
-            <textarea
-              value={bulkCidrs}
-              onChange={(event) => setBulkCidrs(event.target.value)}
-              rows={3}
-              placeholder={"10.0.0.0/24\n2001:db8::/32"}
-            />
-          </label>
-          <div className="profile-bulk-actions">
-            <input
-              type="file"
-              accept=".txt,.csv,text/plain,text/csv"
-              aria-label="Load CIDRs from file"
-              onChange={async (event) => {
-                const file = event.target.files?.[0];
-                event.target.value = "";
-                if (!file) return;
-                if (file.size > 1024 * 1024) {
-                  setFormError("CIDR file exceeds 1 MiB.");
-                  return;
-                }
-                try {
-                  setBulkCidrs(await file.text());
-                } catch {
-                  setFormError("Could not read CIDR file.");
-                }
-              }}
-            />
-            <button type="button" onClick={addBulkCidrs} disabled={bulkBusy || !bulkCidrs.trim()}>
-              {bulkBusy ? "Adding…" : "Add CIDRs"}
-            </button>
+        <button
+          type="button"
+          className="connection-detail-toggle"
+          onClick={() => setBulkOpen((v) => !v)}
+          aria-expanded={bulkOpen}
+        >
+          <ChevronIcon size={13} collapsed={!bulkOpen} />
+          Paste a CIDR list or load from file
+        </button>
+        {bulkOpen && (
+          <div className="profile-bulk-cidrs">
+            <label>
+              Paste CIDRs (one per line or comma-separated)
+              <textarea
+                value={bulkCidrs}
+                onChange={(event) => setBulkCidrs(event.target.value)}
+                rows={3}
+                placeholder={"10.0.0.0/24\n2001:db8::/32"}
+              />
+            </label>
+            <div className="profile-bulk-actions">
+              <input
+                type="file"
+                accept=".txt,.csv,text/plain,text/csv"
+                aria-label="Load CIDRs from file"
+                onChange={async (event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (!file) return;
+                  if (file.size > 1024 * 1024) {
+                    setFormError("CIDR file exceeds 1 MiB.");
+                    return;
+                  }
+                  try {
+                    setBulkCidrs(await file.text());
+                  } catch {
+                    setFormError("Could not read CIDR file.");
+                  }
+                }}
+              />
+              <button type="button" onClick={addBulkCidrs} disabled={bulkBusy || !bulkCidrs.trim()}>
+                {bulkBusy ? "Adding…" : "Add CIDRs"}
+              </button>
+            </div>
           </div>
-        </div>
+        )}
         {current.routes.length === 0 && (
           <span className="profile-routes-empty">
             No routes — tunnel uses its own routing.
@@ -1002,64 +1107,44 @@ export default function ProfileFormModal({
         <div className="profile-routes">
           <div className="profile-routes-head">
             <span>Domain/IP routing</span>
-            <button
-              type="button"
-              onClick={() =>
-                update({
-                  domainPolicies: [
-                    ...current.domainPolicies,
-                    { domains: [""], target: "proxy" },
-                  ],
-                })
-              }
-            >
-              Add routing rule
-            </button>
           </div>
-          {current.domainPolicies.length === 0 && (
-            <span className="profile-routes-empty">
-              No custom rules — all traffic uses the proxy.
-            </span>
-          )}
-          {current.domainPolicies.map((policy, index) => (
-            <div className="profile-route-row" key={index}>
-              <input
-                type="text"
-                value={policy.domains.join(",")}
-                onChange={(e) =>
-                  updateDomainRule(index, {
-                    domains: e.target.value.split(","),
-                  })
-                }
-                placeholder="domain:example.com, geosite:cn, geoip:us"
+          <span className="profile-routes-hint">
+            One selector per line: domain:example.com, geosite:category, geoip:cc,
+            or a bare IP/CIDR. Lines starting with # are comments. Rules are
+            evaluated block → proxy → direct; unmatched traffic uses the proxy.
+          </span>
+          <div className="rules-grid">
+            <label className="rules-pane">
+              <span className="rules-pane-title rules-pane-proxy">Proxy</span>
+              <textarea
+                className="rules-textarea"
+                value={current.rulesProxy}
+                onChange={(e) => update({ rulesProxy: e.target.value })}
+                placeholder={"geosite:youtube\ndomain:example.com"}
+                spellCheck={false}
               />
-              <select
-                className="filter-select"
-                value={policy.target}
-                onChange={(e) =>
-                  updateDomainRule(index, {
-                    target: e.target.value as DomainRouteTarget,
-                  })
-                }
-              >
-                <option value="proxy">Through proxy</option>
-                <option value="direct">Direct</option>
-                <option value="block">Block</option>
-              </select>
-              <button
-                type="button"
-                onClick={() =>
-                  update({
-                    domainPolicies: current.domainPolicies.filter(
-                      (_, i) => i !== index,
-                    ),
-                  })
-                }
-              >
-                Remove
-              </button>
-            </div>
-          ))}
+            </label>
+            <label className="rules-pane">
+              <span className="rules-pane-title rules-pane-direct">Direct</span>
+              <textarea
+                className="rules-textarea"
+                value={current.rulesDirect}
+                onChange={(e) => update({ rulesDirect: e.target.value })}
+                placeholder={"geosite:private\n# my services\n10.0.0.0/8"}
+                spellCheck={false}
+              />
+            </label>
+            <label className="rules-pane">
+              <span className="rules-pane-title rules-pane-block">Block</span>
+              <textarea
+                className="rules-textarea"
+                value={current.rulesBlock}
+                onChange={(e) => update({ rulesBlock: e.target.value })}
+                placeholder={"geosite:category-ads\ndomain:tracker.io"}
+                spellCheck={false}
+              />
+            </label>
+          </div>
           <label className="profile-proxy-toggle">
             <input
               type="checkbox"
@@ -1068,9 +1153,34 @@ export default function ProfileFormModal({
             />
             Direct for private/LAN IPs (after custom rules)
           </label>
+          {current.xrayMode === "tun" && (
+            <div className="geo-override">
+              <span className="profile-routes-hint">
+                Custom geo data (optional) — HTTPS URLs to geoip.dat / geosite.dat
+                replacing the bundled files. Downloaded on connect, cached 24h.
+              </span>
+              <div className="geo-override-fields">
+                <input
+                  type="text"
+                  value={current.xrayGeoipUrl}
+                  onChange={(e) => update({ xrayGeoipUrl: e.target.value })}
+                  placeholder="https://…/geoip.dat"
+                  spellCheck={false}
+                />
+                <input
+                  type="text"
+                  value={current.xrayGeositeUrl}
+                  onChange={(e) => update({ xrayGeositeUrl: e.target.value })}
+                  placeholder="https://…/geosite.dat"
+                  spellCheck={false}
+                />
+              </div>
+            </div>
+          )}
         </div>
       )}
       </div>
+      )}
     </Modal>
   );
 }

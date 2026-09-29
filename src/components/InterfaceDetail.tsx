@@ -3,13 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { NetworkInterface, RouteEntry, formatKind, CATEGORY_LABELS, ifTypeName } from "../types";
 import { kindIcon, CloseIcon } from "../icons";
 import { ensureElevation } from "../elevation";
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
+import { formatBytes } from "../format";
 
 interface Props {
   iface: NetworkInterface;
@@ -44,9 +38,23 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
     }
   };
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   return (
     <div className="detail-overlay" onClick={onClose}>
-      <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="detail-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label={iface.friendlyName}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="detail-header">
           <div className="detail-title">
             {kindIcon(iface.kind, 22)}
@@ -83,19 +91,19 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
 
           <table className="detail-table">
             <tbody>
-              <tr><td>ifIndex</td><td className="mono">{iface.ifIndex}</td></tr>
+              <tr><td>ifIndex</td><td className="mono num">{iface.ifIndex}</td></tr>
               <tr><td>ifType</td><td className="mono">{iface.ifType} ({ifTypeName(iface.ifType)})</td></tr>
               <tr><td>Name</td><td className="mono">{iface.name}</td></tr>
               {iface.description && <tr><td>Driver</td><td className="mono">{iface.description}</td></tr>}
               {iface.tunnelType && <tr><td>Tunnel type</td><td className="mono">{iface.tunnelType}</td></tr>}
               {iface.mac && <tr><td>MAC</td><td className="mono">{iface.mac}</td></tr>}
-              {iface.mtu !== null && <tr><td>MTU</td><td>{iface.mtu}</td></tr>}
-              {iface.linkSpeedMbps !== null && <tr><td>Link speed</td><td>{iface.linkSpeedMbps} Mbps</td></tr>}
+              {iface.mtu !== null && <tr><td>MTU</td><td className="num">{iface.mtu}</td></tr>}
+              {iface.linkSpeedMbps !== null && <tr><td>Link speed</td><td className="num">{iface.linkSpeedMbps} Mbps</td></tr>}
               {iface.gateway && <tr><td>Gateway</td><td className="mono">{iface.gateway}</td></tr>}
               {iface.ipv6Gateway && <tr><td>IPv6 gateway</td><td className="mono">{iface.ipv6Gateway}</td></tr>}
               {iface.dnsSuffix && <tr><td>DNS suffix</td><td className="mono">{iface.dnsSuffix}</td></tr>}
-              {iface.rxBytes !== null && <tr><td>RX total</td><td>{formatBytes(iface.rxBytes)}</td></tr>}
-              {iface.txBytes !== null && <tr><td>TX total</td><td>{formatBytes(iface.txBytes)}</td></tr>}
+              {iface.rxBytes !== null && <tr><td>RX total</td><td className="num">{formatBytes(iface.rxBytes)}</td></tr>}
+              {iface.txBytes !== null && <tr><td>TX total</td><td className="num">{formatBytes(iface.txBytes)}</td></tr>}
             </tbody>
           </table>
 
@@ -139,16 +147,16 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
                     <th>Destination</th>
                     <th>Prefix</th>
                     <th>Gateway</th>
-                    <th>Metric</th>
+                    <th className="num">Metric</th>
                   </tr>
                 </thead>
                 <tbody>
                   {routes.map((r, i) => (
                     <tr key={i}>
                       <td className="mono">{r.destination}</td>
-                      <td>/{r.prefixLen}</td>
+                      <td className="num">/{r.prefixLen}</td>
                       <td className="mono">{r.gateway ?? "—"}</td>
-                      <td>{r.metric}</td>
+                      <td className="num">{r.metric}</td>
                     </tr>
                   ))}
                 </tbody>
