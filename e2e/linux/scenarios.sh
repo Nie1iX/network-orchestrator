@@ -20,6 +20,29 @@ wait_socket() {
     for _ in $(seq 50); do [ -S "$SOCK" ] && return 0; sleep 0.1; done
     fail "daemon socket did not appear"
 }
+cond_status() {
+    python3 "$CLIENT" condRules.list | python3 -c '
+import json, sys
+want = sys.argv[1]
+rules = [r for r in json.load(sys.stdin)["rules"] if r["rule"]["id"] == want]
+if not rules:
+    print("missing")
+else:
+    s = rules[0]["status"]
+    print(s["state"], s.get("matchedInterface"))' "$1"
+}
+cond_wait() { # RULE_ID EXPECTED_STATE [EXPECTED_IFACE] — polls up to ~20s
+    local id=$1 want=$2 iface=${3:-} state matched
+    for _ in $(seq 100); do
+        read -r state matched <<<"$(cond_status "$id")"
+        if [ "$state" = "$want" ] && { [ -z "$iface" ] || [ "$matched" = "$iface" ]; }; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    printf 'cond_wait %s: wanted "%s %s", last "%s"\n' "$id" "$want" "$iface" "$(cond_status "$id")" >&2
+    return 1
+}
 
 step "service under systemd hardening"
 systemctl is-active --quiet "$UNIT" || fail "unit not active: $(systemctl status "$UNIT" --no-pager)"
@@ -170,5 +193,90 @@ systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
 systemctl start "$UNIT"
 wait_socket
 ok "daemon starts after journal recovery"
+
+step "conditional rules: interface-address lifecycle"
+expect_eq "$(python3 "$CLIENT" condRules.list)" '{"rules": []}' "no conditional rules initially"
+
+ip link add e2econd0 type dummy
+ip link set e2econd0 up
+
+# The condition prefix is absent from every interface: rule stores but
+# stays inactive and installs nothing.
+out=$(python3 "$CLIENT" condRules.put '{"rule":{"id":"office","name":"Office LAN","enabled":true,"condition":{"kind":"interfaceAddressIn","prefix":"203.0.222.0/24"},"routes":[{"destination":"203.0.223.0/24","metric":50},{"destination":"203.0.225.0/24","via":"203.0.222.1","metric":50}]}}')
+echo "$out" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["stored"] is True and r["status"]["state"]=="inactive", r' \
+    && ok "rule stored inactive while prefix absent" || fail "condRules.put: $out"
+expect_eq "$(stat -c %a /var/lib/network-orchestrator/cond-rules/0/rules.json)" 600 "cond-rules file mode 0600"
+ours -4 | grep -q "203.0.22" && fail "routes installed without a match" || ok "no routes without a match"
+
+# An address inside the prefix on a physical-looking link activates the
+# rule: both routes land on the matching interface under proto 79.
+ip addr add 203.0.222.7/24 dev e2econd0
+cond_wait office active e2econd0 || fail "rule did not activate on address add"
+ok "rule active on e2econd0 after address add"
+ours -4 | grep -q "^203.0.223.0/24 dev e2econd0 .*scope link .*metric 50" \
+    && ok "conditional on-link route installed" || fail "on-link route: $(ours -4)"
+ours -4 | grep -q "^203.0.225.0/24 via 203.0.222.1 dev e2econd0 .*metric 50" \
+    && ok "conditional via-route installed" || fail "via route: $(ours -4)"
+python3 "$CLIENT" owned.list | grep -q '"cond:office"' \
+    && ok "cond:office owner journaled" || fail "owned.list: $(python3 "$CLIENT" owned.list)"
+
+# Clients cannot claim the reserved owner namespace.
+out=$(python3 "$CLIENT" routes.apply "{\"owner\":\"cond:evil\",\"routes\":[{\"destination\":\"203.0.230.0/24\",\"interfaceIndex\":$IDX,\"metric\":5}]}" || true)
+echo "$out" | grep -q '"invalidParams"' && ok "cond: prefix reserved from routes.apply" || fail "reserved owner: $out"
+ip route show 203.0.230.0/24 | grep -q . && fail "reserved-owner route installed" || ok "reserved-owner route not installed"
+
+# The trusted address moving to another interface rebinds the routes.
+ip link add e2econd1 type dummy
+ip addr add 203.0.222.9/24 dev e2econd1
+ip link set e2econd1 up
+ip addr del 203.0.222.7/24 dev e2econd0
+cond_wait office active e2econd1 || fail "rule did not rebind to e2econd1"
+ok "rule rebound to e2econd1"
+ours -4 | grep -q "^203.0.223.0/24 dev e2econd1" && ok "route on new interface" || fail "rebind: $(ours -4)"
+ours -4 | grep -q "dev e2econd0" && fail "stale route left on e2econd0" || ok "old interface withdrawn"
+
+# Losing the address withdraws the routes and frees the owner.
+ip addr del 203.0.222.9/24 dev e2econd1
+cond_wait office inactive || fail "rule did not deactivate"
+ok "rule inactive after address removal"
+ours -4 | grep -q "203.0.22" && fail "conditional routes leaked" || ok "routes withdrawn"
+python3 "$CLIENT" owned.list | grep -q '"cond:office"' && fail "owner left after deactivation" || ok "cond owner dropped"
+
+# Restart: the rule file persists and the startup evaluation re-applies.
+ip addr add 203.0.222.11/24 dev e2econd0
+cond_wait office active e2econd0 || fail "rule did not reactivate"
+systemctl restart "$UNIT"; wait_socket
+restart_ok=0
+for _ in $(seq 100); do
+    [ "$(cond_status office)" = "active e2econd0" ] \
+        && ours -4 | grep -q "^203.0.223.0/24 dev e2econd0" \
+        && { restart_ok=1; break; }
+    sleep 0.2
+done
+[ "$restart_ok" = 1 ] && ok "conditional rule survives daemon restart" || fail "post-restart: $(cond_status office) / $(ours -4)"
+
+# Disabling withdraws the routes even though the condition still holds.
+out=$(python3 "$CLIENT" condRules.put '{"rule":{"id":"office","name":"Office LAN","enabled":false,"condition":{"kind":"interfaceAddressIn","prefix":"203.0.222.0/24"},"routes":[{"destination":"203.0.223.0/24","metric":50}]}}')
+echo "$out" | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["status"]["state"]=="disabled", r' \
+    && ok "disabled rule reports disabled" || fail "disable: $out"
+ours -4 | grep -q "203.0.223" && fail "disabled rule kept routes" || ok "disabling withdraws routes"
+
+expect_eq "$(python3 "$CLIENT" condRules.remove '{"ruleId":"office"}')" '{"removed": true}' "condRules.remove"
+expect_eq "$(python3 "$CLIENT" condRules.remove '{"ruleId":"office"}')" '{"removed": false}' "remove of absent rule is false"
+python3 "$CLIENT" owned.list | grep -q 'cond:' && fail "cond owner left in journal" || ok "removal cleans journal"
+
+# Validation happens before authorization side effects.
+out=$(python3 "$CLIENT" condRules.put '{"rule":{"id":"bad id!","name":"x","enabled":true,"condition":{"kind":"interfaceAddressIn","prefix":"203.0.222.0/24"},"routes":[{"destination":"203.0.223.0/24","metric":1}]}}' || true)
+echo "$out" | grep -q '"invalidParams"' && ok "invalid rule id rejected" || fail "bad id: $out"
+out=$(python3 "$CLIENT" condRules.put '{"rule":{"id":"hostbits","name":"x","enabled":true,"condition":{"kind":"interfaceAddressIn","prefix":"203.0.222.0/24"},"routes":[{"destination":"203.0.223.7/24","metric":1}]}}' || true)
+echo "$out" | grep -q '"invalidParams"' && ok "host-bits destination rejected" || fail "host bits: $out"
+out=$(as alice python3 "$CLIENT" condRules.put '{"rule":{"id":"a","name":"x","enabled":true,"condition":{"kind":"interfaceAddressIn","prefix":"203.0.222.0/24"},"routes":[{"destination":"203.0.227.0/24","metric":5}]}}' || true)
+echo "$out" | grep -qE '"notAuthorized"|"authorizationDismissed"' && ok "unauthorized user cannot put rule" || fail "alice put: $out"
+expect_eq "$(as alice python3 "$CLIENT" condRules.list)" '{"rules": []}' "alice sees only her own rules"
+
+ip link del e2econd0
+ip link del e2econd1
+expect_eq "$(python3 "$CLIENT" owned.list)" '{"owners": []}' "no owners left after conditional scenario"
+expect_eq "$(python3 "$CLIENT" condRules.list)" '{"rules": []}' "no rules left after conditional scenario"
 
 printf '\nALL %d CHECKS PASSED\n' "$PASS"
