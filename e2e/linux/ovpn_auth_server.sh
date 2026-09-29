@@ -28,4 +28,4 @@ push "route 10.89.0.0 255.255.255.0"
 verb 3
 EOF
 
-openvpn --config server-auth.conf --log /run/ovpn-e2e/server-auth.log --daemon
+openvpn --config server-auth.conf --disable-dco --log /run/ovpn-e2e/server-auth.log --daemon

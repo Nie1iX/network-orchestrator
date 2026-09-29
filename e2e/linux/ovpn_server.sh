@@ -39,4 +39,4 @@ verb 3
 EOF
 
 ip addr add 10.89.0.1/32 dev lo
-openvpn --config server.conf --log /run/ovpn-e2e/server.log --daemon
+openvpn --config server.conf --disable-dco --log /run/ovpn-e2e/server.log --daemon

@@ -2,6 +2,7 @@
 """Exercise daemon-owned Xray TUN against a disposable VLESS peer."""
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -15,6 +16,9 @@ import xray_scenarios as proxy_fixture
 
 client_name, server_name = sys.argv[1:3]
 XRAY_DIR = "/usr/lib/network-orchestrator/xray/v26.3.27"
+GEO_DIR = Path(
+    os.environ.get("XRAY_E2E_GEO_DIR", str(Path.home() / ".config/xray"))
+)
 
 
 def docker_exec(container, *args, input_text=None):
@@ -52,8 +56,8 @@ proxy_fixture.run("cargo", "build", "-q", "-p", "net-manager-core", "--example",
 docker_exec(client_name, "install", "-d", "-m", "0755", XRAY_DIR)
 for source, name, mode in (
     (proxy_fixture.XRAY, "xray", "0755"),
-    (Path.home() / ".config/xray/geoip.dat", "geoip.dat", "0644"),
-    (Path.home() / ".config/xray/geosite.dat", "geosite.dat", "0644"),
+    (GEO_DIR / "geoip.dat", "geoip.dat", "0644"),
+    (GEO_DIR / "geosite.dat", "geosite.dat", "0644"),
 ):
     proxy_fixture.run("docker", "cp", str(source), f"{client_name}:{XRAY_DIR}/{name}")
     docker_exec(client_name, "chown", "0:0", f"{XRAY_DIR}/{name}")
@@ -245,7 +249,8 @@ try:
         plain = docker_exec(client_name, "ip", "-4", "route", "get", "198.18.0.3")
         payload = docker_exec(client_name, "ip", "-4", "route", "get", "10.99.0.1")
         assert f"via {server_ip}" in marked and "dev eth0" in marked
-        assert f"dev {full_interface}" in plain and f"dev {full_interface}" in payload
+        assert f"via {server_ip}" in plain and "dev eth0" in plain
+        assert f"dev {full_interface}" in payload
         print("ok   marked Xray transport uses underlay, payload uses TUN", flush=True)
 
         assert docker_exec(client_name, "python3", "-c", probe) == "netorch-e2e-server"

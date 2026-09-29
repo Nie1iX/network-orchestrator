@@ -18,7 +18,13 @@ its own network namespace. Never run `scenarios.sh` directly on the host.
 e2e/linux/run.sh
 ```
 
-This requires Docker access and `/dev/net/tun`. The harness grants the
+This requires Docker access and `/dev/net/tun`. `CONTAINER_ENGINE=podman`
+runs the same suite under rootless Podman (systemd containers get
+`--systemd=always` and `CAP_NET_RAW`, which `systemd-resolved` needs for
+`SO_BINDTOINDEX` on per-link DNS sockets). The Xray scenarios take a host
+binary via `XRAY_E2E_BINARY` (default `~/.local/bin/xray`) and pinned geo
+assets via `XRAY_E2E_GEO_DIR` (default `~/.config/xray`, contents must match
+the release hashes in `managed_xray.rs`). The harness grants the
 client container `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`, and unconfined AppArmor so systemd
 can remount cgroup2. Use it on a development machine or CI worker that accepts
 those container privileges. The peer container needs `CAP_NET_ADMIN`. The

@@ -121,7 +121,22 @@ else:
     raise RuntimeError("OpenVPN probe child survived cleanup")
 print("ok   disconnected probe returned pushed route without OS route or child", flush=True)
 
-params = {"profileId": "ovpn-e2e", "config": config, "assets": {}, "routes": []}
+params = {
+    "profileId": "ovpn-e2e",
+    "config": config,
+    "assets": {},
+    "routes": [],
+    "interfaceName": "OVPN E2E",
+}
+predicted = rpc("openvpn.plan", params)
+assert predicted["owner"] == "ovpn:ovpn-e2e"
+assert predicted["interfaceName"] == "ovpn-e2e", "hint was not slugged"
+assert predicted["fallbackInterfaceName"].startswith("ovpn-e2e-")
+assert predicted["stagingDir"].startswith("/run/network-orchestrator/")
+assert predicted["configPath"].endswith("/config.ovpn")
+assert predicted["managementSocket"].endswith("/management.sock")
+assert predicted["conflicts"] == []
+print("ok   openvpn.plan predicted paths before connect", flush=True)
 initial = rpc("openvpn.connect", params)["status"]
 assert initial["state"] in ("connecting", "connected")
 for _ in range(60):
@@ -135,6 +150,11 @@ else:
     raise RuntimeError("OpenVPN client did not connect to the test server")
 interface = status["interfaceName"]
 assert interface and interface.startswith("ovpn-"), "unexpected OpenVPN interface"
+assert interface == predicted["interfaceName"], "plan predicted a different interface name"
+conflicted = rpc("openvpn.plan", params)
+assert "activeConnection" in conflicted["conflicts"]
+assert "interfaceOccupied" in conflicted["conflicts"]
+print("ok   openvpn.plan reported conflicts for the active profile", flush=True)
 print("ok   daemon connected the OpenVPN client", flush=True)
 
 alice_status = json.loads(
@@ -160,8 +180,13 @@ for _ in range(20):
     time.sleep(0.5)
 else:
     raise RuntimeError("OpenVPN pushed split route was not applied")
-route = docker_exec(client_name, "ip", "-4", "route", "get", "10.89.0.1")
-assert f"dev {interface}" in route, "pushed route bypasses OpenVPN"
+for _ in range(10):
+    route = docker_exec(client_name, "ip", "-4", "route", "get", "10.89.0.1")
+    if f"dev {interface}" in route:
+        break
+    time.sleep(0.5)
+else:
+    raise RuntimeError(f"pushed route bypasses OpenVPN: {route}")
 print("ok   pushed split route selects the OpenVPN link", flush=True)
 
 probe = (

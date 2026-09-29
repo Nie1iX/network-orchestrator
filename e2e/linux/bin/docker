@@ -1,0 +1,5 @@
+#!/bin/sh
+# Forward `docker` calls from the E2E scenario drivers to the selected
+# engine. run.sh puts this directory on PATH only when CONTAINER_ENGINE
+# points at a non-docker engine (e.g. podman).
+exec "${CONTAINER_ENGINE:?CONTAINER_ENGINE must name the engine binary}" "$@"

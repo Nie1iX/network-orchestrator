@@ -16,4 +16,6 @@ RUN dnf -y install --setopt=install_weak_deps=False \
     && useradd --create-home --uid 1002 bob
 STOPSIGNAL SIGRTMIN+3
 # Docker mounts cgroup2 read-only; systemd needs it writable to start.
-ENTRYPOINT ["sh", "-c", "mount -o remount,rw /sys/fs/cgroup && exec /sbin/init"]
+# Rootless podman already hands the container a writable private cgroupns
+# where the remount itself is denied — accept either outcome.
+ENTRYPOINT ["sh", "-c", "[ -w /sys/fs/cgroup ] || mount -o remount,rw /sys/fs/cgroup 2>/dev/null || exit 32; exec /sbin/init"]
