@@ -4,7 +4,13 @@ import { listen } from "@tauri-apps/api/event";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
-import { backendIcon, ChevronIcon, CloseIcon, PlusIcon } from "../icons";
+import {
+  backendIcon,
+  ChevronIcon,
+  CloseIcon,
+  GripVerticalIcon,
+  PlusIcon,
+} from "../icons";
 import AddConnectionMenu from "./AddConnectionMenu";
 import DiagnosticsModal from "./DiagnosticsModal";
 import ImportModal from "./ImportModal";
@@ -121,6 +127,30 @@ function sameIds(a: string[], b: string[]): boolean {
   return b.every((id) => setA.has(id));
 }
 
+interface ProfileGroup {
+  backend: TunnelBackend;
+  items: Profile[];
+}
+
+/** Applies a new order of one backend group to the flat profile list —
+ * mirrors `ProfileStore::reorder` for optimistic updates. */
+function applyGroupOrder(
+  profiles: Profile[],
+  backend: TunnelBackend,
+  orderedIds: string[],
+): Profile[] {
+  const byId = new Map(
+    profiles.filter((p) => p.backend === backend).map((p) => [p.id, p]),
+  );
+  const ordered = orderedIds
+    .map((id) => byId.get(id))
+    .filter((p): p is Profile => p !== undefined);
+  let i = 0;
+  return profiles.map((p) =>
+    p.backend === backend && i < ordered.length ? ordered[i++] : p,
+  );
+}
+
 function ConnectionCardSkeleton() {
   return (
     <div className="connection-card">
@@ -196,6 +226,14 @@ export default function ProfileManager() {
   >({});
   const prevStats = useRef<Record<number, { rx: number; tx: number; time: number }>>({});
   const prevTunnelStates = useRef<Record<string, TunnelState>>({});
+  const [dragState, setDragState] = useState<{
+    backend: TunnelBackend;
+    profileId: string;
+  } | null>(null);
+  const [dropTarget, setDropTarget] = useState<{
+    profileId: string;
+    before: boolean;
+  } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -453,6 +491,107 @@ export default function ProfileManager() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profiles]);
+
+  const commitReorder = async (backend: TunnelBackend, orderedIds: string[]) => {
+    const previous = profiles;
+    setProfiles(applyGroupOrder(previous, backend, orderedIds));
+    try {
+      setProfiles(
+        await invoke<Profile[]>("reorder_profiles", { backend, orderedIds }),
+      );
+    } catch (err) {
+      setProfiles(previous);
+      toast("error", String(err));
+    }
+  };
+
+  const moveProfileInGroup = (items: Profile[], profileId: string, delta: number) => {
+    const index = items.findIndex((p) => p.id === profileId);
+    const swap = index + delta;
+    if (index < 0 || swap < 0 || swap >= items.length) return;
+    const ids = items.map((p) => p.id);
+    [ids[index], ids[swap]] = [ids[swap], ids[index]];
+    void commitReorder(items[index].backend, ids);
+  };
+
+  const onCardDragStart = (
+    event: React.DragEvent<HTMLElement>,
+    profile: Profile,
+  ) => {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", profile.id);
+    // A compact name pill as the drag ghost: snapshotting the whole card
+    // renders oversized on HiDPI/scaled webviews.
+    const preview = document.createElement("div");
+    preview.className = "connection-drag-preview";
+    preview.textContent = profile.name;
+    document.body.appendChild(preview);
+    event.dataTransfer.setDragImage(preview, 12, 12);
+    requestAnimationFrame(() => preview.remove());
+    setDragState({ backend: profile.backend, profileId: profile.id });
+    setDropTarget(null);
+  };
+
+  const onCardDragEnd = () => {
+    setDragState(null);
+    setDropTarget(null);
+  };
+
+  const pointerInUpperHalf = (event: React.DragEvent<HTMLElement>): boolean => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return event.clientY < rect.top + rect.height / 2;
+  };
+
+  const onCardDragOver = (
+    event: React.DragEvent<HTMLElement>,
+    group: ProfileGroup,
+    target: Profile,
+  ) => {
+    if (!dragState) return;
+    if (dragState.backend !== group.backend || dragState.profileId === target.id) {
+      setDropTarget(null);
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    const before = pointerInUpperHalf(event);
+    setDropTarget((prev) =>
+      prev && prev.profileId === target.id && prev.before === before
+        ? prev
+        : { profileId: target.id, before },
+    );
+  };
+
+  const onCardDrop = (
+    event: React.DragEvent<HTMLElement>,
+    group: ProfileGroup,
+    target: Profile,
+  ) => {
+    if (
+      !dragState ||
+      dragState.backend !== group.backend ||
+      dragState.profileId === target.id
+    ) {
+      return;
+    }
+    event.preventDefault();
+    const ids = group.items
+      .map((p) => p.id)
+      .filter((id) => id !== dragState.profileId);
+    const at = ids.indexOf(target.id);
+    ids.splice(pointerInUpperHalf(event) ? at : at + 1, 0, dragState.profileId);
+    setDragState(null);
+    setDropTarget(null);
+    if (ids.join(",") !== group.items.map((p) => p.id).join(",")) {
+      void commitReorder(group.backend, ids);
+    }
+  };
+
+  const onListDragLeave = (event: React.DragEvent<HTMLElement>) => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setDropTarget(null);
+    }
+  };
 
   const withBusy = async (
     id: string,
@@ -895,7 +1034,7 @@ export default function ProfileManager() {
       )
     : profiles;
 
-  const groups: { backend: TunnelBackend; items: Profile[] }[] = (
+  const groups: ProfileGroup[] = (
     ["wireGuard", "openVpn", "xray", "none"] as TunnelBackend[]
   )
     .map((backend) => ({
@@ -1051,6 +1190,7 @@ export default function ProfileManager() {
       ) : (
         groups.map((group) => {
           const isCollapsed = collapsedGroups.has(group.backend);
+          const canReorder = !lowerSearch && group.items.length > 1;
           return (
           <div key={group.backend} className="profile-group">
             <button
@@ -1069,8 +1209,8 @@ export default function ProfileManager() {
               </span>
             </button>
             {!isCollapsed && (
-            <div className="connection-list">
-              {group.items.map((profile) => {
+            <div className="connection-list" onDragLeave={onListDragLeave}>
+              {group.items.map((profile, index) => {
                 const status = statusFor(profile.id);
                 const isBusy = busy.has(profile.id);
                 const alwaysOnKind: AlwaysOnKind | null =
@@ -1093,9 +1233,30 @@ export default function ProfileManager() {
                     key={profile.id}
                     className={`connection-card ${
                       status.state === "running" ? "state-active" : ""
-                    } ${status.state === "failed" ? "state-failed" : ""}`}
+                    } ${status.state === "failed" ? "state-failed" : ""} ${
+                      dragState?.profileId === profile.id ? "drag-source" : ""
+                    } ${
+                      dropTarget?.profileId === profile.id
+                        ? dropTarget.before
+                          ? "drop-before"
+                          : "drop-after"
+                        : ""
+                    }`}
+                    onDragOver={(event) => onCardDragOver(event, group, profile)}
+                    onDrop={(event) => onCardDrop(event, group, profile)}
                   >
                     <div className="connection-card-main">
+                      <span
+                        className={`connection-drag-handle${
+                          canReorder ? "" : " disabled"
+                        }`}
+                        draggable={canReorder}
+                        onDragStart={(event) => onCardDragStart(event, profile)}
+                        onDragEnd={onCardDragEnd}
+                        title={canReorder ? "Drag to reorder" : undefined}
+                      >
+                        <GripVerticalIcon size={15} />
+                      </span>
                       <span className={`backend-avatar backend-avatar-${profile.backend}`}>
                         {backendIcon(profile.backend, 18)}
                       </span>
@@ -1151,6 +1312,16 @@ export default function ProfileManager() {
                         title="Profile actions"
                         items={[
                           { label: "Edit", onClick: () => openEdit(profile), disabled: isBusy },
+                          {
+                            label: "Move up",
+                            onClick: () => moveProfileInGroup(group.items, profile.id, -1),
+                            disabled: isBusy || !canReorder || index === 0,
+                          },
+                          {
+                            label: "Move down",
+                            onClick: () => moveProfileInGroup(group.items, profile.id, 1),
+                            disabled: isBusy || !canReorder || index === group.items.length - 1,
+                          },
                           ...(caps?.os === "linux" && alwaysOnKind && (alwaysOnEntry || canEnableAlwaysOn) ? [{
                             label: alwaysOnEntry ? "Disable always-on" : "Enable always-on before sign-in",
                             onClick: () => onToggleAlwaysOn(profile, alwaysOnKind, Boolean(alwaysOnEntry)),

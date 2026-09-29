@@ -1304,6 +1304,7 @@ a:focus-visible,
 }
 
 .connection-card {
+  position: relative;
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
   padding: var(--sp-3) var(--sp-4);
@@ -1313,7 +1314,74 @@ a:focus-visible,
   gap: var(--sp-2);
   transition:
     border-color var(--dur-fast) var(--ease-out),
-    box-shadow var(--dur-fast) var(--ease-out);
+    box-shadow var(--dur-fast) var(--ease-out),
+    opacity var(--dur-fast) var(--ease-out);
+}
+
+.connection-card.drag-source {
+  opacity: 0.5;
+}
+
+/* Insertion line sits in the --sp-3 list gap, clear of the card's own
+   border and the state-active box-shadow ring. */
+.connection-card.drop-before::before,
+.connection-card.drop-after::after {
+  content: "";
+  position: absolute;
+  left: var(--sp-2);
+  right: var(--sp-2);
+  height: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+}
+
+.connection-card.drop-before::before {
+  top: -7px;
+}
+
+.connection-card.drop-after::after {
+  bottom: -7px;
+}
+
+.connection-drag-handle {
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  color: var(--text-muted);
+  cursor: grab;
+  flex-shrink: 0;
+  padding: 0 2px;
+  border-radius: var(--r-sm);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.connection-drag-handle:hover {
+  color: var(--text-primary);
+}
+
+.connection-drag-handle:active {
+  cursor: grabbing;
+}
+
+.connection-drag-handle.disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* Lives off-screen; only the setDragImage snapshot is ever shown. */
+.connection-drag-preview {
+  position: fixed;
+  top: -1000px;
+  left: -1000px;
+  padding: var(--sp-2) var(--sp-4);
+  border-radius: var(--r-full);
+  background: var(--bg-elev);
+  border: 1px solid var(--border-hover);
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-strong);
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 .connection-card.state-active {
