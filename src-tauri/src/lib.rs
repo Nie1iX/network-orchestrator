@@ -112,6 +112,7 @@ pub fn run() {
             get_subscription_endpoints,
             switch_subscription_endpoint,
             delete_profile,
+            reorder_profiles,
             connect_profile,
             connect_openvpn_with_credentials,
             disconnect_profile,

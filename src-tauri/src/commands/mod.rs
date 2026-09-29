@@ -20,9 +20,9 @@ pub(crate) use explorer::{get_interfaces, get_routes, lookup_destination, set_in
 pub(crate) use logs::{clear_logs, daemon_log_tail, get_logs};
 pub(crate) use profiles::{
     delete_profile, get_profiles, get_subscription_endpoints, import_configs_batch,
-    import_subscription, measure_subscription_endpoint_delay, refresh_subscription, save_profile,
-    save_vless_profile, save_wireguard_profile, set_subscription_refresh_interval,
-    switch_subscription_endpoint,
+    import_subscription, measure_subscription_endpoint_delay, refresh_subscription,
+    reorder_profiles, save_profile, save_vless_profile, save_wireguard_profile,
+    set_subscription_refresh_interval, switch_subscription_endpoint,
 };
 pub(crate) use recovery::{cleanup_recovery, get_recovery_report};
 pub(crate) use route_map::get_route_map;

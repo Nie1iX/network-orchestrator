@@ -373,6 +373,19 @@ pub(crate) async fn get_profiles(state: State<'_, AppState>) -> Result<Vec<Profi
 }
 
 #[tauri::command]
+pub(crate) async fn reorder_profiles(
+    backend: TunnelBackend,
+    ordered_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let doc = state
+        .profiles
+        .reorder(backend, &ordered_ids)
+        .map_err(|e| e.to_string())?;
+    Ok(redact_profiles_for_ipc(doc.profiles))
+}
+
+#[tauri::command]
 pub(crate) async fn save_profile(
     mut profile: Profile,
     state: State<'_, AppState>,

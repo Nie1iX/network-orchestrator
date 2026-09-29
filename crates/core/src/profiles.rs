@@ -1,5 +1,6 @@
 use crate::models::{Profile, TunnelBackend};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -82,6 +83,52 @@ impl ProfileStore {
                 io::ErrorKind::NotFound,
                 format!("profile '{id}' not found"),
             ));
+        }
+        self.save(&document)?;
+        Ok(document)
+    }
+
+    /// Reorders the profiles of one backend group in place. `ordered_ids`
+    /// must be exactly the ids of the stored profiles with `backend`, in the
+    /// desired order; profiles of other backends keep their positions.
+    pub fn reorder(
+        &self,
+        backend: TunnelBackend,
+        ordered_ids: &[String],
+    ) -> io::Result<ProfileDocument> {
+        let mut document = self.load()?;
+        let positions: Vec<usize> = document
+            .profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.backend == backend)
+            .map(|(i, _)| i)
+            .collect();
+        if positions.len() != ordered_ids.len() {
+            return Err(invalid_input(
+                "reorder must list every profile of the group exactly once",
+            ));
+        }
+        let mut seen = HashSet::with_capacity(ordered_ids.len());
+        let mut ordered: Vec<Profile> = Vec::with_capacity(ordered_ids.len());
+        for id in ordered_ids {
+            if !seen.insert(id.as_str()) {
+                return Err(invalid_input(format!(
+                    "reorder lists profile '{id}' more than once"
+                )));
+            }
+            let profile = document
+                .profiles
+                .iter()
+                .find(|p| p.backend == backend && p.id == *id)
+                .ok_or_else(|| {
+                    invalid_input(format!("profile '{id}' is not in the reordered group"))
+                })?;
+            ordered.push(profile.clone());
+        }
+        let mut ordered = ordered.into_iter();
+        for &index in &positions {
+            document.profiles[index] = ordered.next().expect("queue covers the group");
         }
         self.save(&document)?;
         Ok(document)
@@ -204,6 +251,10 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +290,85 @@ mod tests {
             auto_connect: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn reorder_permutates_only_the_target_backend() {
+        let dir = unique_dir("reorder");
+        let store = ProfileStore::new(dir.join("profiles.json"));
+        let mut wg_a = wg_profile();
+        wg_a.id = "wg-a".into();
+        let mut xray = xray_profile();
+        xray.id = "xr-1".into();
+        let mut wg_b = wg_profile();
+        wg_b.id = "wg-b".into();
+        let mut ovpn = wg_profile();
+        ovpn.id = "ov-1".into();
+        ovpn.backend = TunnelBackend::OpenVpn;
+        let mut wg_c = wg_profile();
+        wg_c.id = "wg-c".into();
+        for profile in [&wg_a, &xray, &wg_b, &ovpn, &wg_c] {
+            store.upsert(profile.clone()).unwrap();
+        }
+
+        let doc = store
+            .reorder(
+                TunnelBackend::WireGuard,
+                &["wg-c".into(), "wg-a".into(), "wg-b".into()],
+            )
+            .unwrap();
+
+        let ids: Vec<&str> = doc.profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["wg-c", "xr-1", "wg-a", "ov-1", "wg-b"]);
+        assert_eq!(doc.profiles[0].name, wg_c.name);
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.profiles, doc.profiles);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reorder_rejects_incomplete_and_foreign_ids() {
+        let dir = unique_dir("reorder-invalid");
+        let store = ProfileStore::new(dir.join("profiles.json"));
+        let mut wg_a = wg_profile();
+        wg_a.id = "wg-a".into();
+        let mut wg_b = wg_profile();
+        wg_b.id = "wg-b".into();
+        let mut xray = xray_profile();
+        xray.id = "xr-1".into();
+        for profile in [&wg_a, &wg_b, &xray] {
+            store.upsert(profile.clone()).unwrap();
+        }
+
+        // Missing member of the group.
+        let err = store
+            .reorder(TunnelBackend::WireGuard, &["wg-a".into()])
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Id that belongs to another backend group.
+        let err = store
+            .reorder(TunnelBackend::WireGuard, &["wg-a".into(), "xr-1".into()])
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Duplicate id passes the length check but must still fail.
+        let err = store
+            .reorder(TunnelBackend::WireGuard, &["wg-a".into(), "wg-a".into()])
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Unknown id.
+        let err = store
+            .reorder(TunnelBackend::WireGuard, &["wg-a".into(), "ghost".into()])
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Nothing was persisted.
+        let loaded = store.load().unwrap();
+        let ids: Vec<&str> = loaded.profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["wg-a", "wg-b", "xr-1"]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
