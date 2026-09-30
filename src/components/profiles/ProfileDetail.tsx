@@ -1,5 +1,6 @@
 import { backendIcon } from "../../icons";
 import { formatBytes } from "../../format";
+import { useT } from "../../i18n";
 import {
   AlwaysOnKind,
   AlwaysOnListResult,
@@ -14,10 +15,13 @@ import OverflowMenu from "../ui/OverflowMenu";
 import RateText from "../ui/RateText";
 import ToggleSwitch from "../ui/ToggleSwitch";
 
-export const DOMAIN_TARGET_LABELS: Record<DomainRouteTarget, string> = {
-  block: "Block",
-  proxy: "Proxy",
-  direct: "Direct",
+export const DOMAIN_TARGET_LABEL_KEYS: Record<
+  DomainRouteTarget,
+  "rules.block" | "rules.proxy" | "rules.direct"
+> = {
+  block: "rules.block",
+  proxy: "rules.proxy",
+  direct: "rules.direct",
 };
 
 /** Counts real selectors; `#` comment lines are stored in `domains` for
@@ -99,6 +103,7 @@ export default function ProfileDetail({
   onMeasureAllEndpoints,
   onSetRefreshInterval,
 }: ProfileDetailProps) {
+  const t = useT();
   const alwaysOnKind: AlwaysOnKind | null =
     profile.backend === "wireGuard"
       ? "wireGuard"
@@ -128,22 +133,22 @@ export default function ProfileDetail({
           <div className="connection-card-name-row">
             <span className="profile-detail-name">{profile.name}</span>
             {managedConfig === true && (
-              <span className="badge badge-managed">Managed</span>
+              <span className="badge badge-managed">{t("detail.managed")}</span>
             )}
             {profile.useSystemProxy && (
-              <span className="badge badge-managed">Proxy</span>
+              <span className="badge badge-managed">{t("detail.proxy")}</span>
             )}
             {alwaysOnEntry && (
               <span className="badge badge-managed">
                 {alwaysOnEntry.enabled
                   ? alwaysOn?.paused
-                    ? "Always-on paused"
-                    : "Always-on"
-                  : "Always-on cleanup pending"}
+                    ? t("detail.alwaysOnPaused")
+                    : t("detail.alwaysOn")
+                  : t("detail.alwaysOnPending")}
               </span>
             )}
             {managedConfig === false && (
-              <span className="badge badge-external">External</span>
+              <span className="badge badge-external">{t("detail.external")}</span>
             )}
           </div>
           <span
@@ -157,10 +162,13 @@ export default function ProfileDetail({
             }
           >
             {status.state === "failed"
-              ? (status.message ?? "Connection failed")
+              ? (status.message ?? t("detail.failed"))
               : status.state === "running"
-                ? `Running on ${status.interfaceName || profile.interfaceName || "tunnel"}`
-                : "Stopped"}
+                ? t("detail.runningOn", {
+                    iface:
+                      status.interfaceName || profile.interfaceName || "tunnel",
+                  })
+                : t("detail.stopped")}
           </span>
         </div>
         <ToggleSwitch
@@ -170,19 +178,19 @@ export default function ProfileDetail({
           }
           disabled={isBusy}
           busy={isBusy}
-          title={status.state === "running" ? "Disconnect" : "Connect"}
+          title={status.state === "running" ? t("common.disconnect") : t("common.connect")}
         />
         <OverflowMenu
-          title="Profile actions"
+          title={t("detail.actions")}
           items={[
-            { label: "Edit", onClick: onEdit, disabled: isBusy },
+            { label: t("common.edit"), onClick: onEdit, disabled: isBusy },
             {
-              label: "Move up",
+              label: t("detail.moveUp"),
               onClick: onMoveUp,
               disabled: isBusy || !canMoveUp,
             },
             {
-              label: "Move down",
+              label: t("detail.moveDown"),
               onClick: onMoveDown,
               disabled: isBusy || !canMoveDown,
             },
@@ -192,8 +200,8 @@ export default function ProfileDetail({
               ? [
                   {
                     label: alwaysOnEntry
-                      ? "Disable always-on"
-                      : "Enable always-on before sign-in",
+                      ? t("detail.disableAlwaysOn")
+                      : t("detail.enableAlwaysOn"),
                     onClick: () =>
                       onToggleAlwaysOn(alwaysOnKind, Boolean(alwaysOnEntry)),
                     disabled: isBusy,
@@ -203,7 +211,7 @@ export default function ProfileDetail({
             ...(os === "linux" && profile.backend === "openVpn"
               ? [
                   {
-                    label: "Credentials…",
+                    label: t("detail.credentials"),
                     onClick: onCredentials,
                     disabled: isBusy,
                   },
@@ -213,8 +221,8 @@ export default function ProfileDetail({
               ? [
                   {
                     label: refreshingSubscription
-                      ? "Refreshing…"
-                      : "Refresh subscription",
+                      ? t("detail.refreshing")
+                      : t("detail.refreshSub"),
                     onClick: onRefreshSubscription,
                     disabled:
                       refreshingSubscription ||
@@ -225,12 +233,12 @@ export default function ProfileDetail({
                 ]
               : []),
             {
-              label: diagBusy ? "Running diagnostics…" : "Diagnostics",
+              label: diagBusy ? t("detail.runningDiag") : t("detail.diagnostics"),
               onClick: onDiagnose,
               disabled: isBusy || diagBusy,
             },
             {
-              label: "Delete",
+              label: t("common.delete"),
               onClick: onDelete,
               disabled: isBusy,
               danger: true,
@@ -241,18 +249,18 @@ export default function ProfileDetail({
 
       <div className="profile-detail-body">
         <div className="interface-row">
-          <span className="row-label">Backend</span>
+          <span className="row-label">{t("detail.backend")}</span>
           <span className="row-value">{backendLabel}</span>
         </div>
         <div className="interface-row">
-          <span className="row-label">Interface</span>
+          <span className="row-label">{t("detail.interface")}</span>
           <span className="row-value mono">
-            {profile.interfaceName || "Not assigned"}
+            {profile.interfaceName || t("detail.notAssigned")}
           </span>
         </div>
         {rate && (
           <div className="interface-row">
-            <span className="row-label">Rate</span>
+            <span className="row-label">{t("detail.rate")}</span>
             <span className="row-value">
               <RateText rx={rate.rxRate} tx={rate.txRate} live />
             </span>
@@ -283,8 +291,8 @@ export default function ProfileDetail({
           <div className="endpoint-section">
             <div className="endpoint-section-head">
               <span className="section-label">
-                Endpoints · {endpoints.length}
-                {switching && <span className="endpoint-note">switching…</span>}
+                {t("detail.endpoints")} · {endpoints.length}
+                {switching && <span className="endpoint-note">{t("detail.switching")}</span>}
               </span>
               <button
                 type="button"
@@ -296,9 +304,9 @@ export default function ProfileDetail({
                   refreshingSubscription ||
                   isBusy
                 }
-                title="Measure delay for every endpoint"
+                title={t("detail.testAllTitle")}
               >
-                {measuringAll ? "Testing…" : "Test all"}
+                {measuringAll ? t("profiles.testing") : t("detail.testAll")}
               </button>
             </div>
             <ul className="endpoint-list">
@@ -320,10 +328,10 @@ export default function ProfileDetail({
                       }
                       title={
                         status.state === "running"
-                          ? "Disconnect to switch endpoints"
+                          ? t("detail.disconnectToSwitch")
                           : ep.active
-                            ? "Active endpoint"
-                            : "Switch to this endpoint"
+                            ? t("detail.activeEndpoint")
+                            : t("detail.switchEndpoint")
                       }
                     >
                       <span
@@ -336,7 +344,7 @@ export default function ProfileDetail({
                           : res
                             ? res.delayMs !== null
                               ? `${res.delayMs} ms`
-                              : "unreachable"
+                              : t("detail.unreachable")
                             : "—"}
                       </span>
                     </button>
@@ -348,7 +356,7 @@ export default function ProfileDetail({
         )}
         {profile.subscription && (
           <div className="interface-row">
-            <span className="row-label">Auto-refresh</span>
+            <span className="row-label">{t("detail.autoRefresh")}</span>
             <span className="row-value">
               <select
                 value={profile.subscription.refreshIntervalMinutes ?? ""}
@@ -359,10 +367,10 @@ export default function ProfileDetail({
                 }
                 disabled={settingRefreshInterval || isBusy}
               >
-                <option value="">Off</option>
-                <option value="15">Every 15 minutes</option>
-                <option value="60">Every hour</option>
-                <option value="360">Every 6 hours</option>
+                <option value="">{t("common.off")}</option>
+                <option value="15">{t("detail.every15")}</option>
+                <option value="60">{t("detail.everyHour")}</option>
+                <option value="360">{t("detail.every6h")}</option>
               </select>
             </span>
           </div>
@@ -375,22 +383,22 @@ export default function ProfileDetail({
           <div className="connection-card-details">
             {profile.subscription?.userInfo && (
               <div className="interface-row">
-                <span className="row-label">Traffic</span>
+                <span className="row-label">{t("detail.traffic")}</span>
                 <span className="row-value">
                   {formatBytes(
                     profile.subscription.userInfo.uploadBytes +
                       profile.subscription.userInfo.downloadBytes,
                   )}{" "}
-                  used
+                  {t("detail.used")}
                   {profile.subscription.userInfo.totalBytes !== null
                     ? ` / ${formatBytes(profile.subscription.userInfo.totalBytes)}`
-                    : " / unlimited"}
+                    : ` / ${t("detail.unlimited")}`}
                 </span>
               </div>
             )}
             {profile.subscription?.userInfo?.expiresAtUnix != null && (
               <div className="interface-row">
-                <span className="row-label">Expires</span>
+                <span className="row-label">{t("detail.expires")}</span>
                 <span className="row-value">
                   {new Date(
                     profile.subscription.userInfo.expiresAtUnix * 1000,
@@ -401,7 +409,7 @@ export default function ProfileDetail({
             {profile.subscription &&
               profile.subscription.lastRefreshAtUnix !== null && (
                 <div className="interface-row">
-                  <span className="row-label">Last checked</span>
+                  <span className="row-label">{t("detail.lastChecked")}</span>
                   <span className="row-value">
                     {new Date(
                       profile.subscription.lastRefreshAtUnix * 1000,
@@ -411,7 +419,7 @@ export default function ProfileDetail({
               )}
             {profile.subscription?.lastRefreshError && (
               <div className="interface-row">
-                <span className="row-label">Refresh</span>
+                <span className="row-label">{t("detail.refreshLabel")}</span>
                 <span className="row-value">
                   {profile.subscription.lastRefreshError}
                 </span>
@@ -419,21 +427,21 @@ export default function ProfileDetail({
             )}
             {profile.backend === "xray" && profile.privateLanDirect && (
               <div className="interface-row">
-                <span className="row-label">Private/LAN IPs</span>
-                <span className="row-value">Direct after custom rules</span>
+                <span className="row-label">{t("detail.privateLan")}</span>
+                <span className="row-value">{t("detail.privateLanValue")}</span>
               </div>
             )}
             {profile.useSystemProxy && (
               <div className="interface-row">
-                <span className="row-label">Proxy bypass</span>
+                <span className="row-label">{t("detail.proxyBypass")}</span>
                 <span className="row-value mono">
-                  {profile.proxyBypass.join("; ") || "LAN/localhost defaults"}
+                  {profile.proxyBypass.join("; ") || t("detail.bypassDefault")}
                 </span>
               </div>
             )}
             {ruleCount > 0 && (
               <div className="interface-row">
-                <span className="row-label">Domain/IP rules</span>
+                <span className="row-label">{t("detail.domainRules")}</span>
                 <span className="row-value">
                   {(["block", "proxy", "direct"] as const)
                     .map((target) => ({
@@ -446,7 +454,7 @@ export default function ProfileDetail({
                     .filter((entry) => entry.count > 0)
                     .map(
                       (entry) =>
-                        `${DOMAIN_TARGET_LABELS[entry.target]} ${entry.count}`,
+                        `${t(DOMAIN_TARGET_LABEL_KEYS[entry.target])} ${entry.count}`,
                     )
                     .join(" · ")}
                 </span>
@@ -454,12 +462,12 @@ export default function ProfileDetail({
             )}
             {profile.routes.length > 0 && (
               <div className="interface-section">
-                <span className="section-label">Routes</span>
+                <span className="section-label">{t("detail.routes")}</span>
                 <ul className="profile-route-list">
                   {profile.routes.map((route, i) => (
                     <li key={i}>
                       <span className="mono">{route.destination}</span>
-                      <span className="family-tag">metric {route.metric}</span>
+                      <span className="family-tag">{t("detail.metric", { n: route.metric })}</span>
                     </li>
                   ))}
                 </ul>

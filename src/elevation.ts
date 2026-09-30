@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
+import { t } from "./i18n";
 import type { DaemonStatus, Profile } from "./types";
 
 export function requiresElevation(profile: Profile): boolean {
@@ -14,8 +15,8 @@ export async function ensureElevation(action: string): Promise<boolean> {
   const daemon = await invoke<DaemonStatus>("daemon_status");
   if (daemon.state === "ready") return true;
   if (daemon.state !== "notRequired") {
-    await message(`${action} requires the network daemon. ${daemon.message}`, {
-      title: "Network daemon unavailable",
+    await message(t("elev.daemonUnavailable", { action, msg: daemon.message }), {
+      title: t("elev.daemonUnavailableTitle"),
       kind: "warning",
     });
     return false;
@@ -23,12 +24,12 @@ export async function ensureElevation(action: string): Promise<boolean> {
   const elevated = await invoke<boolean>("is_elevated");
   if (elevated) return true;
   const approved = await confirm(
-    `${action} requires administrator privileges. Restart the application as administrator?`,
+    t("elev.adminRequired", { action }),
     {
-      title: "Administrator privileges required",
+      title: t("elev.adminRequiredTitle"),
       kind: "warning",
-      okLabel: "Restart as administrator",
-      cancelLabel: "Cancel",
+      okLabel: t("elev.restartAdmin"),
+      cancelLabel: t("common.cancel"),
     }
   );
   if (!approved) return false;

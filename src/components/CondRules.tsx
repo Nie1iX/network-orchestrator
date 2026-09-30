@@ -15,19 +15,20 @@ import Modal from "./Modal";
 import Page from "./Page";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import { useToast } from "./ui/Toast";
+import { pluralize, t, TranslationKey, useT } from "../i18n";
 
-const STATE_LABELS: Record<ConditionalRuleState, string> = {
-  active: "Active",
-  inactive: "Inactive",
-  disabled: "Disabled",
-  error: "Error",
+const STATE_LABEL_KEYS: Record<ConditionalRuleState, TranslationKey> = {
+  active: "cond.stateActive",
+  inactive: "cond.stateInactive",
+  disabled: "cond.stateDisabled",
+  error: "cond.stateError",
 };
 
-const STATE_HINTS: Record<ConditionalRuleState, string> = {
-  active: "Condition holds; routes are installed",
-  inactive: "Outside the conditioned network; nothing is installed",
-  disabled: "Rule is switched off",
-  error: "Last apply or remove failed",
+const STATE_HINT_KEYS: Record<ConditionalRuleState, TranslationKey> = {
+  active: "cond.hintActive",
+  inactive: "cond.hintInactive",
+  disabled: "cond.hintDisabled",
+  error: "cond.hintError",
 };
 
 function stateClass(state: ConditionalRuleState): string {
@@ -42,7 +43,7 @@ function stateClass(state: ConditionalRuleState): string {
 function conditionText(rule: ConditionalRouteRule): string {
   switch (rule.condition.kind) {
     case "interfaceAddressIn":
-      return `Interface address inside ${rule.condition.prefix}`;
+      return t("cond.conditionText", { prefix: rule.condition.prefix });
   }
 }
 
@@ -96,29 +97,29 @@ function draftOf(rule?: ConditionalRouteRule): Draft {
 function draftToRule(draft: Draft): ConditionalRouteRule | string {
   const id = draft.editingId ?? (draft.id.trim() || slugify(draft.name));
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,47}$/.test(id)) {
-    return "Id must start with a letter or digit and use [a-z0-9._-] only";
+    return t("cond.errId");
   }
   if (!draft.name.trim()) {
-    return "Name is required";
+    return t("cond.errName");
   }
   if (!/^\S+\/\d+$/.test(draft.prefix.trim())) {
-    return "Condition prefix must look like 10.228.32.0/21";
+    return t("cond.errPrefix");
   }
   const routes: PolicyRoute[] = [];
   for (const route of draft.routes) {
     const destination = route.destination.trim();
     if (!/^\S+\/\d+$/.test(destination)) {
-      return `Route destination "${destination || "?"}" must look like 10.99.0.0/24`;
+      return t("cond.errDest", { dest: destination || "?" });
     }
     const metric = Number(route.metric);
     if (!Number.isInteger(metric) || metric < 0 || metric > 4_294_967_295) {
-      return `Route metric for ${destination} must be a number`;
+      return t("cond.errMetric", { dest: destination });
     }
     const via = route.via.trim();
     routes.push({ destination, metric, via: via ? via : null });
   }
   if (routes.length === 0) {
-    return "Add at least one route";
+    return t("cond.errNoRoutes");
   }
   return {
     id,
@@ -131,6 +132,7 @@ function draftToRule(draft: Draft): ConditionalRouteRule | string {
 
 export default function CondRules() {
   const toast = useToast();
+  const tr = useT();
   const [entries, setEntries] = useState<ConditionalRuleEntry[]>([]);
   const [caps, setCaps] = useState<PlatformCapabilities | null>(null);
   const [loading, setLoading] = useState(true);
@@ -183,13 +185,13 @@ export default function CondRules() {
       setDraft(null);
       const status = result.status;
       if (status.state === "active") {
-        toast("success", `${rule.name}: active on ${status.matchedInterface ?? "?"}`);
+        toast("success", t("cond.toastActive", { name: rule.name, iface: status.matchedInterface ?? "?" }));
       } else if (status.state === "inactive") {
-        toast("info", `${rule.name}: stored, waiting for the conditioned network`);
+        toast("info", t("cond.toastInactive", { name: rule.name }));
       } else if (status.state === "error") {
-        toast("error", `${rule.name}: ${status.detail ?? "apply failed"}`);
+        toast("error", t("cond.toastError", { name: rule.name, detail: status.detail ?? t("cond.applyFailed") }));
       } else {
-        toast("info", `${rule.name}: stored (disabled)`);
+        toast("info", t("cond.toastDisabled", { name: rule.name }));
       }
       await refresh();
     } catch (err) {
@@ -201,14 +203,14 @@ export default function CondRules() {
 
   const remove = async (rule: ConditionalRouteRule) => {
     const ok = await confirm(
-      `Delete rule "${rule.name}"? Its routes are withdrawn immediately.`,
-      { title: "Delete conditional rule", kind: "warning" },
+      t("cond.deleteConfirm", { name: rule.name }),
+      { title: t("cond.deleteTitle"), kind: "warning" },
     );
     if (!ok) return;
     setBusyId(rule.id);
     try {
       await invoke("remove_conditional_rule", { ruleId: rule.id });
-      toast("info", `${rule.name}: removed`);
+      toast("info", t("cond.toastRemoved", { name: rule.name }));
       await refresh();
     } catch (err) {
       toast("error", String(err));
@@ -236,7 +238,7 @@ export default function CondRules() {
     <Page width="wide">
       <section>
         <div className="page-head">
-          <h2>Conditional rules</h2>
+          <h2>{tr("cond.title")}</h2>
           <button
             type="button"
             className="btn-primary btn-with-icon"
@@ -248,31 +250,27 @@ export default function CondRules() {
             disabled={!supported}
           >
             <PlusIcon size={14} />
-            New rule
+            {tr("cond.newRule")}
           </button>
         </div>
         <p className="page-subtitle">
-          Routes that exist only while a condition holds — e.g. "on the office
-          LAN, reach internal subnets directly". The daemon evaluates them
-          against local interface addresses and installs or withdraws routes
-          automatically.
+          {tr("cond.subtitle")}
         </p>
         {!supported && (
           <p className="runtime-notice">
-            Conditional rules are available on Linux only — they are evaluated
-            by the privileged daemon.
+            {tr("cond.linuxOnly")}
           </p>
         )}
-        {error && <p className="error">Error loading rules: {error}</p>}
+        {error && <p className="error">{tr("cond.loadError", { err: error })}</p>}
 
         {!loading && supported && entries.length === 0 && !error && (
           <div className="empty-state">
             <ConditionsIcon size={32} />
-            <p>No conditional rules yet.</p>
+            <p>{tr("cond.emptyTitle")}</p>
             <p>
-              Example: prefix <span className="mono">10.228.32.0/21</span> marks
-              the office LAN — while an uplink holds an address from it, the
-              rule's routes are installed; away from the office they disappear.
+              {tr("cond.emptyExampleA")}{" "}
+              <span className="mono">10.228.32.0/21</span>{" "}
+              {tr("cond.emptyExampleB")}
             </p>
           </div>
         )}
@@ -288,28 +286,35 @@ export default function CondRules() {
                       checked={rule.enabled}
                       busy={busyId === rule.id}
                       onChange={() => toggle(entry)}
-                      title={rule.enabled ? "Disable rule" : "Enable rule"}
+                      title={rule.enabled ? tr("cond.toggleDisable") : tr("cond.toggleEnable")}
                     />
                     <span className="interface-name">{rule.name}</span>
                     <span className="meta-label mono">{rule.id}</span>
                   </div>
                   <span
                     className={`state-badge ${stateClass(status.state)}`}
-                    title={STATE_HINTS[status.state]}
+                    title={tr(STATE_HINT_KEYS[status.state])}
                   >
-                    {STATE_LABELS[status.state]}
+                    {tr(STATE_LABEL_KEYS[status.state])}
                   </span>
                 </div>
                 <div className="interface-meta">
                   <span className="meta-label">{conditionText(rule)}</span>
                   {status.matchedInterface && (
                     <span className="meta-label">
-                      on {status.matchedInterface}
+                      {tr("cond.onIface", { iface: status.matchedInterface })}
                     </span>
                   )}
                   <span className="meta-label">
-                    {status.appliedRoutes}/{rule.routes.length} route
-                    {rule.routes.length === 1 ? "" : "s"} installed
+                    {tr("cond.installedCount", {
+                      applied: status.appliedRoutes,
+                      total: rule.routes.length,
+                      unit: pluralize(
+                        rule.routes.length,
+                        ["маршрут", "маршрута", "маршрутов"],
+                        ["route", "routes"],
+                      ),
+                    })}
                   </span>
                 </div>
                 {status.detail && (
@@ -332,7 +337,7 @@ export default function CondRules() {
                       setDraft(draftOf(rule));
                     }}
                   >
-                    Edit
+                    {tr("common.edit")}
                   </button>
                   <button
                     type="button"
@@ -340,7 +345,7 @@ export default function CondRules() {
                     disabled={busyId === rule.id}
                     onClick={() => remove(rule)}
                   >
-                    Delete
+                    {tr("common.delete")}
                   </button>
                 </div>
               </div>
@@ -351,12 +356,12 @@ export default function CondRules() {
 
       <Modal
         open={draft !== null}
-        title={draft?.editingId ? "Edit conditional rule" : "New conditional rule"}
+        title={draft?.editingId ? tr("cond.editTitle") : tr("cond.newTitle")}
         onClose={() => setDraft(null)}
         footer={
           <>
             <button type="button" onClick={() => setDraft(null)} disabled={saving}>
-              Cancel
+              {tr("common.cancel")}
             </button>
             <button
               type="button"
@@ -364,7 +369,7 @@ export default function CondRules() {
               onClick={save}
               disabled={saving}
             >
-              {saving ? "Saving…" : "Save"}
+              {saving ? tr("common.saving") : tr("common.save")}
             </button>
           </>
         }
@@ -373,12 +378,12 @@ export default function CondRules() {
           <div className="modal-tab-body">
             {formError && <p className="error">{formError}</p>}
             <label>
-              Name
+              {tr("cond.name")}
               <input
                 type="text"
                 value={draft.name}
                 autoFocus
-                placeholder="Office LAN direct"
+                placeholder={tr("cond.namePh")}
                 onChange={(e) => {
                   const name = e.target.value;
                   setDraft((current) =>
@@ -395,13 +400,13 @@ export default function CondRules() {
               />
             </label>
             <label>
-              Id
+              {tr("cond.id")}
               <input
                 type="text"
                 className="mono"
                 value={draft.editingId ?? draft.id}
                 disabled={draft.editingId !== null}
-                placeholder="office-lan"
+                placeholder={tr("cond.idPh")}
                 onChange={(e) => {
                   idTouched.current = true;
                   setDraft((current) =>
@@ -411,7 +416,7 @@ export default function CondRules() {
               />
             </label>
             <label>
-              Condition — uplink address inside prefix
+              {tr("cond.condPrefix")}
               <input
                 type="text"
                 className="mono"
@@ -434,10 +439,10 @@ export default function CondRules() {
                   )
                 }
               />
-              Enabled
+              {tr("cond.enabled")}
             </label>
             <div className="cond-route-editor">
-              <span className="section-label">Routes while the condition holds</span>
+              <span className="section-label">{tr("cond.routesWhile")}</span>
               {draft.routes.map((route, i) => (
                 <div key={i} className="cond-route-row">
                   <input
@@ -458,8 +463,8 @@ export default function CondRules() {
                     type="text"
                     className="mono"
                     value={route.metric}
-                    placeholder="metric"
-                    title="Metric"
+                    placeholder={tr("cond.metricPh")}
+                    title={tr("routes.metricCol")}
                     onChange={(e) =>
                       setDraft((current) => {
                         if (!current) return current;
@@ -473,8 +478,8 @@ export default function CondRules() {
                     type="text"
                     className="mono"
                     value={route.via}
-                    placeholder="via (optional)"
-                    title="Gateway"
+                    placeholder={tr("cond.viaPh")}
+                    title={tr("cond.gwTitle")}
                     onChange={(e) =>
                       setDraft((current) => {
                         if (!current) return current;
@@ -487,7 +492,7 @@ export default function CondRules() {
                   <button
                     type="button"
                     className="btn-sm"
-                    title="Remove route"
+                    title={tr("cond.removeRoute")}
                     onClick={() =>
                       setDraft((current) =>
                         current && {
@@ -517,7 +522,7 @@ export default function CondRules() {
                 }
               >
                 <PlusIcon size={12} />
-                Add route
+                {tr("cond.addRoute")}
               </button>
             </div>
           </div>

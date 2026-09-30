@@ -16,13 +16,8 @@ import {
 } from "../types";
 import { usePlatformCapabilities } from "../platform";
 import { ChevronIcon } from "../icons";
-
-const BACKEND_LABELS: Record<TunnelBackend, string> = {
-  none: "Static routes",
-  wireGuard: "WireGuard",
-  openVpn: "OpenVPN",
-  xray: "Xray",
-};
+import { t, useT } from "../i18n";
+import { BACKEND_LABEL_KEYS } from "../i18n/labels";
 
 const BACKEND_EXTENSIONS: Record<TunnelBackend, string[]> = {
   none: [],
@@ -222,6 +217,7 @@ export default function ProfileFormModal({
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [tab, setTab] = useState<FormTab>("general");
+  const tr = useT();
 
   useEffect(() => {
     if (open) {
@@ -270,7 +266,7 @@ export default function ProfileFormModal({
         directory: false,
         filters: [
           {
-            name: `${BACKEND_LABELS[current.backend]} config`,
+            name: tr("form.configFilter", { backend: tr(BACKEND_LABEL_KEYS[current.backend]) }),
             extensions: BACKEND_EXTENSIONS[current.backend],
           },
         ],
@@ -285,7 +281,7 @@ export default function ProfileFormModal({
 
   const probeRoutes = async () => {
     if (!current.configPath.trim()) {
-      setProbeNotice("Set a config file first.");
+      setProbeNotice(tr("form.probeSetConfig"));
       return;
     }
     setProbing(true);
@@ -298,8 +294,8 @@ export default function ProfileFormModal({
       setProbeResults(routes);
       setProbeNotice(
         routes.length === 0
-          ? "Probe completed, but no pushed routes were found."
-          : `Found ${routes.length} route(s). Add them to policy routes below.`,
+          ? tr("form.probeNone")
+          : tr("form.probeFound", { n: routes.length }),
       );
     } catch (err) {
       setProbeNotice(String(err));
@@ -318,11 +314,11 @@ export default function ProfileFormModal({
         metric: 5,
       }));
     if (toAdd.length === 0) {
-      setProbeNotice("All probed routes are already in the policy routes list.");
+      setProbeNotice(tr("form.probeAllAdded"));
       return;
     }
     update({ routes: [...current.routes, ...toAdd] });
-    setProbeNotice(`Added ${toAdd.length} route(s) to policy routes.`);
+    setProbeNotice(tr("form.probeAdded", { n: toAdd.length }));
   };
 
   const updateRoute = (index: number, patch: Partial<PolicyRoute>) =>
@@ -339,7 +335,7 @@ export default function ProfileFormModal({
     try {
       const cidrs = await invoke<string[]>("parse_bulk_cidrs", { input: bulkCidrs });
       if (cidrs.length === 0) {
-        setFormError("No CIDRs found in the pasted list.");
+        setFormError(tr("form.errNoCidrs"));
         return;
       }
       const existing = new Set(current.routes.map((route) => route.destination.trim()));
@@ -360,17 +356,17 @@ export default function ProfileFormModal({
   const save = async () => {
     for (const route of current.routes) {
       if (!route.destination.trim()) {
-        fail("Route destination cannot be blank.", "routing");
+        fail(tr("form.errRouteBlank"), "routing");
         return;
       }
     }
     if (current.routes.length > 0 && !current.interfaceName.trim()
       && !daemonManagedInterface) {
-      fail("Target interface is required when policy routes are set.", "routing");
+      fail(tr("form.errIfaceRequired"), "routing");
       return;
     }
     if (current.backend === "none" && current.routes.length === 0) {
-      fail("Static-routes profile requires at least one policy route.", "routing");
+      fail(tr("form.errStaticRoute"), "routing");
       return;
     }
     const isXray = current.backend === "xray";
@@ -384,7 +380,7 @@ export default function ProfileFormModal({
     if (isXray && current.useSystemProxy) {
       for (const entry of proxyBypass) {
         if (entry.includes(";")) {
-          fail("Proxy bypass entries must not contain ';'.", "connection");
+          fail(tr("form.errBypassSemicolon"), "connection");
           return;
         }
       }
@@ -396,7 +392,7 @@ export default function ProfileFormModal({
     );
     if (isVlessImport) {
       if (!current.vlessUrl.trim()) {
-        fail("Share link is required.", "connection");
+        fail(tr("form.errShareRequired"), "connection");
         return;
       }
       if (
@@ -405,30 +401,30 @@ export default function ProfileFormModal({
           current.xraySocksPort < 1 ||
           current.xraySocksPort > 65535)
       ) {
-        fail("SOCKS port must be an integer between 1 and 65535.", "connection");
+        fail(tr("form.errSocksPort"), "connection");
         return;
       }
     }
     if (isWgFields) {
       const f = current.wgFields;
       if (!f.privateKey.trim()) {
-        fail("WireGuard private key is required.", "connection");
+        fail(tr("form.errWgPrivKey"), "connection");
         return;
       }
       if (!f.address.trim()) {
-        fail("WireGuard interface address is required.", "connection");
+        fail(tr("form.errWgAddr"), "connection");
         return;
       }
       if (!f.peerPublicKey.trim()) {
-        fail("WireGuard peer public key is required.", "connection");
+        fail(tr("form.errWgPeerKey"), "connection");
         return;
       }
       if (!f.peerEndpoint.trim()) {
-        fail("WireGuard peer endpoint is required.", "connection");
+        fail(tr("form.errWgEndpoint"), "connection");
         return;
       }
       if (!f.allowedIps.trim()) {
-        fail("WireGuard allowed IPs are required.", "connection");
+        fail(tr("form.errWgAllowed"), "connection");
         return;
       }
     }
@@ -486,7 +482,7 @@ export default function ProfileFormModal({
           { id: current.id },
         );
       } catch (err) {
-        onError(`Profile was saved, but static analysis failed: ${String(err)}`);
+        onError(t("form.errAnalysis", { err: String(err) }));
       }
       onSaved(updated, inspection);
       setForm(null);
@@ -501,12 +497,12 @@ export default function ProfileFormModal({
   return (
     <Modal
       open={open}
-      title={current.isNew ? "New profile" : "Edit profile"}
+      title={current.isNew ? tr("form.newTitle") : tr("form.editTitle")}
       onClose={onClose}
       footer={
         <>
           <button type="button" onClick={onClose} disabled={saving}>
-            Cancel
+            {tr("common.cancel")}
           </button>
           <button
             type="button"
@@ -514,12 +510,12 @@ export default function ProfileFormModal({
             onClick={save}
             disabled={saving}
           >
-            {saving ? "Saving…" : "Save"}
+            {saving ? tr("common.saving") : tr("common.save")}
           </button>
         </>
       }
     >
-      <div className="modal-tabs" role="tablist" aria-label="Profile sections">
+      <div className="modal-tabs" role="tablist" aria-label={tr("form.tabsAria")}>
         <button
           type="button"
           role="tab"
@@ -527,7 +523,7 @@ export default function ProfileFormModal({
           className={`modal-tab ${tab === "general" ? "active" : ""}`}
           onClick={() => setTab("general")}
         >
-          General
+          {tr("form.tabGeneral")}
         </button>
         <button
           type="button"
@@ -536,7 +532,7 @@ export default function ProfileFormModal({
           className={`modal-tab ${tab === "connection" ? "active" : ""}`}
           onClick={() => setTab("connection")}
         >
-          Connection
+          {tr("form.tabConnection")}
         </button>
         <button
           type="button"
@@ -545,7 +541,7 @@ export default function ProfileFormModal({
           className={`modal-tab ${tab === "routing" ? "active" : ""}`}
           onClick={() => setTab("routing")}
         >
-          Routing
+          {tr("form.tabRouting")}
           {routingCount > 0 && (
             <span className="modal-tab-count">{routingCount}</span>
           )}
@@ -557,17 +553,17 @@ export default function ProfileFormModal({
       {tab === "general" && (
       <div className="modal-tab-body" role="tabpanel">
       <label>
-        Name
+        {tr("form.name")}
         <input
           type="text"
           value={current.name}
           onChange={(e) => update({ name: e.target.value })}
-          placeholder="Work VPN"
+          placeholder={tr("form.namePh")}
           autoFocus
         />
       </label>
       <label>
-        Backend
+        {tr("detail.backend")}
         <select
           className="filter-select"
           value={current.backend}
@@ -591,7 +587,7 @@ export default function ProfileFormModal({
             });
           }}
         >
-          <option value="none">Static routes (no tunnel)</option>
+          <option value="none">{tr("form.staticNoTunnel")}</option>
           <option value="wireGuard">WireGuard</option>
           <option value="openVpn">OpenVPN</option>
           <option value="xray">Xray</option>
@@ -604,7 +600,7 @@ export default function ProfileFormModal({
             checked={current.autoConnect}
             onChange={(e) => update({ autoConnect: e.target.checked })}
           />
-          Connect when the app starts
+          {tr("form.autoConnect")}
         </label>
       )}
       </div>
@@ -614,7 +610,7 @@ export default function ProfileFormModal({
       <div className="modal-tab-body" role="tabpanel">
       {current.backend !== "none" && current.backend === "xray" && current.isNew && (
         <label>
-          Config source
+          {tr("form.configSource")}
           <select
             className="filter-select"
             value={current.xraySource}
@@ -622,14 +618,14 @@ export default function ProfileFormModal({
               update({ xraySource: e.target.value as "json" | "vless" })
             }
           >
-            <option value="json">Existing Xray JSON</option>
-            <option value="vless">Import share link</option>
+            <option value="json">{tr("form.xrayJson")}</option>
+            <option value="vless">{tr("form.shareLink")}</option>
           </select>
         </label>
       )}
       {current.backend === "wireGuard" && current.isNew && (
         <label>
-          Config source
+          {tr("form.configSource")}
           <select
             className="filter-select"
             value={current.wgSource}
@@ -637,8 +633,8 @@ export default function ProfileFormModal({
               update({ wgSource: e.target.value as "file" | "fields" })
             }
           >
-            <option value="fields">Enter tunnel fields</option>
-            <option value="file">Existing .conf file</option>
+            <option value="fields">{tr("form.wgFields")}</option>
+            <option value="file">{tr("form.wgFile")}</option>
           </select>
         </label>
       )}
@@ -647,7 +643,7 @@ export default function ProfileFormModal({
       current.xraySource === "vless" ? (
         <>
           <label>
-            Share link
+            {tr("form.shareLink")}
             <input
               type="password"
               value={current.vlessUrl}
@@ -657,8 +653,7 @@ export default function ProfileFormModal({
             />
           </label>
           <span className="profile-help">
-            SOCKS5 port will be assigned automatically when the profile is
-            saved.
+            {tr("form.socksAuto")}
           </span>
         </>
       ) : current.backend === "wireGuard" &&
@@ -666,7 +661,7 @@ export default function ProfileFormModal({
         current.wgSource === "fields" ? (
         <div className="profile-wg-fields">
           <label>
-            Private key
+            {tr("form.privKey")}
             <input
               type="password"
               value={current.wgFields.privateKey}
@@ -675,12 +670,12 @@ export default function ProfileFormModal({
                   wgFields: { ...current.wgFields, privateKey: e.target.value },
                 })
               }
-              placeholder="base64 private key"
+              placeholder={tr("form.privKeyPh")}
               autoComplete="off"
             />
           </label>
           <label>
-            Interface address
+            {tr("form.ifaceAddr")}
             <input
               type="text"
               value={current.wgFields.address}
@@ -693,7 +688,7 @@ export default function ProfileFormModal({
             />
           </label>
           <label>
-            DNS (optional)
+            {tr("form.dnsOpt")}
             <input
               type="text"
               value={current.wgFields.dns}
@@ -706,7 +701,7 @@ export default function ProfileFormModal({
             />
           </label>
           <label>
-            Peer public key
+            {tr("form.peerKey")}
             <input
               type="text"
               value={current.wgFields.peerPublicKey}
@@ -718,11 +713,11 @@ export default function ProfileFormModal({
                   },
                 })
               }
-              placeholder="base64 public key"
+              placeholder={tr("form.peerKeyPh")}
             />
           </label>
           <label>
-            Peer endpoint
+            {tr("form.peerEndpoint")}
             <input
               type="text"
               value={current.wgFields.peerEndpoint}
@@ -738,7 +733,7 @@ export default function ProfileFormModal({
             />
           </label>
           <label>
-            Allowed IPs
+            {tr("form.allowedIps")}
             <input
               type="text"
               value={current.wgFields.allowedIps}
@@ -751,7 +746,7 @@ export default function ProfileFormModal({
             />
           </label>
           <label>
-            Preshared key (optional)
+            {tr("form.psk")}
             <input
               type="password"
               value={current.wgFields.presharedKey}
@@ -763,12 +758,12 @@ export default function ProfileFormModal({
                   },
                 })
               }
-              placeholder="base64 preshared key"
+              placeholder={tr("form.pskPh")}
               autoComplete="off"
             />
           </label>
           <label>
-            Persistent keepalive (seconds, optional)
+            {tr("form.keepalive")}
             <input
               type="number"
               min={0}
@@ -789,7 +784,7 @@ export default function ProfileFormModal({
         </div>
       ) : current.backend !== "none" ? (
         <label>
-          Config file
+          {tr("form.configFile")}
           <div className="profile-config-row">
             <input
               type="text"
@@ -804,14 +799,13 @@ export default function ProfileFormModal({
               }
             />
             <button type="button" onClick={browseConfig}>
-              Browse…
+              {tr("form.browse")}
             </button>
           </div>
         </label>
       ) : (
         <span className="profile-help">
-          Static-routes profiles apply policy routes through an existing
-          interface (e.g. Ethernet) without starting a tunnel.
+          {tr("form.staticHelp")}
         </span>
       )}
       {current.backend === "openVpn" && caps?.os !== "linux" && !current.isNew && current.configPath.trim() && (
@@ -822,11 +816,10 @@ export default function ProfileFormModal({
             onClick={probeRoutes}
             disabled={probing}
           >
-            {probing ? "Probing…" : "Probe routes"}
+            {probing ? tr("form.probing") : tr("form.probe")}
           </button>
           <span className="profile-help">
-            Connects briefly with <code>--route-nopull</code> to discover
-            server-pushed routes without installing them.
+            {tr("form.probeHelpA")} <code>--route-nopull</code> {tr("form.probeHelpB")}
           </span>
           {probeNotice && (
             <p className={`probe-notice ${probeResults && probeResults.length > 0 ? "ok" : ""}`}>
@@ -836,9 +829,9 @@ export default function ProfileFormModal({
           {probeResults && probeResults.length > 0 && (
             <div className="probe-results">
               <div className="probe-results-head">
-                <span>Discovered routes ({probeResults.length})</span>
+                <span>{tr("form.probeDiscovered", { n: probeResults.length })}</span>
                 <button type="button" className="profile-probe-add" onClick={addProbedRoutes}>
-                  Add all to policy routes
+                  {tr("form.probeAddAll")}
                 </button>
               </div>
               <ul className="probe-route-list">
@@ -855,7 +848,7 @@ export default function ProfileFormModal({
       )}
       {current.backend === "xray" && (
         <label>
-          Xray mode
+          {tr("form.xrayMode")}
           <select
             className="filter-select"
             value={current.xrayMode}
@@ -863,9 +856,9 @@ export default function ProfileFormModal({
               update({ xrayMode: e.target.value as XrayMode })
             }
           >
-            <option value="socks">SOCKS5 (system proxy)</option>
+            <option value="socks">{tr("form.socksMode")}</option>
             <option value="tun" disabled={caps?.os === "linux" && current.xraySource !== "vless" && current.xraySocksPort === null}>
-              {caps?.os === "linux" ? "TUN (network daemon, generated links)" : "TUN (full tunnel, requires admin)"}
+              {caps?.os === "linux" ? tr("form.tunLinux") : tr("form.tunWin")}
             </option>
           </select>
         </label>
@@ -875,14 +868,12 @@ export default function ProfileFormModal({
           <div className="profile-tun-fields">
             {caps?.os === "linux" ? (
               <span className="profile-help">
-                The network daemon assigns the TUN interface and IP. With no
-                policy routes, IPv4 uses a default route and 1.1.1.1 DNS;
-                explicit split routes do not set DNS automatically.
+                {tr("form.tunHelpLinux")}
               </span>
             ) : (
             <>
             <label>
-              TUN interface name
+              {tr("form.tunIface")}
               <input
                 type="text"
                 value={current.xrayTunInterface}
@@ -893,7 +884,7 @@ export default function ProfileFormModal({
               />
             </label>
             <label>
-              TUN interface IP
+              {tr("form.tunIp")}
               <input
                 type="text"
                 value={current.xrayTunIp}
@@ -902,8 +893,7 @@ export default function ProfileFormModal({
               />
             </label>
             <span className="profile-help">
-              TUN mode captures all IP traffic via a TUN interface. Domain
-              policies still apply inside Xray. System proxy is not used.
+              {tr("form.tunHelpWin")}
             </span>
             </>
             )}
@@ -944,22 +934,20 @@ export default function ProfileFormModal({
                 update({ useSystemProxy: e.target.checked })
               }
             />
-            Use Windows system proxy
+            {tr("form.sysProxy")}
           </label>
           {!systemProxyAvailable ? (
             <span className="profile-help">
-              System proxy requires a generated Xray profile with a SOCKS5
-              listener — this existing JSON config has none.
+              {tr("form.sysProxyUnavailable")}
             </span>
           ) : (
             <span className="profile-help">
-              Applies only to apps that honor Windows proxy settings. LAN and
-              localhost are always bypassed; add extra entries below.
+              {tr("form.sysProxyHelp")}
             </span>
           )}
           {current.useSystemProxy && systemProxyAvailable && (
             <label>
-              Extra proxy bypass (comma-separated)
+              {tr("form.bypassLabel")}
               <input
                 type="text"
                 value={current.proxyBypass}
@@ -976,13 +964,13 @@ export default function ProfileFormModal({
       {tab === "routing" && (
       <div className="modal-tab-body" role="tabpanel">
       {!daemonManagedInterface && <label>
-        Target interface (required for policy routes)
+        {tr("form.targetIface")}
         <input
           type="text"
           list="profile-target-interfaces"
           value={current.interfaceName}
           onChange={(e) => update({ interfaceName: e.target.value })}
-          placeholder="Interface friendly name"
+          placeholder={tr("form.targetIfacePh")}
         />
         <datalist id="profile-target-interfaces">
           {targetable.map((i) => (
@@ -996,7 +984,7 @@ export default function ProfileFormModal({
       </label>}
       <div className="profile-routes">
         <div className="profile-routes-head">
-          <span>Policy routes</span>
+          <span>{tr("form.policyRoutes")}</span>
           <button
             type="button"
             onClick={() =>
@@ -1008,7 +996,7 @@ export default function ProfileFormModal({
               })
             }
           >
-            Add route
+            {tr("form.addRoute")}
           </button>
         </div>
         <button
@@ -1018,12 +1006,12 @@ export default function ProfileFormModal({
           aria-expanded={bulkOpen}
         >
           <ChevronIcon size={13} collapsed={!bulkOpen} />
-          Paste a CIDR list or load from file
+          {tr("form.bulkToggle")}
         </button>
         {bulkOpen && (
           <div className="profile-bulk-cidrs">
             <label>
-              Paste CIDRs (one per line or comma-separated)
+              {tr("form.bulkLabel")}
               <textarea
                 value={bulkCidrs}
                 onChange={(event) => setBulkCidrs(event.target.value)}
@@ -1035,31 +1023,31 @@ export default function ProfileFormModal({
               <input
                 type="file"
                 accept=".txt,.csv,text/plain,text/csv"
-                aria-label="Load CIDRs from file"
+                aria-label={tr("form.bulkFileAria")}
                 onChange={async (event) => {
                   const file = event.target.files?.[0];
                   event.target.value = "";
                   if (!file) return;
                   if (file.size > 1024 * 1024) {
-                    setFormError("CIDR file exceeds 1 MiB.");
+                    setFormError(tr("form.bulkTooBig"));
                     return;
                   }
                   try {
                     setBulkCidrs(await file.text());
                   } catch {
-                    setFormError("Could not read CIDR file.");
+                    setFormError(tr("form.bulkReadFailed"));
                   }
                 }}
               />
               <button type="button" onClick={addBulkCidrs} disabled={bulkBusy || !bulkCidrs.trim()}>
-                {bulkBusy ? "Adding…" : "Add CIDRs"}
+                {bulkBusy ? tr("form.adding") : tr("form.addCidrs")}
               </button>
             </div>
           </div>
         )}
         {current.routes.length === 0 && (
           <span className="profile-routes-empty">
-            No routes — tunnel uses its own routing.
+            {tr("form.noRoutes")}
           </span>
         )}
         {current.routes.map((route, index) => (
@@ -1076,8 +1064,8 @@ export default function ProfileFormModal({
               type="text"
               value={route.via ?? ""}
               onChange={(e) => updateRoute(index, { via: e.target.value })}
-              placeholder="Gateway (optional)"
-              aria-label="Gateway (optional)"
+              placeholder={tr("form.gwPh")}
+              aria-label={tr("form.gwPh")}
             />
             <input
               type="number"
@@ -1098,7 +1086,7 @@ export default function ProfileFormModal({
                 })
               }
             >
-              Remove
+              {tr("common.remove")}
             </button>
           </div>
         ))}
@@ -1106,16 +1094,14 @@ export default function ProfileFormModal({
       {current.backend === "xray" && (
         <div className="profile-routes">
           <div className="profile-routes-head">
-            <span>Domain/IP routing</span>
+            <span>{tr("form.domainRouting")}</span>
           </div>
           <span className="profile-routes-hint">
-            One selector per line: domain:example.com, geosite:category, geoip:cc,
-            or a bare IP/CIDR. Lines starting with # are comments. Rules are
-            evaluated block → proxy → direct; unmatched traffic uses the proxy.
+            {tr("form.rulesHint")}
           </span>
           <div className="rules-grid">
             <label className="rules-pane">
-              <span className="rules-pane-title rules-pane-proxy">Proxy</span>
+              <span className="rules-pane-title rules-pane-proxy">{tr("rules.proxy")}</span>
               <textarea
                 className="rules-textarea"
                 value={current.rulesProxy}
@@ -1125,7 +1111,7 @@ export default function ProfileFormModal({
               />
             </label>
             <label className="rules-pane">
-              <span className="rules-pane-title rules-pane-direct">Direct</span>
+              <span className="rules-pane-title rules-pane-direct">{tr("rules.direct")}</span>
               <textarea
                 className="rules-textarea"
                 value={current.rulesDirect}
@@ -1135,7 +1121,7 @@ export default function ProfileFormModal({
               />
             </label>
             <label className="rules-pane">
-              <span className="rules-pane-title rules-pane-block">Block</span>
+              <span className="rules-pane-title rules-pane-block">{tr("rules.block")}</span>
               <textarea
                 className="rules-textarea"
                 value={current.rulesBlock}
@@ -1151,13 +1137,12 @@ export default function ProfileFormModal({
               checked={current.privateLanDirect}
               onChange={(e) => update({ privateLanDirect: e.target.checked })}
             />
-            Direct for private/LAN IPs (after custom rules)
+            {tr("form.privateLanDirect")}
           </label>
           {current.xrayMode === "tun" && (
             <div className="geo-override">
               <span className="profile-routes-hint">
-                Custom geo data (optional) — HTTPS URLs to geoip.dat / geosite.dat
-                replacing the bundled files. Downloaded on connect, cached 24h.
+                {tr("form.geoHint")}
               </span>
               <div className="geo-override-fields">
                 <input

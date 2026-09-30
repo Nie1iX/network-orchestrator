@@ -2,8 +2,10 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { ensureElevation } from "../elevation";
 import { RecoveryReport } from "../types";
+import { useT } from "../i18n";
 
 function RecoveryPrompt() {
+  const t = useT();
   const [report, setReport] = useState<RecoveryReport | null>(null);
   const [dismissed, setDismissed] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -16,13 +18,11 @@ function RecoveryPrompt() {
     try {
       setReport(await invoke<RecoveryReport>("get_recovery_report"));
     } catch (err) {
-      setError(
-        `Could not inspect resources from the previous session: ${String(err)}`
-      );
+      setError(t("recovery.inspectFailed", { err: String(err) }));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -37,12 +37,14 @@ function RecoveryPrompt() {
     return (
       <div className="recovery-overlay">
         <div className="recovery-panel">
-          <h2>Recovery check failed</h2>
+          <h2>{t("recovery.checkFailed")}</h2>
           {error && <p className="error">{error}</p>}
           <div className="recovery-actions">
-            <button onClick={() => setDismissed(true)}>Keep for now</button>
+            <button onClick={() => setDismissed(true)}>
+              {t("recovery.keep")}
+            </button>
             <button className="btn-primary" onClick={loadReport}>
-              Retry
+              {t("common.retry")}
             </button>
           </div>
         </div>
@@ -56,9 +58,7 @@ function RecoveryPrompt() {
     try {
       if (
         report.requiresElevation &&
-        !(await ensureElevation(
-          "Cleaning up resources from the previous session"
-        ))
+        !(await ensureElevation(t("recovery.elevationReason")))
       ) {
         return;
       }
@@ -75,11 +75,8 @@ function RecoveryPrompt() {
   return (
     <div className="recovery-overlay">
       <div className="recovery-panel">
-        <h2>Recovery required</h2>
-        <p>
-          The previous session left behind resources owned by this application.
-          No changes were made automatically.
-        </p>
+        <h2>{t("recovery.required")}</h2>
+        <p>{t("recovery.explanation")}</p>
         <ul className="recovery-issues">
           {report.issues.map((issue, index) => (
             <li key={index}>{issue.message}</li>
@@ -88,14 +85,14 @@ function RecoveryPrompt() {
         {error && <p className="error">{error}</p>}
         <div className="recovery-actions">
           <button onClick={() => setDismissed(true)} disabled={busy}>
-            Keep for now
+            {t("recovery.keep")}
           </button>
           <button
             className="btn-primary"
             onClick={onCleanup}
             disabled={busy}
           >
-            Clean up
+            {t("recovery.cleanUp")}
           </button>
         </div>
       </div>

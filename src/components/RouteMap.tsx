@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PlannedRoute, RouteMap as RouteMapData } from "../types";
 import { ChevronIcon } from "../icons";
+import { useT } from "../i18n";
 
 function parseCidr(cidr: string): { bits: bigint; len: number; family: 4 | 6 } | null {
   const [addr, lenStr] = cidr.split("/");
@@ -98,6 +99,7 @@ function groupKey(route: PlannedRoute): string {
 }
 
 export default function RouteMap() {
+  const t = useT();
   const [map, setMap] = useState<RouteMapData | null>(null);
   const [includeInactive, setIncludeInactive] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -191,7 +193,7 @@ export default function RouteMap() {
             checked={includeInactive}
             onChange={(e) => setIncludeInactive(e.target.checked)}
           />
-          Include stopped profiles
+          {t("routes.includeStopped")}
         </label>
       </div>
 
@@ -200,11 +202,11 @@ export default function RouteMap() {
         type="text"
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
-        placeholder="Filter by destination or owner (e.g. 10.0.0.0/8, work-vpn)"
+        placeholder={t("routes.filterPlaceholder")}
       />
 
-      {loading && <p>Loading route map...</p>}
-      {error && <p className="error">Error loading route map: {error}</p>}
+      {loading && <p>{t("routes.loadingMap")}</p>}
+      {error && <p className="error">{t("routes.mapError", { err: error })}</p>}
 
       {map && (
         <>
@@ -218,9 +220,9 @@ export default function RouteMap() {
             </ul>
           )}
 
-          <h3>Predicted routes</h3>
+          <h3>{t("routes.predicted")}</h3>
           {map.predicted.length === 0 ? (
-            <p>No predicted routes.</p>
+            <p>{t("routes.noPredicted")}</p>
           ) : (
             <div className="route-map-groups">
               {[...predictedGroups.entries()].map(([key, routes]) => {
@@ -244,7 +246,7 @@ export default function RouteMap() {
                         <ChevronIcon size={12} collapsed={collapsed} />
                       </span>
                       <span className="route-map-group-name">
-                        {key === "auto" ? "auto interface" : key}
+                        {key === "auto" ? t("routes.autoInterface") : key}
                       </span>
                       <span className="route-map-group-count">{routes.length}</span>
                     </button>
@@ -252,11 +254,11 @@ export default function RouteMap() {
                       <table className="route-map-table">
                         <thead>
                           <tr>
-                            <th>Destination</th>
-                            <th>Owner</th>
-                            <th>Source</th>
-                            <th className="num">Metric</th>
-                            <th>State</th>
+                            <th>{t("routes.destination")}</th>
+                            <th>{t("routes.owner")}</th>
+                            <th>{t("routes.source")}</th>
+                            <th className="num">{t("routes.metricCol")}</th>
+                            <th>{t("routes.stateCol")}</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -286,7 +288,7 @@ export default function RouteMap() {
                                         type="button"
                                         className="route-map-node-toggle"
                                         onClick={() => toggleNode(key)}
-                                        aria-label={isCollapsed ? "Expand" : "Collapse"}
+                                        aria-label={isCollapsed ? t("common.expand") : t("common.collapse")}
                                       >
                                         <ChevronIcon size={12} collapsed={isCollapsed} />
                                       </button>
@@ -302,8 +304,8 @@ export default function RouteMap() {
                                   <span className="owner-badge">{route.ownerName}</span>
                                 </td>
                                 <td>{route.source}</td>
-                                <td className="num">{route.metric ?? "auto"}</td>
-                                <td>{route.active ? "active" : "stopped"}</td>
+                                <td className="num">{route.metric ?? t("routes.auto")}</td>
+                                <td>{route.active ? t("routes.active") : t("routes.stopped")}</td>
                               </tr>
                             );
                           })}
@@ -311,7 +313,7 @@ export default function RouteMap() {
                       </table>
                     )}
                     {!collapsed && visible.length === 0 && filterText && (
-                      <p className="route-map-empty">No routes match the filter.</p>
+                      <p className="route-map-empty">{t("routes.noFilterMatch")}</p>
                     )}
                   </div>
                 );
@@ -321,13 +323,13 @@ export default function RouteMap() {
 
           {map.pushedRoutes.length > 0 && (
             <>
-              <h3>Server-pushed routes (OpenVPN, runtime)</h3>
+              <h3>{t("routes.pushed")}</h3>
               <table className="route-map-table pushed">
                 <thead>
                   <tr>
-                    <th>Destination</th>
-                    <th>Owner</th>
-                    <th>State</th>
+                    <th>{t("routes.destination")}</th>
+                    <th>{t("routes.owner")}</th>
+                    <th>{t("routes.stateCol")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -344,7 +346,7 @@ export default function RouteMap() {
                         <td>
                           <span className="owner-badge">{route.ownerName}</span>
                         </td>
-                        <td>active</td>
+                        <td>{t("routes.active")}</td>
                       </tr>
                     ))}
                 </tbody>
@@ -352,11 +354,9 @@ export default function RouteMap() {
             </>
           )}
 
-          <h3>Differences</h3>
+          <h3>{t("routes.differences")}</h3>
           {map.diffs.length === 0 ? (
-            <p className="route-map-ok">
-              Predicted active routes match the effective table.
-            </p>
+            <p className="route-map-ok">{t("routes.diffsOk")}</p>
           ) : (
             <ul className="route-map-diffs">
               {map.diffs.map((diff, i) => (
@@ -367,9 +367,9 @@ export default function RouteMap() {
             </ul>
           )}
 
-          <h3>Effective routes</h3>
+          <h3>{t("routes.effective")}</h3>
           {map.effective.length === 0 ? (
-            <p>No effective routes reported.</p>
+            <p>{t("routes.noEffective")}</p>
           ) : (
             <div className="route-map-groups">
               {[...effectiveGroups.entries()].map(([key, routes]) => {
@@ -395,8 +395,8 @@ export default function RouteMap() {
                       <table className="route-map-table effective">
                         <thead>
                           <tr>
-                            <th>Destination</th>
-                            <th className="num">Metric</th>
+                            <th>{t("routes.destination")}</th>
+                            <th className="num">{t("routes.metricCol")}</th>
                           </tr>
                         </thead>
                         <tbody>

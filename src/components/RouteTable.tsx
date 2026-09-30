@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { RouteEntry } from "../types";
+import { useT } from "../i18n";
 
 export default function RouteTable() {
+  const t = useT();
   const [routes, setRoutes] = useState<RouteEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -29,22 +31,22 @@ export default function RouteTable() {
     return () => window.removeEventListener("route-changed", handler);
   }, []);
 
-  if (loading) return <p>Loading routes...</p>;
-  if (error) return <p className="error">Error loading routes: {error}</p>;
+  if (loading) return <p>{t("routes.loading")}</p>;
+  if (error) return <p className="error">{t("routes.loadError", { err: error })}</p>;
 
   return (
     <section>
       {routes.length === 0 ? (
-        <p>No routes found.</p>
+        <p>{t("routes.none")}</p>
       ) : (
         <table className="route-table">
           <thead>
             <tr>
-              <th>Destination</th>
-              <th>Prefix</th>
-              <th>Gateway</th>
-              <th>Interface</th>
-              <th className="num">Metric</th>
+              <th>{t("routes.destination")}</th>
+              <th>{t("routes.prefix")}</th>
+              <th>{t("routes.gateway")}</th>
+              <th>{t("routes.interfaceCol")}</th>
+              <th className="num">{t("routes.metricCol")}</th>
             </tr>
           </thead>
           <tbody>

@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useToast } from "./ui/Toast";
+import { t } from "../i18n";
 import {
   AutoConnectResult,
   Profile,
@@ -25,14 +26,11 @@ export default function AppEvents() {
     const showResult = (result: AutoConnectResult | null) => {
       if (!active || !result) return;
       if (result.startupFailed) {
-        toast(
-          "error",
-          "Auto-connect could not start. Check Network daemon in Settings and profile Diagnostics.",
-        );
+        toast("error", t("events.autoConnectFailed"));
       } else if (result.failedCount > 0) {
         toast(
           "error",
-          `${result.failedCount} profile(s) could not connect automatically. Check Diagnostics and retry Connect manually.`,
+          t("events.autoConnectPartial", { n: result.failedCount }),
         );
       }
     };
@@ -92,12 +90,16 @@ export default function AppEvents() {
       }
       for (const status of newlyFailed) {
         const name =
-          profiles.find((p) => p.id === status.profileId)?.name ?? "Profile";
+          profiles.find((p) => p.id === status.profileId)?.name ??
+          t("events.profileFallback");
         toast(
           "error",
           status.message
-            ? `${name} failed to connect: ${status.message}`
-            : `${name} failed to connect. Run Diagnostics for details.`,
+            ? t("events.connectFailedDetail", {
+                name,
+                message: status.message,
+              })
+            : t("events.connectFailed", { name }),
         );
       }
     };

@@ -1,4 +1,5 @@
 import { CloseIcon, PlusIcon } from "../../icons";
+import { pluralize, useT } from "../../i18n";
 import { ConnectionSnippet } from "./sets";
 
 interface SetsBarProps {
@@ -22,16 +23,15 @@ export default function SetsBar({
   onUpdateActive,
   onSaveNew,
 }: SetsBarProps) {
+  const t = useT();
   const activeSnippet =
     snippets.find((s) => s.id === activeSnippetId) ?? null;
 
   return (
     <div className="snippets-bar">
-      <span className="snippets-label">Sets</span>
+      <span className="snippets-label">{t("sets.label")}</span>
       {snippets.length === 0 && (
-        <span className="snippets-hint">
-          Save the running combination for one-click restore
-        </span>
+        <span className="snippets-hint">{t("sets.hint")}</span>
       )}
       <div className="snippets-chips">
         {snippets.map((snippet) => {
@@ -48,10 +48,15 @@ export default function SetsBar({
                 onClick={() => onApply(snippet)}
                 title={
                   isDirty
-                    ? "Connections have changed since this set was saved"
-                    : `Switch to exactly these ${snippet.profileIds.length} connection${
-                        snippet.profileIds.length === 1 ? "" : "s"
-                      }`
+                    ? t("sets.dirtyTitle")
+                    : t("sets.applyTitle", {
+                        n: snippet.profileIds.length,
+                        unit: pluralize(
+                          snippet.profileIds.length,
+                          ["подключение", "подключения", "подключений"],
+                          ["connection", "connections"],
+                        ),
+                      })
                 }
               >
                 {snippet.name}
@@ -63,7 +68,7 @@ export default function SetsBar({
                 type="button"
                 className="snippet-chip-delete"
                 onClick={() => onDelete(snippet.id)}
-                title="Delete set"
+                title={t("sets.deleteTitle")}
               >
                 <CloseIcon size={12} />
               </button>
@@ -75,9 +80,9 @@ export default function SetsBar({
             type="button"
             className="snippet-chip-add"
             onClick={onUpdateActive}
-            title={`Update "${activeSnippet.name}" to match the currently running connections`}
+            title={t("sets.updateTitle", { name: activeSnippet.name })}
           >
-            Update "{activeSnippet.name}"
+            {t("sets.updateActive", { name: activeSnippet.name })}
           </button>
         )}
         <button
@@ -86,12 +91,10 @@ export default function SetsBar({
           onClick={onSaveNew}
           disabled={runningCount === 0}
           title={
-            runningCount === 0
-              ? "Connect something first"
-              : "Save the currently running connections as a set"
+            runningCount === 0 ? t("sets.connectFirst") : t("sets.saveTitle")
           }
         >
-          <PlusIcon size={12} /> Save current
+          <PlusIcon size={12} /> {t("sets.saveCurrent")}
         </button>
       </div>
     </div>

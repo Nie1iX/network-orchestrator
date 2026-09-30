@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { RouteMap as RouteMapData } from "../types";
 import { OWNER_COLORS, OWNER_FALLBACK, FLOW_NEUTRAL, FLOW_NEUTRAL_FAINT, FLOW_TEXT, FLOW_TEXT_DIM } from "../palette";
+import { useT } from "../i18n";
 
 // Simple Sankey-style flow: Profile → Interface → Destination prefix group.
 // Rendered as horizontal bands with SVG paths, no external library.
@@ -30,6 +31,7 @@ function destGroup(dest: string): string {
 }
 
 export default function RouteFlow() {
+  const t = useT();
   const [map, setMap] = useState<RouteMapData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -146,12 +148,12 @@ export default function RouteFlow() {
     return { nodes: nodeList, links: [...p2iLinks, ...i2dLinks] };
   }, [map]);
 
-  if (loading) return <p>Loading traffic flow...</p>;
-  if (error) return <p className="error">Error: {error}</p>;
+  if (loading) return <p>{t("routes.loadingFlow")}</p>;
+  if (error) return <p className="error">{t("common.error", { err: error })}</p>;
   if (!map) return null;
 
   if (nodes.length === 0) {
-    return <p className="empty-state">No active routes to visualize. Connect a profile first.</p>;
+    return <p className="empty-state">{t("routes.noActiveRoutes")}</p>;
   }
 
   // Layout: 3 columns
@@ -203,8 +205,10 @@ export default function RouteFlow() {
   return (
     <div className="route-flow">
       <p className="flow-hint">
-        Traffic flow: <strong>Profile</strong> → <strong>Interface</strong> →{" "}
-        <strong>Destination</strong>. Only active routes are shown.
+        {t("routes.flowHint")}: <strong>{t("routes.profile")}</strong> →{" "}
+        <strong>{t("routes.interface")}</strong> →{" "}
+        <strong>{t("routes.destinationWord")}</strong>.{" "}
+        {t("routes.onlyActive")}
       </p>
       <div className="flow-container">
         <svg width={totalWidth} height={totalHeight} className="flow-svg">

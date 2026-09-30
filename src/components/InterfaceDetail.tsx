@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { NetworkInterface, RouteEntry, formatKind, CATEGORY_LABELS, ifTypeName } from "../types";
+import { NetworkInterface, RouteEntry, formatKind, ifTypeName } from "../types";
 import { kindIcon, CloseIcon } from "../icons";
 import { ensureElevation } from "../elevation";
 import { formatBytes } from "../format";
+import { useT } from "../i18n";
+import { CATEGORY_LABEL_KEYS } from "../i18n/labels";
 
 interface Props {
   iface: NetworkInterface;
@@ -11,6 +13,7 @@ interface Props {
 }
 
 export default function InterfaceDetail({ iface, onClose }: Props) {
+  const t = useT();
   const [routes, setRoutes] = useState<RouteEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [toggling, setToggling] = useState(false);
@@ -29,7 +32,7 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
     setToggling(true);
     setToggleError(null);
     try {
-      if (!(await ensureElevation("Changing interface state"))) return;
+      if (!(await ensureElevation(t("iface.elevationState")))) return;
       await invoke("set_interface_state", { name: iface.name, up: iface.state !== "Up" });
     } catch (err) {
       setToggleError(String(err));
@@ -60,7 +63,7 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
             {kindIcon(iface.kind, 22)}
             <span>{iface.friendlyName}</span>
           </div>
-          <button className="close-btn" onClick={onClose}>
+          <button className="close-btn" onClick={onClose} title={t("common.close")}>
             <CloseIcon size={20} />
           </button>
         </div>
@@ -68,10 +71,10 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
         <div className="detail-body">
           <div className="detail-badges">
             <span className={`badge cat-badge cat-${iface.category.toLowerCase()}`}>
-              {CATEGORY_LABELS[iface.category]}
+              {t(CATEGORY_LABEL_KEYS[iface.category])}
             </span>
             <span className={`badge ${iface.physical ? "badge-physical" : "badge-virtual"}`}>
-              {iface.physical ? "Physical" : "Virtual"}
+              {iface.physical ? t("iface.physical") : t("iface.virtual")}
             </span>
             <span className={`state-badge state-${iface.state.toLowerCase()}`}>
               {iface.state}
@@ -83,9 +86,9 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
             className="toggle-btn"
             onClick={toggleState}
             disabled={toggling || iface.kind === "loopback"}
-            title={iface.kind === "loopback" ? "Loopback cannot be toggled" : ""}
+            title={iface.kind === "loopback" ? t("iface.loopbackNoToggle") : ""}
           >
-            {toggling ? "..." : iface.state === "Up" ? "Bring Down" : "Bring Up"}
+            {toggling ? "…" : iface.state === "Up" ? t("iface.bringDown") : t("iface.bringUp")}
           </button>
           {toggleError && <p className="error toggle-error">{toggleError}</p>}
 
@@ -93,23 +96,23 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
             <tbody>
               <tr><td>ifIndex</td><td className="mono num">{iface.ifIndex}</td></tr>
               <tr><td>ifType</td><td className="mono">{iface.ifType} ({ifTypeName(iface.ifType)})</td></tr>
-              <tr><td>Name</td><td className="mono">{iface.name}</td></tr>
-              {iface.description && <tr><td>Driver</td><td className="mono">{iface.description}</td></tr>}
-              {iface.tunnelType && <tr><td>Tunnel type</td><td className="mono">{iface.tunnelType}</td></tr>}
+              <tr><td>{t("iface.name")}</td><td className="mono">{iface.name}</td></tr>
+              {iface.description && <tr><td>{t("iface.driver")}</td><td className="mono">{iface.description}</td></tr>}
+              {iface.tunnelType && <tr><td>{t("iface.tunnelType")}</td><td className="mono">{iface.tunnelType}</td></tr>}
               {iface.mac && <tr><td>MAC</td><td className="mono">{iface.mac}</td></tr>}
               {iface.mtu !== null && <tr><td>MTU</td><td className="num">{iface.mtu}</td></tr>}
-              {iface.linkSpeedMbps !== null && <tr><td>Link speed</td><td className="num">{iface.linkSpeedMbps} Mbps</td></tr>}
-              {iface.gateway && <tr><td>Gateway</td><td className="mono">{iface.gateway}</td></tr>}
-              {iface.ipv6Gateway && <tr><td>IPv6 gateway</td><td className="mono">{iface.ipv6Gateway}</td></tr>}
-              {iface.dnsSuffix && <tr><td>DNS suffix</td><td className="mono">{iface.dnsSuffix}</td></tr>}
-              {iface.rxBytes !== null && <tr><td>RX total</td><td className="num">{formatBytes(iface.rxBytes)}</td></tr>}
-              {iface.txBytes !== null && <tr><td>TX total</td><td className="num">{formatBytes(iface.txBytes)}</td></tr>}
+              {iface.linkSpeedMbps !== null && <tr><td>{t("iface.linkSpeed")}</td><td className="num">{iface.linkSpeedMbps} Mbps</td></tr>}
+              {iface.gateway && <tr><td>{t("iface.gateway")}</td><td className="mono">{iface.gateway}</td></tr>}
+              {iface.ipv6Gateway && <tr><td>{t("iface.gatewayV6")}</td><td className="mono">{iface.ipv6Gateway}</td></tr>}
+              {iface.dnsSuffix && <tr><td>{t("iface.dnsSuffix")}</td><td className="mono">{iface.dnsSuffix}</td></tr>}
+              {iface.rxBytes !== null && <tr><td>{t("iface.rxTotal")}</td><td className="num">{formatBytes(iface.rxBytes)}</td></tr>}
+              {iface.txBytes !== null && <tr><td>{t("iface.txTotal")}</td><td className="num">{formatBytes(iface.txBytes)}</td></tr>}
             </tbody>
           </table>
 
           {iface.addresses.length > 0 && (
             <div className="detail-section">
-              <span className="section-label">Addresses</span>
+              <span className="section-label">{t("iface.addresses")}</span>
               <ul className="address-list">
                 {iface.addresses.map((addr, i) => (
                   <li key={i}>
@@ -123,7 +126,7 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
 
           {iface.dnsServers.length > 0 && (
             <div className="detail-section">
-              <span className="section-label">DNS servers</span>
+              <span className="section-label">{t("iface.dnsServers")}</span>
               <ul className="dns-list">
                 {iface.dnsServers.map((dns, i) => (
                   <li key={i} className="mono">{dns}</li>
@@ -134,20 +137,20 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
 
           <div className="detail-section">
             <span className="section-label">
-              Routes ({loading ? "..." : routes.length})
+              {t("iface.routesCount", { n: loading ? "…" : routes.length })}
             </span>
             {loading ? (
-              <p>Loading routes...</p>
+              <p>{t("iface.loadingRoutes")}</p>
             ) : routes.length === 0 ? (
-              <p>No routes on this interface.</p>
+              <p>{t("iface.noRoutes")}</p>
             ) : (
               <table className="route-table compact">
                 <thead>
                   <tr>
-                    <th>Destination</th>
-                    <th>Prefix</th>
-                    <th>Gateway</th>
-                    <th className="num">Metric</th>
+                    <th>{t("routes.destination")}</th>
+                    <th>{t("routes.prefix")}</th>
+                    <th>{t("routes.gateway")}</th>
+                    <th className="num">{t("routes.metricCol")}</th>
                   </tr>
                 </thead>
                 <tbody>

@@ -1,5 +1,6 @@
 import { backendIcon, GripVerticalIcon } from "../../icons";
 import { Profile, TunnelStatus } from "../../types";
+import { useT } from "../../i18n";
 import RateText from "../ui/RateText";
 import ToggleSwitch from "../ui/ToggleSwitch";
 
@@ -41,6 +42,7 @@ export default function ProfileRow({
   onDragOver,
   onDrop,
 }: ProfileRowProps) {
+  const t = useT();
   return (
     <div
       role="button"
@@ -65,7 +67,7 @@ export default function ProfileRow({
         draggable={canReorder}
         onDragStart={onDragStart}
         onDragEnd={onDragEnd}
-        title={canReorder ? "Drag to reorder" : undefined}
+        title={canReorder ? t("profiles.dragTitle") : undefined}
       >
         <GripVerticalIcon size={15} />
       </span>
@@ -88,12 +90,12 @@ export default function ProfileRow({
           ) : rate ? (
             <RateText rx={rate.rxRate} tx={rate.txRate} live />
           ) : (
-            profile.interfaceName || "No target interface"
+            profile.interfaceName || t("profiles.noIface")
           )}
         </span>
       </div>
       {delayText !== null && (
-        <span className="profile-row-delay" title="Delay to the active endpoint">
+        <span className="profile-row-delay" title={t("profiles.delayTitle")}>
           {delayText}
         </span>
       )}
@@ -102,7 +104,7 @@ export default function ProfileRow({
         onChange={onToggle}
         disabled={isBusy}
         busy={isBusy}
-        title={status.state === "running" ? "Disconnect" : "Connect"}
+        title={status.state === "running" ? t("common.disconnect") : t("common.connect")}
       />
     </div>
   );

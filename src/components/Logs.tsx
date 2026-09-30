@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Page from "./Page";
 import { LogEvent, LogLevel } from "../types";
+import { useT } from "../i18n";
 
 const POLL_MS = 2000;
 const MAX_RENDERED = 1000;
@@ -13,6 +14,7 @@ function formatTime(tsUnix: number): string {
 }
 
 export default function Logs() {
+  const t = useT();
   const [events, setEvents] = useState<LogEvent[]>([]);
   const [daemonLines, setDaemonLines] = useState<LogEvent[]>([]);
   const [search, setSearch] = useState("");
@@ -40,11 +42,11 @@ export default function Logs() {
           tsUnix: Math.floor(Date.now() / 1000),
           level: "warn",
           source: "app",
-          message: `daemon log unavailable: ${e}`,
+          message: t("logs.daemonUnavailable", { err: String(e) }),
         },
       ]);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     void refresh();
@@ -85,7 +87,7 @@ export default function Logs() {
         <input
           className="filter-search"
           type="text"
-          placeholder="Filter log messages..."
+          placeholder={t("logs.filterPlaceholder")}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
@@ -94,16 +96,16 @@ export default function Logs() {
           value={levelFilter}
           onChange={(e) => setLevelFilter(e.target.value as "all" | LogLevel)}
         >
-          <option value="all">All levels</option>
-          <option value="info">Info</option>
-          <option value="warn">Warnings</option>
-          <option value="error">Errors</option>
+          <option value="all">{t("logs.allLevels")}</option>
+          <option value="info">{t("logs.levelInfo")}</option>
+          <option value="warn">{t("logs.levelWarn")}</option>
+          <option value="error">{t("logs.levelError")}</option>
         </select>
         <button className="btn-sm" onClick={() => void refresh()}>
-          Refresh
+          {t("common.refresh")}
         </button>
         <button className="btn-sm" onClick={() => void clear()}>
-          Clear
+          {t("common.clear")}
         </button>
       </div>
 
@@ -118,8 +120,8 @@ export default function Logs() {
         {shown.length === 0 ? (
           <div className="log-empty">
             {events.length === 0
-              ? "No log entries yet. Connect or disconnect a profile to see activity."
-              : "No entries match the current filters."}
+              ? t("logs.empty")
+              : t("logs.noMatch")}
           </div>
         ) : (
           shown.map((e, i) => (
@@ -132,7 +134,10 @@ export default function Logs() {
         )}
         {filtered.length > MAX_RENDERED && (
           <div className="log-empty">
-            Showing last {MAX_RENDERED} of {filtered.length} matching entries.
+            {t("logs.showingLast", {
+              shown: MAX_RENDERED,
+              total: filtered.length,
+            })}
           </div>
         )}
         <div ref={bottomRef} />
@@ -143,7 +148,7 @@ export default function Logs() {
           className="filter-btn daemon-log-toggle"
           onClick={() => setDaemonOpen((v) => !v)}
         >
-          {daemonOpen ? "Hide daemon log" : "Show daemon log (journald tail)"}
+          {daemonOpen ? t("logs.hideDaemon") : t("logs.showDaemon")}
         </button>
         {daemonOpen && (
           <div className="log-view log-view-daemon">

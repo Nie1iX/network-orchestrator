@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { ExitIpEntry } from "../types";
+import { pluralize, useT } from "../i18n";
 
 type ExitIpEvent =
   | { kind: "pending"; names: string[] }
@@ -15,6 +16,7 @@ export default function ExitIpPanel() {
   const [started, setStarted] = useState(false);
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const t = useT();
 
   const check = async () => {
     setChecking(true);
@@ -47,15 +49,22 @@ export default function ExitIpPanel() {
   return (
     <div className="exit-ip-panel">
       <div className="interface-row">
-        <span className="row-label">Exit IPs</span>
+        <span className="row-label">{t("exitIp.label")}</span>
         <span className="row-value">
           {done && (
             <span className="exit-ip-summary">
               {distinct.size === 0
-                ? "no response"
+                ? t("exitIp.noResponse")
                 : distinct.size === 1
-                  ? `${[...distinct][0]} — one exit`
-                  : `${distinct.size} distinct exits — split routing active`}
+                  ? t("exitIp.oneExit", { ip: [...distinct][0] })
+                  : t("exitIp.multiExit", {
+                      n: distinct.size,
+                      word: pluralize(
+                        distinct.size,
+                        ["выход", "выхода", "выходов"],
+                        ["exit", "exits"],
+                      ),
+                    })}
             </span>
           )}
           <button
@@ -64,7 +73,11 @@ export default function ExitIpPanel() {
             onClick={check}
             disabled={checking}
           >
-            {checking ? "Checking…" : started ? "Re-check" : "Check"}
+            {checking
+              ? t("exitIp.checking")
+              : started
+                ? t("exitIp.recheck")
+                : t("exitIp.check")}
           </button>
         </span>
       </div>

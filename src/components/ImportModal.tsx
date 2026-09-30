@@ -5,6 +5,7 @@ import Modal from "./Modal";
 import { ensureElevation } from "../elevation";
 import { BatchImportResult } from "../types";
 import { usePlatformCapabilities } from "../platform";
+import { useT } from "../i18n";
 
 type ImportTab = "files" | "subscription" | "wireguard";
 
@@ -27,6 +28,7 @@ export default function ImportModal({
   const [subUrl, setSubUrl] = useState("");
   const [subHwid, setSubHwid] = useState("");
   const [subRefreshMinutes, setSubRefreshMinutes] = useState<number | null>(null);
+  const t = useT();
 
   const onImportFiles = async () => {
     setBusy(true);
@@ -36,7 +38,7 @@ export default function ImportModal({
         directory: false,
         filters: [
           {
-            name: "Tunnel configs",
+            name: t("import.filesFilter"),
             extensions: ["conf", "dpapi", "ovpn", "json"],
           },
         ],
@@ -84,12 +86,12 @@ export default function ImportModal({
   const onImportWireGuardStandard = async () => {
     setBusy(true);
     try {
-      if (!(await ensureElevation("Importing WireGuard configs"))) {
+      if (!(await ensureElevation(t("elev.actImportWg")))) {
         return;
       }
       const paths = await invoke<string[]>("discover_wireguard_configs");
       if (paths.length === 0) {
-        onError("No WireGuard configs found in the standard location");
+        onError(t("import.noWgConfigs"));
         return;
       }
       const result = await invoke<BatchImportResult>("import_configs_batch", {
@@ -108,7 +110,7 @@ export default function ImportModal({
   return (
     <Modal
       open={open}
-      title="Import configurations"
+      title={t("import.title")}
       onClose={onClose}
       maxWidth="520px"
     >
@@ -118,14 +120,14 @@ export default function ImportModal({
           className={`modal-tab ${tab === "files" ? "active" : ""}`}
           onClick={() => setTab("files")}
         >
-          Files
+          {t("import.tabFiles")}
         </button>
         <button
           type="button"
           className={`modal-tab ${tab === "subscription" ? "active" : ""}`}
           onClick={() => setTab("subscription")}
         >
-          Subscription
+          {t("import.tabSub")}
         </button>
         {caps?.wireguardStandardImport && (
           <button
@@ -141,8 +143,7 @@ export default function ImportModal({
       {tab === "files" && (
         <div className="modal-tab-body">
           <p className="profile-help">
-            Select one or more WireGuard (.conf/.conf.dpapi), OpenVPN (.ovpn),
-            or Xray (.json) config files. Backend is detected from extension.
+            {t("import.filesHelp")}
           </p>
           <button
             type="button"
@@ -150,7 +151,7 @@ export default function ImportModal({
             onClick={onImportFiles}
             disabled={busy}
           >
-            {busy ? "Importing…" : "Browse files…"}
+            {busy ? t("import.importing") : t("import.browse")}
           </button>
         </div>
       )}
@@ -158,11 +159,10 @@ export default function ImportModal({
       {tab === "subscription" && (
         <div className="modal-tab-body">
           <p className="profile-help">
-            Import a subscription URL. Supported vless:// and hysteria2://
-            endpoints are grouped into a profile with an endpoint selector.
+            {t("import.subHelp")}
           </p>
           <label>
-            Subscription URL
+            {t("import.subUrl")}
             <input
               type="text"
               value={subUrl}
@@ -171,7 +171,7 @@ export default function ImportModal({
             />
           </label>
           <label>
-            HWID (X-HWID header, optional)
+            {t("import.hwid")}
             <input
               type="password"
               value={subHwid}
@@ -180,15 +180,15 @@ export default function ImportModal({
             />
           </label>
           <label>
-            Automatic refresh
+            {t("import.autoRefresh")}
             <select
               value={subRefreshMinutes ?? ""}
               onChange={(event) => setSubRefreshMinutes(event.target.value ? Number(event.target.value) : null)}
             >
-              <option value="">Off</option>
-              <option value="15">Every 15 minutes</option>
-              <option value="60">Every hour</option>
-              <option value="360">Every 6 hours</option>
+              <option value="">{t("common.off")}</option>
+              <option value="15">{t("detail.every15")}</option>
+              <option value="60">{t("detail.everyHour")}</option>
+              <option value="360">{t("detail.every6h")}</option>
             </select>
           </label>
           <button
@@ -197,7 +197,7 @@ export default function ImportModal({
             onClick={onImportSubscription}
             disabled={busy || !subUrl.trim()}
           >
-            {busy ? "Fetching…" : "Fetch subscription"}
+            {busy ? t("import.fetching") : t("import.fetch")}
           </button>
         </div>
       )}
@@ -205,9 +205,7 @@ export default function ImportModal({
       {tab === "wireguard" && caps?.wireguardStandardImport && (
         <div className="modal-tab-body">
           <p className="profile-help">
-            Import all WireGuard configs from the standard Windows location
-            (C:\Program Files\WireGuard\Data\Configurations). Requires
-            administrator privileges to read encrypted .conf.dpapi files.
+            {t("import.wgHelp")}
           </p>
           <button
             type="button"
@@ -215,7 +213,7 @@ export default function ImportModal({
             onClick={onImportWireGuardStandard}
             disabled={busy}
           >
-            {busy ? "Importing…" : "Import WireGuard (standard)"}
+            {busy ? t("import.importing") : t("import.wgImport")}
           </button>
         </div>
       )}

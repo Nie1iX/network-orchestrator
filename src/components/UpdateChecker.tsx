@@ -1,8 +1,10 @@
 import { useState } from "react";
 import { check, Update } from "@tauri-apps/plugin-updater";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
+import { useT } from "../i18n";
 
 export default function UpdateChecker() {
+  const t = useT();
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [progress, setProgress] = useState<string | null>(null);
@@ -13,20 +15,20 @@ export default function UpdateChecker() {
       const update = await check();
       if (update?.available) {
         const ok = await confirm(
-          `New version ${update.version} is available. Install now?`,
-          { title: "Update available", kind: "info" },
+          t("update.available", { version: update.version }),
+          { title: t("update.availableTitle"), kind: "info" },
         );
         if (!ok) return;
         await installUpdate(update);
       } else {
-        await message("You are running the latest version.", {
-          title: "No updates",
+        await message(t("update.latest"), {
+          title: t("update.noUpdates"),
           kind: "info",
         });
       }
     } catch (err) {
-      await message(`Update check failed: ${err}`, {
-        title: "Update error",
+      await message(t("update.checkFailed", { err: String(err) }), {
+        title: t("update.errorTitle"),
         kind: "error",
       });
     } finally {
@@ -36,7 +38,7 @@ export default function UpdateChecker() {
 
   const installUpdate = async (update: Update) => {
     setInstalling(true);
-    setProgress("Downloading…");
+    setProgress(t("update.downloading"));
     try {
       let downloaded = 0;
       let total = 0;
@@ -44,22 +46,26 @@ export default function UpdateChecker() {
         switch (event.event) {
           case "Started":
             total = event.data.contentLength ?? 0;
-            setProgress(`Downloading 0 / ${total} bytes`);
+            setProgress(
+              t("update.downloadProgress", { done: 0, total }),
+            );
             break;
           case "Progress":
             downloaded += event.data.chunkLength;
-            setProgress(`Downloading ${downloaded} / ${total} bytes`);
+            setProgress(
+              t("update.downloadProgress", { done: downloaded, total }),
+            );
             break;
           case "Finished":
-            setProgress("Installing…");
+            setProgress(t("update.installing"));
             break;
         }
       });
-      setProgress("Installed. Restarting…");
+      setProgress(t("update.restarting"));
       await relaunch();
     } catch (err) {
-      await message(`Update install failed: ${err}`, {
-        title: "Update error",
+      await message(t("update.installFailed", { err: String(err) }), {
+        title: t("update.errorTitle"),
         kind: "error",
       });
     } finally {
@@ -74,9 +80,13 @@ export default function UpdateChecker() {
         className="btn-sm"
         onClick={checkForUpdates}
         disabled={checking || installing}
-        title="Check for updates"
+        title={t("update.checkTitle")}
       >
-        {checking ? "Checking…" : installing ? "Updating…" : "Check updates"}
+        {checking
+          ? t("common.checking")
+          : installing
+            ? t("update.updating")
+            : t("update.check")}
       </button>
       {progress && <span className="update-progress">{progress}</span>}
     </div>

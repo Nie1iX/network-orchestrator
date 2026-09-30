@@ -1,27 +1,28 @@
 import Modal from "./Modal";
 import { backendIcon, ImportIcon } from "../icons";
 import { TunnelBackend } from "../types";
+import { TranslationKey, useT } from "../i18n";
 
-const BACKEND_OPTIONS: { backend: TunnelBackend; title: string; desc: string }[] = [
+const BACKEND_OPTIONS: { backend: TunnelBackend; titleKey: TranslationKey; descKey: TranslationKey }[] = [
   {
     backend: "wireGuard",
-    title: "WireGuard",
-    desc: "Enter tunnel keys, or open an existing .conf file.",
+    titleKey: "backend.wireGuard",
+    descKey: "add.wireguardDesc",
   },
   {
     backend: "openVpn",
-    title: "OpenVPN",
-    desc: "Use an existing .ovpn client config.",
+    titleKey: "backend.openVpn",
+    descKey: "add.openvpnDesc",
   },
   {
     backend: "xray",
-    title: "Xray",
-    desc: "Import a vless:// or hysteria2:// link, or an Xray JSON config.",
+    titleKey: "backend.xray",
+    descKey: "add.xrayDesc",
   },
   {
     backend: "none",
-    title: "Static routes",
-    desc: "Route traffic through an existing interface, no tunnel.",
+    titleKey: "backend.none",
+    descKey: "add.staticDesc",
   },
 ];
 
@@ -38,8 +39,9 @@ export default function AddConnectionMenu({
   onChooseImport,
   onChooseBackend,
 }: AddConnectionMenuProps) {
+  const t = useT();
   return (
-    <Modal open={open} title="Add a connection" onClose={onClose} maxWidth="480px">
+    <Modal open={open} title={t("add.title")} onClose={onClose} maxWidth="480px">
       <div className="add-connection-list">
         <button
           type="button"
@@ -51,10 +53,10 @@ export default function AddConnectionMenu({
           </span>
           <span className="add-connection-text">
             <span className="add-connection-title">
-              Paste a link or import a file
+              {t("add.importTitle")}
             </span>
             <span className="add-connection-desc">
-              Subscription URL, share link, or a config file
+              {t("add.importDesc")}
             </span>
           </span>
         </button>
@@ -69,8 +71,8 @@ export default function AddConnectionMenu({
               {backendIcon(opt.backend, 18)}
             </span>
             <span className="add-connection-text">
-              <span className="add-connection-title">{opt.title}</span>
-              <span className="add-connection-desc">{opt.desc}</span>
+              <span className="add-connection-title">{t(opt.titleKey)}</span>
+              <span className="add-connection-desc">{t(opt.descKey)}</span>
             </span>
           </button>
         ))}

@@ -4,25 +4,12 @@ import { listen } from "@tauri-apps/api/event";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import {
   BackendAvailability,
-  BackendExecutableSource,
   BackendInstallProgress,
   ManagedXrayOffer,
-  TunnelBackend,
 } from "../types";
 import { usePlatformCapabilities } from "../platform";
-
-const BACKEND_LABELS: Record<TunnelBackend, string> = {
-  none: "Static routes",
-  wireGuard: "WireGuard",
-  openVpn: "OpenVPN",
-  xray: "Xray",
-};
-
-const SOURCE_LABELS: Record<BackendExecutableSource, string> = {
-  autoDetected: "Auto-detected",
-  configured: "Configured",
-  managed: "Managed",
-};
+import { useT } from "../i18n";
+import { BACKEND_LABEL_KEYS, SOURCE_LABEL_KEYS } from "../i18n/labels";
 
 const MIB = 1024 * 1024;
 
@@ -41,6 +28,7 @@ function installProgressPercent(progress: BackendInstallProgress): number {
 }
 
 export default function BackendStatus() {
+  const t = useT();
   const [items, setItems] = useState<BackendAvailability[]>([]);
   const caps = usePlatformCapabilities();
   const [offer, setOffer] = useState<ManagedXrayOffer | null>(null);
@@ -108,7 +96,7 @@ export default function BackendStatus() {
         directory: false,
         filters: [
           {
-            name: `${BACKEND_LABELS[item.backend]} executable`,
+            name: `${t(BACKEND_LABEL_KEYS[item.backend])} executable`,
             extensions: caps?.executableExtensions ?? [],
           },
         ].filter((filter) => filter.extensions.length > 0),
@@ -130,12 +118,12 @@ export default function BackendStatus() {
     run("install-xray", async () => {
       if (!offer) return;
       const approved = await confirm(
-        `Install managed Xray ${offer.version}?\n\n` +
-          `The archive will be downloaded from:\n${offer.sourceUrl}\n\n` +
-          `SHA-256: ${offer.sha256}\n\n` +
-          `Files are verified and stored under the application data directory. ` +
-          `Managed installations are never updated automatically.`,
-        { title: "Install managed Xray", kind: "info" }
+        t("backend.installConfirm", {
+          version: offer.version,
+          url: offer.sourceUrl,
+          sha256: offer.sha256,
+        }),
+        { title: t("backend.installTitle"), kind: "info" }
       );
       if (!approved) return;
       setProgress(null);
@@ -146,9 +134,8 @@ export default function BackendStatus() {
   const removeManaged = () =>
     run("remove-xray", async () => {
       const approved = await confirm(
-        "Remove the managed Xray installation? Managed files will be deleted. " +
-          "Your profiles and configs are not affected.",
-        { title: "Remove managed Xray", kind: "warning" }
+        t("backend.removeConfirm"),
+        { title: t("backend.removeTitle"), kind: "warning" }
       );
       if (!approved) return;
       await invoke("remove_managed_xray");
@@ -167,23 +154,23 @@ export default function BackendStatus() {
   return (
     <div className="backend-status">
       <div className="backend-status-head">
-        <span className="section-label">Backend prerequisites</span>
+        <span className="section-label">{t("backend.prerequisites")}</span>
         <button type="button" className="btn-sm" onClick={load} disabled={loading || busy !== null}>
-          {loading ? "Checking…" : "Refresh"}
+          {loading ? t("backend.checking") : t("common.refresh")}
         </button>
       </div>
       {error && <p className="error">{error}</p>}
       {items.map((item) => (
         <div key={item.backend} className="backend-status-row">
-          <span className="backend-name">{BACKEND_LABELS[item.backend]}</span>
+          <span className="backend-name">{t(BACKEND_LABEL_KEYS[item.backend])}</span>
           <span
             className={`badge ${item.available ? "badge-managed" : "badge-external"}`}
           >
-            {item.available ? "Available" : "Missing"}
+            {item.available ? t("backend.available") : t("backend.missing")}
           </span>
           {item.source && (
             <span className={`badge badge-source-${item.source.toLowerCase()}`}>
-              {SOURCE_LABELS[item.source]}
+              {t(SOURCE_LABEL_KEYS[item.source])}
             </span>
           )}
           {item.version && (
@@ -201,7 +188,7 @@ export default function BackendStatus() {
                 disabled={busy !== null || item.source === "managed"}
                 onClick={() => chooseExecutable(item)}
               >
-                Choose existing…
+                {t("backend.chooseExisting")}
               </button>
             )}
             {item.source === "configured" && (
@@ -211,7 +198,7 @@ export default function BackendStatus() {
                 disabled={busy !== null}
                 onClick={() => resetExecutable(item)}
               >
-                Reset to auto-detect
+                {t("backend.resetAuto")}
               </button>
             )}
             {item.backend === "xray" &&
@@ -224,7 +211,7 @@ export default function BackendStatus() {
                 disabled={busy !== null}
                 onClick={installManaged}
               >
-                Install managed {offer.version}
+                {t("backend.installManaged", { version: offer.version })}
               </button>
             )}
             {item.backend === "xray" && item.source === "managed" && (
@@ -234,7 +221,7 @@ export default function BackendStatus() {
                 disabled={busy !== null}
                 onClick={removeManaged}
               >
-                Remove managed
+                {t("backend.removeManaged")}
               </button>
             )}
           </span>
@@ -251,7 +238,7 @@ export default function BackendStatus() {
           <div className="backend-install-row">
             <span className="row-value">{progressText(progress)}</span>
             <button type="button" className="btn-sm" onClick={cancelInstall} disabled={cancelling}>
-              {cancelling ? "Cancelling…" : "Cancel"}
+              {cancelling ? t("common.cancelling") : t("common.cancel")}
             </button>
           </div>
         </div>

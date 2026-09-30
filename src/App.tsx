@@ -13,7 +13,8 @@ import RecoveryPrompt from "./components/RecoveryPrompt";
 import RouteView from "./components/RouteView";
 import Settings from "./components/Settings";
 import { ToastProvider } from "./components/ui/Toast";
-import { TunnelStatus } from "./types";
+import { TailscaleStatusResult, TunnelStatus } from "./types";
+import { t } from "./i18n";
 import "./App.css";
 
 function App() {
@@ -27,7 +28,7 @@ function App() {
     });
     const unlistenShutdown = listen<string>("shutdown-failed", (event) => {
       void message(event.payload, {
-        title: "Could not shut down safely",
+        title: t("app.shutdownFailed"),
         kind: "error",
       });
     });
@@ -41,7 +42,17 @@ function App() {
     if (!isTauri()) return;
     try {
       const statuses = await invoke<TunnelStatus[]>("get_tunnel_statuses");
-      setActiveCount(statuses.filter((s) => s.state === "running").length);
+      let count = statuses.filter((s) => s.state === "running").length;
+      try {
+        const tailscale =
+          await invoke<TailscaleStatusResult>("tailscale_status");
+        if (tailscale.available && tailscale.backendState === "Running") {
+          count += 1;
+        }
+      } catch {
+        // Tailscale is absent on non-Linux builds or without a daemon.
+      }
+      setActiveCount(count);
     } catch {
       // keep last known count on poll failure
     }

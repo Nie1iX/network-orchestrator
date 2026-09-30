@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { CloseIcon } from "../icons";
+import { useT } from "../i18n";
 
 interface ModalProps {
   open: boolean;
@@ -19,6 +20,7 @@ export default function Modal({
   maxWidth = "560px",
 }: ModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  const t = useT();
 
   useEffect(() => {
     if (!open) return;
@@ -50,7 +52,7 @@ export default function Modal({
             type="button"
             className="modal-close"
             onClick={onClose}
-            title="Close"
+            title={t("common.close")}
           >
             <CloseIcon size={18} />
           </button>

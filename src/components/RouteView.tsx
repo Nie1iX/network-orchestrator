@@ -5,16 +5,18 @@ import RouteFlow from "./RouteFlow";
 import RouteMap from "./RouteMap";
 import RouteTable from "./RouteTable";
 import { RouteLookupResult, RouteMap as RouteMapData } from "../types";
+import { pluralize, TranslationKey, useT } from "../i18n";
 
 type RouteTab = "flow" | "tree" | "table";
 
-const TABS: { id: RouteTab; label: string }[] = [
-  { id: "flow", label: "Traffic flow" },
-  { id: "tree", label: "Tree" },
-  { id: "table", label: "Table" },
+const TABS: { id: RouteTab; labelKey: TranslationKey }[] = [
+  { id: "flow", labelKey: "routes.flow" },
+  { id: "tree", labelKey: "routes.tree" },
+  { id: "table", labelKey: "routes.table" },
 ];
 
 export default function RouteView() {
+  const t = useT();
   const [tab, setTab] = useState<RouteTab>("flow");
   const [map, setMap] = useState<RouteMapData | null>(null);
   const [lookupDest, setLookupDest] = useState("");
@@ -67,37 +69,47 @@ export default function RouteView() {
   return (
     <Page width="full">
       <div className="routes-toolbar">
-        <h2>Routes</h2>
-        <nav className="route-tabs" aria-label="Route views">
-          {TABS.map((t) => (
+        <h2>{t("routes.title")}</h2>
+        <nav className="route-tabs" aria-label={t("routes.viewsAria")}>
+          {TABS.map((item) => (
             <button
-              key={t.id}
+              key={item.id}
               type="button"
-              className={`route-tab ${tab === t.id ? "active" : ""}`}
-              onClick={() => setTab(t.id)}
+              className={`route-tab ${tab === item.id ? "active" : ""}`}
+              onClick={() => setTab(item.id)}
             >
-              {t.label}
+              {t(item.labelKey)}
             </button>
           ))}
         </nav>
         {map && (
           <div className="routes-summary">
-            <span className="route-stat">{activeCount} active</span>
+            <span className="route-stat">{t("routes.activeCount", { n: activeCount ?? 0 })}</span>
             <button
               type="button"
               className={`route-stat route-stat-btn ${conflicts ? "bad" : ""}`}
               onClick={() => setTab("tree")}
-              title="Show conflicts in Tree"
+              title={t("routes.conflictsTitle")}
             >
-              {conflicts} {conflicts === 1 ? "conflict" : "conflicts"}
+              {conflicts}{" "}
+              {pluralize(
+                conflicts ?? 0,
+                ["конфликт", "конфликта", "конфликтов"],
+                ["conflict", "conflicts"],
+              )}
             </button>
             <button
               type="button"
               className={`route-stat route-stat-btn ${warnings ? "warn" : ""}`}
               onClick={() => setTab("tree")}
-              title="Show warnings in Tree"
+              title={t("routes.warningsTitle")}
             >
-              {warnings} {warnings === 1 ? "warning" : "warnings"}
+              {warnings}{" "}
+              {pluralize(
+                warnings ?? 0,
+                ["предупреждение", "предупреждения", "предупреждений"],
+                ["warning", "warnings"],
+              )}
             </button>
           </div>
         )}
@@ -112,14 +124,14 @@ export default function RouteView() {
             type="text"
             value={lookupDest}
             onChange={(e) => setLookupDest(e.currentTarget.value)}
-            placeholder="Lookup destination…"
+            placeholder={t("routes.lookupPlaceholder")}
           />
           <button
             type="submit"
             className="btn-sm"
             disabled={lookupLoading || !lookupDest.trim()}
           >
-            {lookupLoading ? "…" : "Lookup"}
+            {lookupLoading ? "…" : t("routes.lookup")}
           </button>
         </form>
       </div>
@@ -134,8 +146,10 @@ export default function RouteView() {
                 {lookupResult.matchedRoute.destination}/
                 {lookupResult.matchedRoute.prefixLen}
               </span>{" "}
-              via {lookupResult.interfaceName}
-              {lookupResult.table ? ` · table ${lookupResult.table}` : ""}
+              {t("routes.via")} {lookupResult.interfaceName}
+              {lookupResult.table
+                ? ` · ${t("routes.tableN", { n: lookupResult.table })}`
+                : ""}
             </span>
             <button
               type="button"
@@ -145,7 +159,7 @@ export default function RouteView() {
                 setLookupError(null);
               }}
             >
-              Clear
+              {t("common.clear")}
             </button>
           </div>
           <div className="lookup-result-meta">
@@ -154,7 +168,9 @@ export default function RouteView() {
                 gw {lookupResult.matchedRoute.gateway}
               </span>
             )}
-            <span>metric {lookupResult.matchedRoute.metric}</span>
+            <span>
+              {t("routes.metric", { n: lookupResult.matchedRoute.metric })}
+            </span>
           </div>
         </div>
       )}

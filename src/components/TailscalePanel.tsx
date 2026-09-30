@@ -1,6 +1,7 @@
 import { TailscaleStatusResult } from "../types";
 import { TailscaleIcon } from "../icons";
 import ToggleSwitch from "./ui/ToggleSwitch";
+import { useT } from "../i18n";
 
 interface TailscalePanelProps {
   status: TailscaleStatusResult;
@@ -18,6 +19,7 @@ export default function TailscalePanel({
   busy,
   onToggle,
 }: TailscalePanelProps) {
+  const t = useT();
   const running = status.available && status.backendState === "Running";
   const needsLogin = status.backendState === "NeedsLogin";
 
@@ -31,13 +33,13 @@ export default function TailscalePanel({
           <div className="connection-card-name-row">
             <span className="profile-detail-name">Tailscale</span>
             {status.exitNodeActive && (
-              <span className="badge badge-managed">exit node</span>
+              <span className="badge badge-managed">{t("ts.exitNode")}</span>
             )}
           </div>
           <span className="profile-detail-meta">
             {status.available
               ? status.backendState
-              : "tailscaled unavailable"}
+              : t("ts.unavailable")}
           </span>
         </div>
         <ToggleSwitch
@@ -47,12 +49,12 @@ export default function TailscalePanel({
           busy={busy}
           title={
             !status.available
-              ? "tailscaled is not installed or not running"
+              ? t("ts.notInstalled")
               : needsLogin
-                ? "Log in first: tailscale login"
+                ? t("ts.loginFirst")
                 : running
-                  ? "tailscale down"
-                  : "tailscale up"
+                  ? t("ts.down")
+                  : t("ts.up")
           }
         />
       </div>
@@ -60,12 +62,12 @@ export default function TailscalePanel({
       <div className="profile-detail-body">
         {!status.available ? (
           <p className="empty-state">
-            tailscaled is not installed or not running.
+            {t("ts.notInstalled")}
           </p>
         ) : (
           <>
             <div className="interface-row">
-              <span className="row-label">State</span>
+              <span className="row-label">{t("ts.state")}</span>
               <span className="row-value">
                 {status.backendState}
                 {status.tailnet ? ` · ${status.tailnet}` : ""}
@@ -73,7 +75,7 @@ export default function TailscalePanel({
             </div>
             {status.selfIps.length > 0 && (
               <div className="interface-row">
-                <span className="row-label">This node</span>
+                <span className="row-label">{t("ts.thisNode")}</span>
                 <span className="row-value mono">
                   {status.selfHostName} · {status.selfIps.join(", ")}
                 </span>
@@ -81,13 +83,14 @@ export default function TailscalePanel({
             )}
             {needsLogin && (
               <p className="empty-state">
-                Not logged in — run <code>tailscale login</code> in a terminal.
+                {t("ts.notLoggedInPre")} <code>tailscale login</code>{" "}
+                {t("ts.notLoggedInPost")}
               </p>
             )}
             {status.peers.length > 0 && (
               <div className="interface-section">
                 <span className="section-label">
-                  Peers · {status.peers.length}
+                  {t("ts.peers")} · {status.peers.length}
                 </span>
                 <div className="active-now-list">
                   {status.peers.map((peer) => (
@@ -95,7 +98,7 @@ export default function TailscalePanel({
                       <div className="active-now-info">
                         <span className="active-now-name">
                           {peer.hostName}
-                          {peer.exitNode && " · exit node"}
+                          {peer.exitNode && ` · ${t("ts.exitNode")}`}
                         </span>
                         <span className="active-now-meta">
                           {peer.tailscaleIps.join(", ")}
@@ -103,7 +106,9 @@ export default function TailscalePanel({
                             ` → ${peer.routes.join(", ")}`}
                         </span>
                       </div>
-                      {!peer.online && <span className="badge">offline</span>}
+                      {!peer.online && (
+                        <span className="badge">{t("ts.offline")}</span>
+                      )}
                     </div>
                   ))}
                 </div>

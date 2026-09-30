@@ -8,6 +8,7 @@ import RateText from "./ui/RateText";
 import Skeleton from "./ui/Skeleton";
 import { useToast } from "./ui/Toast";
 import { NetworkInterface, Profile, TunnelStatus } from "../types";
+import { pluralize, useT } from "../i18n";
 
 interface Throughput {
   rxRate: number;
@@ -24,8 +25,9 @@ const CHART_W = 600;
 const CHART_H = 96;
 
 function ThroughputChart({ samples }: { samples: Sample[] }) {
+  const t = useT();
   if (samples.length < 2) {
-    return <div className="chart-empty">Collecting traffic data…</div>;
+    return <div className="chart-empty">{t("monitor.collecting")}</div>;
   }
   const pad = 4;
   const max = Math.max(
@@ -69,6 +71,7 @@ export default function Monitor() {
     statuses: [],
   });
   const toast = useToast();
+  const t = useT();
 
   useEffect(() => {
     liveRef.current = { profiles, statuses };
@@ -227,7 +230,7 @@ export default function Monitor() {
           </div>
         </div>
         <section>
-          <h2>Active tunnels</h2>
+          <h2>{t("monitor.activeTunnels")}</h2>
           <div className="active-now-list">
             <div className="active-now-card">
               <Skeleton width="30px" height="30px" radius="50%" />
@@ -252,20 +255,42 @@ export default function Monitor() {
           <span className="status-strip-title">
             {running.length === 0
               ? failed.length > 0
-                ? `${failed.length} tunnel${failed.length === 1 ? "" : "s"} failed`
-                : "All disconnected"
-              : `${running.length} of ${profiles.length} tunnel${profiles.length === 1 ? "" : "s"} active`}
+                ? t("monitor.tunnelsFailed", {
+                    n: failed.length,
+                    word: pluralize(
+                      failed.length,
+                      ["туннель", "туннеля", "туннелей"],
+                      ["tunnel", "tunnels"],
+                    ),
+                  })
+                : t("monitor.allDisconnected")
+              : t("monitor.tunnelsActive", {
+                    n: running.length,
+                    total: profiles.length,
+                    word: pluralize(
+                      profiles.length,
+                      ["туннеля", "туннелей", "туннелей"],
+                      ["tunnel", "tunnels"],
+                    ),
+                  })}
           </span>
           <span className="status-strip-sub">
             {running.length > 0 ? (
               <RateText rx={totalRate.rx} tx={totalRate.tx} live />
             ) : (
-              `${profiles.length} profile${profiles.length === 1 ? "" : "s"} configured`
+              t("monitor.profilesConfigured", {
+                n: profiles.length,
+                word: pluralize(
+                  profiles.length,
+                  ["профиль", "профиля", "профилей"],
+                  ["profile", "profiles"],
+                ),
+              })
             )}
             {failed.length > 0 && running.length > 0 && (
               <span className="monitor-failed-note">
                 {" "}
-                · {failed.length} failed
+                · {t("monitor.failedSuffix", { n: failed.length })}
               </span>
             )}
           </span>
@@ -274,23 +299,23 @@ export default function Monitor() {
 
       <div className="monitor-grid">
         <section className="monitor-card">
-          <h3>Throughput</h3>
+          <h3>{t("monitor.throughput")}</h3>
           <ThroughputChart samples={samples} />
           <div className="chart-legend">
-            <span className="chart-legend-item chart-rx-text">↓ download</span>
-            <span className="chart-legend-item chart-tx-text">↑ upload</span>
+            <span className="chart-legend-item chart-rx-text">↓ {t("monitor.download")}</span>
+            <span className="chart-legend-item chart-tx-text">↑ {t("monitor.upload")}</span>
           </div>
         </section>
         <section className="monitor-card">
-          <h3>Exit addresses</h3>
+          <h3>{t("monitor.exitAddresses")}</h3>
           <ExitIpPanel />
         </section>
       </div>
 
       <section>
-        <h2>Active tunnels</h2>
+        <h2>{t("monitor.activeTunnels")}</h2>
         {running.length === 0 ? (
-          <p className="empty-state">No tunnels are running.</p>
+          <p className="empty-state">{t("monitor.noTunnels")}</p>
         ) : (
           <div className="active-now-list">
             {running.map((profile) => {
@@ -317,9 +342,9 @@ export default function Monitor() {
                     className="btn-sm"
                     onClick={() => onDisconnect(profile)}
                     disabled={busy.has(profile.id)}
-                    title="Disconnect"
+                    title={t("common.disconnect")}
                   >
-                    Disconnect
+                    {t("common.disconnect")}
                   </button>
                 </div>
               );
@@ -330,7 +355,7 @@ export default function Monitor() {
 
       {failed.length > 0 && (
         <section>
-          <h2>Needs attention</h2>
+          <h2>{t("monitor.needsAttention")}</h2>
           <div className="active-now-list">
             {failed.map((profile) => {
               const status = statusFor(profile.id);
@@ -344,7 +369,7 @@ export default function Monitor() {
                   <div className="active-now-info">
                     <span className="active-now-name">{profile.name}</span>
                     <span className="active-now-meta">
-                      {status.message ?? "Connection failed"}
+                      {status.message ?? t("monitor.connectionFailed")}
                     </span>
                   </div>
                 </div>

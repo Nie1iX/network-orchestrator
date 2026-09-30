@@ -4,9 +4,12 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation, requiresElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
 import { useProfileListMode } from "../prefs";
+import { pluralize, useT } from "../i18n";
+import { BACKEND_LABEL_KEYS } from "../i18n/labels";
 import {
   backendIcon,
   ChevronIcon,
+  InfoIcon,
   PlusIcon,
   TailscaleIcon,
 } from "../icons";
@@ -50,13 +53,6 @@ import {
   TunnelBackend,
   TunnelStatus,
 } from "../types";
-
-const BACKEND_LABELS: Record<TunnelBackend, string> = {
-  none: "Static routes",
-  wireGuard: "WireGuard",
-  openVpn: "OpenVPN",
-  xray: "Xray",
-};
 
 const COLLAPSED_GROUPS_KEY = "netmanager.connections.collapsedGroups";
 
@@ -110,6 +106,7 @@ function ProfileRowSkeleton() {
 export default function ProfileManager() {
   const caps = usePlatformCapabilities();
   const toast = useToast();
+  const t = useT();
   const listMode = useProfileListMode();
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [statuses, setStatuses] = useState<TunnelStatus[]>([]);
@@ -533,7 +530,7 @@ export default function ProfileManager() {
   const onConnect = async (profile: Profile) => {
     if (requiresElevation(profile)) {
       try {
-        if (!(await ensureElevation(`Connecting ${profile.name}`))) return;
+        if (!(await ensureElevation(t("profiles.connecting", { name: profile.name })))) return;
       } catch (err) {
         toast("error", String(err));
         return;
@@ -547,7 +544,7 @@ export default function ProfileManager() {
         toast(
           "error",
           status.message ??
-            `${profile.name} failed to connect. Run Diagnostics for details.`,
+            t("profiles.connectFailedDiag", { name: profile.name }),
         );
       } else if (status.message) {
         toast("info", status.message);
@@ -575,11 +572,11 @@ export default function ProfileManager() {
   const submitOpenVpnCredentials = async () => {
     if (!openVpnCredentialProfile) return;
     if (openVpnPassword && !openVpnUsername) {
-      setOpenVpnCredentialError("Enter a username with the password.");
+      setOpenVpnCredentialError(t("ovpn.errUserPass"));
       return;
     }
     if (!openVpnUsername && !openVpnKeyPassphrase) {
-      setOpenVpnCredentialError("Enter the credentials required by this profile.");
+      setOpenVpnCredentialError(t("ovpn.errCreds"));
       return;
     }
     setOpenVpnCredentialBusy(true);
@@ -601,7 +598,9 @@ export default function ProfileManager() {
       setRememberOpenVpnCredentials(false);
       await refreshAll();
     } catch (err) {
-      setOpenVpnCredentialError(`OpenVPN connection failed: ${String(err)}`);
+      setOpenVpnCredentialError(
+        t("ovpn.errFailed", { err: String(err) }),
+      );
     } finally {
       setOpenVpnCredentialBusy(false);
     }
@@ -610,7 +609,7 @@ export default function ProfileManager() {
   const onDisconnect = async (profile: Profile) => {
     if (requiresElevation(profile)) {
       try {
-        if (!(await ensureElevation(`Disconnecting ${profile.name}`))) return;
+        if (!(await ensureElevation(t("profiles.disconnecting", { name: profile.name })))) return;
       } catch (err) {
         toast("error", String(err));
         return;
@@ -639,11 +638,11 @@ export default function ProfileManager() {
 
   const onDelete = async (profile: Profile) => {
     if (alwaysOn?.profiles.some((item) => item.profileId === profile.id)) {
-      setError("Disable always-on before deleting this profile.");
+      setError(t("profiles.disableAlwaysOnDelete"));
       return;
     }
-    const ok = await confirm(`Delete profile "${profile.name}"?`, {
-      title: "Delete profile",
+    const ok = await confirm(t("profiles.deleteConfirm", { name: profile.name }), {
+      title: t("profiles.deleteTitle"),
       kind: "warning",
     });
     if (!ok) return;
@@ -697,11 +696,18 @@ export default function ProfileManager() {
         return next;
       });
       const details = [
-        `Subscription refreshed: ${result.endpointCount} endpoint${result.endpointCount === 1 ? "" : "s"}.`,
+        t("profiles.subRefreshed", {
+          n: result.endpointCount,
+          unit: pluralize(
+            result.endpointCount,
+            ["эндпоинт", "эндпоинта", "эндпоинтов"],
+            ["endpoint", "endpoints"],
+          ),
+        }),
       ];
-      if (result.skippedCount > 0) details.push(`${result.skippedCount} skipped.`);
-      if (result.fallbackUsed) details.push("Selected endpoint disappeared; first endpoint selected.");
-      if (result.cleanupFailed) details.push("Previous config cleanup failed.");
+      if (result.skippedCount > 0) details.push(t("profiles.subSkipped", { n: result.skippedCount }));
+      if (result.fallbackUsed) details.push(t("profiles.subFallback"));
+      if (result.cleanupFailed) details.push(t("profiles.subCleanupFailed"));
       toast("info", details.join(" "));
     } catch (err) {
       setError(String(err));
@@ -719,7 +725,7 @@ export default function ProfileManager() {
       });
       setProfiles(updated);
     } catch {
-      setError("Cannot update subscription refresh interval.");
+      setError(t("profiles.refreshIntervalFailed"));
     } finally {
       setSettingRefreshInterval(null);
     }
@@ -742,7 +748,7 @@ export default function ProfileManager() {
         ...current,
         [profile.id]: {
           ...(current[profile.id] ?? {}),
-          [index]: { delayMs: null, error: "Delay check failed" },
+          [index]: { delayMs: null, error: t("profiles.delayCheckFailed") },
         },
       }));
     } finally {
@@ -847,7 +853,7 @@ export default function ProfileManager() {
 
   const openEdit = (profile: Profile) => {
     if (alwaysOn?.profiles.some((item) => item.profileId === profile.id)) {
-      setError("Disable always-on before editing this profile.");
+      setError(t("profiles.disableAlwaysOnEdit"));
       return;
     }
     setEditing(editFormState(profile));
@@ -857,8 +863,8 @@ export default function ProfileManager() {
   const onToggleAlwaysOn = async (profile: Profile, kind: AlwaysOnKind, enrolled: boolean) => {
     if (!enrolled && kind === "wireGuard") {
       const approved = await confirm(
-        "Always-on stores a copy of this WireGuard config, including its private key, in root-only system state. It can connect before you sign in. Enable it?",
-        { title: "Enable always-on WireGuard", kind: "warning" },
+        t("profiles.alwaysOnConfirm"),
+        { title: t("profiles.alwaysOnTitle"), kind: "warning" },
       );
       if (!approved) return;
     }
@@ -867,7 +873,7 @@ export default function ProfileManager() {
         await invoke("remove_always_on_profile", { kind, profileId: profile.id });
       } else {
         const result = await invoke<AlwaysOnSetResult>("set_always_on_profile", { id: profile.id });
-        if (!result.active) toast("info", "Always-on saved. Resume always-on to activate it.");
+        if (!result.active) toast("info", t("profiles.alwaysOnSaved"));
       }
     });
   };
@@ -911,11 +917,12 @@ export default function ProfileManager() {
           ]);
           toast(
             status.message ? "info" : "success",
-            status.message ?? `Reloaded ${editing.name || editing.id}`,
+            status.message ??
+              t("profiles.reloaded", { name: editing.name || editing.id }),
           );
         })
         .catch((err) =>
-          toast("info", `Reconnect the profile to apply changes (${String(err)})`),
+          toast("info", t("profiles.reloadReconnect", { err: String(err) })),
         );
     }
     if (inspection && editing) {
@@ -947,7 +954,7 @@ export default function ProfileManager() {
     return (
       <Page width="full">
         <div className="profiles-toolbar">
-          <h2>Profiles</h2>
+          <h2>{t("profiles.title")}</h2>
         </div>
         <div className="profiles-layout">
           <div className="profiles-list-pane">
@@ -1008,7 +1015,7 @@ export default function ProfileManager() {
     tailscale.backendState === "Running";
   const tsNeedsLogin = tailscale?.backendState === "NeedsLogin";
   const tsMeta = !tailscale?.available
-    ? "tailscaled unavailable"
+    ? t("ts.unavailable")
     : tailscale.selfIps.length > 0
       ? tailscale.selfIps.join(", ")
       : tailscale.backendState;
@@ -1107,20 +1114,35 @@ export default function ProfileManager() {
   return (
     <Page width="full">
       <div className="profiles-toolbar">
-        <h2>Profiles</h2>
+        <h2>{t("profiles.title")}</h2>
         <span className="profiles-status">
           <span
             className={`status-dot ${
               runningProfiles.length > 0 ? "state-running" : "state-stopped"
             }`}
           />
-          {runningProfiles.length} of {profiles.length} running
+          {t("profiles.runningSummary", {
+            running: runningProfiles.length,
+            total: profiles.length,
+          })}
           {failedCount > 0 && (
             <span className="profiles-status-failed">
               {" "}
-              · {failedCount} failed
+              · {t("profiles.failedSuffix", { n: failedCount })}
             </span>
           )}
+        </span>
+        <span
+          className="profiles-info"
+          role="note"
+          title={
+            t("profiles.infoElev") +
+            (caps?.os === "linux"
+              ? `\n\n${t("profiles.infoAlwaysOn")}`
+              : "")
+          }
+        >
+          <InfoIcon size={15} />
         </span>
         {profiles.some((p) => p.subscription !== null) && (
           <button
@@ -1128,41 +1150,29 @@ export default function ProfileManager() {
             className="btn-sm"
             onClick={() => measureActiveEndpoints(endpoints)}
             disabled={measuringEndpoints.size > 0}
-            title="Measure delay to the active endpoint of every subscription"
+            title={t("profiles.testDelaysTitle")}
           >
-            {measuringEndpoints.size > 0 ? "Testing…" : "Test delays"}
+            {measuringEndpoints.size > 0 ? t("profiles.testing") : t("profiles.testDelays")}
           </button>
         )}
         <button
           className="profile-new-btn btn-primary btn-with-icon"
           onClick={() => setAddMenuOpen(true)}
         >
-          <PlusIcon size={14} /> Add connection
+          <PlusIcon size={14} /> {t("profiles.add")}
         </button>
         <button
           className="btn-with-icon"
           onClick={() => setImportOpen(true)}
         >
-          Import…
+          {t("profiles.import")}
         </button>
       </div>
-      <p className="profiles-note">
-        WireGuard, OpenVPN, interface changes, and policy routes require
-        administrator privileges. Several connections can run at once.
-      </p>
-
-      {caps?.os === "linux" && (
-        <p className="profiles-note">
-          Always-on before sign-in is available for WireGuard and static routes.
-          OpenVPN and Xray are not supported.
-        </p>
-      )}
-
       {caps?.os === "linux" && alwaysOn?.paused && (
         <div className="runtime-notice" role="status">
-          <span>Always-on is paused after Disconnect all.</span>
+          <span>{t("profiles.alwaysOnPaused")}</span>
           <button type="button" onClick={onResumeAlwaysOn} disabled={resumingAlwaysOn}>
-            {resumingAlwaysOn ? "Resuming…" : "Resume always-on"}
+            {resumingAlwaysOn ? t("profiles.resuming") : t("profiles.resume")}
           </button>
         </div>
       )}
@@ -1170,9 +1180,9 @@ export default function ProfileManager() {
       {importErrors && (
         <div className="save-notice">
           <div className="diagnostics-head">
-            <span>Import finished with errors</span>
+            <span>{t("profiles.importErrors")}</span>
             <button type="button" onClick={() => setImportErrors(null)}>
-              Dismiss
+              {t("common.dismiss")}
             </button>
           </div>
           <ul className="save-notice-list">
@@ -1188,9 +1198,9 @@ export default function ProfileManager() {
       {saveNotice && (
         <div className="save-notice">
           <div className="diagnostics-head">
-            <span>Saved "{saveNotice.profileName}" — review notes</span>
+            <span>{t("profiles.savedNotice", { name: saveNotice.profileName })}</span>
             <button type="button" onClick={() => setSaveNotice(null)}>
-              Dismiss
+              {t("common.dismiss")}
             </button>
           </div>
           <ul className="save-notice-list">
@@ -1223,16 +1233,16 @@ export default function ProfileManager() {
         <input
           className="filter-search connections-search"
           type="text"
-          placeholder="Search connections…"
+          placeholder={t("profiles.searchPh")}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
       )}
 
       {profiles.length === 0 ? (
-        <p className="empty-state">No profiles yet. Create one to get started.</p>
+        <p className="empty-state">{t("profiles.empty")}</p>
       ) : filteredProfiles.length === 0 ? (
-        <p className="empty-state">No connections match "{search}".</p>
+        <p className="empty-state">{t("profiles.noMatch", { query: search })}</p>
       ) : listMode === "flat" ? (
         <div className="profile-rows">
           {flatList.map((profile) => renderProfileRow(profile, null, false))}
@@ -1252,7 +1262,7 @@ export default function ProfileManager() {
               <ChevronIcon size={13} collapsed={isCollapsed} />
               {backendIcon(group.backend, 18)}
               <span className="profile-group-title">
-                {BACKEND_LABELS[group.backend]}
+                {t(BACKEND_LABEL_KEYS[group.backend])}
               </span>
               <span className="profile-group-count">
                 {group.items.length}
@@ -1272,7 +1282,7 @@ export default function ProfileManager() {
 
       {tailscale !== null && (
         <div className="profile-group">
-          <div className="profile-group-label">Services</div>
+          <div className="profile-group-label">{t("profiles.services")}</div>
           <div className="profile-rows">
             <div
               role="button"
@@ -1311,12 +1321,12 @@ export default function ProfileManager() {
                 busy={tailscaleBusy}
                 title={
                   !tailscale.available
-                    ? "tailscaled is not installed or not running"
+                    ? t("ts.notInstalled")
                     : tsNeedsLogin
-                      ? "Log in first: tailscale login"
+                      ? t("ts.loginFirst")
                       : tsRunning
-                        ? "tailscale down"
-                        : "tailscale up"
+                        ? t("ts.down")
+                        : t("ts.up")
                 }
               />
             </div>
@@ -1342,7 +1352,7 @@ export default function ProfileManager() {
                   : null
               }
               isBusy={busy.has(selected.id)}
-              backendLabel={BACKEND_LABELS[selected.backend]}
+              backendLabel={t(BACKEND_LABEL_KEYS[selected.backend])}
               managedConfig={inspections[selected.id]?.managedConfig}
               alwaysOn={alwaysOn}
               os={caps?.os}
@@ -1396,8 +1406,8 @@ export default function ProfileManager() {
           ) : (
             <div className="profile-detail-empty">
               {profiles.length === 0
-                ? "Add a connection to get started."
-                : "Select a connection to see its details."}
+                ? t("profiles.detailEmptyNone")
+                : t("profiles.detailEmpty")}
             </div>
           )}
         </div>
@@ -1441,51 +1451,51 @@ export default function ProfileManager() {
 
       <Modal
         open={openVpnCredentialProfile !== null}
-        title="OpenVPN credentials"
+        title={t("ovpn.title")}
         onClose={closeOpenVpnCredentials}
         maxWidth="420px"
         footer={
           <>
             <button type="button" onClick={closeOpenVpnCredentials} disabled={openVpnCredentialBusy}>
-              Cancel
+              {t("common.cancel")}
             </button>
             <button type="button" className="btn-primary" onClick={submitOpenVpnCredentials} disabled={openVpnCredentialBusy}>
-              {openVpnCredentialBusy ? "Connecting…" : "Connect"}
+              {openVpnCredentialBusy ? t("common.connecting") : t("common.connect")}
             </button>
           </>
         }
       >
         <form className="profile-form" onSubmit={(event) => { event.preventDefault(); void submitOpenVpnCredentials(); }}>
           <label>
-            Username
+            {t("ovpn.username")}
             <input type="text" autoComplete="username" value={openVpnUsername} onChange={(event) => setOpenVpnUsername(event.target.value)} />
           </label>
           <label>
-            Password
+            {t("ovpn.password")}
             <input type="password" autoComplete="current-password" value={openVpnPassword} onChange={(event) => setOpenVpnPassword(event.target.value)} />
           </label>
           <label>
-            Private key passphrase (if required)
+            {t("ovpn.keyPass")}
             <input type="password" autoComplete="off" value={openVpnKeyPassphrase} onChange={(event) => setOpenVpnKeyPassphrase(event.target.value)} />
           </label>
           <label className="profile-proxy-toggle">
             <input type="checkbox" checked={rememberOpenVpnCredentials} onChange={(event) => setRememberOpenVpnCredentials(event.target.checked)} />
-            Remember on this device
+            {t("ovpn.remember")}
           </label>
-          <span className="profile-help">Stored in the system keyring (GNOME Keyring or KWallet). Without a keyring, kept only until the app exits.</span>
+          <span className="profile-help">{t("ovpn.keyringHelp")}</span>
           {openVpnCredentialError && <p className="error" role="alert">{openVpnCredentialError}</p>}
         </form>
       </Modal>
 
       <Modal
         open={saveModalOpen}
-        title="Save set"
+        title={t("sets.modalTitle")}
         onClose={() => setSaveModalOpen(false)}
         maxWidth="420px"
         footer={
           <>
             <button type="button" onClick={() => setSaveModalOpen(false)}>
-              Cancel
+              {t("common.cancel")}
             </button>
             <button
               type="button"
@@ -1493,15 +1503,21 @@ export default function ProfileManager() {
               onClick={createSnippet}
               disabled={!newSnippetName.trim()}
             >
-              Save as new
+              {t("sets.saveAsNew")}
             </button>
           </>
         }
       >
         <div className="interface-section">
           <span className="section-label">
-            Will include {runningProfiles.length} connection
-            {runningProfiles.length === 1 ? "" : "s"}
+            {t("sets.willInclude", {
+              n: runningProfiles.length,
+              unit: pluralize(
+                runningProfiles.length,
+                ["подключение", "подключения", "подключений"],
+                ["connection", "connections"],
+              ),
+            })}
           </span>
           <ul className="profile-route-list">
             {runningProfiles.map((p) => (
@@ -1516,17 +1532,17 @@ export default function ProfileManager() {
             className="snippet-overwrite-btn"
             onClick={overwriteActiveSnippet}
           >
-            Update "{activeSnippet.name}" with these connections
+            {t("sets.updateWith", { name: activeSnippet.name })}
           </button>
         )}
 
         <label>
-          {activeSnippet ? "Or save as a new set" : "Name"}
+          {activeSnippet ? t("sets.orSaveNew") : t("sets.name")}
           <input
             type="text"
             value={newSnippetName}
             onChange={(e) => setNewSnippetName(e.target.value)}
-            placeholder="Work"
+            placeholder={t("sets.namePh")}
             autoFocus
           />
         </label>

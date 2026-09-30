@@ -1194,11 +1194,15 @@ a:focus-visible,
   margin: 0;
 }
 
-.profiles-note {
-  font-size: var(--fs-xs);
+.profiles-info {
+  display: inline-flex;
+  align-items: center;
   color: var(--text-muted);
-  margin-bottom: var(--sp-3);
-  max-width: 60ch;
+  cursor: help;
+}
+
+.profiles-info:hover {
+  color: var(--text-secondary);
 }
 
 .profile-new-btn {

@@ -1,23 +1,24 @@
 import { ActivityIcon, ConditionsIcon, ProfileIcon, NetworkIcon, RouteIcon, LogsIcon, SettingsIcon } from "../icons";
+import { TranslationKey, useT } from "../i18n";
 
 export type Tab = "profiles" | "monitor" | "routes" | "conditions" | "network" | "logs" | "settings";
 
 interface NavItem {
   id: Tab;
-  label: string;
+  labelKey: TranslationKey;
   icon: React.ReactElement;
 }
 
 const PRIMARY: NavItem[] = [
-  { id: "profiles", label: "Profiles", icon: <ProfileIcon size={20} /> },
-  { id: "monitor", label: "Monitor", icon: <ActivityIcon size={20} /> },
-  { id: "routes", label: "Routes", icon: <RouteIcon size={20} /> },
+  { id: "profiles", labelKey: "nav.profiles", icon: <ProfileIcon size={20} /> },
+  { id: "monitor", labelKey: "nav.monitor", icon: <ActivityIcon size={20} /> },
+  { id: "routes", labelKey: "nav.routes", icon: <RouteIcon size={20} /> },
 ];
 
 const ADVANCED: NavItem[] = [
-  { id: "conditions", label: "Conditions", icon: <ConditionsIcon size={20} /> },
-  { id: "network", label: "Network", icon: <NetworkIcon size={20} /> },
-  { id: "logs", label: "Logs", icon: <LogsIcon size={20} /> },
+  { id: "conditions", labelKey: "nav.conditions", icon: <ConditionsIcon size={20} /> },
+  { id: "network", labelKey: "nav.network", icon: <NetworkIcon size={20} /> },
+  { id: "logs", labelKey: "nav.logs", icon: <LogsIcon size={20} /> },
 ];
 
 interface NavRailProps {
@@ -37,26 +38,29 @@ function RailButton({
   onClick: () => void;
   badge?: number;
 }) {
+  const t = useT();
+  const label = t(item.labelKey);
   return (
     <button
       type="button"
       className={`rail-item ${active ? "active" : ""}`}
       onClick={onClick}
-      title={item.label}
+      title={label}
     >
       {item.icon}
       {badge !== undefined && badge > 0 && (
         <span className="rail-badge">{badge > 9 ? "9+" : badge}</span>
       )}
-      <span className="rail-tooltip">{item.label}</span>
+      <span className="rail-tooltip">{label}</span>
     </button>
   );
 }
 
 export default function NavRail({ tab, setTab, activeCount }: NavRailProps) {
+  const t = useT();
   return (
     <nav className="rail">
-      <div className="rail-brand" title="Network Orchestrator">
+      <div className="rail-brand" title={t("app.name")}>
         <NetworkIcon size={20} />
       </div>
       <div className="rail-group">
@@ -84,7 +88,7 @@ export default function NavRail({ tab, setTab, activeCount }: NavRailProps) {
       <div className="rail-spacer" />
       <div className="rail-group">
         <RailButton
-          item={{ id: "settings", label: "Settings", icon: <SettingsIcon size={20} /> }}
+          item={{ id: "settings", labelKey: "nav.settings", icon: <SettingsIcon size={20} /> }}
           active={tab === "settings"}
           onClick={() => setTab("settings")}
         />

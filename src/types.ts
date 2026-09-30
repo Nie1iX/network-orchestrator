@@ -86,24 +86,6 @@ export const CATEGORY_ORDER: InterfaceCategory[] = [
   "filter",
 ];
 
-export const CATEGORY_LABELS: Record<InterfaceCategory, string> = {
-  physical: "Physical",
-  vpn: "VPN",
-  virtual: "Virtual",
-  system: "System",
-  tunnel: "Tunnel",
-  filter: "Filter",
-};
-
-export const CATEGORY_DESCRIPTIONS: Record<InterfaceCategory, string> = {
-  physical: "Real network adapters: Ethernet, Wi-Fi, Bluetooth",
-  vpn: "VPN tunnels: WireGuard, OpenVPN, Xray, Tailscale",
-  virtual: "Virtual links, switches and bridges",
-  system: "OS-internal: loopback and kernel interfaces",
-  tunnel: "OS tunnel pseudo-interfaces: Teredo, 6to4, WAN Miniports",
-  filter: "Filter drivers: WFP, Npcap, QoS — sub-interfaces of real adapters",
-};
-
 // IANA ifType values (https://www.iana.org/assignments/ianaiftype-mib/ianaiftype-mib)
 export const IF_TYPE_NAMES: Record<number, string> = {
   1: "Other",

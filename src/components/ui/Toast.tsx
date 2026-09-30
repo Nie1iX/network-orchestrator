@@ -6,6 +6,7 @@ import {
   useState,
 } from "react";
 import { CloseIcon } from "../../icons";
+import { useT } from "../../i18n";
 
 export type ToastKind = "info" | "success" | "error";
 
@@ -31,6 +32,7 @@ export function useToast() {
 }
 
 export function ToastProvider({ children }: { children: React.ReactNode }) {
+  const t = useT();
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const nextId = useRef(0);
 
@@ -60,7 +62,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
               type="button"
               className="toast-close"
               onClick={() => dismiss(toast.id)}
-              title="Dismiss"
+              title={t("common.dismiss")}
             >
               <CloseIcon size={12} />
             </button>

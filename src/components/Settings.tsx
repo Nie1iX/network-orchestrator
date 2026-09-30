@@ -8,19 +8,27 @@ import ToggleSwitch from "./ui/ToggleSwitch";
 import { usePlatformCapabilities } from "../platform";
 import { setProfileListMode, useProfileListMode } from "../prefs";
 import { VpnAuthMode } from "../types";
+import {
+  Lang,
+  LANGS,
+  setLang,
+  TranslationKey,
+  useLang,
+  useT,
+} from "../i18n";
 
-const VPN_AUTH_MODES: { value: VpnAuthMode; label: string }[] = [
-  { value: "noPrompt", label: "Never" },
-  { value: "fullTunnelOnly", label: "Full tunnel and OpenVPN only" },
-  { value: "always", label: "Every connection" },
+const VPN_AUTH_MODES: { value: VpnAuthMode; labelKey: TranslationKey }[] = [
+  { value: "noPrompt", labelKey: "settings.authNever" },
+  { value: "fullTunnelOnly", labelKey: "settings.authFullTunnel" },
+  { value: "always", labelKey: "settings.authAlways" },
 ];
 
 type SettingsTab = "general" | "system" | "about";
 
-const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
-  { id: "general", label: "General" },
-  { id: "system", label: "System" },
-  { id: "about", label: "About" },
+const SETTINGS_TAB_KEYS: { id: SettingsTab; labelKey: TranslationKey }[] = [
+  { id: "general", labelKey: "settings.tabGeneral" },
+  { id: "system", labelKey: "settings.tabSystem" },
+  { id: "about", labelKey: "settings.tabAbout" },
 ];
 
 export default function Settings() {
@@ -34,6 +42,8 @@ export default function Settings() {
   const [vpnAuthBusy, setVpnAuthBusy] = useState(false);
   const [vpnAuthError, setVpnAuthError] = useState<string | null>(null);
   const listMode = useProfileListMode();
+  const lang = useLang();
+  const t = useT();
 
   useEffect(() => {
     getVersion().then(setVersion).catch(() => setVersion(null));
@@ -47,7 +57,7 @@ export default function Settings() {
         if (active) setLoginAutostart(enabled);
       })
       .catch(() => {
-        if (active) setAutostartError("Could not read login autostart setting.");
+        if (active) setAutostartError(t("settings.autostartReadErr"));
       });
     return () => {
       active = false;
@@ -93,7 +103,7 @@ export default function Settings() {
         }),
       );
     } catch {
-      setAutostartError("Could not update login autostart setting.");
+      setAutostartError(t("settings.autostartUpdateErr"));
     } finally {
       setAutostartBusy(false);
     }
@@ -101,17 +111,17 @@ export default function Settings() {
 
   return (
     <Page width="narrow">
-      <h2>Settings</h2>
+      <h2>{t("settings.title")}</h2>
 
-      <nav className="route-tabs" aria-label="Settings sections">
-        {SETTINGS_TABS.map((t) => (
+      <nav className="route-tabs" aria-label={t("settings.sectionsAria")}>
+        {SETTINGS_TAB_KEYS.map((tabDef) => (
           <button
-            key={t.id}
+            key={tabDef.id}
             type="button"
-            className={`route-tab ${tab === t.id ? "active" : ""}`}
-            onClick={() => setTab(t.id)}
+            className={`route-tab ${tab === tabDef.id ? "active" : ""}`}
+            onClick={() => setTab(tabDef.id)}
           >
-            {t.label}
+            {t(tabDef.labelKey)}
           </button>
         ))}
       </nav>
@@ -119,16 +129,38 @@ export default function Settings() {
       {tab === "general" && (
         <>
           <div className="settings-group">
-            <div className="settings-group-title">Profiles</div>
+            <div className="settings-group-title">{t("settings.language")}</div>
             <div className="settings-group-body">
               <div className="settings-row">
                 <div className="settings-row-main">
                   <span className="settings-row-label">
-                    Group connections by backend
+                    {t("settings.languageSub")}
+                  </span>
+                </div>
+                <select
+                  value={lang}
+                  onChange={(e) => setLang(e.target.value as Lang)}
+                >
+                  {LANGS.map((l) => (
+                    <option key={l.id} value={l.id}>
+                      {l.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="settings-group">
+            <div className="settings-group-title">{t("settings.groupProfiles")}</div>
+            <div className="settings-group-body">
+              <div className="settings-row">
+                <div className="settings-row-main">
+                  <span className="settings-row-label">
+                    {t("settings.groupByBackend")}
                   </span>
                   <span className="settings-row-sub">
-                    When off, the list is a single column sorted by state:
-                    running first, then failures, then stopped.
+                    {t("settings.groupByBackendSub")}
                   </span>
                 </div>
                 <ToggleSwitch
@@ -138,7 +170,7 @@ export default function Settings() {
                       listMode === "grouped" ? "flat" : "grouped",
                     )
                   }
-                  title="Group connections by backend"
+                  title={t("settings.groupByBackend")}
                 />
               </div>
             </div>
@@ -146,14 +178,13 @@ export default function Settings() {
 
           {caps?.os === "linux" && (
             <div className="settings-group">
-              <div className="settings-group-title">Startup</div>
+              <div className="settings-group-title">{t("settings.groupStartup")}</div>
               <div className="settings-group-body">
                 <div className="settings-row">
                   <div className="settings-row-main">
-                    <span className="settings-row-label">Start at login</span>
+                    <span className="settings-row-label">{t("settings.startAtLogin")}</span>
                     <span className="settings-row-sub">
-                      Launch the app and connect profiles marked for
-                      auto-connect.
+                      {t("settings.startAtLoginSub")}
                     </span>
                   </div>
                   <ToggleSwitch
@@ -161,7 +192,7 @@ export default function Settings() {
                     onChange={toggleLoginAutostart}
                     disabled={loginAutostart === null}
                     busy={autostartBusy}
-                    title="Start at login"
+                    title={t("settings.startAtLogin")}
                   />
                 </div>
                 {autostartError && <p className="error">{autostartError}</p>}
@@ -174,7 +205,7 @@ export default function Settings() {
       {tab === "system" && (
         <>
           <div className="settings-group">
-            <div className="settings-group-title">Backend &amp; dependencies</div>
+            <div className="settings-group-title">{t("settings.groupBackend")}</div>
             <div className="settings-group-body">
               <BackendStatus />
             </div>
@@ -182,16 +213,15 @@ export default function Settings() {
 
           {caps?.os === "linux" && (
             <div className="settings-group">
-              <div className="settings-group-title">Security</div>
+              <div className="settings-group-title">{t("settings.groupSecurity")}</div>
               <div className="settings-group-body">
                 <div className="settings-row">
                   <div className="settings-row-main">
                     <span className="settings-row-label">
-                      Ask for administrator password when connecting VPN
+                      {t("settings.vpnAuth")}
                     </span>
                     <span className="settings-row-sub">
-                      Applies to every user of this computer. Changing it
-                      requires an administrator password.
+                      {t("settings.vpnAuthSub")}
                     </span>
                   </div>
                   <select
@@ -203,7 +233,7 @@ export default function Settings() {
                   >
                     {VPN_AUTH_MODES.map((mode) => (
                       <option key={mode.value} value={mode.value}>
-                        {mode.label}
+                        {t(mode.labelKey)}
                       </option>
                     ))}
                   </select>
@@ -219,13 +249,13 @@ export default function Settings() {
         <>
           {caps?.appUpdates && (
             <div className="settings-group">
-              <div className="settings-group-title">Updates</div>
+              <div className="settings-group-title">{t("settings.groupUpdates")}</div>
               <div className="settings-group-body">
                 <div className="settings-row">
                   <div className="settings-row-main">
-                    <span className="settings-row-label">App updates</span>
+                    <span className="settings-row-label">{t("settings.appUpdates")}</span>
                     <span className="settings-row-sub">
-                      Check for and install new versions
+                      {t("settings.appUpdatesSub")}
                     </span>
                   </div>
                   <UpdateChecker />
@@ -235,7 +265,7 @@ export default function Settings() {
           )}
 
           <div className="settings-group">
-            <div className="settings-group-title">About</div>
+            <div className="settings-group-title">{t("settings.tabAbout")}</div>
             <div className="settings-group-body">
               <div className="settings-row">
                 <div className="settings-row-main">
@@ -243,7 +273,7 @@ export default function Settings() {
                     Network Orchestrator
                   </span>
                   <span className="settings-row-sub">
-                    {version ? `Version ${version}` : "Loading version…"}
+                    {version ? t("settings.version", { v: version }) : t("settings.loadingVersion")}
                   </span>
                 </div>
               </div>

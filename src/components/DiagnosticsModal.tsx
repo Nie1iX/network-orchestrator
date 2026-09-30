@@ -1,5 +1,6 @@
 import Modal from "./Modal";
 import { Profile, ProfileDiagnostics } from "../types";
+import { useT } from "../i18n";
 
 interface DiagnosticsModalProps {
   open: boolean;
@@ -14,6 +15,7 @@ export default function DiagnosticsModal({
   profiles,
   onClose,
 }: DiagnosticsModalProps) {
+  const t = useT();
   if (!diagnostics) return null;
   const name =
     profiles.find((p) => p.id === diagnostics.profileId)?.name ??
@@ -21,7 +23,7 @@ export default function DiagnosticsModal({
   return (
     <Modal
       open={open}
-      title={`Diagnostics — ${name}`}
+      title={t("diag.title", { name })}
       onClose={onClose}
       maxWidth="640px"
     >

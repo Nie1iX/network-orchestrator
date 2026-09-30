@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { DotsVerticalIcon } from "../../icons";
+import { t } from "../../i18n";
 
 export interface OverflowMenuItem {
   label: string;
@@ -13,7 +14,8 @@ interface OverflowMenuProps {
   title?: string;
 }
 
-export default function OverflowMenu({ items, title = "More" }: OverflowMenuProps) {
+export default function OverflowMenu({ items, title }: OverflowMenuProps) {
+  const resolvedTitle = title ?? t("common.more");
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -42,7 +44,7 @@ export default function OverflowMenu({ items, title = "More" }: OverflowMenuProp
           e.stopPropagation();
           setOpen((v) => !v);
         }}
-        title={title}
+        title={resolvedTitle}
         aria-haspopup="menu"
         aria-expanded={open}
       >
