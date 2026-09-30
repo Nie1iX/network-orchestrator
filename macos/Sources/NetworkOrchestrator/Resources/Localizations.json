@@ -543,7 +543,10 @@
       "cond.hintInactive": "Outside the conditioned network; nothing is installed",
       "cond.id": "Id",
       "cond.idPh": "office-lan",
-      "cond.installedCount": "{applied}/{total} {unit} installed",
+      "cond.installedCount": {
+        "one": "{applied}/{count} route installed",
+        "other": "{applied}/{count} routes installed"
+      },
       "cond.linuxOnly": "Conditional rules are available on Linux only — they are evaluated by the privileged daemon.",
       "cond.loadError": "Error loading rules: {err}",
       "cond.metricPh": "metric",
@@ -636,7 +639,10 @@
       "exitIp.check": "Check",
       "exitIp.checking": "Checking…",
       "exitIp.label": "Exit IP",
-      "exitIp.multiExit": "{n} distinct {word}",
+      "exitIp.multiExit": {
+        "one": "{count} distinct exit",
+        "other": "{count} distinct exits"
+      },
       "exitIp.noResponse": "no response",
       "exitIp.oneExit": "{ip}",
       "exitIp.recheck": "Re-check",
@@ -820,8 +826,14 @@
         "other": "{count} profiles configured"
       },
       "monitor.throughput": "Tunnel throughput",
-      "monitor.tunnelsActive": "{n} of {total} {word} running",
-      "monitor.tunnelsFailed": "{n} {word} failed",
+      "monitor.tunnelsActive": {
+        "one": "{n} of {count} tunnel running",
+        "other": "{n} of {count} tunnels running"
+      },
+      "monitor.tunnelsFailed": {
+        "one": "{count} tunnel failed",
+        "other": "{count} tunnels failed"
+      },
       "monitor.upload": "upload",
       "nav.conditions": "Conditions",
       "nav.logs": "Logs",
@@ -883,7 +895,10 @@
       "profiles.services": "Services",
       "profiles.subCleanupFailed": "Previous config cleanup failed.",
       "profiles.subFallback": "Selected endpoint disappeared; first endpoint selected.",
-      "profiles.subRefreshed": "Subscription refreshed: {n} {unit}.",
+      "profiles.subRefreshed": {
+        "one": "Subscription refreshed: {count} endpoint.",
+        "other": "Subscription refreshed: {count} endpoints."
+      },
       "profiles.subSkipped": "{n} skipped.",
       "profiles.testDelays": "Test delays",
       "profiles.testDelaysTitle": "Measure delay to the active endpoint of every subscription",
@@ -900,6 +915,10 @@
       "routes.activeCount": "{n} active",
       "routes.auto": "auto",
       "routes.autoInterface": "auto interface",
+      "routes.conflictCount": {
+        "one": "{count} conflict",
+        "other": "{count} conflicts"
+      },
       "routes.conflictsTitle": "Differences between predicted and effective routes",
       "routes.destination": "Destination",
       "routes.destinationWord": "destination",
@@ -942,12 +961,19 @@
       "routes.tree": "Tree",
       "routes.via": "via",
       "routes.viewsAria": "Route views",
+      "routes.warningCount": {
+        "one": "{count} warning",
+        "other": "{count} warnings"
+      },
       "routes.warningsTitle": "Route analysis warnings",
       "rules.block": "Block",
       "rules.direct": "Direct",
       "rules.proxy": "Proxy",
       "running": "running",
-      "sets.applyTitle": "Switch to exactly these {n} {unit}",
+      "sets.applyTitle": {
+        "one": "Switch to exactly {count} connection",
+        "other": "Switch to exactly {count} connections"
+      },
       "sets.connectFirst": "Connect something first",
       "sets.deleteTitle": "Delete set",
       "sets.dirtyTitle": "Connections have changed since this set was saved",
@@ -963,9 +989,13 @@
       "sets.updateActive": "Update \"{name}\"",
       "sets.updateTitle": "Update \"{name}\" to match the currently running connections",
       "sets.updateWith": "Update \"{name}\" with these connections",
-      "sets.willInclude": "Will include {n} {unit}",
+      "sets.willInclude": {
+        "one": "Will include {count} connection",
+        "other": "Will include {count} connections"
+      },
       "settings.appUpdates": "App updates",
       "settings.appUpdatesSub": "Check for and install new versions",
+      "settings.appearance": "Appearance",
       "settings.authAlways": "Every connection",
       "settings.authFullTunnel": "Full tunnel and OpenVPN only",
       "settings.authNever": "Never",
@@ -987,6 +1017,11 @@
       "settings.tabAbout": "About",
       "settings.tabGeneral": "General",
       "settings.tabSystem": "System",
+      "settings.theme": "Theme",
+      "settings.themeDark": "Dark",
+      "settings.themeLight": "Light",
+      "settings.themeSub": "Use system appearance, light or dark.",
+      "settings.themeSystem": "System",
       "settings.title": "Settings",
       "settings.version": "Version {v}",
       "settings.vpnAuth": "Ask for administrator password when connecting VPN",
@@ -1612,7 +1647,12 @@
       "cond.hintInactive": "Вне заданной сети; ничего не установлено",
       "cond.id": "Id",
       "cond.idPh": "office-lan",
-      "cond.installedCount": "{applied}/{total} {unit} установлено",
+      "cond.installedCount": {
+        "few": "{applied}/{count} маршрута установлено",
+        "many": "{applied}/{count} маршрутов установлено",
+        "one": "{applied}/{count} маршрут установлен",
+        "other": "{applied}/{count} маршрута установлено"
+      },
       "cond.linuxOnly": "Условные правила доступны только на Linux — их вычисляет привилегированный демон.",
       "cond.loadError": "Ошибка загрузки правил: {err}",
       "cond.metricPh": "метрика",
@@ -1705,7 +1745,12 @@
       "exitIp.check": "Проверить",
       "exitIp.checking": "Проверка…",
       "exitIp.label": "Выходной IP",
-      "exitIp.multiExit": "{n} различных {word}",
+      "exitIp.multiExit": {
+        "few": "{count} различных выхода",
+        "many": "{count} различных выходов",
+        "one": "{count} различный выход",
+        "other": "{count} различных выхода"
+      },
       "exitIp.noResponse": "нет ответа",
       "exitIp.oneExit": "{ip}",
       "exitIp.recheck": "Ещё раз",
@@ -1895,8 +1940,18 @@
         "other": "Настроено {count} профиля"
       },
       "monitor.throughput": "Трафик туннелей",
-      "monitor.tunnelsActive": "Работает {n} из {total} {word}",
-      "monitor.tunnelsFailed": "Ошибка у {n} {word}",
+      "monitor.tunnelsActive": {
+        "few": "Работает {n} из {count} туннелей",
+        "many": "Работает {n} из {count} туннелей",
+        "one": "Работает {n} из {count} туннеля",
+        "other": "Работает {n} из {count} туннелей"
+      },
+      "monitor.tunnelsFailed": {
+        "few": "Ошибка у {count} туннелей",
+        "many": "Ошибка у {count} туннелей",
+        "one": "Ошибка у {count} туннеля",
+        "other": "Ошибка у {count} туннелей"
+      },
       "monitor.upload": "отдача",
       "nav.conditions": "Условия",
       "nav.logs": "Журнал",
@@ -1958,7 +2013,12 @@
       "profiles.services": "Сервисы",
       "profiles.subCleanupFailed": "Очистка предыдущего конфига не удалась.",
       "profiles.subFallback": "Выбранный эндпоинт исчез; выбран первый эндпоинт.",
-      "profiles.subRefreshed": "Подписка обновлена: {n} {unit}.",
+      "profiles.subRefreshed": {
+        "few": "Подписка обновлена: {count} эндпоинта.",
+        "many": "Подписка обновлена: {count} эндпоинтов.",
+        "one": "Подписка обновлена: {count} эндпоинт.",
+        "other": "Подписка обновлена: {count} эндпоинта."
+      },
       "profiles.subSkipped": "{n} пропущено.",
       "profiles.testDelays": "Замерить задержки",
       "profiles.testDelaysTitle": "Замерить задержку до активного эндпоинта каждой подписки",
@@ -1975,6 +2035,12 @@
       "routes.activeCount": "активных: {n}",
       "routes.auto": "авто",
       "routes.autoInterface": "автоматический интерфейс",
+      "routes.conflictCount": {
+        "few": "{count} конфликта",
+        "many": "{count} конфликтов",
+        "one": "{count} конфликт",
+        "other": "{count} конфликта"
+      },
       "routes.conflictsTitle": "Расхождения предсказанных и действующих маршрутов",
       "routes.destination": "Назначение",
       "routes.destinationWord": "назначение",
@@ -2017,12 +2083,23 @@
       "routes.tree": "Дерево",
       "routes.via": "через",
       "routes.viewsAria": "Представления маршрутов",
+      "routes.warningCount": {
+        "few": "{count} предупреждения",
+        "many": "{count} предупреждений",
+        "one": "{count} предупреждение",
+        "other": "{count} предупреждения"
+      },
       "routes.warningsTitle": "Предупреждения анализа маршрутов",
       "rules.block": "Блок",
       "rules.direct": "Напрямую",
       "rules.proxy": "Прокси",
       "running": "подключён",
-      "sets.applyTitle": "Переключиться ровно на эти {n} {unit}",
+      "sets.applyTitle": {
+        "few": "Переключиться ровно на {count} подключения",
+        "many": "Переключиться ровно на {count} подключений",
+        "one": "Переключиться ровно на {count} подключение",
+        "other": "Переключиться ровно на {count} подключения"
+      },
       "sets.connectFirst": "Сначала подключите что-нибудь",
       "sets.deleteTitle": "Удалить набор",
       "sets.dirtyTitle": "Подключения изменились с момента сохранения набора",
@@ -2038,9 +2115,15 @@
       "sets.updateActive": "Обновить «{name}»",
       "sets.updateTitle": "Обновить «{name}» под текущие работающие подключения",
       "sets.updateWith": "Обновить «{name}» этими подключениями",
-      "sets.willInclude": "Будет включать {n} {unit}",
+      "sets.willInclude": {
+        "few": "Будет включать {count} подключения",
+        "many": "Будет включать {count} подключений",
+        "one": "Будет включать {count} подключение",
+        "other": "Будет включать {count} подключения"
+      },
       "settings.appUpdates": "Обновления приложения",
       "settings.appUpdatesSub": "Проверять и устанавливать новые версии",
+      "settings.appearance": "Внешний вид",
       "settings.authAlways": "При каждом подключении",
       "settings.authFullTunnel": "Только full tunnel и OpenVPN",
       "settings.authNever": "Никогда",
@@ -2062,6 +2145,11 @@
       "settings.tabAbout": "О программе",
       "settings.tabGeneral": "Общие",
       "settings.tabSystem": "Система",
+      "settings.theme": "Тема",
+      "settings.themeDark": "Тёмная",
+      "settings.themeLight": "Светлая",
+      "settings.themeSub": "Как в системе, светлая или тёмная.",
+      "settings.themeSystem": "Как в системе",
       "settings.title": "Настройки",
       "settings.version": "Версия {v}",
       "settings.vpnAuth": "Запрашивать пароль администратора при подключении VPN",
