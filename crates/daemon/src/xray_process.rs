@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 const RUNTIME_ROOT: &str = "/run/network-orchestrator";
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const BINARY_ROOT: &str = "/usr/lib/network-orchestrator/xray";
 #[cfg(target_os = "linux")]
 const LINK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -205,7 +205,7 @@ fn valid_tun_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn trusted_binary() -> io::Result<PathBuf> {
     let root = Path::new(BINARY_ROOT);
     let binary = net_manager_core::managed_xray::linux_managed_version_dir(root).join("xray");
@@ -234,7 +234,15 @@ fn trusted_binary() -> io::Result<PathBuf> {
     Ok(binary)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+fn trusted_binary() -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "managed Xray is not supported on this architecture",
+    ))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn safe_root_owned_path(path: &Path) -> bool {
     if !safe_owned_file(path, 0, true) {
         return false;
@@ -255,7 +263,7 @@ fn safe_root_owned_path(path: &Path) -> bool {
     false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", test)))]
 fn safe_owned_file(path: &Path, owner: u32, executable: bool) -> bool {
     let Ok(file) = fs::symlink_metadata(path) else {
         return false;
@@ -692,6 +700,7 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "-test"));
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn trusted_xray_is_loaded_from_package_owned_directory() {
         assert_eq!(BINARY_ROOT, "/usr/lib/network-orchestrator/xray");
@@ -699,6 +708,15 @@ mod tests {
             net_manager_core::managed_xray::linux_managed_version_dir(Path::new(BINARY_ROOT))
                 .join("xray"),
             Path::new("/usr/lib/network-orchestrator/xray/v26.3.27/xray")
+        );
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    #[test]
+    fn unsupported_architecture_rejects_managed_xray_without_starting_it() {
+        assert_eq!(
+            trusted_binary().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
         );
     }
 
