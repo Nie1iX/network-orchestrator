@@ -1,5 +1,29 @@
 # E2E testing
 
+## Browser sandbox on macOS
+
+```bash
+npm run dev:sandbox
+# Open http://localhost:1422 in a browser.
+npm run test:sandbox
+```
+
+The sandbox uses synthetic WireGuard, OpenVPN, Xray subscription, and static
+route profiles. All IPC calls are intercepted by Tauri's mock transport and
+handled in memory. There is no native-command fallback, VPN process, file
+import, subscription HTTP request, keyring write, OS route, DNS, or proxy
+mutation. Unknown commands, interface changes, elevation, backend installation,
+and process restart are rejected. The installer refuses to run in a native
+Tauri window. Production builds exclude the sandbox.
+
+The green banner identifies this mode. Reload resets the synthetic backend;
+connection snippets use this browser origin's localStorage and survive reload.
+File dialogs and confirmations return synthetic choices. Subscription delays,
+config analysis, conflicts, and traffic counters are fixtures. IPv4 lookup is
+simulated; IPv6 parsing, bulk CIDR parsing, OpenVPN probes, and real config
+generation are covered by Rust tests instead. Do not use sandbox results as
+evidence that real VPN credentials or connectivity work.
+
 ## Linux daemon in a disposable container
 
 `e2e/linux/run.sh` builds the daemon, starts an Ubuntu 26.04 (default) or

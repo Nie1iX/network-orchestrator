@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:sandbox": "VITE_NETORCH_SANDBOX=1 vite --port 1422",
+    "test:sandbox": "node --experimental-strip-types --test tests/sandbox.test.ts",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
