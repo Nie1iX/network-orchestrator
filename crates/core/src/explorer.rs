@@ -48,13 +48,15 @@ fn build_ifindex_name_map() -> HashMap<u32, String> {
 
 /// Extract metric from a net-route Route (platform-dependent field).
 fn route_metric(r: &net_route::Route) -> u32 {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         r.metric.unwrap_or(0)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        r.metric.unwrap_or(0)
+        // net-route does not expose route metrics on macOS.
+        let _ = r;
+        0
     }
 }
 
@@ -1053,6 +1055,7 @@ pub fn set_interface_state(name: &str, up: bool) -> std::io::Result<()> {
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
+        let _ = (name, up);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "interface state control is only implemented on Windows and Linux",
@@ -1067,6 +1070,24 @@ mod tests {
     use super::*;
     use std::cmp::Reverse;
     use std::net::Ipv4Addr;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_route_entries_preserve_route_without_metric() {
+        let destination = "192.0.2.0".parse().unwrap();
+        let gateway = "192.0.2.1".parse().unwrap();
+        let mut route = net_route::Route::new(destination, 24);
+        route.gateway = Some(gateway);
+        route.ifindex = Some(7);
+        let entries = route_entries(vec![route], &HashMap::from([(7, "en0".into())]));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].destination, destination);
+        assert_eq!(entries[0].prefix_len, 24);
+        assert_eq!(entries[0].gateway, Some(gateway));
+        assert_eq!(entries[0].interface_index, 7);
+        assert_eq!(entries[0].interface_name, "en0");
+        assert_eq!(entries[0].metric, 0);
+    }
 
     #[test]
     fn proc_net_route_gateway_is_per_interface() {
