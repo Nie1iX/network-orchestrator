@@ -2484,7 +2484,7 @@ impl DaemonCore {
                     && domains == &network.dns_domains
                     && is_full == full.is_some()
             })
-            && (current_dns.is_some() == !network.dns_servers.is_empty())
+            && (current_dns.is_some() != network.dns_servers.is_empty())
         {
             return Ok(());
         }
