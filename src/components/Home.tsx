@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import AddConnectionMenu from "./AddConnectionMenu";
@@ -170,7 +171,7 @@ export default function Home({ onNavigate }: HomeProps) {
           </div>
         </div>
         <section>
-          <h2>Active now</h2>
+          <h2>{tr("Active now")}</h2>
           <div className="active-now-list">
             <div className="active-now-card">
               <Skeleton width="30px" height="30px" radius="50%" />
@@ -192,8 +193,8 @@ export default function Home({ onNavigate }: HomeProps) {
         <div className="status-strip-text">
           <span className="status-strip-title">
             {running.length === 0
-              ? "All disconnected"
-              : `${running.length} tunnel${running.length === 1 ? "" : "s"} active`}
+              ? tr("All disconnected")
+              : tr("{count} tunnels active", { count: running.length })}
           </span>
           {running.length > 0 && (
             <span className="status-strip-sub">
@@ -205,23 +206,20 @@ export default function Home({ onNavigate }: HomeProps) {
 
       {notice && (
         <div className="runtime-notice">
-          <span>{notice}</span>
+          <span>{tr(notice)}</span>
           <button type="button" onClick={() => setNotice(null)}>
-            Dismiss
-          </button>
+            {tr("Dismiss")}</button>
         </div>
       )}
 
       <section>
-        <h2>Active now</h2>
+        <h2>{tr("Active now")}</h2>
         {running.length === 0 ? (
           <p className="empty-state">
-            No tunnels are running.{" "}
+            {tr("No tunnels are running.")}{" "}
             <button type="button" className="link-btn" onClick={() => onNavigate("connections")}>
-              Open Connections
-            </button>{" "}
-            to start one.
-          </p>
+              {tr("Open Connections")}</button>{" "}
+            {tr("to start one.")}</p>
         ) : (
           <div className="active-now-list">
             {running.map((profile) => {
@@ -244,10 +242,9 @@ export default function Home({ onNavigate }: HomeProps) {
                     className="active-now-disconnect"
                     onClick={() => onDisconnect(profile)}
                     disabled={busy.has(profile.id)}
-                    title="Disconnect"
+                    title={tr("Disconnect")}
                   >
-                    Disconnect
-                  </button>
+                    {tr("Disconnect")}</button>
                 </div>
               );
             })}
@@ -256,43 +253,39 @@ export default function Home({ onNavigate }: HomeProps) {
       </section>
 
       <section>
-        <h2>Quick actions</h2>
+        <h2>{tr("Quick actions")}</h2>
         <div className="quick-actions">
           <button
             type="button"
             className="quick-action-btn"
             onClick={() => setAddMenuOpen(true)}
           >
-            + Add connection
-          </button>
+            {tr("+ Add connection")}</button>
           <button type="button" className="quick-action-btn" onClick={() => setImportOpen(true)}>
-            Import…
-          </button>
+            {tr("Import…")}</button>
         </div>
       </section>
 
       <section>
-        <h2>Advanced</h2>
+        <h2>{tr("Advanced")}</h2>
         <div className="advanced-shortcuts">
           <button
             type="button"
             className="advanced-shortcut-card"
             onClick={() => onNavigate("network")}
           >
-            <span className="advanced-shortcut-title">Network</span>
+            <span className="advanced-shortcut-title">{tr("Network")}</span>
             <span className="advanced-shortcut-desc">
-              Inspect adapters, addresses, and live throughput.
-            </span>
+              {tr("Inspect adapters, addresses, and live throughput.")}</span>
           </button>
           <button
             type="button"
             className="advanced-shortcut-card"
             onClick={() => onNavigate("routes")}
           >
-            <span className="advanced-shortcut-title">Routes</span>
+            <span className="advanced-shortcut-title">{tr("Routes")}</span>
             <span className="advanced-shortcut-desc">
-              Diagnose routing conflicts and traffic flow.
-            </span>
+              {tr("Diagnose routing conflicts and traffic flow.")}</span>
           </button>
         </div>
       </section>

@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import Modal from "./Modal";
 import { Profile, ProfileDiagnostics } from "../types";
 
@@ -21,7 +22,7 @@ export default function DiagnosticsModal({
   return (
     <Modal
       open={open}
-      title={`Diagnostics — ${name}`}
+      title={tr("Diagnostics — {name}", { name: String(name) })}
       onClose={onClose}
       maxWidth="640px"
     >

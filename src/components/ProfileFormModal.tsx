@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -255,7 +256,7 @@ export default function ProfileFormModal({
       return;
     }
     update({ routes: [...current.routes, ...toAdd] });
-    setProbeNotice(`Added ${toAdd.length} route(s) to policy routes.`);
+    setProbeNotice(tr("Added {length} route(s) to policy routes.", { length: String(toAdd.length) }));
   };
 
   const updateDomainRule = (index: number, patch: Partial<DomainPolicy>) =>
@@ -446,39 +447,36 @@ export default function ProfileFormModal({
   return (
     <Modal
       open={open}
-      title={current.isNew ? "New profile" : "Edit profile"}
+      title={current.isNew ? tr("New profile") : tr("Edit profile")}
       onClose={onClose}
       footer={
         <>
           <button type="button" onClick={onClose} disabled={saving}>
-            Cancel
-          </button>
+            {tr("Cancel")}</button>
           <button
             type="button"
             className="profile-save-btn"
             onClick={save}
             disabled={saving}
           >
-            {saving ? "Saving…" : "Save"}
+            {saving ? tr("Saving…") : tr("Save")}
           </button>
         </>
       }
     >
-      {formError && <p className="error">{formError}</p>}
+      {formError && <p className="error">{tr(formError)}</p>}
       <div className="form-section">
-      <span className="form-section-title">Identity</span>
+      <span className="form-section-title">{tr("Identity")}</span>
       <label>
-        Name
-        <input
+        {tr("Name")}<input
           type="text"
           value={current.name}
           onChange={(e) => update({ name: e.target.value })}
-          placeholder="Work VPN"
+          placeholder={tr("Work VPN")}
         />
       </label>
       <label>
-        Backend
-        <select
+        {tr("Backend")}<select
           className="filter-select"
           value={current.backend}
           onChange={(e) => {
@@ -500,10 +498,10 @@ export default function ProfileFormModal({
             });
           }}
         >
-          <option value="none">Static routes (no tunnel)</option>
-          <option value="wireGuard">WireGuard</option>
-          <option value="openVpn">OpenVPN</option>
-          <option value="xray">Xray</option>
+          <option value="none">{tr("Static routes (no tunnel)")}</option>
+          <option value="wireGuard">{tr("WireGuard")}</option>
+          <option value="openVpn">{tr("OpenVPN")}</option>
+          <option value="xray">{tr("Xray")}</option>
         </select>
       </label>
       {caps?.os === "linux" && (
@@ -513,40 +511,37 @@ export default function ProfileFormModal({
             checked={current.autoConnect}
             onChange={(e) => update({ autoConnect: e.target.checked })}
           />
-          Connect when the app starts
-        </label>
+          {tr("Connect when the app starts")}</label>
       )}
       </div>
 
       <div className="form-section">
-      <span className="form-section-title">Configuration</span>
+      <span className="form-section-title">{tr("Configuration")}</span>
       {current.backend !== "none" && current.backend === "xray" && current.isNew && (
         <label>
-          Config source
-          <select
+          {tr("Config source")}<select
             className="filter-select"
             value={current.xraySource}
             onChange={(e) =>
               update({ xraySource: e.target.value as "json" | "vless" })
             }
           >
-            <option value="json">Existing Xray JSON</option>
-            <option value="vless">Import share link</option>
+            <option value="json">{tr("Existing Xray JSON")}</option>
+            <option value="vless">{tr("Import share link")}</option>
           </select>
         </label>
       )}
       {current.backend === "wireGuard" && current.isNew && (
         <label>
-          Config source
-          <select
+          {tr("Config source")}<select
             className="filter-select"
             value={current.wgSource}
             onChange={(e) =>
               update({ wgSource: e.target.value as "file" | "fields" })
             }
           >
-            <option value="fields">Enter tunnel fields</option>
-            <option value="file">Existing .conf file</option>
+            <option value="fields">{tr("Enter tunnel fields")}</option>
+            <option value="file">{tr("Existing .conf file")}</option>
           </select>
         </label>
       )}
@@ -555,27 +550,23 @@ export default function ProfileFormModal({
       current.xraySource === "vless" ? (
         <>
           <label>
-            Share link
-            <input
+            {tr("Share link")}<input
               type="password"
               value={current.vlessUrl}
               onChange={(e) => update({ vlessUrl: e.target.value })}
-              placeholder="vless:// or hysteria2://…"
+              placeholder={tr("vless:// or hysteria2://…")}
               autoComplete="off"
             />
           </label>
           <span className="profile-help">
-            SOCKS5 port will be assigned automatically when the profile is
-            saved.
-          </span>
+            {tr("SOCKS5 port will be assigned automatically when the profile is saved.")}</span>
         </>
       ) : current.backend === "wireGuard" &&
         current.isNew &&
         current.wgSource === "fields" ? (
         <div className="profile-wg-fields">
           <label>
-            Private key
-            <input
+            {tr("Private key")}<input
               type="password"
               value={current.wgFields.privateKey}
               onChange={(e) =>
@@ -583,13 +574,12 @@ export default function ProfileFormModal({
                   wgFields: { ...current.wgFields, privateKey: e.target.value },
                 })
               }
-              placeholder="base64 private key"
+              placeholder={tr("base64 private key")}
               autoComplete="off"
             />
           </label>
           <label>
-            Interface address
-            <input
+            {tr("Interface address")}<input
               type="text"
               value={current.wgFields.address}
               onChange={(e) =>
@@ -601,8 +591,7 @@ export default function ProfileFormModal({
             />
           </label>
           <label>
-            DNS (optional)
-            <input
+            {tr("DNS (optional)")}<input
               type="text"
               value={current.wgFields.dns}
               onChange={(e) =>
@@ -614,8 +603,7 @@ export default function ProfileFormModal({
             />
           </label>
           <label>
-            Peer public key
-            <input
+            {tr("Peer public key")}<input
               type="text"
               value={current.wgFields.peerPublicKey}
               onChange={(e) =>
@@ -626,12 +614,11 @@ export default function ProfileFormModal({
                   },
                 })
               }
-              placeholder="base64 public key"
+              placeholder={tr("base64 public key")}
             />
           </label>
           <label>
-            Peer endpoint
-            <input
+            {tr("Peer endpoint")}<input
               type="text"
               value={current.wgFields.peerEndpoint}
               onChange={(e) =>
@@ -642,12 +629,11 @@ export default function ProfileFormModal({
                   },
                 })
               }
-              placeholder="vpn.example.com:51820"
+              placeholder={tr("vpn.example.com:51820")}
             />
           </label>
           <label>
-            Allowed IPs
-            <input
+            {tr("Allowed IPs")}<input
               type="text"
               value={current.wgFields.allowedIps}
               onChange={(e) =>
@@ -659,8 +645,7 @@ export default function ProfileFormModal({
             />
           </label>
           <label>
-            Preshared key (optional)
-            <input
+            {tr("Preshared key (optional)")}<input
               type="password"
               value={current.wgFields.presharedKey}
               onChange={(e) =>
@@ -671,13 +656,12 @@ export default function ProfileFormModal({
                   },
                 })
               }
-              placeholder="base64 preshared key"
+              placeholder={tr("base64 preshared key")}
               autoComplete="off"
             />
           </label>
           <label>
-            Persistent keepalive (seconds, optional)
-            <input
+            {tr("Persistent keepalive (seconds, optional)")}<input
               type="number"
               min={0}
               max={65535}
@@ -697,30 +681,26 @@ export default function ProfileFormModal({
         </div>
       ) : current.backend !== "none" ? (
         <label>
-          Config file
-          <div className="profile-config-row">
+          {tr("Config file")}<div className="profile-config-row">
             <input
               type="text"
               value={current.configPath}
               onChange={(e) => update({ configPath: e.target.value })}
               placeholder={
                 current.backend === "wireGuard"
-                  ? "C:\\path\\tunnel.conf"
+                  ? tr("C:\\path\\tunnel.conf")
                   : current.backend === "openVpn"
-                    ? "C:\\path\\client.ovpn"
-                    : "C:\\path\\config.json"
+                    ? tr("C:\\path\\client.ovpn")
+                    : tr("C:\\path\\config.json")
               }
             />
             <button type="button" onClick={browseConfig}>
-              Browse…
-            </button>
+              {tr("Browse…")}</button>
           </div>
         </label>
       ) : (
         <span className="profile-help">
-          Static-routes profiles apply policy routes through an existing
-          interface (e.g. Ethernet) without starting a tunnel.
-        </span>
+          {tr("Static-routes profiles apply policy routes through an existing interface (e.g. Ethernet) without starting a tunnel.")}</span>
       )}
       {current.backend === "openVpn" && caps?.os !== "linux" && !current.isNew && current.configPath.trim() && (
         <div className="profile-probe">
@@ -730,24 +710,21 @@ export default function ProfileFormModal({
             onClick={probeRoutes}
             disabled={probing}
           >
-            {probing ? "Probing…" : "Probe routes"}
+            {probing ? tr("Probing…") : tr("Probe routes")}
           </button>
           <span className="profile-help">
-            Connects briefly with <code>--route-nopull</code> to discover
-            server-pushed routes without installing them.
-          </span>
+            {tr("Connects briefly with ")}<code>{tr("--route-nopull")}</code> {tr(" to discover server-pushed routes without installing them.")}</span>
           {probeNotice && (
             <p className={`probe-notice ${probeResults && probeResults.length > 0 ? "ok" : ""}`}>
-              {probeNotice}
+              {tr(probeNotice)}
             </p>
           )}
           {probeResults && probeResults.length > 0 && (
             <div className="probe-results">
               <div className="probe-results-head">
-                <span>Discovered routes ({probeResults.length})</span>
+                <span>{tr("Discovered routes (")}{probeResults.length})</span>
                 <button type="button" className="profile-probe-add" onClick={addProbedRoutes}>
-                  Add all to policy routes
-                </button>
+                  {tr("Add all to policy routes")}</button>
               </div>
               <ul className="probe-route-list">
                 {probeResults.map((r, i) => (
@@ -763,17 +740,16 @@ export default function ProfileFormModal({
       )}
       {current.backend === "xray" && (
         <label>
-          Xray mode
-          <select
+          {tr("Xray mode")}<select
             className="filter-select"
             value={current.xrayMode}
             onChange={(e) =>
               update({ xrayMode: e.target.value as XrayMode })
             }
           >
-            <option value="socks">SOCKS5 (system proxy)</option>
+            <option value="socks">{tr("SOCKS5 (system proxy)")}</option>
             <option value="tun" disabled={caps?.os === "linux" && current.xraySource !== "vless" && current.xraySocksPort === null}>
-              {caps?.os === "linux" ? "TUN (network daemon, generated links)" : "TUN (full tunnel, requires admin)"}
+              {caps?.os === "linux" ? tr("TUN (network daemon, generated links)") : tr("TUN (full tunnel, requires admin)")}
             </option>
           </select>
         </label>
@@ -783,26 +759,21 @@ export default function ProfileFormModal({
           <div className="profile-tun-fields">
             {caps?.os === "linux" ? (
               <span className="profile-help">
-                The network daemon assigns the TUN interface and IP. With no
-                policy routes, IPv4 uses a default route and 1.1.1.1 DNS;
-                explicit split routes do not set DNS automatically.
-              </span>
+                {tr("The network daemon assigns the TUN interface and IP. With no policy routes, IPv4 uses a default route and 1.1.1.1 DNS; explicit split routes do not set DNS automatically.")}</span>
             ) : (
             <>
             <label>
-              TUN interface name
-              <input
+              {tr("TUN interface name")}<input
                 type="text"
                 value={current.xrayTunInterface}
                 onChange={(e) =>
                   update({ xrayTunInterface: e.target.value })
                 }
-                placeholder="xray-tun"
+                placeholder={tr("xray-tun")}
               />
             </label>
             <label>
-              TUN interface IP
-              <input
+              {tr("TUN interface IP")}<input
                 type="text"
                 value={current.xrayTunIp}
                 onChange={(e) => update({ xrayTunIp: e.target.value })}
@@ -810,9 +781,7 @@ export default function ProfileFormModal({
               />
             </label>
             <span className="profile-help">
-              TUN mode captures all IP traffic via a TUN interface. Domain
-              policies still apply inside Xray. System proxy is not used.
-            </span>
+              {tr("TUN mode captures all IP traffic via a TUN interface. Domain policies still apply inside Xray. System proxy is not used.")}</span>
             </>
             )}
           </div>
@@ -822,7 +791,7 @@ export default function ProfileFormModal({
         current.xrayMode === "socks" &&
         current.xraySocksPort !== null && (
           <div className="interface-row">
-            <span className="row-label">SOCKS5</span>
+            <span className="row-label">{tr("SOCKS5")}</span>
             <span className="row-value mono">
               127.0.0.1:{current.xraySocksPort}
             </span>
@@ -833,7 +802,7 @@ export default function ProfileFormModal({
         current.xrayMode === "socks" &&
         current.xrayHttpPort !== null && (
           <div className="interface-row">
-            <span className="row-label">HTTP CONNECT</span>
+            <span className="row-label">{tr("HTTP CONNECT")}</span>
             <span className="row-value mono">
               127.0.0.1:{current.xrayHttpPort}
             </span>
@@ -854,22 +823,17 @@ export default function ProfileFormModal({
                 update({ useSystemProxy: e.target.checked })
               }
             />
-            Use Windows system proxy
-          </label>
+            {tr("Use Windows system proxy")}</label>
           {!systemProxyAvailable ? (
             <span className="profile-help">
-              System proxy requires a generated Xray profile with a SOCKS5
-              listener — this existing JSON config has none.
-            </span>
+              {tr("System proxy requires a generated Xray profile with a SOCKS5 listener — this existing JSON config has none.")}</span>
           ) : (
             <span className="profile-help">
-              Applies only to apps that honor Windows proxy settings.
-            </span>
+              {tr("Applies only to apps that honor Windows proxy settings.")}</span>
           )}
           {current.useSystemProxy && systemProxyAvailable && (
             <label>
-              Proxy bypass (comma-separated)
-              <input
+              {tr("Proxy bypass (comma-separated)")}<input
                 type="text"
                 value={current.proxyBypass}
                 onChange={(e) => update({ proxyBypass: e.target.value })}
@@ -880,15 +844,14 @@ export default function ProfileFormModal({
         </div>
       )}
       <div className="form-section">
-      <span className="form-section-title">Routing</span>
+      <span className="form-section-title">{tr("Routing")}</span>
       {!daemonManagedInterface && <label>
-        Target interface (required for policy routes)
-        <input
+        {tr("Target interface (required for policy routes)")}<input
           type="text"
           list="profile-target-interfaces"
           value={current.interfaceName}
           onChange={(e) => update({ interfaceName: e.target.value })}
-          placeholder="Interface friendly name"
+          placeholder={tr("Interface friendly name")}
         />
         <datalist id="profile-target-interfaces">
           {targetable.map((i) => (
@@ -902,7 +865,7 @@ export default function ProfileFormModal({
       </label>}
       <div className="profile-routes">
         <div className="profile-routes-head">
-          <span>Policy routes</span>
+          <span>{tr("Policy routes")}</span>
           <button
             type="button"
             onClick={() =>
@@ -914,24 +877,22 @@ export default function ProfileFormModal({
               })
             }
           >
-            Add route
-          </button>
+            {tr("Add route")}</button>
         </div>
         <div className="profile-bulk-cidrs">
           <label>
-            Paste CIDRs (one per line or comma-separated)
-            <textarea
+            {tr("Paste CIDRs (one per line or comma-separated)")}<textarea
               value={bulkCidrs}
               onChange={(event) => setBulkCidrs(event.target.value)}
               rows={3}
-              placeholder={"10.0.0.0/24\n2001:db8::/32"}
+              placeholder={tr("10.0.0.0/24\n2001:db8::/32")}
             />
           </label>
           <div className="profile-bulk-actions">
             <input
               type="file"
               accept=".txt,.csv,text/plain,text/csv"
-              aria-label="Load CIDRs from file"
+              aria-label={tr("Load CIDRs from file")}
               onChange={async (event) => {
                 const file = event.target.files?.[0];
                 event.target.value = "";
@@ -948,14 +909,13 @@ export default function ProfileFormModal({
               }}
             />
             <button type="button" onClick={addBulkCidrs} disabled={bulkBusy || !bulkCidrs.trim()}>
-              {bulkBusy ? "Adding…" : "Add CIDRs"}
+              {bulkBusy ? tr("Adding…") : tr("Add CIDRs")}
             </button>
           </div>
         </div>
         {current.routes.length === 0 && (
           <span className="profile-routes-empty">
-            No routes — tunnel uses its own routing.
-          </span>
+            {tr("No routes — tunnel uses its own routing.")}</span>
         )}
         {current.routes.map((route, index) => (
           <div className="profile-route-row" key={index}>
@@ -971,8 +931,8 @@ export default function ProfileFormModal({
               type="text"
               value={route.via ?? ""}
               onChange={(e) => updateRoute(index, { via: e.target.value })}
-              placeholder="Gateway (optional)"
-              aria-label="Gateway (optional)"
+              placeholder={tr("Gateway (optional)")}
+              aria-label={tr("Gateway (optional)")}
             />
             <input
               type="number"
@@ -993,15 +953,14 @@ export default function ProfileFormModal({
                 })
               }
             >
-              Remove
-            </button>
+              {tr("Remove")}</button>
           </div>
         ))}
       </div>
       {current.backend === "xray" && (
         <div className="profile-routes">
           <div className="profile-routes-head">
-            <span>Domain/IP routing</span>
+            <span>{tr("Domain/IP routing")}</span>
             <button
               type="button"
               onClick={() =>
@@ -1013,13 +972,11 @@ export default function ProfileFormModal({
                 })
               }
             >
-              Add routing rule
-            </button>
+              {tr("Add routing rule")}</button>
           </div>
           {current.domainPolicies.length === 0 && (
             <span className="profile-routes-empty">
-              No custom rules — all traffic uses the proxy.
-            </span>
+              {tr("No custom rules — all traffic uses the proxy.")}</span>
           )}
           {current.domainPolicies.map((policy, index) => (
             <div className="profile-route-row" key={index}>
@@ -1031,7 +988,7 @@ export default function ProfileFormModal({
                     domains: e.target.value.split(","),
                   })
                 }
-                placeholder="domain:example.com, geosite:cn, geoip:us"
+                placeholder={tr("domain:example.com, geosite:cn, geoip:us")}
               />
               <select
                 className="filter-select"
@@ -1042,9 +999,9 @@ export default function ProfileFormModal({
                   })
                 }
               >
-                <option value="proxy">Through proxy</option>
-                <option value="direct">Direct</option>
-                <option value="block">Block</option>
+                <option value="proxy">{tr("Through proxy")}</option>
+                <option value="direct">{tr("Direct")}</option>
+                <option value="block">{tr("Block")}</option>
               </select>
               <button
                 type="button"
@@ -1056,8 +1013,7 @@ export default function ProfileFormModal({
                   })
                 }
               >
-                Remove
-              </button>
+                {tr("Remove")}</button>
             </div>
           ))}
           <label className="profile-proxy-toggle">
@@ -1066,8 +1022,7 @@ export default function ProfileFormModal({
               checked={current.privateLanDirect}
               onChange={(e) => update({ privateLanDirect: e.target.checked })}
             />
-            Direct for private/LAN IPs (after custom rules)
-          </label>
+            {tr("Direct for private/LAN IPs (after custom rules)")}</label>
         </div>
       )}
       </div>

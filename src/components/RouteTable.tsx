@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { RouteEntry } from "../types";
@@ -29,23 +30,23 @@ export default function RouteTable() {
     return () => window.removeEventListener("route-changed", handler);
   }, []);
 
-  if (loading) return <p>Loading routes...</p>;
-  if (error) return <p className="error">Error loading routes: {error}</p>;
+  if (loading) return <p>{tr("Loading routes...")}</p>;
+  if (error) return <p className="error">{tr("Error loading routes: ")}{tr(error)}</p>;
 
   return (
     <section>
-      <h2>Routes</h2>
+      <h2>{tr("Routes")}</h2>
       {routes.length === 0 ? (
-        <p>No routes found.</p>
+        <p>{tr("No routes found.")}</p>
       ) : (
         <table className="route-table">
           <thead>
             <tr>
-              <th>Destination</th>
-              <th>Prefix</th>
-              <th>Gateway</th>
-              <th>Interface</th>
-              <th>Metric</th>
+              <th>{tr("Destination")}</th>
+              <th>{tr("Prefix")}</th>
+              <th>{tr("Gateway")}</th>
+              <th>{tr("Interface")}</th>
+              <th>{tr("Metric")}</th>
             </tr>
           </thead>
           <tbody>

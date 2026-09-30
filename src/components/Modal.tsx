@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useEffect } from "react";
 import { CloseIcon } from "../icons";
 
@@ -36,12 +37,12 @@ export default function Modal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="modal-header">
-          <h3 className="modal-title">{title}</h3>
+          <h3 className="modal-title">{tr(title)}</h3>
           <button
             type="button"
             className="modal-close"
             onClick={onClose}
-            title="Close"
+            title={tr("Close")}
           >
             <CloseIcon size={18} />
           </button>

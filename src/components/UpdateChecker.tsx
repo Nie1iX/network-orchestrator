@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useState } from "react";
 import { check, Update } from "@tauri-apps/plugin-updater";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
@@ -13,20 +14,20 @@ export default function UpdateChecker() {
       const update = await check();
       if (update?.available) {
         const ok = await confirm(
-          `New version ${update.version} is available. Install now?`,
-          { title: "Update available", kind: "info" },
+          tr("New version {version} is available. Install now?", { version: String(update.version) }),
+          { title: tr("Update available"), kind: "info" },
         );
         if (!ok) return;
         await installUpdate(update);
       } else {
-        await message("You are running the latest version.", {
-          title: "No updates",
+        await message(tr("You are running the latest version."), {
+          title: tr("No updates"),
           kind: "info",
         });
       }
     } catch (err) {
-      await message(`Update check failed: ${err}`, {
-        title: "Update error",
+      await message(tr("Update check failed: {err}", { err: String(err) }), {
+        title: tr("Update error"),
         kind: "error",
       });
     } finally {
@@ -58,8 +59,8 @@ export default function UpdateChecker() {
       setProgress("Installed. Restarting…");
       await relaunch();
     } catch (err) {
-      await message(`Update install failed: ${err}`, {
-        title: "Update error",
+      await message(tr("Update install failed: {err}", { err: String(err) }), {
+        title: tr("Update error"),
         kind: "error",
       });
     } finally {
@@ -73,9 +74,9 @@ export default function UpdateChecker() {
       <button
         onClick={checkForUpdates}
         disabled={checking || installing}
-        title="Check for updates"
+        title={tr("Check for updates")}
       >
-        {checking ? "Checking…" : installing ? "Updating…" : "Check updates"}
+        {checking ? tr("Checking…") : installing ? tr("Updating…") : tr("Check updates")}
       </button>
       {progress && <span className="update-progress">{progress}</span>}
     </div>

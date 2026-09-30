@@ -1,3 +1,4 @@
+import { tr } from "../../i18n";
 import { useEffect, useRef, useState } from "react";
 
 export interface OverflowMenuItem {
@@ -41,7 +42,7 @@ export default function OverflowMenu({ items, title = "More" }: OverflowMenuProp
           e.stopPropagation();
           setOpen((v) => !v);
         }}
-        title={title}
+        title={tr(title)}
       >
         ⋮
       </button>
@@ -58,7 +59,7 @@ export default function OverflowMenu({ items, title = "More" }: OverflowMenuProp
                 item.onClick();
               }}
             >
-              {item.label}
+              {tr(item.label)}
             </button>
           ))}
         </div>

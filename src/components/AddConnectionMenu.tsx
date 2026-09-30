@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import Modal from "./Modal";
 import { backendIcon, ImportIcon } from "../icons";
 import { TunnelBackend } from "../types";
@@ -39,7 +40,7 @@ export default function AddConnectionMenu({
   onChooseBackend,
 }: AddConnectionMenuProps) {
   return (
-    <Modal open={open} title="Add a connection" onClose={onClose} maxWidth="480px">
+    <Modal open={open} title={tr("Add a connection")} onClose={onClose} maxWidth="480px">
       <div className="add-connection-list">
         <button
           type="button"
@@ -51,11 +52,9 @@ export default function AddConnectionMenu({
           </span>
           <span className="add-connection-text">
             <span className="add-connection-title">
-              Paste a link or import a file
-            </span>
+              {tr("Paste a link or import a file")}</span>
             <span className="add-connection-desc">
-              Subscription URL, share link, or a config file
-            </span>
+              {tr("Subscription URL, share link, or a config file")}</span>
           </span>
         </button>
         {BACKEND_OPTIONS.map((opt) => (
@@ -69,8 +68,8 @@ export default function AddConnectionMenu({
               {backendIcon(opt.backend, 18)}
             </span>
             <span className="add-connection-text">
-              <span className="add-connection-title">{opt.title}</span>
-              <span className="add-connection-desc">{opt.desc}</span>
+              <span className="add-connection-title">{tr(opt.title)}</span>
+              <span className="add-connection-desc">{tr(opt.desc)}</span>
             </span>
           </button>
         ))}

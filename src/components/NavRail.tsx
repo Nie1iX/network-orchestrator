@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { HomeIcon, ProfileIcon, NetworkIcon, RouteIcon, SettingsIcon } from "../icons";
 
 export type Tab = "home" | "connections" | "network" | "routes" | "settings";
@@ -40,13 +41,13 @@ function RailButton({
       type="button"
       className={`rail-item ${active ? "active" : ""}`}
       onClick={onClick}
-      title={item.label}
+      title={tr(item.label)}
     >
       {item.icon}
       {badge !== undefined && badge > 0 && (
         <span className="rail-badge">{badge > 9 ? "9+" : badge}</span>
       )}
-      <span className="rail-tooltip">{item.label}</span>
+      <span className="rail-tooltip">{tr(item.label)}</span>
     </button>
   );
 }
@@ -54,7 +55,7 @@ function RailButton({
 export default function NavRail({ tab, setTab, activeCount }: NavRailProps) {
   return (
     <nav className="rail">
-      <div className="rail-brand" title="Network Orchestrator">
+      <div className="rail-brand" title={tr("Network Orchestrator")}>
         <NetworkIcon size={20} />
       </div>
       <div className="rail-group">

@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PlannedRoute, RouteMap as RouteMapData, RouteEntry } from "../types";
@@ -73,8 +74,8 @@ export default function RouteOverview() {
     return () => window.removeEventListener("route-changed", handler);
   }, []);
 
-  if (loading) return <p>Loading route overview...</p>;
-  if (error) return <p className="error">Error: {error}</p>;
+  if (loading) return <p>{tr("Loading route overview...")}</p>;
+  if (error) return <p className="error">{tr("Error: ")}{tr(error)}</p>;
   if (!map) return null;
 
   const s = computeSummary(map);
@@ -84,34 +85,34 @@ export default function RouteOverview() {
       <div className="summary-cards">
         <div className="summary-card" onClick={() => setDrill(drill === "owners" ? null : "owners")}>
           <span className="summary-value">{s.activePredicted}</span>
-          <span className="summary-label">Active routes</span>
-          <span className="summary-sub">{s.totalPredicted} total predicted</span>
+          <span className="summary-label">{tr("Active routes")}</span>
+          <span className="summary-sub">{s.totalPredicted} {tr(" total predicted")}</span>
         </div>
         <div className="summary-card">
           <span className="summary-value">{s.totalEffective}</span>
-          <span className="summary-label">OS routes</span>
-          <span className="summary-sub">in effective table</span>
+          <span className="summary-label">{tr("OS routes")}</span>
+          <span className="summary-sub">{tr("in effective table")}</span>
         </div>
         <div
           className={`summary-card ${s.conflicts > 0 ? "summary-warn" : ""}`}
           onClick={() => setDrill(drill === "conflicts" ? null : "conflicts")}
         >
           <span className="summary-value">{s.conflicts}</span>
-          <span className="summary-label">Conflicts</span>
-          <span className="summary-sub">{s.warnings} warnings</span>
+          <span className="summary-label">{tr("Conflicts")}</span>
+          <span className="summary-sub">{s.warnings} {tr(" warnings")}</span>
         </div>
         <div className="summary-card" onClick={() => setDrill(drill === "interfaces" ? null : "interfaces")}>
           <span className="summary-value">{s.interfaces}</span>
-          <span className="summary-label">Interfaces</span>
-          <span className="summary-sub">{s.profiles} profiles</span>
+          <span className="summary-label">{tr("Interfaces")}</span>
+          <span className="summary-sub">{s.profiles} {tr(" profiles")}</span>
         </div>
       </div>
 
       {drill === "conflicts" && (
         <div className="drill-panel">
-          <h3>Conflicts & issues</h3>
+          <h3>{tr("Conflicts & issues")}</h3>
           {map.diffs.length === 0 && map.warnings.length === 0 ? (
-            <p className="empty-state">No conflicts detected.</p>
+            <p className="empty-state">{tr("No conflicts detected.")}</p>
           ) : (
             <>
               {map.diffs.map((d, i) => (
@@ -123,7 +124,7 @@ export default function RouteOverview() {
               ))}
               {map.warnings.map((w, i) => (
                 <div key={`w${i}`} className="drill-item drill-warning">
-                  <span className="drill-tag">warning</span>
+                  <span className="drill-tag">{tr("warning")}</span>
                   <span className="drill-msg">{w}</span>
                 </div>
               ))}
@@ -134,21 +135,20 @@ export default function RouteOverview() {
 
       {drill === "owners" && (
         <div className="drill-panel">
-          <h3>Routes by profile</h3>
+          <h3>{tr("Routes by profile")}</h3>
           {[...groupByOwner(map.predicted).entries()].map(([owner, routes]) => (
             <div key={owner} className="drill-group">
               <div className="drill-group-header">
                 <span className="drill-group-name">{owner}</span>
                 <span className="drill-group-count">
-                  {routes.filter((r) => r.active).length}/{routes.length} active
-                </span>
+                  {routes.filter((r) => r.active).length}/{routes.length} {tr(" active")}</span>
               </div>
               <div className="route-chips">
                 {routes.map((r, i) => (
                   <span
                     key={i}
                     className={`route-chip ${r.active ? "active" : "inactive"}`}
-                    title={`${r.source} · ${r.interfaceName ?? "auto"} · metric ${r.metric ?? "—"}${r.active ? "" : " (inactive)"}`}
+                    title={tr("{source} · {value1} · metric {value2}{value3}", { source: String(r.source), value1: String(r.interfaceName ?? tr("auto")), value2: String(r.metric ?? "—"), value3: String(r.active ? "" : tr(" (inactive)")) })}
                   >
                     {r.destination}
                   </span>
@@ -161,19 +161,19 @@ export default function RouteOverview() {
 
       {drill === "interfaces" && (
         <div className="drill-panel">
-          <h3>OS routes by interface</h3>
+          <h3>{tr("OS routes by interface")}</h3>
           {[...groupByInterface(map.effective).entries()].map(([iface, routes]) => (
             <div key={iface} className="drill-group">
               <div className="drill-group-header">
                 <span className="drill-group-name">{iface}</span>
-                <span className="drill-group-count">{routes.length} routes</span>
+                <span className="drill-group-count">{routes.length} {tr(" routes")}</span>
               </div>
               <div className="route-chips">
                 {routes.map((r, i) => (
                   <span
                     key={i}
                     className="route-chip effective"
-                    title={`metric ${r.metric}${r.gateway ? " via " + r.gateway : ""}`}
+                    title={tr("metric {metric}{value1}", { metric: String(r.metric), value1: String(r.gateway ? tr(" via {gateway}", {gateway: r.gateway}) : "") })}
                   >
                     {r.destination}/{r.prefixLen}
                   </span>
@@ -186,7 +186,7 @@ export default function RouteOverview() {
 
       {!drill && (
         <div className="overview-hint">
-          <p>Click a summary card to drill down into details.</p>
+          <p>{tr("Click a summary card to drill down into details.")}</p>
         </div>
       )}
     </div>

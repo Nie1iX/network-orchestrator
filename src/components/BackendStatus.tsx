@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -103,7 +104,7 @@ export default function BackendStatus() {
         directory: false,
         filters: [
           {
-            name: `${BACKEND_LABELS[item.backend]} executable`,
+            name: tr("{backend} executable", { backend: BACKEND_LABELS[item.backend] }),
             extensions: caps?.executableExtensions ?? [],
           },
         ].filter((filter) => filter.extensions.length > 0),
@@ -125,12 +126,10 @@ export default function BackendStatus() {
     run("install-xray", async () => {
       if (!offer) return;
       const approved = await confirm(
-        `Install managed Xray ${offer.version}?\n\n` +
-          `The archive will be downloaded from:\n${offer.sourceUrl}\n\n` +
-          `SHA-256: ${offer.sha256}\n\n` +
-          `Files are verified and stored under the application data directory. ` +
-          `Managed installations are never updated automatically.`,
-        { title: "Install managed Xray", kind: "info" }
+        tr("Install managed Xray {version}?\n\nThe archive will be downloaded from:\n{sourceUrl}\n\nSHA-256: {sha256}\n\nFiles are verified and stored under the application data directory. Managed installations are never updated automatically.", {
+          version: offer.version, sourceUrl: offer.sourceUrl, sha256: offer.sha256,
+        }),
+        { title: tr("Install managed Xray"), kind: "info" }
       );
       if (!approved) return;
       setProgress(null);
@@ -141,9 +140,8 @@ export default function BackendStatus() {
   const removeManaged = () =>
     run("remove-xray", async () => {
       const approved = await confirm(
-        "Remove the managed Xray installation? Managed files will be deleted. " +
-          "Your profiles and configs are not affected.",
-        { title: "Remove managed Xray", kind: "warning" }
+        tr("Remove the managed Xray installation? Managed files will be deleted. Your profiles and configs are not affected."),
+        { title: tr("Remove managed Xray"), kind: "warning" }
       );
       if (!approved) return;
       await invoke("remove_managed_xray");
@@ -162,23 +160,23 @@ export default function BackendStatus() {
   return (
     <div className="backend-status">
       <div className="backend-status-head">
-        <span className="section-label">Backend prerequisites</span>
+        <span className="section-label">{tr("Backend prerequisites")}</span>
         <button type="button" onClick={load} disabled={loading || busy !== null}>
-          {loading ? "Checking…" : "Refresh"}
+          {loading ? tr("Checking…") : tr("Refresh")}
         </button>
       </div>
-      {error && <p className="error">{error}</p>}
+      {error && <p className="error">{tr(error)}</p>}
       {items.map((item) => (
         <div key={item.backend} className="backend-status-row">
-          <span className="backend-name">{BACKEND_LABELS[item.backend]}</span>
+          <span className="backend-name">{tr(BACKEND_LABELS[item.backend])}</span>
           <span
             className={`badge ${item.available ? "badge-managed" : "badge-external"}`}
           >
-            {item.available ? "Available" : "Missing"}
+            {item.available ? tr("Available") : tr("Missing")}
           </span>
           {item.source && (
             <span className={`badge badge-source-${item.source.toLowerCase()}`}>
-              {SOURCE_LABELS[item.source]}
+              {tr(SOURCE_LABELS[item.source])}
             </span>
           )}
           {item.version && (
@@ -195,8 +193,7 @@ export default function BackendStatus() {
                 disabled={busy !== null || item.source === "managed"}
                 onClick={() => chooseExecutable(item)}
               >
-                Choose existing…
-              </button>
+                {tr("Choose existing…")}</button>
             )}
             {item.source === "configured" && (
               <button
@@ -204,8 +201,7 @@ export default function BackendStatus() {
                 disabled={busy !== null}
                 onClick={() => resetExecutable(item)}
               >
-                Reset to auto-detect
-              </button>
+                {tr("Reset to auto-detect")}</button>
             )}
             {item.backend === "xray" &&
               item.source !== "managed" &&
@@ -216,7 +212,7 @@ export default function BackendStatus() {
                 disabled={busy !== null}
                 onClick={installManaged}
               >
-                Install managed {offer.version}
+                {tr("Install managed ")}{offer.version}
               </button>
             )}
             {item.backend === "xray" && item.source === "managed" && (
@@ -225,8 +221,7 @@ export default function BackendStatus() {
                 disabled={busy !== null}
                 onClick={removeManaged}
               >
-                Remove managed
-              </button>
+                {tr("Remove managed")}</button>
             )}
           </span>
         </div>
@@ -235,7 +230,7 @@ export default function BackendStatus() {
         <div className="backend-install-progress">
           <span className="row-value">{progressText(progress)}</span>
           <button type="button" onClick={cancelInstall} disabled={cancelling}>
-            {cancelling ? "Cancelling…" : "Cancel"}
+            {cancelling ? tr("Cancelling…") : tr("Cancel")}
           </button>
         </div>
       )}

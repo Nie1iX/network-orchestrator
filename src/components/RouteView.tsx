@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useState } from "react";
 import Page from "./Page";
 import RouteOverview from "./RouteOverview";
@@ -30,7 +31,7 @@ export default function RouteView() {
   return (
     <Page width="wide">
       <section>
-        <h2>Routes</h2>
+        <h2>{tr("Routes")}</h2>
         <div className="route-tabs">
           {TABS.map((t) => (
             <button
@@ -38,7 +39,7 @@ export default function RouteView() {
               className={`route-tab ${tab === t.id ? "active" : ""}`}
               onClick={() => setTab(t.id)}
             >
-              {t.label}
+              {tr(t.label)}
             </button>
           ))}
         </div>

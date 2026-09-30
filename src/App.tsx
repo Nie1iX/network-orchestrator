@@ -1,3 +1,5 @@
+import { tr } from "./i18n";
+import { useLanguage } from "./i18n";
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -14,6 +16,7 @@ import "./App.css";
 import { applyAppearance, readAppearance } from "./theme";
 
 function App() {
+  useLanguage();
   useEffect(() => { applyAppearance(readAppearance()); }, []);
   const [tab, setTab] = useState<Tab>("home");
   const [activeCount, setActiveCount] = useState(0);
@@ -24,7 +27,7 @@ function App() {
     });
     const unlistenShutdown = listen<string>("shutdown-failed", (event) => {
       void message(event.payload, {
-        title: "Could not shut down safely",
+        title: tr("Could not shut down safely"),
         kind: "error",
       });
     });

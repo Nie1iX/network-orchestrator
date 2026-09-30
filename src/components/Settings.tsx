@@ -1,3 +1,5 @@
+import { tr } from "../i18n";
+import { availableLanguages, useLanguage } from "../i18n";
 import { useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
@@ -16,6 +18,7 @@ const VPN_AUTH_MODES: { value: VpnAuthMode; label: string }[] = [
 ];
 
 export default function Settings() {
+  const locale = useLanguage();
   const [appearance, setAppearance] = useState<Appearance>(readAppearance);
   const [version, setVersion] = useState<string | null>(null);
   const [loginAutostart, setLoginAutostart] = useState<boolean | null>(null);
@@ -92,31 +95,41 @@ export default function Settings() {
 
   return (
     <Page width="narrow">
-      <h2>Settings</h2>
+      <h2>{tr("Settings")}</h2>
 
       <div className="settings-group">
-        <div className="settings-group-title">Appearance</div>
+        <div className="settings-group-title">{tr("Appearance")}</div>
         <div className="settings-group-body">
           <div className="settings-row">
             <div className="settings-row-main">
-              <span className="settings-row-label">Theme</span>
-              <span className="settings-row-sub">Use system appearance, light or dark.</span>
+              <span className="settings-row-label">{tr("Theme")}</span>
+              <span className="settings-row-sub">{tr("Use system appearance, light or dark.")}</span>
             </div>
-            <select aria-label="Theme" value={appearance} onChange={(event) => {
+            <select aria-label={tr("Theme")} value={appearance} onChange={(event) => {
               const value = event.target.value as Appearance;
               setAppearance(value);
               saveAppearance(value);
             }}>
-              <option value="system">System</option>
-              <option value="light">Light</option>
-              <option value="dark">Dark</option>
+              <option value="system">{tr("System")}</option>
+              <option value="light">{tr("Light")}</option>
+              <option value="dark">{tr("Dark")}</option>
+            </select>
+          </div>
+          <div className="settings-row">
+            <div className="settings-row-main">
+              <span className="settings-row-label">{tr("Language")}</span>
+              <span className="settings-row-sub">{tr("Choose the interface language.")}</span>
+            </div>
+            <select aria-label={tr("Language")} value={locale.preference} onChange={(event) => locale.setLanguage(event.target.value)}>
+              <option value="system">{tr("System")}</option>
+              {availableLanguages.map(({ code, name }) => <option key={code} value={code}>{name}</option>)}
             </select>
           </div>
         </div>
       </div>
 
       <div className="settings-group">
-        <div className="settings-group-title">Backend &amp; dependencies</div>
+        <div className="settings-group-title">{tr("Backend & dependencies")}</div>
         <div className="settings-group-body">
           <BackendStatus />
         </div>
@@ -124,41 +137,37 @@ export default function Settings() {
 
       {caps?.os === "linux" && (
         <div className="settings-group">
-          <div className="settings-group-title">Startup</div>
+          <div className="settings-group-title">{tr("Startup")}</div>
           <div className="settings-group-body">
             <div className="settings-row">
               <div className="settings-row-main">
-                <span className="settings-row-label">Start at login</span>
+                <span className="settings-row-label">{tr("Start at login")}</span>
                 <span className="settings-row-sub">
-                  Launch the app and connect profiles marked for auto-connect.
-                </span>
+                  {tr("Launch the app and connect profiles marked for auto-connect.")}</span>
               </div>
               <ToggleSwitch
                 checked={loginAutostart ?? false}
                 onChange={toggleLoginAutostart}
                 disabled={loginAutostart === null}
                 busy={autostartBusy}
-                title="Start at login"
+                title={tr("Start at login")}
               />
             </div>
-            {autostartError && <p className="error">{autostartError}</p>}
+            {autostartError && <p className="error">{tr(autostartError)}</p>}
           </div>
         </div>
       )}
 
       {caps?.os === "linux" && (
         <div className="settings-group">
-          <div className="settings-group-title">Security</div>
+          <div className="settings-group-title">{tr("Security")}</div>
           <div className="settings-group-body">
             <div className="settings-row">
               <div className="settings-row-main">
                 <span className="settings-row-label">
-                  Ask for administrator password when connecting VPN
-                </span>
+                  {tr("Ask for administrator password when connecting VPN")}</span>
                 <span className="settings-row-sub">
-                  Applies to every user of this computer. Changing it requires
-                  an administrator password.
-                </span>
+                  {tr("Applies to every user of this computer. Changing it requires an administrator password.")}</span>
               </div>
               <select
                 value={vpnAuthMode ?? ""}
@@ -167,26 +176,25 @@ export default function Settings() {
               >
                 {VPN_AUTH_MODES.map((mode) => (
                   <option key={mode.value} value={mode.value}>
-                    {mode.label}
+                    {tr(mode.label)}
                   </option>
                 ))}
               </select>
             </div>
-            {vpnAuthError && <p className="error">{vpnAuthError}</p>}
+            {vpnAuthError && <p className="error">{tr(vpnAuthError)}</p>}
           </div>
         </div>
       )}
 
       {caps?.appUpdates && (
         <div className="settings-group">
-          <div className="settings-group-title">Updates</div>
+          <div className="settings-group-title">{tr("Updates")}</div>
           <div className="settings-group-body">
             <div className="settings-row">
               <div className="settings-row-main">
-                <span className="settings-row-label">App updates</span>
+                <span className="settings-row-label">{tr("App updates")}</span>
                 <span className="settings-row-sub">
-                  Check for and install new versions
-                </span>
+                  {tr("Check for and install new versions")}</span>
               </div>
               <UpdateChecker />
             </div>
@@ -195,13 +203,13 @@ export default function Settings() {
       )}
 
       <div className="settings-group">
-        <div className="settings-group-title">About</div>
+        <div className="settings-group-title">{tr("About")}</div>
         <div className="settings-group-body">
           <div className="settings-row">
             <div className="settings-row-main">
-              <span className="settings-row-label">Network Orchestrator</span>
+              <span className="settings-row-label">{tr("Network Orchestrator")}</span>
               <span className="settings-row-sub">
-                {version ? `Version ${version}` : "Loading version…"}
+                {version ? tr("Version {version}", { version: String(version) }) : tr("Loading version…")}
               </span>
             </div>
           </div>

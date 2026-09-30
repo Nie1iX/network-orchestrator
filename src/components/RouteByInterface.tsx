@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PlannedRoute, RouteMap as RouteMapData } from "../types";
@@ -65,8 +66,8 @@ export default function RouteByInterface() {
     return () => window.removeEventListener("route-changed", handler);
   }, []);
 
-  if (loading) return <p>Loading...</p>;
-  if (error) return <p className="error">Error: {error}</p>;
+  if (loading) return <p>{tr("Loading...")}</p>;
+  if (error) return <p className="error">{tr("Error: ")}{tr(error)}</p>;
   if (!map) return null;
 
   const owners = [...new Set(map.predicted.map((r) => r.ownerName))];
@@ -80,7 +81,7 @@ export default function RouteByInterface() {
         className="route-filter-input"
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
-        placeholder="Filter by destination or owner..."
+        placeholder={tr("Filter by destination or owner...")}
       />
       <div className="route-owner-legend">
         {owners.map((o) => (
@@ -113,7 +114,7 @@ export default function RouteByInterface() {
                     key={i}
                     className={`route-chip ${r.active ? "active" : "inactive"}`}
                     style={{ borderColor: colorForOwner(r.ownerName, owners) }}
-                    title={`${r.ownerName} · ${r.source} · metric ${r.metric ?? "—"}${r.active ? "" : " (inactive)"}`}
+                    title={tr("{ownerName} · {source} · metric {value2}{value3}", { ownerName: String(r.ownerName), source: String(r.source), value2: String(r.metric ?? "—"), value3: String(r.active ? "" : tr(" (inactive)")) })}
                   >
                     {r.destination}
                   </span>

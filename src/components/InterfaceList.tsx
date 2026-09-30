@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -187,7 +188,7 @@ export default function InterfaceList() {
     return (
       <Page width="wide">
         <section>
-          <h2>Network</h2>
+          <h2>{tr("Network")}</h2>
           <div className="interface-grid">
             {Array.from({ length: 6 }).map((_, i) => (
               <div key={i} className="interface-card">
@@ -209,19 +210,19 @@ export default function InterfaceList() {
   if (error)
     return (
       <Page width="wide">
-        <p className="error">Error loading interfaces: {error}</p>
+        <p className="error">{tr("Error loading interfaces: ")}{tr(error)}</p>
       </Page>
     );
 
   return (
     <Page width="wide">
     <section>
-      <h2>Network</h2>
+      <h2>{tr("Network")}</h2>
       <div className="filter-bar">
         <input
           className="filter-search"
           type="text"
-          placeholder="Search by name, MAC, address..."
+          placeholder={tr("Search by name, MAC, address...")}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
@@ -230,29 +231,26 @@ export default function InterfaceList() {
           value={typePreset}
           onChange={(e) => applyTypePreset(e.target.value as TypePreset)}
         >
-          <option value="main">Main</option>
-          <option value="all">All interfaces</option>
-          <option value="osinternal">OS-internal</option>
+          <option value="main">{tr("Main")}</option>
+          <option value="all">{tr("All interfaces")}</option>
+          <option value="osinternal">{tr("OS-internal")}</option>
         </select>
         <div className="filter-state">
           <button
             className={`filter-btn ${stateFilter === "all" ? "active" : ""}`}
             onClick={() => setStateFilter("all")}
           >
-            All
-          </button>
+            {tr("All")}</button>
           <button
             className={`filter-btn ${stateFilter === "up" ? "active" : ""}`}
             onClick={() => setStateFilter("up")}
           >
-            Up
-          </button>
+            {tr("Up")}</button>
           <button
             className={`filter-btn ${stateFilter === "down" ? "active" : ""}`}
             onClick={() => setStateFilter("down")}
           >
-            Down
-          </button>
+            {tr("Down")}</button>
         </div>
       </div>
       <div className="filter-categories">
@@ -265,10 +263,10 @@ export default function InterfaceList() {
               key={cat}
               className={`cat-chip ${active ? "active" : ""} cat-${cat.toLowerCase()}`}
               onClick={() => toggleCategory(cat)}
-              title={CATEGORY_DESCRIPTIONS[cat]}
+              title={tr(CATEGORY_DESCRIPTIONS[cat])}
             >
               {categoryIcon(cat, 14)}
-              <span>{CATEGORY_LABELS[cat]}</span>
+              <span>{tr(cat === "system" ? "System interfaces" : CATEGORY_LABELS[cat])}</span>
               <span className="cat-count">{count}</span>
             </button>
           );
@@ -276,7 +274,7 @@ export default function InterfaceList() {
       </div>
 
       {grouped.size === 0 ? (
-        <p className="empty-state">No interfaces match the current filters.</p>
+        <p className="empty-state">{tr("No interfaces match the current filters.")}</p>
       ) : (
         <div className="interface-groups">
           {CATEGORY_ORDER.map((cat) => {
@@ -291,9 +289,9 @@ export default function InterfaceList() {
                 >
                   <ChevronIcon size={16} collapsed={isCollapsed} />
                   {categoryIcon(cat, 16)}
-                  <span className="group-title">{CATEGORY_LABELS[cat]}</span>
+                  <span className="group-title">{tr(cat === "system" ? "System interfaces" : CATEGORY_LABELS[cat])}</span>
                   <span className="group-count">{list.length}</span>
-                  <span className="group-desc">{CATEGORY_DESCRIPTIONS[cat]}</span>
+                  <span className="group-desc">{tr(CATEGORY_DESCRIPTIONS[cat])}</span>
                 </div>
                 {!isCollapsed && (
                   <div className="interface-grid">
@@ -312,53 +310,53 @@ export default function InterfaceList() {
                             </div>
                             <div className="badge-group">
                               <span className={`badge ${iface.physical ? "badge-physical" : "badge-virtual"}`}>
-                                {iface.physical ? "Physical" : "Virtual"}
+                                {iface.physical ? tr("Physical") : tr("Virtual")}
                               </span>
                               <span className={`state-badge state-${iface.state.toLowerCase()}`}>
-                                {iface.state}
+                                {tr(iface.state)}
                               </span>
                             </div>
                           </div>
                           <div className="interface-meta">
-                            <span className="meta-label">{formatKind(iface.kind)}</span>
+                            <span className="meta-label">{tr(formatKind(iface.kind))}</span>
                             <span className="meta-label">{ifTypeName(iface.ifType)}</span>
                             {iface.tunnelType && (
-                              <span className="meta-label">Tunnel: {iface.tunnelType}</span>
+                              <span className="meta-label">{tr("Tunnel: ")}{iface.tunnelType}</span>
                             )}
                             {iface.mtu !== null && (
-                              <span className="meta-label">MTU: {iface.mtu}</span>
+                              <span className="meta-label">{tr("MTU: ")}{iface.mtu}</span>
                             )}
                             {iface.linkSpeedMbps !== null && (
-                              <span className="meta-label">{iface.linkSpeedMbps} Mbps</span>
+                              <span className="meta-label">{iface.linkSpeedMbps} {tr(" Mbps")}</span>
                             )}
                           </div>
                           {iface.description && (
                             <div className="interface-row">
-                              <span className="row-label">Driver</span>
+                              <span className="row-label">{tr("Driver")}</span>
                               <span className="row-value mono">{iface.description}</span>
                             </div>
                           )}
                           {iface.mac && (
                             <div className="interface-row">
-                              <span className="row-label">MAC</span>
+                              <span className="row-label">{tr("MAC")}</span>
                               <span className="row-value mono">{iface.mac}</span>
                             </div>
                           )}
                           {iface.gateway && (
                             <div className="interface-row">
-                              <span className="row-label">Gateway</span>
+                              <span className="row-label">{tr("Gateway")}</span>
                               <span className="row-value mono">{iface.gateway}</span>
                             </div>
                           )}
                           {iface.ipv6Gateway && (
                             <div className="interface-row">
-                              <span className="row-label">IPv6 gateway</span>
+                              <span className="row-label">{tr("IPv6 gateway")}</span>
                               <span className="row-value mono">{iface.ipv6Gateway}</span>
                             </div>
                           )}
                           {iface.addresses.length > 0 && (
                             <div className="interface-section">
-                              <span className="section-label">Addresses</span>
+                              <span className="section-label">{tr("Addresses")}</span>
                               <ul className="address-list">
                                 {iface.addresses.map((addr, i) => (
                                   <li key={i}>
@@ -371,7 +369,7 @@ export default function InterfaceList() {
                           )}
                           {iface.dnsServers.length > 0 && (
                             <div className="interface-section">
-                              <span className="section-label">DNS</span>
+                              <span className="section-label">{tr("DNS")}</span>
                               <ul className="dns-list">
                                 {iface.dnsServers.map((dns, i) => (
                                   <li key={i} className="mono">{dns}</li>
@@ -381,14 +379,14 @@ export default function InterfaceList() {
                           )}
                           {iface.dnsSuffix && (
                             <div className="interface-row">
-                              <span className="row-label">DNS suffix</span>
+                              <span className="row-label">{tr("DNS suffix")}</span>
                               <span className="row-value mono">{iface.dnsSuffix}</span>
                             </div>
                           )}
                           {iface.rxBytes !== null && iface.txBytes !== null && (
                             <div className="traffic-row">
                               <div className="interface-row">
-                                <span className="row-label">Total</span>
+                                <span className="row-label">{tr("Total")}</span>
                                 <span className="row-value">
                                   <span className="traffic">↓ {formatBytes(iface.rxBytes)}</span>
                                   <span className="traffic">↑ {formatBytes(iface.txBytes)}</span>
@@ -396,7 +394,7 @@ export default function InterfaceList() {
                               </div>
                               {tp && (
                                 <div className="interface-row">
-                                  <span className="row-label">Rate</span>
+                                  <span className="row-label">{tr("Rate")}</span>
                                   <span className="row-value">
                                   <span className="traffic rate">↓ {formatRate(tp.rxRate)}</span>
                                   <span className="traffic rate">↑ {formatRate(tp.txRate)}</span>

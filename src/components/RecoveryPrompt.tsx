@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ensureElevation } from "../elevation";
@@ -17,7 +18,7 @@ function RecoveryPrompt() {
       setReport(await invoke<RecoveryReport>("get_recovery_report"));
     } catch (err) {
       setError(
-        `Could not inspect resources from the previous session: ${String(err)}`
+        tr("Could not inspect resources from the previous session: {value0}", { value0: String(String(err)) })
       );
     } finally {
       setLoading(false);
@@ -36,13 +37,12 @@ function RecoveryPrompt() {
     return (
       <div className="recovery-overlay">
         <div className="recovery-panel">
-          <h2>Recovery check failed</h2>
-          {error && <p className="error">{error}</p>}
+          <h2>{tr("Recovery check failed")}</h2>
+          {error && <p className="error">{tr(error)}</p>}
           <div className="recovery-actions">
-            <button onClick={() => setDismissed(true)}>Keep for now</button>
+            <button onClick={() => setDismissed(true)}>{tr("Keep for now")}</button>
             <button className="recovery-cleanup-btn" onClick={loadReport}>
-              Retry
-            </button>
+              {tr("Retry")}</button>
           </div>
         </div>
       </div>
@@ -56,7 +56,7 @@ function RecoveryPrompt() {
       if (
         report.requiresElevation &&
         !(await ensureElevation(
-          "Cleaning up resources from the previous session"
+          tr("Cleaning up resources from the previous session")
         ))
       ) {
         return;
@@ -74,28 +74,24 @@ function RecoveryPrompt() {
   return (
     <div className="recovery-overlay">
       <div className="recovery-panel">
-        <h2>Recovery required</h2>
+        <h2>{tr("Recovery required")}</h2>
         <p>
-          The previous session left behind resources owned by this application.
-          No changes were made automatically.
-        </p>
+          {tr("The previous session left behind resources owned by this application. No changes were made automatically.")}</p>
         <ul className="recovery-issues">
           {report.issues.map((issue, index) => (
             <li key={index}>{issue.message}</li>
           ))}
         </ul>
-        {error && <p className="error">{error}</p>}
+        {error && <p className="error">{tr(error)}</p>}
         <div className="recovery-actions">
           <button onClick={() => setDismissed(true)} disabled={busy}>
-            Keep for now
-          </button>
+            {tr("Keep for now")}</button>
           <button
             className="recovery-cleanup-btn"
             onClick={onCleanup}
             disabled={busy}
           >
-            Clean up
-          </button>
+            {tr("Clean up")}</button>
         </div>
       </div>
     </div>

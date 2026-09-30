@@ -1,3 +1,4 @@
+import { tr } from "../i18n";
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { RouteMap as RouteMapData } from "../types";
@@ -156,12 +157,12 @@ export default function RouteFlow() {
     return { nodes: nodeList, links: [...p2iLinks, ...i2dLinks] };
   }, [map]);
 
-  if (loading) return <p>Loading traffic flow...</p>;
-  if (error) return <p className="error">Error: {error}</p>;
+  if (loading) return <p>{tr("Loading traffic flow...")}</p>;
+  if (error) return <p className="error">{tr("Error: ")}{tr(error)}</p>;
   if (!map) return null;
 
   if (nodes.length === 0) {
-    return <p className="empty-state">No active routes to visualize. Connect a profile first.</p>;
+    return <p className="empty-state">{tr("No active routes to visualize. Connect a profile first.")}</p>;
   }
 
   // Layout: 3 columns
@@ -213,9 +214,8 @@ export default function RouteFlow() {
   return (
     <div className="route-flow">
       <p className="flow-hint">
-        Traffic flow: <strong>Profile</strong> → <strong>Interface</strong> →{" "}
-        <strong>Destination</strong>. Only active routes are shown.
-      </p>
+        {tr("Traffic flow: ")}<strong>{tr("Profile")}</strong> → <strong>{tr("Interface")}</strong> →{" "}
+        <strong>{tr("Destination")}</strong>{tr(". Only active routes are shown.")}</p>
       <div className="flow-container">
         <svg width={totalWidth} height={totalHeight} className="flow-svg">
           {/* Links */}
