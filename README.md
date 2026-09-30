@@ -85,6 +85,8 @@ backends were found.
 - `docs/security.md` — threat model, vault ACL/DPAPI, redaction, trust.
 - `docs/recovery.md` — crash recovery, Job Object, ownership model.
 - `docs/testing.md` — Linux container and opt-in Windows VM E2E instructions.
+- `docs/versioning.md` — SemVer, commit message and release rules.
+- `CHANGELOG.md` — changes by version.
 - `docs/plans/` — stage-by-stage implementation plans.
 - `AGENTS.md` — contributor/agent commands and safety rules.
 

@@ -86,5 +86,8 @@ npm run build
   refresh; types stay in `src/types.ts`.
 - App version has one source of truth: `[workspace.package].version` in the
   root `Cargo.toml`; do not duplicate it in `package.json` or `tauri.conf.json`.
+- Versioning, commit messages and releases follow `docs/versioning.md`
+  (SemVer, Conventional Commits in English, `CHANGELOG.md`); bump the version
+  in a separate `chore(release): X.Y.Z` commit after each group of changes.
 - Store files are versioned documents written atomically (temp + rename)
   and ACL-protected via `config_security::protect_path`.
