@@ -1,5 +1,5 @@
 import { CloseIcon, PlusIcon } from "../../icons";
-import { pluralize, useT } from "../../i18n";
+import { useT } from "../../i18n";
 import { ConnectionSnippet } from "./sets";
 
 interface SetsBarProps {
@@ -50,12 +50,7 @@ export default function SetsBar({
                   isDirty
                     ? t("sets.dirtyTitle")
                     : t("sets.applyTitle", {
-                        n: snippet.profileIds.length,
-                        unit: pluralize(
-                          snippet.profileIds.length,
-                          ["подключение", "подключения", "подключений"],
-                          ["connection", "connections"],
-                        ),
+                        count: snippet.profileIds.length,
                       })
                 }
               >

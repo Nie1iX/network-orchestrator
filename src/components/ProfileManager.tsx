@@ -4,7 +4,7 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation, requiresElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
 import { useProfileListMode } from "../prefs";
-import { pluralize, useT } from "../i18n";
+import { useT } from "../i18n";
 import { BACKEND_LABEL_KEYS } from "../i18n/labels";
 import {
   backendIcon,
@@ -696,14 +696,7 @@ export default function ProfileManager() {
         return next;
       });
       const details = [
-        t("profiles.subRefreshed", {
-          n: result.endpointCount,
-          unit: pluralize(
-            result.endpointCount,
-            ["эндпоинт", "эндпоинта", "эндпоинтов"],
-            ["endpoint", "endpoints"],
-          ),
-        }),
+        t("profiles.subRefreshed", { count: result.endpointCount }),
       ];
       if (result.skippedCount > 0) details.push(t("profiles.subSkipped", { n: result.skippedCount }));
       if (result.fallbackUsed) details.push(t("profiles.subFallback"));
@@ -1513,14 +1506,7 @@ export default function ProfileManager() {
       >
         <div className="interface-section">
           <span className="section-label">
-            {t("sets.willInclude", {
-              n: runningProfiles.length,
-              unit: pluralize(
-                runningProfiles.length,
-                ["подключение", "подключения", "подключений"],
-                ["connection", "connections"],
-              ),
-            })}
+            {t("sets.willInclude", { count: runningProfiles.length })}
           </span>
           <ul className="profile-route-list">
             {runningProfiles.map((p) => (

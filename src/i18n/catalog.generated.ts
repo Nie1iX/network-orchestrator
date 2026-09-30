@@ -545,7 +545,10 @@ export const catalogs: Catalogs = {
       "cond.hintInactive": "Outside the conditioned network; nothing is installed",
       "cond.id": "Id",
       "cond.idPh": "office-lan",
-      "cond.installedCount": "{applied}/{total} {unit} installed",
+      "cond.installedCount": {
+        "one": "{applied}/{count} route installed",
+        "other": "{applied}/{count} routes installed"
+      },
       "cond.linuxOnly": "Conditional rules are available on Linux only — they are evaluated by the privileged daemon.",
       "cond.loadError": "Error loading rules: {err}",
       "cond.metricPh": "metric",
@@ -638,7 +641,10 @@ export const catalogs: Catalogs = {
       "exitIp.check": "Check",
       "exitIp.checking": "Checking…",
       "exitIp.label": "Exit IP",
-      "exitIp.multiExit": "{n} distinct {word}",
+      "exitIp.multiExit": {
+        "one": "{count} distinct exit",
+        "other": "{count} distinct exits"
+      },
       "exitIp.noResponse": "no response",
       "exitIp.oneExit": "{ip}",
       "exitIp.recheck": "Re-check",
@@ -822,8 +828,14 @@ export const catalogs: Catalogs = {
         "other": "{count} profiles configured"
       },
       "monitor.throughput": "Tunnel throughput",
-      "monitor.tunnelsActive": "{n} of {total} {word} running",
-      "monitor.tunnelsFailed": "{n} {word} failed",
+      "monitor.tunnelsActive": {
+        "one": "{n} of {count} tunnel running",
+        "other": "{n} of {count} tunnels running"
+      },
+      "monitor.tunnelsFailed": {
+        "one": "{count} tunnel failed",
+        "other": "{count} tunnels failed"
+      },
       "monitor.upload": "upload",
       "nav.conditions": "Conditions",
       "nav.logs": "Logs",
@@ -885,7 +897,10 @@ export const catalogs: Catalogs = {
       "profiles.services": "Services",
       "profiles.subCleanupFailed": "Previous config cleanup failed.",
       "profiles.subFallback": "Selected endpoint disappeared; first endpoint selected.",
-      "profiles.subRefreshed": "Subscription refreshed: {n} {unit}.",
+      "profiles.subRefreshed": {
+        "one": "Subscription refreshed: {count} endpoint.",
+        "other": "Subscription refreshed: {count} endpoints."
+      },
       "profiles.subSkipped": "{n} skipped.",
       "profiles.testDelays": "Test delays",
       "profiles.testDelaysTitle": "Measure delay to the active endpoint of every subscription",
@@ -902,6 +917,10 @@ export const catalogs: Catalogs = {
       "routes.activeCount": "{n} active",
       "routes.auto": "auto",
       "routes.autoInterface": "auto interface",
+      "routes.conflictCount": {
+        "one": "{count} conflict",
+        "other": "{count} conflicts"
+      },
       "routes.conflictsTitle": "Differences between predicted and effective routes",
       "routes.destination": "Destination",
       "routes.destinationWord": "destination",
@@ -944,12 +963,19 @@ export const catalogs: Catalogs = {
       "routes.tree": "Tree",
       "routes.via": "via",
       "routes.viewsAria": "Route views",
+      "routes.warningCount": {
+        "one": "{count} warning",
+        "other": "{count} warnings"
+      },
       "routes.warningsTitle": "Route analysis warnings",
       "rules.block": "Block",
       "rules.direct": "Direct",
       "rules.proxy": "Proxy",
       "running": "running",
-      "sets.applyTitle": "Switch to exactly these {n} {unit}",
+      "sets.applyTitle": {
+        "one": "Switch to exactly {count} connection",
+        "other": "Switch to exactly {count} connections"
+      },
       "sets.connectFirst": "Connect something first",
       "sets.deleteTitle": "Delete set",
       "sets.dirtyTitle": "Connections have changed since this set was saved",
@@ -965,9 +991,13 @@ export const catalogs: Catalogs = {
       "sets.updateActive": "Update \"{name}\"",
       "sets.updateTitle": "Update \"{name}\" to match the currently running connections",
       "sets.updateWith": "Update \"{name}\" with these connections",
-      "sets.willInclude": "Will include {n} {unit}",
+      "sets.willInclude": {
+        "one": "Will include {count} connection",
+        "other": "Will include {count} connections"
+      },
       "settings.appUpdates": "App updates",
       "settings.appUpdatesSub": "Check for and install new versions",
+      "settings.appearance": "Appearance",
       "settings.authAlways": "Every connection",
       "settings.authFullTunnel": "Full tunnel and OpenVPN only",
       "settings.authNever": "Never",
@@ -989,6 +1019,11 @@ export const catalogs: Catalogs = {
       "settings.tabAbout": "About",
       "settings.tabGeneral": "General",
       "settings.tabSystem": "System",
+      "settings.theme": "Theme",
+      "settings.themeDark": "Dark",
+      "settings.themeLight": "Light",
+      "settings.themeSub": "Use system appearance, light or dark.",
+      "settings.themeSystem": "System",
       "settings.title": "Settings",
       "settings.version": "Version {v}",
       "settings.vpnAuth": "Ask for administrator password when connecting VPN",
@@ -1614,7 +1649,12 @@ export const catalogs: Catalogs = {
       "cond.hintInactive": "Вне заданной сети; ничего не установлено",
       "cond.id": "Id",
       "cond.idPh": "office-lan",
-      "cond.installedCount": "{applied}/{total} {unit} установлено",
+      "cond.installedCount": {
+        "few": "{applied}/{count} маршрута установлено",
+        "many": "{applied}/{count} маршрутов установлено",
+        "one": "{applied}/{count} маршрут установлен",
+        "other": "{applied}/{count} маршрута установлено"
+      },
       "cond.linuxOnly": "Условные правила доступны только на Linux — их вычисляет привилегированный демон.",
       "cond.loadError": "Ошибка загрузки правил: {err}",
       "cond.metricPh": "метрика",
@@ -1707,7 +1747,12 @@ export const catalogs: Catalogs = {
       "exitIp.check": "Проверить",
       "exitIp.checking": "Проверка…",
       "exitIp.label": "Выходной IP",
-      "exitIp.multiExit": "{n} различных {word}",
+      "exitIp.multiExit": {
+        "few": "{count} различных выхода",
+        "many": "{count} различных выходов",
+        "one": "{count} различный выход",
+        "other": "{count} различных выхода"
+      },
       "exitIp.noResponse": "нет ответа",
       "exitIp.oneExit": "{ip}",
       "exitIp.recheck": "Ещё раз",
@@ -1897,8 +1942,18 @@ export const catalogs: Catalogs = {
         "other": "Настроено {count} профиля"
       },
       "monitor.throughput": "Трафик туннелей",
-      "monitor.tunnelsActive": "Работает {n} из {total} {word}",
-      "monitor.tunnelsFailed": "Ошибка у {n} {word}",
+      "monitor.tunnelsActive": {
+        "few": "Работает {n} из {count} туннелей",
+        "many": "Работает {n} из {count} туннелей",
+        "one": "Работает {n} из {count} туннеля",
+        "other": "Работает {n} из {count} туннелей"
+      },
+      "monitor.tunnelsFailed": {
+        "few": "Ошибка у {count} туннелей",
+        "many": "Ошибка у {count} туннелей",
+        "one": "Ошибка у {count} туннеля",
+        "other": "Ошибка у {count} туннелей"
+      },
       "monitor.upload": "отдача",
       "nav.conditions": "Условия",
       "nav.logs": "Журнал",
@@ -1960,7 +2015,12 @@ export const catalogs: Catalogs = {
       "profiles.services": "Сервисы",
       "profiles.subCleanupFailed": "Очистка предыдущего конфига не удалась.",
       "profiles.subFallback": "Выбранный эндпоинт исчез; выбран первый эндпоинт.",
-      "profiles.subRefreshed": "Подписка обновлена: {n} {unit}.",
+      "profiles.subRefreshed": {
+        "few": "Подписка обновлена: {count} эндпоинта.",
+        "many": "Подписка обновлена: {count} эндпоинтов.",
+        "one": "Подписка обновлена: {count} эндпоинт.",
+        "other": "Подписка обновлена: {count} эндпоинта."
+      },
       "profiles.subSkipped": "{n} пропущено.",
       "profiles.testDelays": "Замерить задержки",
       "profiles.testDelaysTitle": "Замерить задержку до активного эндпоинта каждой подписки",
@@ -1977,6 +2037,12 @@ export const catalogs: Catalogs = {
       "routes.activeCount": "активных: {n}",
       "routes.auto": "авто",
       "routes.autoInterface": "автоматический интерфейс",
+      "routes.conflictCount": {
+        "few": "{count} конфликта",
+        "many": "{count} конфликтов",
+        "one": "{count} конфликт",
+        "other": "{count} конфликта"
+      },
       "routes.conflictsTitle": "Расхождения предсказанных и действующих маршрутов",
       "routes.destination": "Назначение",
       "routes.destinationWord": "назначение",
@@ -2019,12 +2085,23 @@ export const catalogs: Catalogs = {
       "routes.tree": "Дерево",
       "routes.via": "через",
       "routes.viewsAria": "Представления маршрутов",
+      "routes.warningCount": {
+        "few": "{count} предупреждения",
+        "many": "{count} предупреждений",
+        "one": "{count} предупреждение",
+        "other": "{count} предупреждения"
+      },
       "routes.warningsTitle": "Предупреждения анализа маршрутов",
       "rules.block": "Блок",
       "rules.direct": "Напрямую",
       "rules.proxy": "Прокси",
       "running": "подключён",
-      "sets.applyTitle": "Переключиться ровно на эти {n} {unit}",
+      "sets.applyTitle": {
+        "few": "Переключиться ровно на {count} подключения",
+        "many": "Переключиться ровно на {count} подключений",
+        "one": "Переключиться ровно на {count} подключение",
+        "other": "Переключиться ровно на {count} подключения"
+      },
       "sets.connectFirst": "Сначала подключите что-нибудь",
       "sets.deleteTitle": "Удалить набор",
       "sets.dirtyTitle": "Подключения изменились с момента сохранения набора",
@@ -2040,9 +2117,15 @@ export const catalogs: Catalogs = {
       "sets.updateActive": "Обновить «{name}»",
       "sets.updateTitle": "Обновить «{name}» под текущие работающие подключения",
       "sets.updateWith": "Обновить «{name}» этими подключениями",
-      "sets.willInclude": "Будет включать {n} {unit}",
+      "sets.willInclude": {
+        "few": "Будет включать {count} подключения",
+        "many": "Будет включать {count} подключений",
+        "one": "Будет включать {count} подключение",
+        "other": "Будет включать {count} подключения"
+      },
       "settings.appUpdates": "Обновления приложения",
       "settings.appUpdatesSub": "Проверять и устанавливать новые версии",
+      "settings.appearance": "Внешний вид",
       "settings.authAlways": "При каждом подключении",
       "settings.authFullTunnel": "Только full tunnel и OpenVPN",
       "settings.authNever": "Никогда",
@@ -2064,6 +2147,11 @@ export const catalogs: Catalogs = {
       "settings.tabAbout": "О программе",
       "settings.tabGeneral": "Общие",
       "settings.tabSystem": "Система",
+      "settings.theme": "Тема",
+      "settings.themeDark": "Тёмная",
+      "settings.themeLight": "Светлая",
+      "settings.themeSub": "Как в системе, светлая или тёмная.",
+      "settings.themeSystem": "Как в системе",
       "settings.title": "Настройки",
       "settings.version": "Версия {v}",
       "settings.vpnAuth": "Запрашивать пароль администратора при подключении VPN",
@@ -2195,3 +2283,4 @@ export const catalogs: Catalogs = {
     ]
   }
 };
+export type TranslationKey = " (inactive)" | " / unlimited" | " Mbps" | " active" | " connection" | " profiles" | " routes" | " switching…" | " to discover server-pushed routes without installing them." | " total predicted" | " used" | " via {gateway}" | " warnings" | "\" with these connections" | "\" — review notes" | "+ Add connection" | "+ Save current" | "--route-nopull" | ". Only active routes are shown." | "10.0.0.0/24\n2001:db8::/32" | "A private, managed copy is stored locally. Import does not start a VPN." | "ADDRESSES" | "About" | "Active now" | "Active routes" | "Adapter preset" | "Add CIDRs" | "Add a connection" | "Add all to policy routes" | "Add route" | "Add routing rule" | "Added {length} route(s) to policy routes." | "Adding…" | "Addresses" | "Administrator privileges required" | "Advanced" | "All" | "All adapters" | "All disconnected" | "All interfaces" | "All probed routes are already in the policy routes list." | "Allowed IPs" | "Always-on" | "Always-on before sign-in is available for WireGuard and static routes. OpenVPN and Xray are not supported." | "Always-on cleanup pending" | "Always-on is paused after Disconnect all." | "Always-on paused" | "Always-on saved. Resume always-on to activate it." | "Always-on stores a copy of this WireGuard config, including its private key, in root-only system state. It can connect before you sign in. Enable it?" | "Analyzing configuration…" | "App updates" | "App updates are not implemented for local native builds." | "Appearance" | "Applies only to apps that honor Windows proxy settings." | "Applies to every user of this computer. Changing it requires an administrator password." | "Ask for administrator password when connecting VPN" | "Auto-connect could not start. Check Network daemon in Settings and profile Diagnostics." | "Auto-detected" | "Auto-refresh" | "Automatic discovery is not implemented on macOS yet. Use Files to choose your WireGuard configuration." | "Automatic refresh" | "Available" | "Backend" | "Backend & dependencies" | "Backend prerequisites" | "Block" | "Bring Down" | "Bring Up" | "Browse files…" | "Browse…" | "Bulk CIDRs" | "By interface" | "C:\\path\\client.ovpn" | "C:\\path\\config.json" | "C:\\path\\tunnel.conf" | "CIDR file exceeds 1 MiB." | "Cancel" | "Cancelling…" | "Cannot update subscription refresh interval." | "Changing interface state" | "Check for and install new versions" | "Check for updates" | "Check updates" | "Checking…" | "Choose existing…" | "Choose files…" | "Choose the interface language." | "Clean up" | "Cleaning up resources from the previous session" | "Click a summary card to drill down into details." | "Close" | "Close interface details" | "Collapse" | "Config file" | "Config source" | "Configuration" | "Configuration analysis — {name}" | "Configuration import and analysis work. VPN activation and backend installation are not implemented in this native version." | "Configured" | "Conflicts" | "Conflicts & issues" | "Connect" | "Connect something first" | "Connect something first. VPN activation is not available yet." | "Connect when the app starts" | "Connecting {name}" | "Connecting…" | "Connection name" | "Connections" | "Connections have changed since this snippet was saved" | "Connects briefly with " | "Could not inspect resources from the previous session: {value0}" | "Could not read CIDR file." | "Could not read login autostart setting." | "Could not shut down safely" | "Could not update login autostart setting." | "Credentials…" | "DNS" | "DNS (optional)" | "DNS servers" | "DNS suffix" | "Dark" | "Darwin does not expose comparable metrics through the shared reader." | "Delete" | "Delete connection?" | "Delete profile" | "Delete profile \"{name}\"?" | "Delete snippet" | "Destination" | "Destination:" | "Destination:  {destination}" | "Diagnose routing conflicts and traffic flow." | "Diagnostics — requires VPN provider" | "Diagnostics — {name}" | "Differences" | "Direct" | "Direct after custom rules" | "Direct for private/LAN IPs (after custom rules)" | "Disable always-on before deleting this profile." | "Disable always-on before editing this profile." | "Disconnect" | "Disconnecting {name}" | "Discovered routes (" | "Dismiss" | "Domain/IP routing" | "Domain/IP rules" | "Down" | "Driver" | "Each routing rule must list at least one selector." | "Edit" | "Edit profile" | "Effective routes" | "Enable always-on WireGuard" | "Endpoint" | "Enter IPv4 or IPv6 address..." | "Enter IPv4 or IPv6 address…" | "Enter a username with the password." | "Enter the credentials required by this profile." | "Enter tunnel fields" | "Enter tunnel keys, or open an existing .conf file." | "Error loading interfaces: " | "Error loading route map: " | "Error loading routes: " | "Error: " | "Ethernet" | "Every 15 minutes" | "Every 6 hours" | "Every connection" | "Every hour" | "Existing .conf file" | "Existing Xray JSON" | "Expand" | "Expires" | "External" | "Fetch subscription" | "Fetching…" | "Files" | "Filter" | "Filter by destination or owner (e.g. 10.0.0.0/8, work-vpn)" | "Filter by destination or owner..." | "Filter by destination or owner…" | "Filter drivers: WFP, Npcap, QoS — sub-interfaces of real adapters" | "Filters" | "Full tunnel and OpenVPN only" | "Gateway" | "Gateway (optional)" | "HTTP CONNECT" | "HWID (X-HWID header, optional)" | "Home" | "IP tunnels" | "IPv6 gateway" | "Identity" | "Import" | "Import WireGuard (.conf), OpenVPN (.ovpn), or Xray (.json) configurations." | "Import WireGuard (standard)" | "Import a share link, or an Xray JSON config." | "Import a subscription URL. Supported vless:// and hysteria2:// endpoints are grouped into a profile with an endpoint selector." | "Import a vless:// or hysteria2:// link, or an Xray JSON config." | "Import all WireGuard configs from the standard Windows location (C:\\Program Files\\WireGuard\\Data\\Configurations). Requires administrator privileges to read encrypted .conf.dpapi files." | "Import configurations" | "Import finished with errors" | "Import share link" | "Importing WireGuard configs" | "Importing…" | "Import…" | "Include stopped profiles" | "Inspect adapters, addresses, and live throughput." | "Inspect configuration" | "Install managed " | "Install managed Xray" | "Install managed Xray {version}?\n\nThe archive will be downloaded from:\n{sourceUrl}\n\nSHA-256: {sha256}\n\nFiles are verified and stored under the application data directory. Managed installations are never updated automatically." | "Interface" | "Interface address" | "Interface friendly name" | "Interface name, e.g. en0" | "Interface:" | "Interface:  {interfaceName}" | "Interfaces" | "Internal proxy routes" | "Keep for now" | "Language" | "Last checked" | "Launch the app and connect profiles marked for auto-connect." | "Light" | "Link speed" | "Load CIDRs from file" | "Loading route map..." | "Loading route overview..." | "Loading routes..." | "Loading traffic flow..." | "Loading version…" | "Loading..." | "Local listeners" | "Looking up..." | "Lookup" | "Loopback" | "Loopback cannot be toggled" | "MAC" | "MTU" | "MTU: " | "MTU: {value0}" | "Main" | "Main adapters" | "Managed" | "Matched route" | "Metric" | "Missing" | "More" | "Name" | "Native VPN provider pending" | "Network" | "Network Orchestrator" | "Network daemon unavailable" | "Network filter interfaces" | "Never" | "New connection" | "New profile" | "New version {version} is available. Install now?" | "No CIDRs found in the pasted list." | "No active route differences. Saved native profiles are stopped." | "No active routes to visualize. Connect a profile first." | "No conflicts detected." | "No connections match \"" | "No connections match \"{search}\"." | "No connections match “{query}”." | "No custom rules — all traffic uses the proxy." | "No declared OS routes" | "No effective routes reported." | "No interfaces match the current filters." | "No predicted routes." | "No profiles yet. Create one to get started." | "No routes found." | "No routes match the filter." | "No routes on this interface." | "No routes — tunnel uses its own routing." | "No target interface" | "No tunnels are running." | "No updates" | "None" | "Not available" | "Not connected" | "OS internal" | "OS routes" | "OS routes by interface" | "OS tunnel pseudo-interfaces: Teredo, 6to4, WAN Miniports" | "OS-internal" | "OS-internal: loopback and kernel interfaces" | "Off" | "Open Connections" | "OpenVPN" | "OpenVPN connection failed. Check credentials and profile settings." | "OpenVPN credentials" | "Or save as a new snippet" | "Overview" | "Owner" | "Password" | "Paste CIDRs (one per line or comma-separated)" | "Paste IPv4/IPv6 CIDRs. Duplicates and adjacent networks are aggregated. Routes are saved and analyzed, never applied in this native version." | "Paste a link or import a file" | "Peer endpoint" | "Peer public key" | "Persistent keepalive (seconds, optional)" | "Physical" | "Physical network adapters" | "Policy routes" | "Predicted active routes match the effective table." | "Predicted routes" | "Prefix" | "Preshared key (optional)" | "Private key" | "Private key passphrase (if required)" | "Private/LAN IPs" | "Probe routes" | "Probing…" | "Profile" | "Profile actions" | "Proxy" | "Proxy bypass" | "Proxy bypass (comma-separated)" | "Proxy bypass entries must not contain ';'." | "Quick actions" | "RX total" | "Rate" | "Raw table" | "Real network adapters: Ethernet, Wi-Fi, Bluetooth" | "Recovery check failed" | "Recovery required" | "Refresh" | "Refresh network" | "Refreshing…" | "Remember on this device" | "Remove" | "Remove managed" | "Remove managed Xray" | "Remove the managed Xray installation? Managed files will be deleted. Your profiles and configs are not affected." | "Rename" | "Rename connection" | "Reset to auto-detect" | "Restart as administrator" | "Resume always-on" | "Resuming…" | "Retry" | "Route Lookup" | "Route destination cannot be blank." | "Route map" | "Route traffic through an existing interface, no tunnel." | "Routes" | "Routes (" | "Routes by profile" | "Routing" | "Routing table:" | "SNIPPETS" | "SOCKS port must be an integer between 1 and 65535." | "SOCKS5" | "SOCKS5 (system proxy)" | "SOCKS5 port will be assigned automatically when the profile is saved." | "Save" | "Save as new" | "Save snippet" | "Save the currently running connections as a snippet" | "Saved \"" | "Saving…" | "Search by name, MAC, address..." | "Search by name, MAC, address…" | "Search connections…" | "Security" | "Select one or more WireGuard (.conf/.conf.dpapi), OpenVPN (.ovpn), or Xray (.json) config files. Backend is detected from extension." | "Server-pushed routes (OpenVPN, runtime)" | "Server-pushed routes are not known until connection" | "Set a config file first." | "Settings" | "Share link" | "Share link is required." | "Snippets" | "Source" | "Start at login" | "Startup" | "State" | "Static routes" | "Static routes (no tunnel)" | "Static-routes profile requires at least one policy route." | "Static-routes profiles apply policy routes through an existing interface (e.g. Ethernet) without starting a tunnel." | "Stored in the system keyring (GNOME Keyring or KWallet). Without a keyring, kept only until the app exits." | "Subscription" | "Subscription URL" | "Subscription URL, share link, or a config file" | "Subscription URLs and share links are not implemented in the native version yet. Use Files to import a configuration." | "Switch to exactly these {count} connections" | "System" | "System and loopback interfaces" | "System interfaces" | "System proxy requires a generated Xray profile with a SOCKS5 listener — this existing JSON config has none." | "TUN (full tunnel, requires admin)" | "TUN (network daemon, generated links)" | "TUN interface IP" | "TUN interface name" | "TUN mode captures all IP traffic via a TUN interface. Domain policies still apply inside Xray. System proxy is not used." | "TX total" | "Table preview uses longest-prefix match. Interface-scoped macOS policy can affect the kernel’s route choice." | "Target interface (required for policy routes)" | "Target interface is required when policy routes are set." | "Test delay" | "Testing…" | "The network daemon assigns the TUN interface and IP. With no policy routes, IPv4 uses a default route and 1.1.1.1 DNS; explicit split routes do not set DNS automatically." | "The previous session left behind resources owned by this application. No changes were made automatically." | "The saved profile and its managed configuration will be removed." | "Theme" | "Through proxy" | "Total" | "Traffic" | "Traffic flow" | "Traffic flow: " | "Tree" | "Tunnel" | "Tunnel type" | "Tunnel: " | "Tunnels" | "Unavailable in the native macOS version" | "Unknown" | "Up" | "Update \"" | "Update available" | "Update check failed: {err}" | "Update error" | "Update install failed: {err}" | "Updates" | "Updating…" | "Use Windows system proxy" | "Use an existing .ovpn client config." | "Use system appearance, light or dark." | "Username" | "VPN" | "VPN activation is not implemented in this native version." | "VPN activation is not implemented in this native version. Profiles, imports, and configuration analysis are available." | "VPN tunnel interfaces" | "VPN tunnels: WireGuard, OpenVPN, Xray, Tailscale" | "Version {value0}" | "Version {version}" | "Virtual" | "Virtual links, switches and bridges" | "Virtual network adapters" | "WiFi" | "Will include " | "Will include {count} connections" | "WireGuard" | "WireGuard (standard)" | "WireGuard allowed IPs are required." | "WireGuard interface address is required." | "WireGuard location" | "WireGuard peer endpoint is required." | "WireGuard peer public key is required." | "WireGuard private key is required." | "WireGuard, OpenVPN, interface changes, and policy routes require administrator privileges. Several connections can run at once." | "Work" | "Work VPN" | "Xray" | "Xray mode" | "You are running the latest version." | "active" | "add.importDesc" | "add.importTitle" | "add.openvpnDesc" | "add.staticDesc" | "add.title" | "add.wireguardDesc" | "add.xrayDesc" | "app.name" | "app.shutdownFailed" | "auto" | "auto interface" | "backend.available" | "backend.checking" | "backend.chooseExisting" | "backend.installConfirm" | "backend.installManaged" | "backend.installTitle" | "backend.missing" | "backend.none" | "backend.openVpn" | "backend.prerequisites" | "backend.removeConfirm" | "backend.removeManaged" | "backend.removeTitle" | "backend.resetAuto" | "backend.srcAuto" | "backend.srcConfigured" | "backend.srcManaged" | "backend.wireGuard" | "backend.xray" | "base64 preshared key" | "base64 private key" | "base64 public key" | "common.all" | "common.cancel" | "common.cancelling" | "common.checking" | "common.clear" | "common.close" | "common.collapse" | "common.connect" | "common.connecting" | "common.delete" | "common.disconnect" | "common.dismiss" | "common.edit" | "common.error" | "common.expand" | "common.more" | "common.off" | "common.refresh" | "common.remove" | "common.retry" | "common.save" | "common.saving" | "cond.addRoute" | "cond.applyFailed" | "cond.condPrefix" | "cond.conditionText" | "cond.deleteConfirm" | "cond.deleteTitle" | "cond.editTitle" | "cond.emptyExampleA" | "cond.emptyExampleB" | "cond.emptyTitle" | "cond.enabled" | "cond.errDest" | "cond.errId" | "cond.errMetric" | "cond.errName" | "cond.errNoRoutes" | "cond.errPrefix" | "cond.gwTitle" | "cond.hintActive" | "cond.hintDisabled" | "cond.hintError" | "cond.hintInactive" | "cond.id" | "cond.idPh" | "cond.installedCount" | "cond.linuxOnly" | "cond.loadError" | "cond.metricPh" | "cond.name" | "cond.namePh" | "cond.newRule" | "cond.newTitle" | "cond.onIface" | "cond.removeRoute" | "cond.routesWhile" | "cond.stateActive" | "cond.stateDisabled" | "cond.stateError" | "cond.stateInactive" | "cond.subtitle" | "cond.title" | "cond.toastActive" | "cond.toastDisabled" | "cond.toastError" | "cond.toastInactive" | "cond.toastRemoved" | "cond.toggleDisable" | "cond.toggleEnable" | "cond.viaPh" | "detail.actions" | "detail.activeEndpoint" | "detail.alwaysOn" | "detail.alwaysOnPaused" | "detail.alwaysOnPending" | "detail.autoRefresh" | "detail.backend" | "detail.bypassDefault" | "detail.credentials" | "detail.diagnostics" | "detail.disableAlwaysOn" | "detail.disconnectToSwitch" | "detail.domainRules" | "detail.enableAlwaysOn" | "detail.endpoints" | "detail.every15" | "detail.every6h" | "detail.everyHour" | "detail.expires" | "detail.external" | "detail.failed" | "detail.interface" | "detail.lastChecked" | "detail.managed" | "detail.metric" | "detail.moveDown" | "detail.moveUp" | "detail.notAssigned" | "detail.privateLan" | "detail.privateLanValue" | "detail.proxy" | "detail.proxyBypass" | "detail.rate" | "detail.refreshLabel" | "detail.refreshSub" | "detail.refreshing" | "detail.routes" | "detail.runningDiag" | "detail.runningOn" | "detail.stopped" | "detail.switchEndpoint" | "detail.switching" | "detail.testAll" | "detail.testAllTitle" | "detail.traffic" | "detail.unlimited" | "detail.unreachable" | "detail.used" | "device-hwid" | "diag.title" | "domain:example.com, geosite:cn, geoip:us" | "down" | "elev.actConnect" | "elev.actDisconnect" | "elev.actImportWg" | "elev.adminRequired" | "elev.adminRequiredTitle" | "elev.daemonUnavailable" | "elev.daemonUnavailableTitle" | "elev.restartAdmin" | "events.autoConnectFailed" | "events.autoConnectPartial" | "events.connectFailed" | "events.connectFailedDetail" | "events.profileFallback" | "exitIp.check" | "exitIp.checking" | "exitIp.label" | "exitIp.multiExit" | "exitIp.noResponse" | "exitIp.oneExit" | "exitIp.recheck" | "failed" | "form.addCidrs" | "form.addRoute" | "form.adding" | "form.allowedIps" | "form.autoConnect" | "form.backend" | "form.browse" | "form.bulkFileAria" | "form.bulkLabel" | "form.bulkReadFailed" | "form.bulkToggle" | "form.bulkTooBig" | "form.bypassLabel" | "form.configFile" | "form.configFilter" | "form.configSource" | "form.dnsOpt" | "form.domainRouting" | "form.editTitle" | "form.errAnalysis" | "form.errBypassSemicolon" | "form.errIfaceRequired" | "form.errNoCidrs" | "form.errRouteBlank" | "form.errShareRequired" | "form.errSocksPort" | "form.errStaticRoute" | "form.errWgAddr" | "form.errWgAllowed" | "form.errWgEndpoint" | "form.errWgPeerKey" | "form.errWgPrivKey" | "form.geoHint" | "form.gwPh" | "form.ifaceAddr" | "form.keepalive" | "form.name" | "form.namePh" | "form.newTitle" | "form.noRoutes" | "form.peerEndpoint" | "form.peerKey" | "form.peerKeyPh" | "form.policyRoutes" | "form.privKey" | "form.privKeyPh" | "form.privateLanDirect" | "form.probe" | "form.probeAddAll" | "form.probeAdded" | "form.probeAllAdded" | "form.probeDiscovered" | "form.probeFound" | "form.probeHelpA" | "form.probeHelpB" | "form.probeNone" | "form.probeSetConfig" | "form.probing" | "form.psk" | "form.pskPh" | "form.rulesHint" | "form.shareLink" | "form.shareLinkLabel" | "form.socksAuto" | "form.socksMode" | "form.staticHelp" | "form.staticNoTunnel" | "form.sysProxy" | "form.sysProxyHelp" | "form.sysProxyUnavailable" | "form.tabConnection" | "form.tabGeneral" | "form.tabRouting" | "form.tabsAria" | "form.targetIface" | "form.targetIfacePh" | "form.tunHelpLinux" | "form.tunHelpWin" | "form.tunIface" | "form.tunIp" | "form.tunLinux" | "form.tunWin" | "form.wgFields" | "form.wgFile" | "form.xrayJson" | "form.xrayMode" | "https://example.com/sub" | "ifIndex" | "ifType" | "iface.addresses" | "iface.bringDown" | "iface.bringUp" | "iface.dnsServers" | "iface.dnsSuffix" | "iface.driver" | "iface.elevationState" | "iface.gateway" | "iface.gatewayV6" | "iface.linkSpeed" | "iface.loadingRoutes" | "iface.loopbackNoToggle" | "iface.name" | "iface.noRoutes" | "iface.physical" | "iface.rate" | "iface.routesCount" | "iface.rxTotal" | "iface.stateDown" | "iface.stateUp" | "iface.total" | "iface.tunnel" | "iface.tunnelType" | "iface.txTotal" | "iface.virtual" | "ifcat.desc.filter" | "ifcat.desc.physical" | "ifcat.desc.system" | "ifcat.desc.tunnel" | "ifcat.desc.virtual" | "ifcat.desc.vpn" | "ifcat.filter" | "ifcat.physical" | "ifcat.system" | "ifcat.tunnel" | "ifcat.virtual" | "ifcat.vpn" | "import.autoRefresh" | "import.browse" | "import.fetch" | "import.fetching" | "import.filesFilter" | "import.filesHelp" | "import.hwid" | "import.importing" | "import.noWgConfigs" | "import.subHelp" | "import.subUrl" | "import.tabFiles" | "import.tabSub" | "import.tabWg" | "import.title" | "import.wgHelp" | "import.wgImport" | "in effective table" | "logs.allLevels" | "logs.daemonUnavailable" | "logs.empty" | "logs.filterPlaceholder" | "logs.hideDaemon" | "logs.levelError" | "logs.levelInfo" | "logs.levelWarn" | "logs.noMatch" | "logs.showDaemon" | "logs.showingLast" | "macOS 27 · Native" | "metric " | "metric {metric}" | "metric {metric}{value1}" | "monitor.activeTunnels" | "monitor.allDisconnected" | "monitor.collecting" | "monitor.connectionFailed" | "monitor.download" | "monitor.exitAddresses" | "monitor.failedSuffix" | "monitor.needsAttention" | "monitor.noTunnels" | "monitor.profilesConfigured" | "monitor.throughput" | "monitor.tunnelsActive" | "monitor.tunnelsFailed" | "monitor.upload" | "nav.conditions" | "nav.logs" | "nav.monitor" | "nav.network" | "nav.profiles" | "nav.routes" | "nav.settings" | "net.loadError" | "net.noMatch" | "net.presetAll" | "net.presetMain" | "net.presetOs" | "net.searchPlaceholder" | "net.title" | "none" | "ovpn.errCreds" | "ovpn.errFailed" | "ovpn.errUserPass" | "ovpn.keyPass" | "ovpn.keyringHelp" | "ovpn.password" | "ovpn.remember" | "ovpn.title" | "ovpn.username" | "profiles.add" | "profiles.alwaysOnConfirm" | "profiles.alwaysOnPaused" | "profiles.alwaysOnSaved" | "profiles.alwaysOnTitle" | "profiles.connectFailedDiag" | "profiles.connecting" | "profiles.delayCheckFailed" | "profiles.delayTitle" | "profiles.deleteConfirm" | "profiles.deleteTitle" | "profiles.detailEmpty" | "profiles.detailEmptyNone" | "profiles.disableAlwaysOnDelete" | "profiles.disableAlwaysOnEdit" | "profiles.disconnecting" | "profiles.dragTitle" | "profiles.empty" | "profiles.failedSuffix" | "profiles.import" | "profiles.importErrors" | "profiles.infoAlwaysOn" | "profiles.infoElev" | "profiles.noIface" | "profiles.noMatch" | "profiles.refreshIntervalFailed" | "profiles.reloadReconnect" | "profiles.reloaded" | "profiles.resume" | "profiles.resuming" | "profiles.runningSummary" | "profiles.savedNotice" | "profiles.searchPh" | "profiles.services" | "profiles.subCleanupFailed" | "profiles.subFallback" | "profiles.subRefreshed" | "profiles.subSkipped" | "profiles.testDelays" | "profiles.testDelaysTitle" | "profiles.testing" | "profiles.title" | "recovery.checkFailed" | "recovery.cleanUp" | "recovery.elevationReason" | "recovery.explanation" | "recovery.inspectFailed" | "recovery.keep" | "recovery.required" | "routes.active" | "routes.activeCount" | "routes.auto" | "routes.autoInterface" | "routes.conflictCount" | "routes.conflictsTitle" | "routes.destination" | "routes.destinationWord" | "routes.differences" | "routes.diffsOk" | "routes.effective" | "routes.filterPlaceholder" | "routes.flow" | "routes.flowHint" | "routes.gateway" | "routes.includeStopped" | "routes.interface" | "routes.interfaceCol" | "routes.loadError" | "routes.loading" | "routes.loadingFlow" | "routes.loadingMap" | "routes.lookup" | "routes.lookupPlaceholder" | "routes.mapError" | "routes.metric" | "routes.metricCol" | "routes.noActiveRoutes" | "routes.noEffective" | "routes.noFilterMatch" | "routes.noPredicted" | "routes.none" | "routes.onlyActive" | "routes.owner" | "routes.predicted" | "routes.prefix" | "routes.profile" | "routes.pushed" | "routes.source" | "routes.stateCol" | "routes.stopped" | "routes.table" | "routes.tableN" | "routes.title" | "routes.tree" | "routes.via" | "routes.viewsAria" | "routes.warningCount" | "routes.warningsTitle" | "rules.block" | "rules.direct" | "rules.proxy" | "running" | "sets.applyTitle" | "sets.connectFirst" | "sets.deleteTitle" | "sets.dirtyTitle" | "sets.hint" | "sets.label" | "sets.modalTitle" | "sets.name" | "sets.namePh" | "sets.orSaveNew" | "sets.saveAsNew" | "sets.saveCurrent" | "sets.saveTitle" | "sets.updateActive" | "sets.updateTitle" | "sets.updateWith" | "sets.willInclude" | "settings.appUpdates" | "settings.appUpdatesSub" | "settings.appearance" | "settings.authAlways" | "settings.authFullTunnel" | "settings.authNever" | "settings.autostartReadErr" | "settings.autostartUpdateErr" | "settings.groupBackend" | "settings.groupByBackend" | "settings.groupByBackendSub" | "settings.groupProfiles" | "settings.groupSecurity" | "settings.groupStartup" | "settings.groupUpdates" | "settings.language" | "settings.languageSub" | "settings.loadingVersion" | "settings.sectionsAria" | "settings.startAtLogin" | "settings.startAtLoginSub" | "settings.tabAbout" | "settings.tabGeneral" | "settings.tabSystem" | "settings.theme" | "settings.themeDark" | "settings.themeLight" | "settings.themeSub" | "settings.themeSystem" | "settings.title" | "settings.version" | "settings.vpnAuth" | "settings.vpnAuthSub" | "starting" | "stopped" | "stopping" | "to start one." | "to view your profiles." | "ts.down" | "ts.exitNode" | "ts.loginFirst" | "ts.notInstalled" | "ts.notLoggedInPost" | "ts.notLoggedInPre" | "ts.offline" | "ts.peers" | "ts.state" | "ts.thisNode" | "ts.unavailable" | "ts.up" | "unknown" | "up" | "update.available" | "update.availableTitle" | "update.check" | "update.checkFailed" | "update.checkTitle" | "update.downloadProgress" | "update.downloading" | "update.errorTitle" | "update.installFailed" | "update.installing" | "update.latest" | "update.noUpdates" | "update.restarting" | "update.updating" | "vless:// or hysteria2://…" | "vpn.example.com:51820" | "warning" | "xray-tun" | "{action} requires administrator privileges. Restart the application as administrator?" | "{action} requires the network daemon. {message}" | "{backend} executable" | "{count} profiles" | "{count} routes" | "{count} routing rules" | "{count} total predicted" | "{count} tunnels active" | "{delayMs} ms" | "{failedCount} profile(s) could not connect automatically. Check Diagnostics and retry Connect manually." | "{ownerName} · {source} · metric {value2}{value3}" | "{source} · {value1} · metric {value2}{value3}" | "{value0} Mbps" | "{value0} system routes" | "{value0} warnings";

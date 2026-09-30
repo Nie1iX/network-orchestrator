@@ -5,7 +5,7 @@ import RouteFlow from "./RouteFlow";
 import RouteMap from "./RouteMap";
 import RouteTable from "./RouteTable";
 import { RouteLookupResult, RouteMap as RouteMapData } from "../types";
-import { pluralize, TranslationKey, useT } from "../i18n";
+import { TranslationKey, useT } from "../i18n";
 
 type RouteTab = "flow" | "tree" | "table";
 
@@ -91,12 +91,7 @@ export default function RouteView() {
               onClick={() => setTab("tree")}
               title={t("routes.conflictsTitle")}
             >
-              {conflicts}{" "}
-              {pluralize(
-                conflicts ?? 0,
-                ["конфликт", "конфликта", "конфликтов"],
-                ["conflict", "conflicts"],
-              )}
+              {t("routes.conflictCount", { count: conflicts ?? 0 })}
             </button>
             <button
               type="button"
@@ -104,12 +99,7 @@ export default function RouteView() {
               onClick={() => setTab("tree")}
               title={t("routes.warningsTitle")}
             >
-              {warnings}{" "}
-              {pluralize(
-                warnings ?? 0,
-                ["предупреждение", "предупреждения", "предупреждений"],
-                ["warning", "warnings"],
-              )}
+              {t("routes.warningCount", { count: warnings ?? 0 })}
             </button>
           </div>
         )}

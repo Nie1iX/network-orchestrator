@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { ExitIpEntry } from "../types";
-import { pluralize, useT } from "../i18n";
+import { useT } from "../i18n";
 
 type ExitIpEvent =
   | { kind: "pending"; names: string[] }
@@ -57,14 +57,7 @@ export default function ExitIpPanel() {
                 ? t("exitIp.noResponse")
                 : distinct.size === 1
                   ? t("exitIp.oneExit", { ip: [...distinct][0] })
-                  : t("exitIp.multiExit", {
-                      n: distinct.size,
-                      word: pluralize(
-                        distinct.size,
-                        ["выход", "выхода", "выходов"],
-                        ["exit", "exits"],
-                      ),
-                    })}
+                  : t("exitIp.multiExit", { count: distinct.size })}
             </span>
           )}
           <button

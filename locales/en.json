@@ -210,7 +210,10 @@
     "cond.hintInactive": "Outside the conditioned network; nothing is installed",
     "cond.id": "Id",
     "cond.idPh": "office-lan",
-    "cond.installedCount": "{applied}/{total} {unit} installed",
+    "cond.installedCount": {
+      "one": "{applied}/{count} route installed",
+      "other": "{applied}/{count} routes installed"
+    },
     "cond.linuxOnly": "Conditional rules are available on Linux only — they are evaluated by the privileged daemon.",
     "cond.loadError": "Error loading rules: {err}",
     "cond.metricPh": "metric",
@@ -381,7 +384,10 @@
     "exitIp.check": "Check",
     "exitIp.checking": "Checking…",
     "exitIp.label": "Exit IP",
-    "exitIp.multiExit": "{n} distinct {word}",
+    "exitIp.multiExit": {
+      "one": "{count} distinct exit",
+      "other": "{count} distinct exits"
+    },
     "exitIp.noResponse": "no response",
     "exitIp.oneExit": "{ip}",
     "exitIp.recheck": "Re-check",
@@ -638,8 +644,14 @@
       "other": "{count} profiles configured"
     },
     "monitor.throughput": "Tunnel throughput",
-    "monitor.tunnelsActive": "{n} of {total} {word} running",
-    "monitor.tunnelsFailed": "{n} {word} failed",
+    "monitor.tunnelsActive": {
+      "one": "{n} of {count} tunnel running",
+      "other": "{n} of {count} tunnels running"
+    },
+    "monitor.tunnelsFailed": {
+      "one": "{count} tunnel failed",
+      "other": "{count} tunnels failed"
+    },
     "monitor.upload": "upload",
     "More": "More",
     "MTU": "MTU",
@@ -773,7 +785,10 @@
     "profiles.services": "Services",
     "profiles.subCleanupFailed": "Previous config cleanup failed.",
     "profiles.subFallback": "Selected endpoint disappeared; first endpoint selected.",
-    "profiles.subRefreshed": "Subscription refreshed: {n} {unit}.",
+    "profiles.subRefreshed": {
+      "one": "Subscription refreshed: {count} endpoint.",
+      "other": "Subscription refreshed: {count} endpoints."
+    },
     "profiles.subSkipped": "{n} skipped.",
     "profiles.testDelays": "Test delays",
     "profiles.testDelaysTitle": "Measure delay to the active endpoint of every subscription",
@@ -886,7 +901,10 @@
     "Server-pushed routes (OpenVPN, runtime)": "Server-pushed routes (OpenVPN, runtime)",
     "Server-pushed routes are not known until connection": "Server-pushed routes are not known until connection",
     "Set a config file first.": "Set a config file first.",
-    "sets.applyTitle": "Switch to exactly these {n} {unit}",
+    "sets.applyTitle": {
+      "one": "Switch to exactly {count} connection",
+      "other": "Switch to exactly {count} connections"
+    },
     "sets.connectFirst": "Connect something first",
     "sets.deleteTitle": "Delete set",
     "sets.dirtyTitle": "Connections have changed since this set was saved",
@@ -902,7 +920,10 @@
     "sets.updateActive": "Update \"{name}\"",
     "sets.updateTitle": "Update \"{name}\" to match the currently running connections",
     "sets.updateWith": "Update \"{name}\" with these connections",
-    "sets.willInclude": "Will include {n} {unit}",
+    "sets.willInclude": {
+      "one": "Will include {count} connection",
+      "other": "Will include {count} connections"
+    },
     "Settings": "Settings",
     "settings.appUpdates": "App updates",
     "settings.appUpdatesSub": "Check for and install new versions",
@@ -918,6 +939,7 @@
     "settings.groupSecurity": "Security",
     "settings.groupStartup": "Startup",
     "settings.groupUpdates": "Updates",
+    "settings.appearance": "Appearance",
     "settings.language": "Language",
     "settings.languageSub": "Interface language",
     "settings.loadingVersion": "Loading version…",
@@ -927,6 +949,11 @@
     "settings.tabAbout": "About",
     "settings.tabGeneral": "General",
     "settings.tabSystem": "System",
+    "settings.theme": "Theme",
+    "settings.themeDark": "Dark",
+    "settings.themeLight": "Light",
+    "settings.themeSub": "Use system appearance, light or dark.",
+    "settings.themeSystem": "System",
     "settings.title": "Settings",
     "settings.version": "Version {v}",
     "settings.vpnAuth": "Ask for administrator password when connecting VPN",
@@ -1062,6 +1089,14 @@
     "Xray": "Xray",
     "Xray mode": "Xray mode",
     "xray-tun": "xray-tun",
-    "You are running the latest version.": "You are running the latest version."
+    "You are running the latest version.": "You are running the latest version.",
+    "routes.conflictCount": {
+      "one": "{count} conflict",
+      "other": "{count} conflicts"
+    },
+    "routes.warningCount": {
+      "one": "{count} warning",
+      "other": "{count} warnings"
+    }
   }
 }

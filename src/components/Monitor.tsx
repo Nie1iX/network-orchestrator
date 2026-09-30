@@ -8,7 +8,7 @@ import RateText from "./ui/RateText";
 import Skeleton from "./ui/Skeleton";
 import { useToast } from "./ui/Toast";
 import { NetworkInterface, Profile, TunnelStatus } from "../types";
-import { pluralize, useT } from "../i18n";
+import { useT } from "../i18n";
 
 interface Throughput {
   rxRate: number;
@@ -255,24 +255,12 @@ export default function Monitor() {
           <span className="status-strip-title">
             {running.length === 0
               ? failed.length > 0
-                ? t("monitor.tunnelsFailed", {
-                    n: failed.length,
-                    word: pluralize(
-                      failed.length,
-                      ["туннель", "туннеля", "туннелей"],
-                      ["tunnel", "tunnels"],
-                    ),
-                  })
+                ? t("monitor.tunnelsFailed", { count: failed.length })
                 : t("monitor.allDisconnected")
               : t("monitor.tunnelsActive", {
-                    n: running.length,
-                    total: profiles.length,
-                    word: pluralize(
-                      profiles.length,
-                      ["туннеля", "туннелей", "туннелей"],
-                      ["tunnel", "tunnels"],
-                    ),
-                  })}
+                  n: running.length,
+                  count: profiles.length,
+                })}
           </span>
           <span className="status-strip-sub">
             {running.length > 0 ? (

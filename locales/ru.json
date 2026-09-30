@@ -261,7 +261,12 @@
     "cond.hintInactive": "Вне заданной сети; ничего не установлено",
     "cond.id": "Id",
     "cond.idPh": "office-lan",
-    "cond.installedCount": "{applied}/{total} {unit} установлено",
+    "cond.installedCount": {
+      "one": "{applied}/{count} маршрут установлен",
+      "few": "{applied}/{count} маршрута установлено",
+      "many": "{applied}/{count} маршрутов установлено",
+      "other": "{applied}/{count} маршрута установлено"
+    },
     "cond.linuxOnly": "Условные правила доступны только на Linux — их вычисляет привилегированный демон.",
     "cond.loadError": "Ошибка загрузки правил: {err}",
     "cond.metricPh": "метрика",
@@ -432,7 +437,12 @@
     "exitIp.check": "Проверить",
     "exitIp.checking": "Проверка…",
     "exitIp.label": "Выходной IP",
-    "exitIp.multiExit": "{n} различных {word}",
+    "exitIp.multiExit": {
+      "one": "{count} различный выход",
+      "few": "{count} различных выхода",
+      "many": "{count} различных выходов",
+      "other": "{count} различных выхода"
+    },
     "exitIp.noResponse": "нет ответа",
     "exitIp.oneExit": "{ip}",
     "exitIp.recheck": "Ещё раз",
@@ -695,8 +705,18 @@
       "other": "Настроено {count} профиля"
     },
     "monitor.throughput": "Трафик туннелей",
-    "monitor.tunnelsActive": "Работает {n} из {total} {word}",
-    "monitor.tunnelsFailed": "Ошибка у {n} {word}",
+    "monitor.tunnelsActive": {
+      "one": "Работает {n} из {count} туннеля",
+      "few": "Работает {n} из {count} туннелей",
+      "many": "Работает {n} из {count} туннелей",
+      "other": "Работает {n} из {count} туннелей"
+    },
+    "monitor.tunnelsFailed": {
+      "one": "Ошибка у {count} туннеля",
+      "few": "Ошибка у {count} туннелей",
+      "many": "Ошибка у {count} туннелей",
+      "other": "Ошибка у {count} туннелей"
+    },
     "monitor.upload": "отдача",
     "More": "Ещё",
     "MTU": "MTU",
@@ -830,7 +850,12 @@
     "profiles.services": "Сервисы",
     "profiles.subCleanupFailed": "Очистка предыдущего конфига не удалась.",
     "profiles.subFallback": "Выбранный эндпоинт исчез; выбран первый эндпоинт.",
-    "profiles.subRefreshed": "Подписка обновлена: {n} {unit}.",
+    "profiles.subRefreshed": {
+      "one": "Подписка обновлена: {count} эндпоинт.",
+      "few": "Подписка обновлена: {count} эндпоинта.",
+      "many": "Подписка обновлена: {count} эндпоинтов.",
+      "other": "Подписка обновлена: {count} эндпоинта."
+    },
     "profiles.subSkipped": "{n} пропущено.",
     "profiles.testDelays": "Замерить задержки",
     "profiles.testDelaysTitle": "Замерить задержку до активного эндпоинта каждой подписки",
@@ -943,7 +968,12 @@
     "Server-pushed routes (OpenVPN, runtime)": "Маршруты сервера (OpenVPN, после подключения)",
     "Server-pushed routes are not known until connection": "Маршруты сервера неизвестны до подключения",
     "Set a config file first.": "Сначала выберите файл конфигурации.",
-    "sets.applyTitle": "Переключиться ровно на эти {n} {unit}",
+    "sets.applyTitle": {
+      "one": "Переключиться ровно на {count} подключение",
+      "few": "Переключиться ровно на {count} подключения",
+      "many": "Переключиться ровно на {count} подключений",
+      "other": "Переключиться ровно на {count} подключения"
+    },
     "sets.connectFirst": "Сначала подключите что-нибудь",
     "sets.deleteTitle": "Удалить набор",
     "sets.dirtyTitle": "Подключения изменились с момента сохранения набора",
@@ -959,7 +989,12 @@
     "sets.updateActive": "Обновить «{name}»",
     "sets.updateTitle": "Обновить «{name}» под текущие работающие подключения",
     "sets.updateWith": "Обновить «{name}» этими подключениями",
-    "sets.willInclude": "Будет включать {n} {unit}",
+    "sets.willInclude": {
+      "one": "Будет включать {count} подключение",
+      "few": "Будет включать {count} подключения",
+      "many": "Будет включать {count} подключений",
+      "other": "Будет включать {count} подключения"
+    },
     "Settings": "Настройки",
     "settings.appUpdates": "Обновления приложения",
     "settings.appUpdatesSub": "Проверять и устанавливать новые версии",
@@ -975,6 +1010,7 @@
     "settings.groupSecurity": "Безопасность",
     "settings.groupStartup": "Запуск",
     "settings.groupUpdates": "Обновления",
+    "settings.appearance": "Внешний вид",
     "settings.language": "Язык",
     "settings.languageSub": "Язык интерфейса",
     "settings.loadingVersion": "Загрузка версии…",
@@ -984,6 +1020,11 @@
     "settings.tabAbout": "О программе",
     "settings.tabGeneral": "Общие",
     "settings.tabSystem": "Система",
+    "settings.theme": "Тема",
+    "settings.themeDark": "Тёмная",
+    "settings.themeLight": "Светлая",
+    "settings.themeSub": "Как в системе, светлая или тёмная.",
+    "settings.themeSystem": "Как в системе",
     "settings.title": "Настройки",
     "settings.version": "Версия {v}",
     "settings.vpnAuth": "Запрашивать пароль администратора при подключении VPN",
@@ -1121,6 +1162,18 @@
     "Xray": "Xray",
     "Xray mode": "Режим Xray",
     "xray-tun": "xray-tun",
-    "You are running the latest version.": "У вас установлена последняя версия."
+    "You are running the latest version.": "У вас установлена последняя версия.",
+    "routes.conflictCount": {
+      "one": "{count} конфликт",
+      "few": "{count} конфликта",
+      "many": "{count} конфликтов",
+      "other": "{count} конфликта"
+    },
+    "routes.warningCount": {
+      "one": "{count} предупреждение",
+      "few": "{count} предупреждения",
+      "many": "{count} предупреждений",
+      "other": "{count} предупреждения"
+    }
   }
 }

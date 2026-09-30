@@ -1,6 +1,8 @@
 import { useSyncExternalStore } from "react";
-import { catalogs } from "./catalog.generated.ts";
+import { catalogs, type TranslationKey } from "./catalog.generated.ts";
 import { resolveLanguage, translateMessage, type Arguments } from "./engine.ts";
+
+export type { TranslationKey };
 
 const STORAGE_KEY = "netmanager.language";
 const LEGACY_STORAGE_KEY = "netmanager.ui.language";
@@ -67,26 +69,6 @@ export function useLanguage() {
 // Compatibility layer for the dotted-key t()/useT() call sites; the same
 // strings live in locales/*.json under their dotted keys.
 
-export type Language = string;
-export type Lang = Language;
-export type TranslationKey = string;
-
-/** Languages shown in Settings → General. `label` stays native on purpose. */
-export const LANGS: { id: Language; label: string }[] = availableLanguages.map(
-  ({ code, name }) => ({ id: code, label: name }),
-);
-
-export function getLanguage(): Language {
-  return currentLanguage();
-}
-
-export const getLang = getLanguage;
-export const setLang = setLanguage;
-
-export function useLang(): Language {
-  return useLanguage().language;
-}
-
 export function t(key: TranslationKey, params?: Arguments): string {
   return tr(key, params);
 }
@@ -94,29 +76,4 @@ export function t(key: TranslationKey, params?: Arguments): string {
 export function useT() {
   useLanguage();
   return t;
-}
-
-/** Russian plurals: [singular, paucal (2–4), plural]. */
-export function pluralRu(n: number, forms: [string, string, string]): string {
-  const a = Math.abs(n) % 10;
-  const b = Math.abs(n) % 100;
-  if (a === 1 && b !== 11) return forms[0];
-  if (a >= 2 && a <= 4 && (b < 12 || b > 14)) return forms[1];
-  return forms[2];
-}
-
-/**
- * Pick a count noun form for the active language.
- * ruForms: [singular, paucal, plural] — enForms: [singular, plural].
- */
-export function pluralize(
-  n: number,
-  ruForms: [string, string, string],
-  enForms: [string, string],
-): string {
-  return currentLanguage() === "ru"
-    ? pluralRu(n, ruForms)
-    : n === 1
-      ? enForms[0]
-      : enForms[1];
 }

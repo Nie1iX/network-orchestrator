@@ -15,7 +15,7 @@ import Modal from "./Modal";
 import Page from "./Page";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import { useToast } from "./ui/Toast";
-import { pluralize, t, TranslationKey, useT } from "../i18n";
+import { t, TranslationKey, useT } from "../i18n";
 
 const STATE_LABEL_KEYS: Record<ConditionalRuleState, TranslationKey> = {
   active: "cond.stateActive",
@@ -308,12 +308,7 @@ export default function CondRules() {
                   <span className="meta-label">
                     {tr("cond.installedCount", {
                       applied: status.appliedRoutes,
-                      total: rule.routes.length,
-                      unit: pluralize(
-                        rule.routes.length,
-                        ["маршрут", "маршрута", "маршрутов"],
-                        ["route", "routes"],
-                      ),
+                      count: rule.routes.length,
                     })}
                   </span>
                 </div>

@@ -1,9 +1,9 @@
-import {
+import type {
   BackendExecutableSource,
   InterfaceCategory,
   TunnelBackend,
-} from "../types";
-import { TranslationKey } from "./index";
+} from "../types.ts";
+import type { TranslationKey } from "./index.ts";
 
 export const BACKEND_LABEL_KEYS: Record<TunnelBackend, TranslationKey> = {
   none: "backend.none",
