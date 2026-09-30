@@ -257,10 +257,7 @@ export default function Monitor() {
               ? failed.length > 0
                 ? t("monitor.tunnelsFailed", { count: failed.length })
                 : t("monitor.allDisconnected")
-              : t("monitor.tunnelsActive", {
-                  n: running.length,
-                  count: profiles.length,
-                })}
+              : t("monitor.tunnelsRunning", { count: running.length })}
           </span>
           <span className="status-strip-sub">
             {running.length > 0 ? (

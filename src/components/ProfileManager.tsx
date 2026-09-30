@@ -396,7 +396,6 @@ export default function ProfileManager() {
       }
       if (!cancelled) {
         setEndpoints(next);
-        measureActiveEndpoints(next);
       }
     })();
     return () => {
@@ -775,18 +774,6 @@ export default function ProfileManager() {
     }
   };
 
-  const measureActiveEndpoints = (
-    endpointMap: Record<string, SubscriptionEndpointInfo[]>,
-  ) => {
-    for (const p of profiles) {
-      if (!p.subscription) continue;
-      const list = endpointMap[p.id];
-      const index = list?.findIndex((e) => e.active) ?? -1;
-      if (index < 0) continue;
-      void onMeasureEndpoint(p, index);
-    }
-  };
-
   const applySnippet = (snippet: ConnectionSnippet) => {
     const targetIds = new Set(snippet.profileIds);
     for (const profile of profiles) {
@@ -1140,17 +1127,6 @@ export default function ProfileManager() {
         >
           <InfoIcon size={15} />
         </span>
-        {profiles.some((p) => p.subscription !== null) && (
-          <button
-            type="button"
-            className="btn-sm"
-            onClick={() => measureActiveEndpoints(endpoints)}
-            disabled={measuringEndpoints.size > 0}
-            title={t("profiles.testDelaysTitle")}
-          >
-            {measuringEndpoints.size > 0 ? t("profiles.testing") : t("profiles.testDelays")}
-          </button>
-        )}
         <button
           className="profile-new-btn btn-primary btn-with-icon"
           onClick={() => setAddMenuOpen(true)}

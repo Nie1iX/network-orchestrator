@@ -837,13 +837,13 @@
         "other": "{count} profiles configured"
       },
       "monitor.throughput": "Tunnel throughput",
-      "monitor.tunnelsActive": {
-        "one": "{n} of {count} tunnel running",
-        "other": "{n} of {count} tunnels running"
-      },
       "monitor.tunnelsFailed": {
         "one": "{count} tunnel failed",
         "other": "{count} tunnels failed"
+      },
+      "monitor.tunnelsRunning": {
+        "one": "{count} tunnel running",
+        "other": "{count} tunnels running"
       },
       "monitor.upload": "upload",
       "nav.conditions": "Conditions",
@@ -911,8 +911,6 @@
         "other": "Subscription refreshed: {count} endpoints."
       },
       "profiles.subSkipped": "{n} skipped.",
-      "profiles.testDelays": "Test delays",
-      "profiles.testDelaysTitle": "Measure delay to the active endpoint of every subscription",
       "profiles.testing": "Testing…",
       "profiles.title": "Profiles",
       "recovery.checkFailed": "Recovery check failed",
@@ -1962,17 +1960,17 @@
         "other": "Настроено {count} профиля"
       },
       "monitor.throughput": "Трафик туннелей",
-      "monitor.tunnelsActive": {
-        "few": "Работает {n} из {count} туннелей",
-        "many": "Работает {n} из {count} туннелей",
-        "one": "Работает {n} из {count} туннеля",
-        "other": "Работает {n} из {count} туннелей"
-      },
       "monitor.tunnelsFailed": {
         "few": "Ошибка у {count} туннелей",
         "many": "Ошибка у {count} туннелей",
         "one": "Ошибка у {count} туннеля",
         "other": "Ошибка у {count} туннелей"
+      },
+      "monitor.tunnelsRunning": {
+        "few": "Работает {count} туннеля",
+        "many": "Работает {count} туннелей",
+        "one": "Работает {count} туннель",
+        "other": "Работает {count} туннеля"
       },
       "monitor.upload": "отдача",
       "nav.conditions": "Условия",
@@ -2042,8 +2040,6 @@
         "other": "Подписка обновлена: {count} эндпоинта."
       },
       "profiles.subSkipped": "{n} пропущено.",
-      "profiles.testDelays": "Замерить задержки",
-      "profiles.testDelaysTitle": "Замерить задержку до активного эндпоинта каждой подписки",
       "profiles.testing": "Замер…",
       "profiles.title": "Профили",
       "recovery.checkFailed": "Проверка восстановления не удалась",
