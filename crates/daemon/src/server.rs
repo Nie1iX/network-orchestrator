@@ -1048,10 +1048,10 @@ mod tests {
     use crate::auth::{Action, AuthDecision, Authorizer, PeerIdentity};
     use crate::core::testing::{FakeLinks, FakeRoutes, Recorder};
     use crate::core::{DaemonCore, WgConfigExecutor, WgSystem};
-    use crate::journal::{JournalStore, JOURNAL_FILE};
     use crate::openvpn_process::OpenVpnProcessRunner;
     use net_manager_core::daemon_protocol::VpnAuthMode;
     use net_manager_core::daemon_protocol::MAX_FRAME_BYTES;
+    use net_manager_core::journal::{JournalStore, JOURNAL_FILE};
     use net_manager_core::openvpn_management::{parse_push_reply, ManagementEvent};
     use serde_json::{json, Value};
     use std::collections::VecDeque;

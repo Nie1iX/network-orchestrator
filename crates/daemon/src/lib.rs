@@ -12,7 +12,6 @@ pub mod cond_rules;
 pub mod core;
 #[cfg(target_os = "linux")]
 pub mod dns;
-pub mod journal;
 #[cfg(target_os = "linux")]
 pub mod netlink;
 pub mod openvpn;

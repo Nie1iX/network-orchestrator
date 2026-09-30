@@ -2,11 +2,11 @@
 //! nothing: executors refuse every call and polkit is never consulted.
 #![cfg(target_os = "linux")]
 
+use net_manager_core::journal::{JournalStore, JOURNAL_FILE};
 use net_manager_core::models::AppliedRoute;
 use net_manager_core::policy::RouteExecutor;
 use network_orchestrator_daemon::auth::{Action, AuthDecision, Authorizer, PeerIdentity};
 use network_orchestrator_daemon::core::{DaemonCore, LinkExecutor};
-use network_orchestrator_daemon::journal::{JournalStore, JOURNAL_FILE};
 use network_orchestrator_daemon::server::{bind_socket, serve, ServerContext};
 use serde_json::{json, Value};
 use std::io;

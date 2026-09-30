@@ -1,7 +1,9 @@
-//! Ownership journal: what the daemon created, for whom. Written ahead of
-//! every netlink mutation so a crash never leaks unowned routes.
+//! Ownership journal: what the daemon (or an elevated app process) created,
+//! for whom. Written ahead of every privileged mutation so a crash never
+//! leaks unowned routes. Platform-neutral; on Windows the elevated app
+//! process owns the journal directly.
 
-use net_manager_core::daemon_protocol::{OwnedResource, OwnedState};
+use crate::daemon_protocol::{OwnedResource, OwnedState};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -75,7 +77,7 @@ impl JournalStore {
 }
 
 /// Atomic replace: 0600 temp file, `sync_all`, rename, fsync directory.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
     let mut temp_name = path.to_path_buf().into_os_string();
@@ -118,8 +120,8 @@ fn sync_dir(_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use net_manager_core::daemon_protocol::{OwnedResource, OwnedState};
-    use net_manager_core::models::AppliedRoute;
+    use crate::daemon_protocol::{OwnedResource, OwnedState};
+    use crate::models::AppliedRoute;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -1,7 +1,7 @@
 //! Administrator-chosen daemon settings, persisted next to the journal.
 
-use crate::journal::write_atomic;
 use net_manager_core::daemon_protocol::VpnAuthMode;
+use net_manager_core::journal::write_atomic;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;

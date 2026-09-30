@@ -5,7 +5,6 @@
 use crate::cond_rules::{match_interface, plan_routes, IfaceAddr, OWNER_PREFIX};
 #[cfg(target_os = "linux")]
 use crate::dns::{DnsApply, DnsExecutor};
-use crate::journal::{JournalDocument, JournalEntry, JournalStore};
 use crate::openvpn::OpenVpnPlan;
 use crate::openvpn_process::OpenVpnProcessRunner;
 use crate::validate::{validate_apply, validate_iface_name, validate_owner};
@@ -21,6 +20,7 @@ use net_manager_core::daemon_protocol::{
     WireGuardLinkResource, WireGuardStatusResult, WireGuardWarning, XrayConnectParams,
     XrayProcessResource, XrayStatusResult,
 };
+use net_manager_core::journal::{JournalDocument, JournalEntry, JournalStore};
 use net_manager_core::models::TunnelState;
 use net_manager_core::models::{AnalyzedRoute, AppliedRoute};
 use net_manager_core::openvpn_management::{ManagementEvent, ManagementSnapshot, OpenVpnState};
@@ -1165,7 +1165,7 @@ mod openvpn_tests {
             },
         ));
         let journal = JournalDocument {
-            version: crate::journal::JOURNAL_VERSION,
+            version: net_manager_core::journal::JOURNAL_VERSION,
             entries: vec![JournalEntry {
                 uid: 1000,
                 owner: "ovpn:home".into(),
@@ -1233,7 +1233,7 @@ mod openvpn_tests {
     fn startup_recovery_removes_only_journaled_openvpn_route() {
         let dir = unique_dir("recovery");
         let journal = JournalDocument {
-            version: crate::journal::JOURNAL_VERSION,
+            version: net_manager_core::journal::JOURNAL_VERSION,
             entries: vec![JournalEntry {
                 uid: 1000,
                 owner: "ovpn:home".into(),
@@ -5535,7 +5535,7 @@ mod xray_core_tests {
         let store = JournalStore::new(dir.join("state.json"));
         store
             .save(&JournalDocument {
-                version: crate::journal::JOURNAL_VERSION,
+                version: net_manager_core::journal::JOURNAL_VERSION,
                 entries: vec![JournalEntry {
                     uid: 1000,
                     owner: "xray:home".into(),
@@ -6124,8 +6124,8 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{FakeLinks, FakeRoutes, Op, Recorder};
     use super::*;
-    use crate::journal::{JournalDocument, JournalEntry, JournalStore, JOURNAL_FILE};
     use net_manager_core::daemon_protocol::{OwnedResource, OwnedState};
+    use net_manager_core::journal::{JournalDocument, JournalEntry, JournalStore, JOURNAL_FILE};
     use net_manager_core::models::AppliedRoute;
     use std::fs;
     use std::io;
@@ -6554,7 +6554,7 @@ mod tests {
         let store = JournalStore::new(&journal_path);
         store
             .save(&JournalDocument {
-                version: crate::journal::JOURNAL_VERSION,
+                version: net_manager_core::journal::JOURNAL_VERSION,
                 entries: vec![JournalEntry {
                     uid: 1000,
                     owner: "wg:home".into(),

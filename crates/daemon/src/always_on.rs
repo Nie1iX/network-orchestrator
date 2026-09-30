@@ -510,7 +510,7 @@ mod tests {
     fn missing_owned_static_route_is_reconciled_without_touching_foreign_route() {
         use crate::core::testing::{FakeLinks, FakeRoutes, Op, Recorder};
         use crate::core::DaemonCore;
-        use crate::journal::{JournalStore, JOURNAL_FILE};
+        use net_manager_core::journal::{JournalStore, JOURNAL_FILE};
         use net_manager_core::models::AppliedRoute;
 
         let dir = test_dir("flap");
@@ -546,7 +546,7 @@ mod tests {
 
     fn fake_core(dir: &Path) -> (DaemonCore, crate::core::testing::Recorder) {
         use crate::core::testing::{FakeLinks, FakeRoutes, Recorder};
-        use crate::journal::{JournalStore, JOURNAL_FILE};
+        use net_manager_core::journal::{JournalStore, JOURNAL_FILE};
 
         let recorder = Recorder::default();
         let core = DaemonCore::open(

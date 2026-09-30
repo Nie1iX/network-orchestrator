@@ -14,12 +14,12 @@ fn main() -> ExitCode {
 #[cfg(target_os = "linux")]
 mod linux {
     use net_manager_core::daemon_protocol::{CleanupResult, DEFAULT_SOCKET_PATH, SOCKET_ENV};
+    use net_manager_core::journal::{JournalStore, JOURNAL_FILE};
     use network_orchestrator_daemon::always_on::{self, AlwaysOnStore};
     use network_orchestrator_daemon::auth::PolkitAuthorizer;
     use network_orchestrator_daemon::cond_rules::CondRuleStore;
     use network_orchestrator_daemon::core::{DaemonCore, TrustedWgCommand};
     use network_orchestrator_daemon::dns::ResolvectlDnsExecutor;
-    use network_orchestrator_daemon::journal::{JournalStore, JOURNAL_FILE};
     use network_orchestrator_daemon::netlink::{watch_network_changes, NetlinkExecutor};
     use network_orchestrator_daemon::openvpn_process::TrustedOpenVpnProcess;
     use network_orchestrator_daemon::server::{

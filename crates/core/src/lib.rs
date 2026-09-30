@@ -5,6 +5,7 @@ pub mod config_security;
 pub mod config_vault;
 pub mod daemon_protocol;
 pub mod explorer;
+pub mod journal;
 #[cfg(target_os = "macos")]
 mod macos_inventory;
 pub mod managed_xray;
