@@ -24,6 +24,106 @@ simulated; IPv6 parsing, bulk CIDR parsing, OpenVPN probes, and real config
 generation are covered by Rust tests instead. Do not use sandbox results as
 evidence that real VPN credentials or connectivity work.
 
+## Local verification record — 2026-09-30
+
+The app was launched on macOS with an isolated QA application identifier.
+Browser checks used the sandbox above. Real Linux network checks used disposable
+ARM64 Ubuntu containers in a separate Docker bridge with no published ports,
+host networking, Docker socket mount, or user VPN files. WireGuard keys and
+OpenVPN certificates/credentials were generated for the test peers. The initial
+internal-only bridge prevented the full-tunnel underlay probe; the successful
+run used the private bridge arrangement from the existing E2E contract.
+
+This was a review of the main paths across core, daemon, Tauri commands, and
+React, backed by tests and UI checks. It is not an exhaustive proof that every
+line or every platform-specific path is correct.
+
+| Area | Verification | Result |
+| --- | --- | --- |
+| macOS workspace | fmt, all-target check, strict clippy, workspace tests | 459 Rust tests passed |
+| Linux x86_64 core + daemon | Docker Rust tests, daemon release build | 539 tests passed, including doc tests |
+| Linux ARM64 core + daemon | fmt, strict all-target clippy, Rust tests | 530 tests passed, including doc tests |
+| Frontend | TypeScript + production Vite build; pure sandbox tests | build passed; 6 tests passed; sandbox absent from dist |
+| Native macOS shell | Tauri dev startup with QA identifier | launched; real host VPN connections were not attempted |
+| Profiles UI | create static route, edit WireGuard, import file/subscription, delete, search/group controls | synthetic data only; passed |
+| Connection UI | four concurrent backends, OpenVPN credential prompt, disconnect, save/apply connection snippet | synthetic data only; passed |
+| Subscription UI | endpoint selection, refresh, interval, delay, disabled edits while active | synthetic data only; passed |
+| Network and routes UI | adapters/details, route overview/table/tree/flow/by-interface, IPv4 longest-prefix lookup | synthetic data only; passed; display findings below |
+| Recovery/settings UI | cleanup, diagnostics, always-on enable/disable and edit guard, login autostart, auth mode, executable selection/reset | synthetic data only; passed |
+| Linux daemon | existing scenarios.sh, including IPv4/IPv6, policy rules, polkit/uid isolation, journal, restart/cleanup, 1,000 routes | all 45 checks passed |
+| WireGuard | existing wg_scenarios.py, real split/full traffic, DNS, crash recovery, always-on | all 28 checks passed |
+| OpenVPN | existing ovpn_scenarios.py, real split/full traffic, pushed DNS, crash recovery | all 19 checks passed |
+| OpenVPN authentication/probe | existing ovpn_auth_scenarios.py | all 4 checks passed |
+| Static always-on | existing always_on_scenarios.sh, pause/resume, repair, late interface, uid isolation | passed |
+| Real Xray proxy/TUN | unit tests and sandbox only in this session | real traffic not verified; pinned Linux managed package is x86_64-only |
+| Windows system proxy, DPAPI, UAC, tunnel services; desktop Linux polkit prompts/tray | applicable ordinary unit tests only | VM acceptance still required |
+| Real subscription service / user's VPN | not used | network/provider behavior remains unverified |
+
+### Reproduced and corrected
+
+- macOS compilation accessed a nonexistent `net_route::Route.metric`; use the
+  platform field only on Linux/Windows and an explicit unavailable-metric
+  fallback elsewhere. Route conversion has a regression test.
+- The Linux daemon's orchestration/process modules were exposed on macOS even
+  though their DNS, D-Bus, and libc dependencies were Linux-only. Gate those
+  modules by platform; neutral protocol/store tests still run on macOS.
+- Concurrent `ProfileStore::upsert` operations could lose unrelated profiles
+  or collide on the temporary file. Serialize write transactions on the shared
+  store instance. A 12-thread regression failed before the fix and passed after.
+  This lock does not provide coordination between separate processes or store
+  instances pointing at the same file.
+- Profile documents lacked private Unix permissions. Protect their directory
+  and temporary document before atomic rename. The permission regression failed
+  before the fix and now verifies modes 0700/0600.
+- Xray profile validation accepted HTTP port 0 and identical SOCKS/HTTP ports.
+  The regression failed before the fix; both invalid states are now rejected.
+- Linux ARM64 daemon compilation referenced x86_64-only managed Xray helpers.
+  ARM64 now builds and returns `Unsupported` for that managed executable;
+  this does not add an ARM64 Xray package. Architecture-specific regression passed.
+- Strict Linux clippy found three nonminimal boolean conditions in DNS/staging
+  cleanup. Apply equivalent expressions and re-run the Linux tests.
+- WireGuard E2E required a host `wg` tool although the documented prerequisite
+  is Docker. Generate test keys through `wg` inside the disposable containers;
+  the full integration suite passed with no host installation.
+- Saved-profile warnings showed the old name or a new profile ID. Resolve the
+  name from the returned saved profiles. Route lookup now asks for an IP literal
+  rather than a hostname the backend does not resolve. The adapter panel close
+  control has an accessible name.
+
+### Remaining logic/display findings
+
+1. **Linux local Xray auto-connect depends unnecessarily on the daemon.**
+   `src-tauri/src/auto_connect.rs::connect_on_startup` calls `hello` and
+   `owned.list` before starting any saved profile, even when all selected profiles
+   are SOCKS Xray (`daemon_owner == None`). If the daemon is unavailable, local
+   proxy auto-connect is skipped although the manual local process path does not
+   require it. Separate local profiles from daemon-owned profiles and add an
+   unavailable-daemon regression. Found by code inspection; not injected into a
+   desktop Linux app during this session.
+2. **Adapter details can display stale routes and hide read failures.**
+   `src/components/InterfaceDetail.tsx` fetches only when `iface.ifIndex` changes,
+   omits the `route-changed` subscription, and ignores errors. An open panel can
+   keep an old route count; a failed initial read looks like an empty table.
+   Subscribe and expose a read error. Found by code inspection.
+3. **Traffic-flow profile identities and destination labels can mislead.**
+   `src/components/RouteFlow.tsx` keys profiles by `ownerName`, so different
+   profiles with the same permitted name merge. `destGroup` changes any IPv4
+   prefix to `/16`, including broader routes such as `10.0.0.0/8`; this can show
+   the wrong apparent coverage. The `/24` fixture rendered as `/16` in the UI.
+   Use `ownerProfileId` for identity and mark aggregates clearly while preserving
+   broader prefixes. Duplicate-name and broad-prefix cases were found by inspection.
+4. **Occupied Xray HTTP listeners do not receive the SOCKS conflict handling.**
+   `src-tauri/src/commands/tunnels.rs::connect_profile` checks/reassigns an
+   occupied SOCKS listener but has no equivalent HTTP preflight, while creation
+   reserves both ports. A program occupying the saved HTTP port can cause a
+   later Xray startup failure. Add a dual-listener regression before extending
+   replacement/rollback logic. Found by code inspection, not a real Xray run.
+
+Sandbox browser logs included Tauri mock callback warnings during development
+reloads/React effect cleanup; no browser error was observed in the completed
+flows. These warnings are a mock-event limitation, not evidence of a native
+backend failure. Production event behavior still needs platform UI acceptance.
+
 ## Linux daemon in a disposable container
 
 `e2e/linux/run.sh` builds the daemon, starts an Ubuntu 26.04 (default) or
