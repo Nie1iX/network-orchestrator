@@ -8,6 +8,18 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-30
+
+### Added
+
+- Native SwiftUI/AppKit client for macOS 27 linked directly to the Rust core
+  (`crates/macos-bridge`), built with `npm run build:macos`. It supports
+  managed configuration imports, static route profiles, static analysis,
+  interface inventory and routing-table inspection with the shared theme and
+  translations. VPN activation and network changes are not available on
+  macOS yet and are refused explicitly.
+- Core lists macOS interfaces through `getifaddrs`.
+
 ## [0.2.0] - 2026-09-30
 
 ### Added
