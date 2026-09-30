@@ -146,7 +146,7 @@ export default function Settings() {
                   value={locale.preference}
                   onChange={(e) => locale.setLanguage(e.target.value)}
                 >
-                  <option value="system">{t("System")}</option>
+                  <option value="system">{t("settings.langSystem")}</option>
                   {availableLanguages.map(({ code, name }) => (
                     <option key={code} value={code}>
                       {name}

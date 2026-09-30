@@ -85,6 +85,10 @@ npm run build
   report RED/GREEN.
 - Frontend: components subscribe to `route-changed` window events for
   refresh; types stay in `src/types.ts`.
+- i18n: the web UI uses dotted keys (`t("profiles.title")`); the macOS app
+  uses English text as the key (`L10n.text("Add a connection")`). Both share
+  `locales/*.json` — never delete an English-text key that only appears in
+  Swift sources.
 - App version has one source of truth: `[workspace.package].version` in the
   root `Cargo.toml`; do not duplicate it in `package.json` or `tauri.conf.json`.
 - Versioning, commit messages and releases follow `docs/versioning.md`
