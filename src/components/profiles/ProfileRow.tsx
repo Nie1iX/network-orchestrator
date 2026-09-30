@@ -18,6 +18,7 @@ interface ProfileRowProps {
   canReorder: boolean;
   onSelect: () => void;
   onToggle: () => void;
+  onContextMenu: (e: React.MouseEvent) => void;
   onDragStart: (e: React.DragEvent<HTMLElement>) => void;
   onDragEnd: () => void;
   onDragOver: (e: React.DragEvent<HTMLElement>) => void;
@@ -37,6 +38,7 @@ export default function ProfileRow({
   canReorder,
   onSelect,
   onToggle,
+  onContextMenu,
   onDragStart,
   onDragEnd,
   onDragOver,
@@ -47,16 +49,20 @@ export default function ProfileRow({
     <div
       role="button"
       tabIndex={0}
+      data-profile-id={profile.id}
       className={`profile-row${selected ? " selected" : ""}${
         status.state === "running" ? " state-running" : ""
       }${status.state === "failed" ? " state-failed" : ""}${
         dragging ? " drag-source" : ""
       }${dropBefore ? " drop-before" : dropAfter ? " drop-after" : ""}`}
       onClick={onSelect}
+      onContextMenu={onContextMenu}
       onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
-          onSelect();
+          if (selected) onToggle();
+          else onSelect();
         }
       }}
       onDragOver={onDragOver}
@@ -69,31 +75,29 @@ export default function ProfileRow({
         onDragEnd={onDragEnd}
         title={canReorder ? t("profiles.dragTitle") : undefined}
       >
-        <GripVerticalIcon size={15} />
+        <GripVerticalIcon size={13} />
       </span>
       <span className={`status-dot state-${status.state}`} />
       <span className={`backend-avatar backend-avatar-${profile.backend}`}>
-        {backendIcon(profile.backend, 18)}
+        {backendIcon(profile.backend, 14)}
       </span>
-      <div className="profile-row-info">
-        <span className="profile-row-name">{profile.name}</span>
-        <span
-          className="profile-row-meta"
-          title={
-            status.state === "failed" && status.message
-              ? status.message
-              : undefined
-          }
-        >
-          {status.state === "failed" && status.message ? (
-            status.message
-          ) : rate ? (
-            <RateText rx={rate.rxRate} tx={rate.txRate} live />
-          ) : (
-            profile.interfaceName || t("profiles.noIface")
-          )}
-        </span>
-      </div>
+      <span className="profile-row-name">{profile.name}</span>
+      <span
+        className="profile-row-meta"
+        title={
+          status.state === "failed" && status.message
+            ? status.message
+            : undefined
+        }
+      >
+        {status.state === "failed" && status.message ? (
+          status.message
+        ) : rate ? (
+          <RateText rx={rate.rxRate} tx={rate.txRate} live />
+        ) : (
+          profile.interfaceName || t("profiles.noIface")
+        )}
+      </span>
       {delayText !== null && (
         <span className="profile-row-delay" title={t("profiles.delayTitle")}>
           {delayText}

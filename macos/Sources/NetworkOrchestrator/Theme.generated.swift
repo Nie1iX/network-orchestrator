@@ -126,10 +126,10 @@ enum DesignMetrics {
   static let bodyFont: CGFloat = 14
   static let headingFont: CGFloat = 16.8
   static let lineHeight: CGFloat = 1.55
-  static let radiusSmall: CGFloat = 6
-  static let radiusMedium: CGFloat = 8
-  static let radiusLarge: CGFloat = 12
-  static let radiusModal: CGFloat = 16
+  static let radiusSmall: CGFloat = 4
+  static let radiusMedium: CGFloat = 6
+  static let radiusLarge: CGFloat = 9
+  static let radiusModal: CGFloat = 10
   static let sp1: CGFloat = 4
   static let sp2: CGFloat = 8
   static let sp3: CGFloat = 12

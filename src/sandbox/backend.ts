@@ -1,6 +1,7 @@
 import type {
-  AlwaysOnListResult, BackendAvailability, ConfigAnalysis, NetworkInterface,
-  Profile, ProfileInspection, RouteEntry, RouteMap, TunnelStatus, VpnAuthMode,
+  AlwaysOnListResult, BackendAvailability, ConditionalRuleEntry, ConditionalRouteRule,
+  ConfigAnalysis, NetworkInterface, Profile, ProfileInspection, RouteEntry, RouteMap,
+  TunnelStatus, VpnAuthMode,
 } from "../types.ts";
 
 // This module intentionally has no I/O imports, fetch, or process calls.
@@ -44,6 +45,18 @@ export class SandboxBackend {
   private recovered = false;
   private endpoints = ["QA Europe", "QA Asia"];
   private backendPaths = new Map<string, string>();
+  private condRules: ConditionalRuleEntry[] = [
+    {
+      rule: {
+        id: "cond-lan",
+        name: "QA LAN bypass",
+        enabled: true,
+        condition: { kind: "interfaceAddressIn", prefix: "192.168.0.0/16" },
+        routes: [{ destination: "10.228.32.0/21", metric: 5, via: null }],
+      },
+      status: { state: "active", matchedInterface: "qa-ethernet", appliedRoutes: 1, detail: null },
+    },
+  ];
 
   constructor() {
     this.profiles[2].subscription = {
@@ -227,6 +240,24 @@ export class SandboxBackend {
         return buttons === "YesNo" ? "Yes" : typeof buttons === "object"
           ? buttons.OkCancelCustom?.[0] ?? buttons.OkCustom ?? buttons.YesNoCancelCustom?.[0] ?? "Ok"
           : "Ok";
+      }
+      case "list_conditional_rules": return { rules: this.condRules };
+      case "put_conditional_rule": {
+        const rule = args.rule as ConditionalRouteRule;
+        const idx = this.condRules.findIndex((e) => e.rule.id === rule.id);
+        const entry: ConditionalRuleEntry = {
+          rule,
+          status: rule.enabled
+            ? { state: "active", matchedInterface: "qa-ethernet", appliedRoutes: rule.routes.length, detail: null }
+            : { state: "disabled", matchedInterface: null, appliedRoutes: 0, detail: null },
+        };
+        if (idx >= 0) this.condRules[idx] = entry; else this.condRules.push(entry);
+        return { stored: true, status: entry.status };
+      }
+      case "remove_conditional_rule": {
+        const idx = this.condRules.findIndex((e) => e.rule.id === args.ruleId);
+        if (idx >= 0) this.condRules.splice(idx, 1);
+        return { removed: idx >= 0 };
       }
       case "plugin:dialog|ask":
       case "plugin:dialog|confirm": return true;

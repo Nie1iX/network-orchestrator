@@ -25,7 +25,7 @@ export function installSandbox() {
   banner.setAttribute("role", "status");
   banner.style.cssText = "position:fixed;top:0;left:0;right:0;height:34px;display:grid;place-items:center;background:#153e35;color:#fff;text-align:center;z-index:9999;font:13px system-ui";
   const layout = document.createElement("style");
-  layout.textContent = "#root{padding-top:34px}.app-layout{height:calc(100vh - 34px)}";
+  layout.textContent = "#root{padding-top:34px}.app-shell{height:calc(100vh - 34px) !important}";
   document.head.append(layout);
   document.body.append(banner);
 }

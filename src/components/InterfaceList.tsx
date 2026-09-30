@@ -9,7 +9,7 @@ import {
 } from "../types";
 import { useT } from "../i18n";
 import { CATEGORY_DESC_KEYS, CATEGORY_LABEL_KEYS } from "../i18n/labels";
-import { kindIcon, categoryIcon, ChevronIcon, ArrowDownIcon, ArrowUpIcon } from "../icons";
+import { kindIcon, categoryIcon, ChevronIcon } from "../icons";
 import InterfaceDetail from "./InterfaceDetail";
 import Page from "./Page";
 import Skeleton from "./ui/Skeleton";
@@ -178,17 +178,11 @@ export default function InterfaceList() {
       <Page width="wide">
         <section>
           <h2>{t("net.title")}</h2>
-          <div className="interface-grid">
+          <div className="iface-list">
             {Array.from({ length: 6 }).map((_, i) => (
-              <div key={i} className="interface-card">
-                <div className="interface-header">
-                  <div className="interface-title">
-                    <Skeleton width="18px" height="18px" radius="4px" />
-                    <Skeleton width="120px" height="1rem" />
-                  </div>
-                </div>
-                <Skeleton width="80%" height="0.8rem" />
-                <Skeleton width="60%" height="0.8rem" />
+              <div key={i} className="iface-row">
+                <Skeleton width="14px" height="14px" />
+                <Skeleton width="160px" height="0.9rem" />
               </div>
             ))}
           </div>
@@ -288,123 +282,69 @@ export default function InterfaceList() {
                   <span className="group-desc">{t(CATEGORY_DESC_KEYS[cat])}</span>
                 </button>
                 {!isCollapsed && (
-                  <div className="interface-grid">
+                  <div className="iface-list">
                     {list.map((iface) => {
                       const tp = throughput[iface.ifIndex];
+                      const primary = iface.addresses[0];
+                      const kindBits = [
+                        formatKind(iface.kind),
+                        ifTypeName(iface.ifType),
+                        iface.tunnelType ? iface.tunnelType : null,
+                        iface.mtu !== null ? `MTU ${iface.mtu}` : null,
+                        iface.linkSpeedMbps !== null
+                          ? `${iface.linkSpeedMbps} Mbps`
+                          : null,
+                      ].filter(Boolean);
                       return (
                         <button
                           key={iface.ifIndex}
                           type="button"
-                          className="interface-card clickable"
+                          className="iface-row"
                           onClick={() => setSelected(iface)}
                         >
-                          <div className="interface-header">
-                            <div className="interface-title">
-                              {kindIcon(iface.kind, 18)}
-                              <span className="interface-name">{iface.friendlyName}</span>
-                            </div>
-                            <div className="badge-group">
-                              <span className={`badge ${iface.physical ? "badge-physical" : "badge-virtual"}`}>
-                                {iface.physical ? t("iface.physical") : t("iface.virtual")}
-                              </span>
-                              <span className={`state-badge state-${iface.state.toLowerCase()}`}>
-                                {iface.state}
-                              </span>
-                            </div>
-                          </div>
-                          <div className="interface-meta">
-                            <span className="meta-label">{formatKind(iface.kind)}</span>
-                            <span className="meta-label">{ifTypeName(iface.ifType)}</span>
-                            {iface.tunnelType && (
-                              <span className="meta-label">{t("iface.tunnel")}: {iface.tunnelType}</span>
-                            )}
-                            {iface.mtu !== null && (
-                              <span className="meta-label">MTU: {iface.mtu}</span>
-                            )}
-                            {iface.linkSpeedMbps !== null && (
-                              <span className="meta-label">{iface.linkSpeedMbps} Mbps</span>
-                            )}
-                          </div>
-                          {iface.description && (
-                            <div className="interface-row">
-                              <span className="row-label">{t("iface.driver")}</span>
-                              <span className="row-value mono">{iface.description}</span>
-                            </div>
-                          )}
-                          {iface.mac && (
-                            <div className="interface-row">
-                              <span className="row-label">MAC</span>
-                              <span className="row-value mono">{iface.mac}</span>
-                            </div>
-                          )}
-                          {iface.gateway && (
-                            <div className="interface-row">
-                              <span className="row-label">{t("iface.gateway")}</span>
-                              <span className="row-value mono">{iface.gateway}</span>
-                            </div>
-                          )}
-                          {iface.ipv6Gateway && (
-                            <div className="interface-row">
-                              <span className="row-label">{t("iface.gatewayV6")}</span>
-                              <span className="row-value mono">{iface.ipv6Gateway}</span>
-                            </div>
-                          )}
-                          {iface.addresses.length > 0 && (
-                            <div className="interface-section">
-                              <span className="section-label">{t("iface.addresses")}</span>
-                              <ul className="address-list">
-                                {iface.addresses.map((addr, i) => (
-                                  <li key={i}>
-                                    <span className="mono">{addr.address}/{addr.prefixLen}</span>
-                                    <span className="family-tag">{addr.family}</span>
-                                  </li>
-                                ))}
-                              </ul>
-                            </div>
-                          )}
-                          {iface.dnsServers.length > 0 && (
-                            <div className="interface-section">
-                              <span className="section-label">DNS</span>
-                              <ul className="dns-list">
-                                {iface.dnsServers.map((dns, i) => (
-                                  <li key={i} className="mono">{dns}</li>
-                                ))}
-                              </ul>
-                            </div>
-                          )}
-                          {iface.dnsSuffix && (
-                            <div className="interface-row">
-                              <span className="row-label">{t("iface.dnsSuffix")}</span>
-                              <span className="row-value mono">{iface.dnsSuffix}</span>
-                            </div>
-                          )}
-                          {iface.rxBytes !== null && iface.txBytes !== null && (
-                            <div className="traffic-row">
-                              <div className="interface-row">
-                                <span className="row-label">{t("iface.total")}</span>
-                                <span className="row-value">
-                                  <span className="rate-pair">
-                                    <span className="rate-dir">
-                                      <ArrowDownIcon size={12} />
-                                      {formatBytes(iface.rxBytes)}
-                                    </span>
-                                    <span className="rate-dir">
-                                      <ArrowUpIcon size={12} />
-                                      {formatBytes(iface.txBytes)}
-                                    </span>
-                                  </span>
-                                </span>
-                              </div>
-                              {tp && (
-                                <div className="interface-row">
-                                  <span className="row-label">{t("iface.rate")}</span>
-                                  <span className="row-value">
-                                    <RateText rx={tp.rxRate} tx={tp.txRate} live />
-                                  </span>
-                                </div>
-                              )}
-                            </div>
-                          )}
+                          <span
+                            className={`status-dot state-${
+                              iface.state === "Up"
+                                ? "running"
+                                : iface.state === "Down"
+                                  ? "stopped"
+                                  : "unknown"
+                            }`}
+                          />
+                          <span className="backend-avatar">
+                            {kindIcon(iface.kind, 14)}
+                          </span>
+                          <span className="iface-row-name">
+                            {iface.friendlyName}
+                          </span>
+                          <span className="iface-row-kind">
+                            {kindBits.join(" · ")}
+                          </span>
+                          <span className="iface-row-addr mono">
+                            {primary
+                              ? `${primary.address}/${primary.prefixLen}${
+                                  iface.addresses.length > 1
+                                    ? ` +${iface.addresses.length - 1}`
+                                    : ""
+                                }`
+                              : ""}
+                          </span>
+                          <span className="iface-row-rate">
+                            {tp ? (
+                              <RateText
+                                rx={tp.rxRate}
+                                tx={tp.txRate}
+                                live
+                              />
+                            ) : iface.rxBytes !== null ? (
+                              `↓${formatBytes(iface.rxBytes)} ↑${formatBytes(iface.txBytes ?? 0)}`
+                            ) : null}
+                          </span>
+                          <span
+                            className={`state-badge state-${iface.state.toLowerCase()}`}
+                          >
+                            {iface.state}
+                          </span>
                         </button>
                       );
                     })}

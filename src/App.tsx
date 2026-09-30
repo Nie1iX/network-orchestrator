@@ -12,6 +12,7 @@ import ProfileManager from "./components/ProfileManager";
 import RecoveryPrompt from "./components/RecoveryPrompt";
 import RouteView from "./components/RouteView";
 import Settings from "./components/Settings";
+import StatusBar from "./components/StatusBar";
 import { ToastProvider } from "./components/ui/Toast";
 import { TailscaleStatusResult, TunnelStatus } from "./types";
 import { t } from "./i18n";
@@ -72,18 +73,21 @@ function App() {
   return (
     <ToastProvider>
       <AppEvents />
-      <div className="app-layout">
-        <NavRail tab={tab} setTab={setTab} activeCount={activeCount} />
-        <main className="content">
-          {tab === "profiles" && <ProfileManager />}
-          {tab === "monitor" && <Monitor />}
-          {tab === "routes" && <RouteView />}
-          {tab === "conditions" && <CondRules />}
-          {tab === "network" && <InterfaceList />}
-          {tab === "logs" && <Logs />}
-          {tab === "settings" && <Settings />}
-        </main>
-        <RecoveryPrompt />
+      <div className="app-shell">
+        <div className="app-layout">
+          <NavRail tab={tab} setTab={setTab} activeCount={activeCount} />
+          <main className="content">
+            {tab === "profiles" && <ProfileManager />}
+            {tab === "monitor" && <Monitor />}
+            {tab === "routes" && <RouteView />}
+            {tab === "conditions" && <CondRules />}
+            {tab === "network" && <InterfaceList />}
+            {tab === "logs" && <Logs />}
+            {tab === "settings" && <Settings />}
+          </main>
+          <RecoveryPrompt />
+        </div>
+        <StatusBar activeCount={activeCount} />
       </div>
     </ToastProvider>
   );

@@ -18,6 +18,7 @@ import DiagnosticsModal from "./DiagnosticsModal";
 import ImportModal from "./ImportModal";
 import Modal from "./Modal";
 import Page from "./Page";
+import ContextMenu from "./ui/ContextMenu";
 import ProfileDetail from "./profiles/ProfileDetail";
 import ProfileRow from "./profiles/ProfileRow";
 import SetsBar from "./profiles/SetsBar";
@@ -93,12 +94,9 @@ function applyGroupOrder(
 function ProfileRowSkeleton() {
   return (
     <div className="profile-row">
-      <Skeleton width="30px" height="30px" radius="50%" />
-      <div className="profile-row-info">
-        <Skeleton width="140px" height="0.9rem" />
-        <Skeleton width="90px" height="0.75rem" />
-      </div>
-      <Skeleton width="40px" height="24px" radius="999px" />
+      <Skeleton width="14px" height="14px" />
+      <Skeleton width="160px" height="0.9rem" />
+      <Skeleton width="34px" height="18px" radius="999px" />
     </div>
   );
 }
@@ -177,6 +175,11 @@ export default function ProfileManager() {
   const [tailscale, setTailscale] = useState<TailscaleStatusResult | null>(null);
   const [tailscaleBusy, setTailscaleBusy] = useState(false);
   const [serviceSelected, setServiceSelected] = useState(false);
+  const [ctxMenu, setCtxMenu] = useState<{
+    x: number;
+    y: number;
+    profile: Profile;
+  } | null>(null);
 
   useEffect(() => {
     try {
@@ -1084,6 +1087,12 @@ export default function ProfileManager() {
             ? void onDisconnect(profile)
             : void onConnect(profile)
         }
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setServiceSelected(false);
+          setSelectedId(profile.id);
+          setCtxMenu({ x: e.clientX, y: e.clientY, profile });
+        }}
         onDragStart={(event) => onCardDragStart(event, profile)}
         onDragEnd={onCardDragEnd}
         onDragOver={(event) =>
@@ -1116,18 +1125,29 @@ export default function ProfileManager() {
         >
           <InfoIcon size={15} />
         </span>
-        <button
-          className="profile-new-btn btn-primary btn-with-icon"
-          onClick={() => setAddMenuOpen(true)}
-        >
-          <PlusIcon size={14} /> {t("profiles.add")}
-        </button>
-        <button
-          className="btn-with-icon"
-          onClick={() => setImportOpen(true)}
-        >
-          {t("profiles.import")}
-        </button>
+        <div className="toolbar-actions">
+          {profiles.length > 0 && (
+            <input
+              className="filter-search connections-search"
+              type="text"
+              placeholder={t("profiles.searchPh")}
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
+          )}
+          <button
+            className="btn-sm btn-with-icon"
+            onClick={() => setImportOpen(true)}
+          >
+            {t("profiles.import")}
+          </button>
+          <button
+            className="btn-primary btn-sm btn-with-icon"
+            onClick={() => setAddMenuOpen(true)}
+          >
+            <PlusIcon size={13} /> {t("profiles.add")}
+          </button>
+        </div>
       </div>
       {caps?.os === "linux" && alwaysOn?.paused && (
         <div className="runtime-notice" role="status">
@@ -1176,7 +1196,42 @@ export default function ProfileManager() {
       )}
 
       <div className="profiles-layout">
-        <div className="profiles-list-pane">
+        <div
+          className="profiles-list-pane"
+          onKeyDown={(event) => {
+            if (event.target instanceof HTMLElement) {
+              const t = event.target;
+              if (t.closest("input, select, textarea, [role='switch'], .snippet-chip")) return;
+            }
+            const visibleIds = (
+              listMode === "flat"
+                ? flatList
+                : groups.flatMap((g) =>
+                    collapsedGroups.has(g.backend) ? [] : g.items,
+                  )
+            ).map((p) => p.id);
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              const idx = visibleIds.indexOf(selectedId ?? "");
+              const next =
+                idx < 0
+                  ? 0
+                  : Math.min(
+                      visibleIds.length - 1,
+                      Math.max(0, idx + (event.key === "ArrowDown" ? 1 : -1)),
+                    );
+              const id = visibleIds[next];
+              if (!id) return;
+              setServiceSelected(false);
+              setSelectedId(id);
+              document
+                .querySelector(`[data-profile-id="${id}"]`)
+                ?.scrollIntoView({ block: "nearest" });
+            } else if (event.key === "Delete" && selected) {
+              void onDelete(selected);
+            }
+          }}
+        >
           {profiles.length > 0 && (
             <SetsBar
               snippets={snippets}
@@ -1189,16 +1244,6 @@ export default function ProfileManager() {
               onSaveNew={openSaveModal}
             />
           )}
-
-      {profiles.length > 0 && (
-        <input
-          className="filter-search connections-search"
-          type="text"
-          placeholder={t("profiles.searchPh")}
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
-      )}
 
       {profiles.length === 0 ? (
         <p className="empty-state">{t("profiles.empty")}</p>
@@ -1251,6 +1296,7 @@ export default function ProfileManager() {
               className={`profile-row${serviceSelected ? " selected" : ""}`}
               onClick={() => setServiceSelected(true)}
               onKeyDown={(e) => {
+                if (e.target !== e.currentTarget) return;
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
                   setServiceSelected(true);
@@ -1267,12 +1313,10 @@ export default function ProfileManager() {
                 }`}
               />
               <span className="backend-avatar backend-avatar-service">
-                <TailscaleIcon size={18} />
+                <TailscaleIcon size={14} />
               </span>
-              <div className="profile-row-info">
-                <span className="profile-row-name">Tailscale</span>
-                <span className="profile-row-meta">{tsMeta}</span>
-              </div>
+              <span className="profile-row-name">Tailscale</span>
+              <span className="profile-row-meta">{tsMeta}</span>
               <ToggleSwitch
                 checked={tsRunning}
                 onChange={() => void onToggleTailscale()}
@@ -1410,6 +1454,68 @@ export default function ProfileManager() {
         onChooseImport={handleChooseImport}
         onChooseBackend={handleChooseBackend}
       />
+
+      {ctxMenu && (() => {
+        const p = ctxMenu.profile;
+        const ctxGroup =
+          listMode === "grouped" && !lowerSearch
+            ? groups.find(
+                (g) =>
+                  g.backend === p.backend &&
+                  g.items.some((item) => item.id === p.id),
+              )
+            : undefined;
+        const ctxIndex = ctxGroup
+          ? ctxGroup.items.findIndex((item) => item.id === p.id)
+          : -1;
+        const running = statusFor(p.id).state === "running";
+        return (
+          <ContextMenu
+            x={ctxMenu.x}
+            y={ctxMenu.y}
+            onClose={() => setCtxMenu(null)}
+            items={[
+              {
+                label: running ? t("common.disconnect") : t("common.connect"),
+                onClick: () =>
+                  running ? void onDisconnect(p) : void onConnect(p),
+                disabled: busy.has(p.id),
+              },
+              {
+                label: t("common.edit"),
+                onClick: () => openEdit(p),
+                disabled: busy.has(p.id),
+              },
+              {
+                label: t("detail.diagnostics"),
+                onClick: () => void onDiagnose(p),
+                disabled: diagBusy === p.id,
+              },
+              "separator",
+              {
+                label: t("detail.moveUp"),
+                onClick: () =>
+                  ctxGroup && moveProfileInGroup(ctxGroup.items, p.id, -1),
+                disabled: !ctxGroup || ctxIndex <= 0,
+              },
+              {
+                label: t("detail.moveDown"),
+                onClick: () =>
+                  ctxGroup && moveProfileInGroup(ctxGroup.items, p.id, 1),
+                disabled:
+                  !ctxGroup || ctxIndex < 0 || ctxIndex >= ctxGroup.items.length - 1,
+              },
+              "separator",
+              {
+                label: t("common.delete"),
+                onClick: () => void onDelete(p),
+                disabled: busy.has(p.id),
+                danger: true,
+              },
+            ]}
+          />
+        );
+      })()}
 
       <Modal
         open={openVpnCredentialProfile !== null}

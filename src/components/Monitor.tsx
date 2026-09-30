@@ -7,6 +7,8 @@ import Page from "./Page";
 import RateText from "./ui/RateText";
 import Skeleton from "./ui/Skeleton";
 import { useToast } from "./ui/Toast";
+import { formatRate } from "../format";
+import { BACKEND_LABEL_KEYS } from "../i18n/labels";
 import { NetworkInterface, Profile, TunnelStatus } from "../types";
 import { useT } from "../i18n";
 
@@ -292,70 +294,98 @@ export default function Monitor() {
 
       <section>
         <h2>{t("monitor.activeTunnels")}</h2>
-        {running.length === 0 ? (
+        {running.length === 0 && failed.length === 0 ? (
           <p className="empty-state">{t("monitor.noTunnels")}</p>
         ) : (
-          <div className="active-now-list">
-            {running.map((profile) => {
-              const rate = rateFor(profile);
-              return (
-                <div key={profile.id} className="active-now-card">
-                  <span
-                    className={`backend-avatar backend-avatar-${profile.backend}`}
-                  >
-                    {backendIcon(profile.backend, 16)}
-                  </span>
-                  <div className="active-now-info">
-                    <span className="active-now-name">{profile.name}</span>
-                    <span className="active-now-meta">
-                      {rate ? (
-                        <RateText rx={rate.rxRate} tx={rate.txRate} />
-                      ) : (
-                        profile.interfaceName
-                      )}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    onClick={() => onDisconnect(profile)}
-                    disabled={busy.has(profile.id)}
-                    title={t("common.disconnect")}
-                  >
-                    {t("common.disconnect")}
-                  </button>
-                </div>
-              );
-            })}
-          </div>
+          <table className="route-table monitor-table">
+            <thead>
+              <tr>
+                <th />
+                <th>{t("monitor.colProfile")}</th>
+                <th>{t("detail.backend")}</th>
+                <th>{t("detail.interface")}</th>
+                <th className="num">{t("monitor.colRx")}</th>
+                <th className="num">{t("monitor.colTx")}</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {running.map((profile) => {
+                const rate = rateFor(profile);
+                return (
+                  <tr key={profile.id}>
+                    <td>
+                      <span className="status-dot state-running" />
+                    </td>
+                    <td>
+                      <span className="monitor-name">
+                        <span
+                          className={`backend-avatar backend-avatar-${profile.backend}`}
+                        >
+                          {backendIcon(profile.backend, 14)}
+                        </span>
+                        {profile.name}
+                      </span>
+                    </td>
+                    <td>{t(BACKEND_LABEL_KEYS[profile.backend])}</td>
+                    <td className="mono">
+                      {statusFor(profile.id).interfaceName ||
+                        profile.interfaceName ||
+                        "—"}
+                    </td>
+                    <td className="num mono">
+                      {rate ? formatRate(rate.rxRate) : "—"}
+                    </td>
+                    <td className="num mono">
+                      {rate ? formatRate(rate.txRate) : "—"}
+                    </td>
+                    <td className="num">
+                      <button
+                        type="button"
+                        className="btn-sm"
+                        onClick={() => onDisconnect(profile)}
+                        disabled={busy.has(profile.id)}
+                        title={t("common.disconnect")}
+                      >
+                        {t("common.disconnect")}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+              {failed.map((profile) => {
+                const status = statusFor(profile.id);
+                return (
+                  <tr key={profile.id} className="failed">
+                    <td>
+                      <span className="status-dot state-failed" />
+                    </td>
+                    <td>
+                      <span className="monitor-name">
+                        <span
+                          className={`backend-avatar backend-avatar-${profile.backend}`}
+                        >
+                          {backendIcon(profile.backend, 14)}
+                        </span>
+                        {profile.name}
+                      </span>
+                    </td>
+                    <td>{t(BACKEND_LABEL_KEYS[profile.backend])}</td>
+                    <td
+                      className="monitor-failed-note"
+                      colSpan={3}
+                      title={status.message ?? undefined}
+                    >
+                      {status.message ?? t("monitor.connectionFailed")}
+                    </td>
+                    <td />
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         )}
       </section>
-
-      {failed.length > 0 && (
-        <section>
-          <h2>{t("monitor.needsAttention")}</h2>
-          <div className="active-now-list">
-            {failed.map((profile) => {
-              const status = statusFor(profile.id);
-              return (
-                <div key={profile.id} className="active-now-card failed">
-                  <span
-                    className={`backend-avatar backend-avatar-${profile.backend}`}
-                  >
-                    {backendIcon(profile.backend, 16)}
-                  </span>
-                  <div className="active-now-info">
-                    <span className="active-now-name">{profile.name}</span>
-                    <span className="active-now-meta">
-                      {status.message ?? t("monitor.connectionFailed")}
-                    </span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
     </Page>
   );
 }
