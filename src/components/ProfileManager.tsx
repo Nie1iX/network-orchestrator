@@ -1350,6 +1350,7 @@ export default function ProfileManager() {
               isBusy={busy.has(selected.id)}
               backendLabel={t(BACKEND_LABEL_KEYS[selected.backend])}
               managedConfig={inspections[selected.id]?.managedConfig}
+              inspection={inspections[selected.id] ?? null}
               alwaysOn={alwaysOn}
               os={caps?.os}
               endpoints={endpoints[selected.id]}

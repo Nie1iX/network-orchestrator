@@ -7,6 +7,7 @@ import {
   DomainPolicy,
   DomainRouteTarget,
   Profile,
+  ProfileInspection,
   SubscriptionDelayResult,
   SubscriptionEndpointInfo,
   TunnelStatus,
@@ -43,6 +44,7 @@ interface ProfileDetailProps {
   isBusy: boolean;
   backendLabel: string;
   managedConfig: boolean | undefined;
+  inspection: ProfileInspection | null;
   alwaysOn: AlwaysOnListResult | null;
   os: string | undefined;
   endpoints: SubscriptionEndpointInfo[] | undefined;
@@ -77,6 +79,7 @@ export default function ProfileDetail({
   isBusy,
   backendLabel,
   managedConfig,
+  inspection,
   alwaysOn,
   os,
   endpoints,
@@ -120,6 +123,14 @@ export default function ProfileDetail({
       (profile.interfaceName.length > 0 && profile.routes.length > 0));
   const ruleCount = countPolicyRules(profile.domainPolicies);
   const detailCount = profile.routes.length + ruleCount;
+  const configRoutes =
+    profile.backend === "wireGuard" || profile.backend === "openVpn"
+      ? (inspection?.analysis.osRoutes ?? [])
+      : [];
+  const configEndpoints =
+    profile.backend === "wireGuard" || profile.backend === "openVpn"
+      ? (inspection?.analysis.endpoints ?? [])
+      : [];
 
   return (
     <div className="profile-detail">
@@ -264,6 +275,30 @@ export default function ProfileDetail({
             <span className="row-value">
               <RateText rx={rate.rxRate} tx={rate.txRate} live />
             </span>
+          </div>
+        )}
+
+        {(configEndpoints.length > 0 || configRoutes.length > 0) && (
+          <div className="interface-section">
+            <span className="section-label">{t("detail.tunnelConfig")}</span>
+            {configEndpoints.map((ep, i) => (
+              <div className="interface-row" key={i}>
+                <span className="row-label">{t("detail.peerEndpoint")}</span>
+                <span className="row-value mono">
+                  {ep.address}
+                  {ep.port !== null ? `:${ep.port}` : ""}
+                </span>
+              </div>
+            ))}
+            {configRoutes.length > 0 && (
+              <ul className="profile-route-list">
+                {configRoutes.map((route, i) => (
+                  <li key={i}>
+                    <span className="mono">{route.destination}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
         )}
 
