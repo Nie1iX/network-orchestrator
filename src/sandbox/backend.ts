@@ -95,6 +95,11 @@ export class SandboxBackend {
       internalRoutes: [], listeners: p.backend === "xray" ? [{ address: "127.0.0.1", port: p.xraySocksPort ?? 10808, protocol: "socks" }] : [],
       endpoints: p.backend === "none" ? [] : [{ address: "vpn.example.invalid", port: 443, protocol: p.backend }],
       domainPatterns: p.domainPolicies.flatMap((d) => d.domains), warnings: ["Synthetic configuration: no network traffic is sent."], routeKnowledgeComplete: true,
+      peers: p.backend === "wireGuard" ? [{
+        endpoint: { address: "vpn.example.invalid", port: 51820, protocol: "wireGuard" },
+        routes: p.routes.map((r) => ({ destination: r.destination, source: "WireGuard AllowedIPs" })),
+      }] : [],
+      interfaceDetails: p.backend === "wireGuard" ? [{ field: "address", value: "10.203.0.2/32" }] : [],
     };
     return { analysis, conflicts: [], managedConfig: true };
   }

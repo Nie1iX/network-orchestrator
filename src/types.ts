@@ -278,6 +278,16 @@ export interface ProfileConflict {
   blocking: boolean;
 }
 
+export interface ConfigPeer {
+  endpoint: RemoteEndpoint | null;
+  routes: AnalyzedRoute[];
+}
+
+export interface ConfigField {
+  field: string;
+  value: string;
+}
+
 export interface ConfigAnalysis {
   profileId: string;
   osRoutes: AnalyzedRoute[];
@@ -287,6 +297,8 @@ export interface ConfigAnalysis {
   domainPatterns: string[];
   warnings: string[];
   routeKnowledgeComplete: boolean;
+  peers: ConfigPeer[];
+  interfaceDetails: ConfigField[];
 }
 
 export interface ProfileInspection {

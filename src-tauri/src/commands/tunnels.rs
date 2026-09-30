@@ -2634,6 +2634,8 @@ mod tests {
             domain_patterns: vec![],
             warnings: vec![],
             route_knowledge_complete: true,
+            peers: Vec::new(),
+            interface_details: Vec::new(),
         };
         let mut other = profile("wg-b");
         other.id = "b".into();

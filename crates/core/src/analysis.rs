@@ -1,7 +1,7 @@
 use crate::config_vault::{inline_tag, tokenize_line, SCRIPT_DIRECTIVES};
 use crate::models::{
-    AnalyzedRoute, ConfigAnalysis, ConflictKind, LocalListener, Profile, ProfileConflict,
-    RemoteEndpoint, RouteEntry, TunnelBackend,
+    AnalyzedRoute, ConfigAnalysis, ConfigField, ConfigPeer, ConflictKind, LocalListener, Profile,
+    ProfileConflict, RemoteEndpoint, RouteEntry, TunnelBackend,
 };
 use ipnet::{IpNet, Ipv4Net};
 use serde_json::Value;
@@ -21,6 +21,8 @@ pub fn analyze_profile(profile: &Profile) -> io::Result<ConfigAnalysis> {
         domain_patterns: Vec::new(),
         warnings: Vec::new(),
         route_knowledge_complete: true,
+        peers: Vec::new(),
+        interface_details: Vec::new(),
     };
     for route in &profile.routes {
         analysis.os_routes.push(AnalyzedRoute {
@@ -272,7 +274,7 @@ fn analyze_wireguard(path: &Path, analysis: &mut ConfigAnalysis) -> io::Result<(
 fn parse_wireguard_text(text: &str, analysis: &mut ConfigAnalysis) {
     let mut section = String::new();
     let mut table_off = false;
-    let mut allowed = Vec::new();
+    let mut allowed: Vec<AnalyzedRoute> = Vec::new();
     for (index, raw) in text.lines().enumerate() {
         let line_no = index + 1;
         let line = raw.split('#').next().unwrap_or("").trim();
@@ -281,6 +283,12 @@ fn parse_wireguard_text(text: &str, analysis: &mut ConfigAnalysis) {
         }
         if line.starts_with('[') && line.ends_with(']') {
             section = line[1..line.len() - 1].trim().to_lowercase();
+            if section == "peer" {
+                analysis.peers.push(ConfigPeer {
+                    endpoint: None,
+                    routes: Vec::new(),
+                });
+            }
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
@@ -294,6 +302,24 @@ fn parse_wireguard_text(text: &str, analysis: &mut ConfigAnalysis) {
                     table_off = true;
                 }
             }
+            ("interface", "address" | "dns") => {
+                let field = if key == "dns" { "dns" } else { "address" };
+                for part in value.split(',') {
+                    let part = part.trim();
+                    if !part.is_empty() {
+                        analysis.interface_details.push(ConfigField {
+                            field: field.to_string(),
+                            value: part.to_string(),
+                        });
+                    }
+                }
+            }
+            ("interface", "mtu" | "listenport") => {
+                analysis.interface_details.push(ConfigField {
+                    field: if key == "mtu" { "mtu" } else { "listenPort" }.to_string(),
+                    value: value.to_string(),
+                });
+            }
             ("peer", "allowedips") => {
                 for part in value.split(',') {
                     let part = part.trim();
@@ -301,11 +327,17 @@ fn parse_wireguard_text(text: &str, analysis: &mut ConfigAnalysis) {
                         continue;
                     }
                     match part.parse::<IpNet>() {
-                        Ok(destination) => allowed.push(AnalyzedRoute {
-                            metric: None,
-                            destination,
-                            source: "WireGuard AllowedIPs".to_string(),
-                        }),
+                        Ok(destination) => {
+                            let route = AnalyzedRoute {
+                                metric: None,
+                                destination,
+                                source: "WireGuard AllowedIPs".to_string(),
+                            };
+                            if let Some(peer) = analysis.peers.last_mut() {
+                                peer.routes.push(route.clone());
+                            }
+                            allowed.push(route);
+                        }
                         Err(_) => analysis
                             .warnings
                             .push(format!("line {line_no}: invalid AllowedIPs entry")),
@@ -313,11 +345,17 @@ fn parse_wireguard_text(text: &str, analysis: &mut ConfigAnalysis) {
                 }
             }
             ("peer", "endpoint") => match parse_endpoint(value) {
-                Some((host, port)) => analysis.endpoints.push(RemoteEndpoint {
-                    address: host,
-                    port: Some(port),
-                    protocol: "wireguard".to_string(),
-                }),
+                Some((host, port)) => {
+                    let endpoint = RemoteEndpoint {
+                        address: host,
+                        port: Some(port),
+                        protocol: "wireguard".to_string(),
+                    };
+                    if let Some(peer) = analysis.peers.last_mut() {
+                        peer.endpoint = Some(endpoint.clone());
+                    }
+                    analysis.endpoints.push(endpoint);
+                }
                 None => analysis
                     .warnings
                     .push(format!("line {line_no}: invalid Endpoint")),
@@ -416,6 +454,24 @@ fn analyze_openvpn(path: &Path, analysis: &mut ConfigAnalysis) -> io::Result<()>
                     protocol,
                 });
             }
+            "proto" | "dev" | "cipher" | "port" => {
+                if let Some(value) = tokens.get(1) {
+                    let field = match directive.as_str() {
+                        "proto" => "protocol",
+                        "dev" => "device",
+                        "port" => "listenPort",
+                        _ => "cipher",
+                    };
+                    analysis.interface_details.push(ConfigField {
+                        field: field.to_string(),
+                        value: value.clone(),
+                    });
+                }
+            }
+            "auth-user-pass" => analysis.interface_details.push(ConfigField {
+                field: "authUserPass".to_string(),
+                value: "required".to_string(),
+            }),
             "client" | "pull" if !push_warned => {
                 push_warned = true;
                 analysis.route_knowledge_complete = false;
@@ -667,6 +723,8 @@ mod tests {
             domain_patterns: vec![],
             warnings: vec![],
             route_knowledge_complete: true,
+            peers: Vec::new(),
+            interface_details: Vec::new(),
         }
     }
 
@@ -706,6 +764,90 @@ mod tests {
         assert_eq!(result.endpoints[0].port, Some(51820));
         assert_eq!(result.endpoints[0].protocol, "wireguard");
         assert_eq!(result.endpoints[1].address, "2001:db8::1");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wireguard_interface_details_and_peers() {
+        let dir = unique_dir("wg-peers");
+        let cfg = dir.join("w.conf");
+        fs::write(
+            &cfg,
+            "[Interface]\nPrivateKey=S3cr3t\nAddress=10.0.0.2/32, fd00::2/128\n\
+             DNS=10.0.0.1\nMTU=1420\nListenPort=51820\n\n\
+             [Peer]\nPublicKey=S3cr3t2\nAllowedIPs=10.0.0.0/24\n\
+             Endpoint=vpn.example.com:51820\n\n\
+             [Peer]\nPublicKey=S3cr3t3\nAllowedIPs=fd00::/64\n",
+        )
+        .unwrap();
+        let result = analyze_profile(&profile(TunnelBackend::WireGuard, &cfg)).unwrap();
+
+        let fields: Vec<(&str, &str)> = result
+            .interface_details
+            .iter()
+            .map(|f| (f.field.as_str(), f.value.as_str()))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                ("address", "10.0.0.2/32"),
+                ("address", "fd00::2/128"),
+                ("dns", "10.0.0.1"),
+                ("mtu", "1420"),
+                ("listenPort", "51820"),
+            ]
+        );
+        assert!(fields
+            .iter()
+            .all(|(_, v)| !v.contains("S3cr3t") && !v.contains("PrivateKey")));
+
+        assert_eq!(result.peers.len(), 2);
+        assert_eq!(
+            result.peers[0].endpoint.as_ref().unwrap().address,
+            "vpn.example.com"
+        );
+        assert_eq!(
+            destinations(&result.peers[0].routes),
+            vec![net("10.0.0.0/24")]
+        );
+        assert!(result.peers[1].endpoint.is_none());
+        assert_eq!(
+            destinations(&result.peers[1].routes),
+            vec![net("fd00::/64")]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn openvpn_interface_details() {
+        let dir = unique_dir("ovpn-details");
+        let cfg = dir.join("client.conf");
+        fs::write(
+            &cfg,
+            "client\nproto udp\ndev tun\nremote vpn.example.com 1194\n\
+             cipher AES-256-GCM\nauth-user-pass\nroute 10.8.0.0 255.255.255.0\n",
+        )
+        .unwrap();
+        let result = analyze_profile(&profile(TunnelBackend::OpenVpn, &cfg)).unwrap();
+
+        let fields: Vec<(&str, &str)> = result
+            .interface_details
+            .iter()
+            .map(|f| (f.field.as_str(), f.value.as_str()))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                ("protocol", "udp"),
+                ("device", "tun"),
+                ("cipher", "AES-256-GCM"),
+                ("authUserPass", "required"),
+            ]
+        );
+        assert_eq!(result.endpoints.len(), 1);
+        assert_eq!(result.endpoints[0].address, "vpn.example.com");
+        assert_eq!(result.endpoints[0].port, Some(1194));
+        assert_eq!(destinations(&result.os_routes), vec![net("10.8.0.0/24")]);
         fs::remove_dir_all(&dir).unwrap();
     }
 

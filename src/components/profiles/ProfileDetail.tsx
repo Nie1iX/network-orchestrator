@@ -1,6 +1,6 @@
 import { backendIcon } from "../../icons";
 import { formatBytes } from "../../format";
-import { useT } from "../../i18n";
+import { TranslationKey, useT } from "../../i18n";
 import {
   AlwaysOnKind,
   AlwaysOnListResult,
@@ -15,6 +15,17 @@ import {
 import OverflowMenu from "../ui/OverflowMenu";
 import RateText from "../ui/RateText";
 import ToggleSwitch from "../ui/ToggleSwitch";
+
+const CONFIG_FIELD_LABEL_KEYS: Record<string, TranslationKey> = {
+  address: "detail.cfg.address",
+  dns: "detail.cfg.dns",
+  mtu: "detail.cfg.mtu",
+  listenPort: "detail.cfg.listenPort",
+  protocol: "detail.cfg.protocol",
+  device: "detail.cfg.device",
+  cipher: "detail.cfg.cipher",
+  authUserPass: "detail.cfg.authUserPass",
+};
 
 export const DOMAIN_TARGET_LABEL_KEYS: Record<
   DomainRouteTarget,
@@ -123,14 +134,18 @@ export default function ProfileDetail({
       (profile.interfaceName.length > 0 && profile.routes.length > 0));
   const ruleCount = countPolicyRules(profile.domainPolicies);
   const detailCount = profile.routes.length + ruleCount;
+  const isWireGuard = profile.backend === "wireGuard";
+  const showConfig =
+    isWireGuard || profile.backend === "openVpn";
+  const configDetails = showConfig
+    ? (inspection?.analysis.interfaceDetails ?? [])
+    : [];
+  // WireGuard peers own their routes; OpenVPN routes/endpoints render flat.
+  const peers = isWireGuard ? (inspection?.analysis.peers ?? []) : [];
   const configRoutes =
-    profile.backend === "wireGuard" || profile.backend === "openVpn"
-      ? (inspection?.analysis.osRoutes ?? [])
-      : [];
+    showConfig && !isWireGuard ? (inspection?.analysis.osRoutes ?? []) : [];
   const configEndpoints =
-    profile.backend === "wireGuard" || profile.backend === "openVpn"
-      ? (inspection?.analysis.endpoints ?? [])
-      : [];
+    showConfig && !isWireGuard ? (inspection?.analysis.endpoints ?? []) : [];
 
   return (
     <div className="profile-detail">
@@ -278,9 +293,43 @@ export default function ProfileDetail({
           </div>
         )}
 
-        {(configEndpoints.length > 0 || configRoutes.length > 0) && (
+        {(configDetails.length > 0 ||
+          configEndpoints.length > 0 ||
+          configRoutes.length > 0 ||
+          peers.length > 0) && (
           <div className="interface-section">
             <span className="section-label">{t("detail.tunnelConfig")}</span>
+            {configDetails.map((d, i) => (
+              <div className="interface-row" key={i}>
+                <span className="row-label">
+                  {t(CONFIG_FIELD_LABEL_KEYS[d.field] ?? "detail.tunnelConfig")}
+                </span>
+                <span className="row-value mono">{d.value}</span>
+              </div>
+            ))}
+            {peers.map((peer, pi) => (
+              <div className="peer-block" key={pi}>
+                <div className="interface-row">
+                  <span className="row-label">
+                    {t("detail.peerN", { n: pi + 1 })}
+                  </span>
+                  <span className="row-value mono">
+                    {peer.endpoint
+                      ? `${peer.endpoint.address}${peer.endpoint.port !== null ? `:${peer.endpoint.port}` : ""}`
+                      : "—"}
+                  </span>
+                </div>
+                {peer.routes.length > 0 && (
+                  <ul className="profile-route-list">
+                    {peer.routes.map((route, i) => (
+                      <li key={i}>
+                        <span className="mono">{route.destination}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ))}
             {configEndpoints.map((ep, i) => (
               <div className="interface-row" key={i}>
                 <span className="row-label">{t("detail.peerEndpoint")}</span>

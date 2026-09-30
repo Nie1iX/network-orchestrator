@@ -401,6 +401,31 @@ pub struct ConfigAnalysis {
     pub domain_patterns: Vec<String>,
     pub warnings: Vec<String>,
     pub route_knowledge_complete: bool,
+    /// WireGuard `[Peer]` sections: the endpoint plus the AllowedIPs it owns.
+    /// Empty for backends without peers.
+    pub peers: Vec<ConfigPeer>,
+    /// Non-secret interface-level facts from the config (Address, DNS, MTU…)
+    /// shown in the profile detail pane. Never populated with private keys,
+    /// preshared keys, or credential material.
+    pub interface_details: Vec<ConfigField>,
+}
+
+/// A `[Peer]` section of a WireGuard config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigPeer {
+    pub endpoint: Option<RemoteEndpoint>,
+    pub routes: Vec<AnalyzedRoute>,
+}
+
+/// One displayable non-secret fact about a tunnel config, e.g. `Address`,
+/// `DNS`, `MTU`, `ListenPort` for WireGuard or `proto`/`dev` for OpenVPN.
+/// `field` is a stable machine name the UI maps to a localized label.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigField {
+    pub field: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

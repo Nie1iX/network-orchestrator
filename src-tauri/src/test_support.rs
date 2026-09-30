@@ -155,6 +155,8 @@ pub(crate) fn inspection_for(p: &Profile, managed: bool) -> ProfileInspection {
             domain_patterns: vec![],
             warnings: vec![],
             route_knowledge_complete: true,
+            peers: Vec::new(),
+            interface_details: Vec::new(),
         },
         conflicts: vec![],
         managed_config: managed,
@@ -204,5 +206,7 @@ pub(crate) fn blank_analysis(id: &str) -> ConfigAnalysis {
         domain_patterns: vec![],
         warnings: vec![],
         route_knowledge_complete: true,
+        peers: Vec::new(),
+        interface_details: Vec::new(),
     }
 }
