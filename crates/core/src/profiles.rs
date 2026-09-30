@@ -176,6 +176,12 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
         if matches!(profile.xray_socks_port, Some(0)) {
             return Err(invalid_data("xray socks port must be nonzero"));
         }
+        if matches!(profile.xray_http_port, Some(0)) {
+            return Err(invalid_data("xray http port must be nonzero"));
+        }
+        if profile.xray_socks_port.is_some() && profile.xray_socks_port == profile.xray_http_port {
+            return Err(invalid_data("xray socks and http ports must be different"));
+        }
     }
     if profile.use_system_proxy {
         if profile.backend != TunnelBackend::Xray {
@@ -307,6 +313,20 @@ mod tests {
             0o700
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn xray_http_listener_requires_nonzero_distinct_port() {
+        let mut profile = wg_profile();
+        profile.backend = TunnelBackend::Xray;
+        profile.config_path = PathBuf::from("config.json");
+        profile.xray_socks_port = Some(10808);
+        profile.xray_http_port = Some(0);
+        assert!(validate_profile(&profile).is_err());
+        profile.xray_http_port = profile.xray_socks_port;
+        assert!(validate_profile(&profile).is_err());
+        profile.xray_http_port = Some(10809);
+        assert!(validate_profile(&profile).is_ok());
     }
 
     #[test]
