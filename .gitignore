@@ -28,6 +28,8 @@ target/
 
 .serena/
 .worktrees/
+macos/.build/
+macos/.swiftpm/
 
 # Python
 __pycache__/

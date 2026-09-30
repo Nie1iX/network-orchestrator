@@ -1,7 +1,13 @@
 # Network Orchestrator
 
-A Tauri 2 desktop app for WireGuard, OpenVPN, Xray/VLESS, policy routes, and
-network exploration. Tunnel management works on Windows. On Linux, the
+A desktop app for WireGuard, OpenVPN, Xray/VLESS, policy routes, and
+network exploration. Windows and Linux use Tauri 2; macOS 27 has a native
+SwiftUI/AppKit client linked directly to the Rust core, without a WebView.
+The macOS client supports managed configuration imports, profile editing,
+static analysis, interface inventory and routing-table inspection. macOS VPN
+activation and network mutations require a separate provider implementation
+and are disabled in this first native stage. Tunnel management works on Windows.
+On Linux, the
 privileged daemon, WireGuard and OpenVPN split/full tunnels with per-link DNS,
 Xray VLESS/Hysteria2 SOCKS5/HTTP proxy and Xray TUN have passed container E2E
 on Ubuntu 26.04 and Fedora 44 clients. Packages: `.deb` (Ubuntu/Debian),
@@ -17,6 +23,28 @@ Local development and release builds are supported and do not require CI/CD. Git
 The repository, Tauri package, window and app UI use **Network Orchestrator**.
 
 ## Quick Start
+
+### macOS 27 native client
+
+Requires macOS 27, Xcode 27 (including Command Line Tools), Rust and Python 3.
+On Apple Silicon:
+
+```bash
+npm run build:macos
+open "target/macos/Network Orchestrator.app"
+```
+
+The script builds a release `.app` with a local ad-hoc signature and a minimum
+OS version of 27.0. App version comes from the root Cargo workspace. Developer
+ID signing and notarization for distribution remain separate release steps.
+No Node runtime, React or WebKit is included in the native app. npm only invokes
+the build script; `bash scripts/build-macos-native.sh` works without npm.
+
+Native data lives under `~/Library/Application Support/com.netmanager.app.macos`.
+The native client currently uses a separate store from Tauri. See
+[`macos/README.md`](macos/README.md) for supported functions and test isolation.
+
+### Windows / Linux Tauri client
 
 ```bash
 npm install

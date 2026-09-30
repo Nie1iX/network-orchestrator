@@ -2643,6 +2643,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-manager-macos-bridge"
+version = "0.2.0"
+dependencies = [
+ "net-manager-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "net-route"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

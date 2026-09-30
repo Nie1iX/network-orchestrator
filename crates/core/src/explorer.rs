@@ -994,7 +994,12 @@ fn classify_category_linux(kind: &InterfaceKind, physical: bool, _name: &str) ->
 
 // ── Non-Windows/Linux stub ──────────────────────────────────────────────
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(target_os = "macos")]
+pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
+    crate::macos_inventory::list_interfaces()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub fn list_interfaces() -> std::io::Result<Vec<NetworkInterface>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

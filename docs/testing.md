@@ -163,6 +163,80 @@ This uses a container-only polkit rule for its headless user session, then
 checks save/connect/disconnect through the installed app's WebView and the
 kernel route table. It does not verify a visible polkit prompt or Wayland.
 
+## macOS 27 native client
+
+The native SwiftUI client is built with `npm run build:macos` (or
+`bash scripts/build-macos-native.sh`). It uses the Rust core directly rather
+than the Tauri IPC/browser sandbox. Build and test commands, the independent
+data directory and current feature boundaries are documented in
+[`../macos/README.md`](../macos/README.md).
+
+On 2026-09-30 the arm64 release bundle was built and launched on macOS 27.0
+with Xcode 27.0. Its Mach-O load command and Info.plist both specify 27.0 as
+the minimum OS; local ad-hoc signing verifies. The binary links SwiftUI/AppKit
+and does not link WebKit. RSS samples were 84.3 MiB for the initial instance
+and 137.4 MiB immediately after launching the final foreground bundle; these
+are not a comparative memory benchmark. The full macOS Rust workspace gate passed
+(467 tests), along with four Swift integration tests and the TypeScript/Vite
+production build. Native window interaction/screenshot acceptance remains
+pending: the Computer Use helper repeatedly closed its pipe, including after
+reset. Automated integration tests are not a substitute for visible UI checks.
+
+Native bridge tests cover persisted profiles, CIDR validation/aggregation,
+managed imports, failed-import cleanup, bounded C ABI buffers and refusal of
+network mutations. Swift tests cover actual FFI decoding, persisted profiles,
+imported-config analysis and read-only Darwin loopback inventory/route lookup.
+Ordinary macOS tests never start real VPNs or apply routes, DNS or proxies.
+
+### Shared dark/light design verification
+
+On 2026-09-30 the native screens were restyled to match the Tauri icon rail,
+cards, typography, filters, route tabs and dialogs. Both clients use generated
+colors and core layout metrics from `design/tokens.json`, with a stale-output
+check in their build commands. Native vector assets preserve the original
+`src/icons.tsx` geometry and have a checked source hash.
+
+The redesign passed fmt, all-target workspace check, strict clippy and all
+467 ordinary Rust tests, TypeScript/Vite build and six sandbox tests. Six Swift
+tests passed with `NETORCH_DESIGN_PREVIEWS` enabled, including packaged-icon
+verification and 28 offscreen SwiftUI renders: five pages, six route tabs and
+three creation/import dialogs in each theme. The native renderer uses an
+injected temporary store and synthetic network data. The Tauri browser preview
+was also checked by switching its Settings theme between Light and Dark.
+
+PNG renders are under `target/macos/design-preview`, with `dark`/`light`
+subdirectories and `tauri-dark.png`/`tauri-light.png` browser references. Exact
+pixel parity and foreground native window interaction remain unverified;
+the Computer Use helper was unavailable. OS-native chrome and unavailable
+backend actions intentionally reflect macOS capabilities. No real VPN was
+started and no host network settings were changed.
+
+### Shared language verification
+
+On 2026-09-30 English/Russian/System selectors were added to Tauri and SwiftUI.
+Catalogs and plural rules are shared in `locales/*.json`; generated outputs
+and native bundle language metadata are checked/derived during builds. Adding
+a catalog does not require editing either client's language list. See
+[`../locales/README.md`](../locales/README.md) for the translator workflow and
+the boundary between UI translations and raw backend diagnostics.
+
+RED: initial runtime tests failed before the translation helper existed.
+GREEN: four translation runtime tests and six Python catalog-validation tests
+passed, together with nine Swift tests (including 56 English/Russian renders
+in dark/light), six sandbox tests and the full required Rust/web quality gate
+(467 ordinary Rust tests). The ad-hoc signed native release bundle includes
+both catalogs and declares the language tags in Info.plist.
+
+Browser acceptance checked English persisting after reload, live Russian
+switching across windows and an open profile form keeping its `Language check`
+name and static-routes backend when its labels changed to Russian. The draft
+was discarded without saving; the second test tab was closed. The browser
+was left on Russian Settings. Native foreground interaction remains limited
+by the unavailable Computer Use helper; native localization/persistence are
+verified through tests and offscreen renders. The PNGs are under
+`target/macos/i18n-preview/{en,ru}/{dark,light}`, with a browser reference at
+`target/macos/i18n-preview/tauri-ru-settings.png`. No real VPN was started.
+
 ## Windows on a disposable VM
 
 `crates/core/tests/windows_e2e.rs` contains opt-in integration scenarios that

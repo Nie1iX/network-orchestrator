@@ -1,0 +1,53 @@
+#!/bin/bash
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+APP_DIR="$REPO_ROOT/target/macos/Network Orchestrator.app"
+if [[ "$(uname -s)" != Darwin ]]; then
+    echo "The native macOS build requires macOS and Xcode 27." >&2
+    exit 1
+fi
+SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+if [[ "${SDK_VERSION%%.*}" -lt 27 ]]; then
+    echo "Xcode 27 or later is required to build the macOS 27 client." >&2
+    exit 1
+fi
+export MACOSX_DEPLOYMENT_TARGET=27.0
+cd "$REPO_ROOT"
+python3 scripts/generate-ui-theme.py --check
+python3 scripts/generate-localizations.py --check
+cargo build --release -p net-manager-macos-bridge
+swift build --package-path macos --configuration release --scratch-path target/macos-swift
+VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "net-manager-macos-bridge"))')"
+BIN_DIR="$(swift build --package-path macos --configuration release --scratch-path target/macos-swift --show-bin-path)"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+install -m 0755 "$BIN_DIR/NetworkOrchestrator" "$APP_DIR/Contents/MacOS/NetworkOrchestrator"
+cp "$REPO_ROOT/src-tauri/icons/icon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+RESOURCE_BUNDLE="NetworkOrchestratorMac_NetworkOrchestrator.bundle"
+ditto "$BIN_DIR/$RESOURCE_BUNDLE" "$APP_DIR/Contents/Resources/$RESOURCE_BUNDLE"
+python3 - "$APP_DIR/Contents/Info.plist" "$VERSION" "$APP_DIR/Contents/Resources/$RESOURCE_BUNDLE/Contents/Resources/Localizations.json" <<'PY'
+import json, plistlib, sys
+with open(sys.argv[3]) as catalog_file:
+    language_tags = sorted(json.load(catalog_file))
+info = {
+    'CFBundleExecutable': 'NetworkOrchestrator',
+    'CFBundleIdentifier': 'com.netmanager.app.macos',
+    'CFBundleName': 'Network Orchestrator',
+    'CFBundleDisplayName': 'Network Orchestrator',
+    'CFBundlePackageType': 'APPL',
+    'CFBundleShortVersionString': sys.argv[2],
+    'CFBundleVersion': sys.argv[2],
+    'CFBundleIconFile': 'AppIcon',
+    'CFBundleDevelopmentRegion': 'en',
+    'CFBundleLocalizations': language_tags,
+    'LSMinimumSystemVersion': '27.0',
+    'LSApplicationCategoryType': 'public.app-category.utilities',
+    'NSHighResolutionCapable': True,
+    'NSSupportsAutomaticGraphicsSwitching': True,
+}
+with open(sys.argv[1], 'wb') as output:
+    plistlib.dump(info, output)
+PY
+# Local ad-hoc signature; Developer ID/notarization are separate release steps.
+codesign --force --sign - "$APP_DIR"
+codesign --verify --strict "$APP_DIR"
+echo "$APP_DIR"
