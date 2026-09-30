@@ -2603,7 +2603,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "dbus-secret-service",
@@ -2627,7 +2627,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "ipnet",
@@ -2725,7 +2725,7 @@ dependencies = [
 
 [[package]]
 name = "network-orchestrator-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "futures",
