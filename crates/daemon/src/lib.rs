@@ -5,6 +5,8 @@
 #[cfg(target_os = "linux")]
 pub mod always_on;
 pub mod auth;
+// Tunnel orchestration depends on Linux DNS and kernel resource executors.
+#[cfg(target_os = "linux")]
 pub mod core;
 #[cfg(target_os = "linux")]
 pub mod dns;
@@ -12,12 +14,15 @@ pub mod journal;
 #[cfg(target_os = "linux")]
 pub mod netlink;
 pub mod openvpn;
+#[cfg(target_os = "linux")]
 pub mod openvpn_process;
 #[cfg(target_os = "linux")]
 pub mod peer;
+#[cfg(target_os = "linux")]
 pub mod server;
 pub mod settings;
 pub mod validate;
 pub mod wireguard;
 pub mod xray;
+#[cfg(target_os = "linux")]
 pub mod xray_process;
