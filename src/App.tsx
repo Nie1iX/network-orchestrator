@@ -11,8 +11,10 @@ import RouteView from "./components/RouteView";
 import Settings from "./components/Settings";
 import { TunnelStatus } from "./types";
 import "./App.css";
+import { applyAppearance, readAppearance } from "./theme";
 
 function App() {
+  useEffect(() => { applyAppearance(readAppearance()); }, []);
   const [tab, setTab] = useState<Tab>("home");
   const [activeCount, setActiveCount] = useState(0);
 

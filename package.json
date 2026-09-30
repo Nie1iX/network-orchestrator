@@ -6,7 +6,7 @@
     "dev": "vite",
     "dev:sandbox": "VITE_NETORCH_SANDBOX=1 vite --port 1422",
     "test:sandbox": "node --experimental-strip-types --test tests/sandbox.test.ts",
-    "build": "tsc && vite build",
+    "build": "python3 scripts/generate-ui-theme.py --check && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },

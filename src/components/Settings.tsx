@@ -7,6 +7,7 @@ import Page from "./Page";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import { usePlatformCapabilities } from "../platform";
 import { VpnAuthMode } from "../types";
+import { readAppearance, saveAppearance, type Appearance } from "../theme";
 
 const VPN_AUTH_MODES: { value: VpnAuthMode; label: string }[] = [
   { value: "noPrompt", label: "Never" },
@@ -15,6 +16,7 @@ const VPN_AUTH_MODES: { value: VpnAuthMode; label: string }[] = [
 ];
 
 export default function Settings() {
+  const [appearance, setAppearance] = useState<Appearance>(readAppearance);
   const [version, setVersion] = useState<string | null>(null);
   const [loginAutostart, setLoginAutostart] = useState<boolean | null>(null);
   const [autostartBusy, setAutostartBusy] = useState(false);
@@ -91,6 +93,27 @@ export default function Settings() {
   return (
     <Page width="narrow">
       <h2>Settings</h2>
+
+      <div className="settings-group">
+        <div className="settings-group-title">Appearance</div>
+        <div className="settings-group-body">
+          <div className="settings-row">
+            <div className="settings-row-main">
+              <span className="settings-row-label">Theme</span>
+              <span className="settings-row-sub">Use system appearance, light or dark.</span>
+            </div>
+            <select aria-label="Theme" value={appearance} onChange={(event) => {
+              const value = event.target.value as Appearance;
+              setAppearance(value);
+              saveAppearance(value);
+            }}>
+              <option value="system">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </div>
+        </div>
+      </div>
 
       <div className="settings-group">
         <div className="settings-group-title">Backend &amp; dependencies</div>

@@ -1,76 +1,7 @@
+@import "./theme.generated.css";
+
 :root {
   /* ── Design tokens ─────────────────────────────────────────────────── */
-
-  /* Surfaces — softer dark, not pure black */
-  --bg-app: #131315;
-  --bg-sidebar: #1a1a1d;
-  --bg-card: #1e1e22;
-  --bg-card-hover: #25252a;
-  --bg-elev: #28282d;
-  --bg-input: #18181b;
-  --bg-overlay: rgba(0, 0, 0, 0.65);
-
-  /* Borders — subtler, with hover states */
-  --border: #2e2e33;
-  --border-hover: #3a3a40;
-  --border-focus: #646cff;
-
-  /* Text — better contrast hierarchy */
-  --text-primary: #f0f0f2;
-  --text-secondary: #b0b0b8;
-  --text-muted: #6a6a72;
-
-  /* Accent — vibrant indigo */
-  --accent: #646cff;
-  --accent-hover: #7c7fff;
-  --accent-dim: rgba(100, 108, 255, 0.12);
-  --accent-border: rgba(100, 108, 255, 0.35);
-  --accent-glow: rgba(100, 108, 255, 0.2);
-
-  /* Status — more vibrant */
-  --up: #34d399;
-  --up-bg: rgba(52, 211, 153, 0.12);
-  --up-border: rgba(52, 211, 153, 0.3);
-  --down: #f87171;
-  --down-bg: rgba(248, 113, 113, 0.12);
-  --down-border: rgba(248, 113, 113, 0.3);
-  --unknown: #9ca3af;
-  --unknown-bg: rgba(156, 163, 175, 0.1);
-  --unknown-border: rgba(156, 163, 175, 0.25);
-
-  /* Virtual / physical */
-  --physical: #646cff;
-  --physical-bg: rgba(100, 108, 255, 0.1);
-  --physical-border: rgba(100, 108, 255, 0.3);
-  --virtual: #f59e0b;
-  --virtual-bg: rgba(245, 158, 11, 0.1);
-  --virtual-border: rgba(245, 158, 11, 0.3);
-
-  /* Backend avatar tints (connection cards, backend groups) */
-  --wg-color: #34d399;
-  --wg-bg: rgba(52, 211, 153, 0.14);
-  --ovpn-color: #f59e0b;
-  --ovpn-bg: rgba(245, 158, 11, 0.14);
-  --xray-color: #a78bfa;
-  --xray-bg: rgba(167, 139, 250, 0.14);
-  --none-color: #9ca3af;
-  --none-bg: rgba(156, 163, 175, 0.14);
-
-  /* Spacing scale */
-  --sp-1: 0.25rem;
-  --sp-2: 0.5rem;
-  --sp-3: 0.75rem;
-  --sp-4: 1rem;
-  --sp-5: 1.25rem;
-  --sp-6: 1.5rem;
-  --sp-8: 2rem;
-
-  /* Radii — slightly larger for modern feel */
-  --r-sm: 6px;
-  --r-md: 8px;
-  --r-lg: 12px;
-  --r-xl: 16px;
-  --r-full: 999px;
 
   /* Shadows — softer, more layered */
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
@@ -79,15 +10,9 @@
   --shadow-panel: -4px 0 24px rgba(0, 0, 0, 0.4);
   --shadow-glow: 0 0 20px var(--accent-glow);
 
-  /* Nav rail */
-  --rail-w: 64px;
-
-  /* Page widths */
-  --page-narrow: 880px;
-
   /* Typography */
   font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  font-size: 14px;
+  font-size: var(--body-font);
   line-height: 1.55;
   font-weight: 400;
   color: var(--text-primary);
@@ -309,7 +234,7 @@ section {
   background-color: var(--down-bg);
   padding: var(--sp-3) var(--sp-4);
   border-radius: var(--r-md);
-  border: 1px solid #5a2a2a;
+  border: 1px solid var(--down-border);
 }
 
 /* ── Interface cards ─────────────────────────────────────────────────── */
@@ -1845,7 +1770,7 @@ button:disabled {
 
 .route-map-diffs li.diff-exactCompetition,
 .route-map-diffs li.diff-interfaceMismatch {
-  border-color: #5a2a2a;
+  border-color: var(--down-border);
   background-color: var(--down-bg);
   color: var(--down);
 }
