@@ -39,7 +39,7 @@ export default function RouteLookup() {
           type="text"
           value={dest}
           onChange={(e) => setDest(e.currentTarget.value)}
-          placeholder="Enter IP address or hostname..."
+          placeholder="Enter IPv4 or IPv6 address..."
           autoFocus
         />
         <button type="submit" disabled={loading || !dest.trim()}>
