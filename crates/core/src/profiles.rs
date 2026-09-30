@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 pub const PROFILE_DOCUMENT_VERSION: u32 = 1;
 
@@ -15,11 +16,15 @@ pub struct ProfileDocument {
 
 pub struct ProfileStore {
     path: PathBuf,
+    write_lock: Mutex<()>,
 }
 
 impl ProfileStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            write_lock: Mutex::new(()),
+        }
     }
 
     pub fn load(&self) -> io::Result<ProfileDocument> {
@@ -45,8 +50,17 @@ impl ProfileStore {
     }
 
     pub fn save(&self, document: &ProfileDocument) -> io::Result<()> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        self.save_locked(document)
+    }
+
+    fn save_locked(&self, document: &ProfileDocument) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
+            crate::config_security::protect_path(parent)?;
         }
         let json = serde_json::to_string_pretty(document)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -54,6 +68,7 @@ impl ProfileStore {
         temp_name.push(".tmp");
         let temp_path = PathBuf::from(temp_name);
         fs::write(&temp_path, json)?;
+        crate::config_security::protect_path(&temp_path)?;
         if let Err(err) = fs::rename(&temp_path, &self.path) {
             let _ = fs::remove_file(&temp_path);
             return Err(err);
@@ -63,17 +78,25 @@ impl ProfileStore {
 
     pub fn upsert(&self, profile: Profile) -> io::Result<ProfileDocument> {
         validate_profile(&profile)?;
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
         let mut document = self.load()?;
         if let Some(existing) = document.profiles.iter_mut().find(|p| p.id == profile.id) {
             *existing = profile;
         } else {
             document.profiles.push(profile);
         }
-        self.save(&document)?;
+        self.save_locked(&document)?;
         Ok(document)
     }
 
     pub fn delete(&self, id: &str) -> io::Result<ProfileDocument> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
         let mut document = self.load()?;
         let len_before = document.profiles.len();
         document.profiles.retain(|p| p.id != id);
@@ -83,7 +106,7 @@ impl ProfileStore {
                 format!("profile '{id}' not found"),
             ));
         }
-        self.save(&document)?;
+        self.save_locked(&document)?;
         Ok(document)
     }
 }
@@ -239,6 +262,51 @@ mod tests {
             auto_connect: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn concurrent_upserts_keep_every_profile() {
+        let dir = unique_dir("concurrent");
+        let store = std::sync::Arc::new(ProfileStore::new(dir.join("profiles.json")));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(12));
+        let threads: Vec<_> = (0..12)
+            .map(|index| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut profile = wg_profile();
+                    profile.id = format!("concurrent-{index}");
+                    barrier.wait();
+                    store.upsert(profile)
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(
+            results.iter().all(Result::is_ok),
+            "concurrent writes failed"
+        );
+        assert_eq!(store.load().unwrap().profiles.len(), 12);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_profile_document_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_dir("private");
+        let path = dir.join("profiles.json");
+        let store = ProfileStore::new(&path);
+        store.upsert(wg_profile()).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
