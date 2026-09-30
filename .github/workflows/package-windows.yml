@@ -2,11 +2,9 @@ name: Package Windows
 
 # Produces an unsigned NSIS installer artifact. No signing, no publishing.
 
+# Manual runs only — tag pushes don't burn GitHub Actions minutes.
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read

@@ -1,8 +1,8 @@
 name: CI
 
+# Manual runs only — pushes/PRs don't burn GitHub Actions minutes.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
