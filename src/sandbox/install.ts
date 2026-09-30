@@ -17,6 +17,9 @@ export function installSandbox() {
     return result;
   }, { shouldMockEvents: true });
   mockWindows("main");
+  // Components gate IPC behind isTauri() (browser preview must stay inert);
+  // the mock provides __TAURI_INTERNALS__ but not the isTauri flag itself.
+  (window as unknown as { isTauri: boolean }).isTauri = true;
   const banner = document.createElement("div");
   banner.textContent = "SANDBOX · Synthetic VPN data · No changes to your network · Reload resets VPN state";
   banner.setAttribute("role", "status");

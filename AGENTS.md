@@ -95,11 +95,16 @@ npm run build
 
 ## Design system
 
-- All colors come from the OKLCH design tokens at the top of `src/App.css`
+- All colors come from the OKLCH design tokens in `design/tokens.json`
   (neutral surfaces, indigo accent, `--up/--down/--warn/--info` semantics,
-  `--cat-*` categorical scale). No hardcoded hex/`rgba()` colors in CSS or
-  TSX — JS-rendered visuals import from `src/palette.ts` (keep in sync with
-  the `--cat-*` tokens).
+  `--cat-*` categorical scale, dark + light themes). Edit `tokens.json` and
+  run `python3 scripts/generate-ui-theme.py` — do not edit the generated
+  outputs (`src/theme.generated.css`, `src/palette.ts`,
+  `macos/Sources/NetworkOrchestrator/Theme.generated.swift`). No hardcoded
+  hex/`rgba()` colors in CSS or TSX — JS-rendered visuals import from
+  `src/palette.ts`. User-facing copy lives in `locales/*.json`; run
+  `python3 scripts/generate-localizations.py` instead of editing
+  `src/i18n/catalog.generated.ts` or the macOS `Localizations.json`.
 - One primary CTA per screen: `btn-primary`. Default `<button>` is the
   secondary style; `btn-danger`, `btn-ghost`, `btn-sm`, `btn-with-icon` are
   the other sanctioned variants.
