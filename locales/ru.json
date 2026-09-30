@@ -972,7 +972,6 @@
     "profiles.reloaded": "{name} перезагружен",
     "profiles.resume": "Возобновить always-on",
     "profiles.resuming": "Возобновление…",
-    "profiles.runningSummary": "работает {running} из {total}",
     "profiles.savedNotice": "«{name}» сохранён — проверьте замечания",
     "profiles.searchPh": "Поиск подключений…",
     "profiles.services": "Сервисы",

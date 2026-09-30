@@ -911,7 +911,6 @@
     "profiles.reloaded": "Reloaded {name}",
     "profiles.resume": "Resume always-on",
     "profiles.resuming": "Resuming…",
-    "profiles.runningSummary": "{running} of {total} running",
     "profiles.savedNotice": "Saved \"{name}\" — review notes",
     "profiles.searchPh": "Search connections…",
     "profiles.services": "Services",

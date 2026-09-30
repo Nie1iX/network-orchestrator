@@ -1098,23 +1098,12 @@ export default function ProfileManager() {
     <Page width="full">
       <div className="profiles-toolbar">
         <h2>{t("profiles.title")}</h2>
-        <span className="profiles-status">
-          <span
-            className={`status-dot ${
-              runningProfiles.length > 0 ? "state-running" : "state-stopped"
-            }`}
-          />
-          {t("profiles.runningSummary", {
-            running: runningProfiles.length,
-            total: profiles.length,
-          })}
-          {failedCount > 0 && (
-            <span className="profiles-status-failed">
-              {" "}
-              · {t("profiles.failedSuffix", { n: failedCount })}
-            </span>
-          )}
-        </span>
+        {failedCount > 0 && (
+          <span className="profiles-status profiles-status-failed">
+            <span className="status-dot state-failed" />
+            {t("profiles.failedSuffix", { n: failedCount })}
+          </span>
+        )}
         <span
           className="profiles-info"
           role="note"
