@@ -3,10 +3,18 @@ import { catalogs } from "./catalog.generated.ts";
 import { resolveLanguage, translateMessage, type Arguments } from "./engine.ts";
 
 const STORAGE_KEY = "netmanager.language";
+const LEGACY_STORAGE_KEY = "netmanager.ui.language";
 const listeners = new Set<() => void>();
 function readPreference(): string {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY);
+    let saved = localStorage.getItem(STORAGE_KEY);
+    if (!saved) {
+      saved = localStorage.getItem(LEGACY_STORAGE_KEY);
+      if (saved) {
+        localStorage.setItem(STORAGE_KEY, saved);
+        localStorage.removeItem(LEGACY_STORAGE_KEY);
+      }
+    }
     return saved && (saved === "system" || Object.prototype.hasOwnProperty.call(catalogs, saved)) ? saved : "system";
   } catch { return "system"; }
 }
