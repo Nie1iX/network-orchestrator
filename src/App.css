@@ -9,86 +9,9 @@
    Spacing: 4pt grid. Corners: inner radius = outer radius − padding.
    ═══════════════════════════════════════════════════════════════════════ */
 
+@import "./theme.generated.css";
+
 :root {
-  /* ── Layer 1 · Neutral foundation ─────────────────────────────────── */
-
-  --bg-app:         oklch(0.150 0.008 280);  /* page background */
-  --bg-sidebar:     oklch(0.195 0.010 280);  /* nav rail */
-  --bg-card:        oklch(0.235 0.012 280);  /* cards */
-  --bg-card-hover:  oklch(0.275 0.014 280);
-  --bg-elev:        oklch(0.315 0.016 280);  /* popovers, menus, dialogs */
-  --bg-input:       oklch(0.175 0.010 280);  /* sunken fields */
-  --bg-overlay:     oklch(0.100 0.010 280 / 0.62);
-
-  /* Borders */
-  --border:        oklch(0.330 0.013 280);
-  --border-hover:  oklch(0.410 0.016 280);
-  --border-focus:  var(--accent);
-
-  /* Text — hierarchy via perceived brightness: ~92% / ~70% / ~52% */
-  --text-primary:   oklch(0.920 0.008 280);
-  --text-secondary: oklch(0.700 0.020 280);
-  --text-muted:     oklch(0.530 0.016 280);
-
-  /* ── Layer 2 · Functional accent (indigo, hue 277) ──────────────────
-     Light tone (400-ish) for text/icons on dark; strong (600) for the
-     single filled CTA; hover one step lighter. */
-
-  --accent:              oklch(0.720 0.160 277);
-  --accent-strong:       oklch(0.580 0.210 277);
-  --accent-strong-hover: oklch(0.650 0.200 277);
-  --accent-contrast:     oklch(0.960 0.010 277);
-  --accent-dim:          oklch(0.720 0.160 277 / 0.14);
-  --accent-border:       oklch(0.720 0.160 277 / 0.40);
-  --accent-glow:         oklch(0.720 0.160 277 / 0.28);
-
-  /* ── Layer 3 · Semantic colors ────────────────────────────────────── */
-
-  --up:          oklch(0.760 0.170 162);
-  --up-bg:       oklch(0.760 0.170 162 / 0.13);
-  --up-border:   oklch(0.760 0.170 162 / 0.32);
-  --down:        oklch(0.700 0.200 22);
-  --down-bg:     oklch(0.700 0.200 22 / 0.13);
-  --down-border: oklch(0.700 0.200 22 / 0.34);
-  --warn:        oklch(0.800 0.140 82);
-  --warn-bg:     oklch(0.800 0.140 82 / 0.12);
-  --warn-border: oklch(0.800 0.140 82 / 0.32);
-  --info:        oklch(0.740 0.130 240);
-  --info-bg:     oklch(0.740 0.130 240 / 0.12);
-  --info-border: oklch(0.740 0.130 240 / 0.32);
-  --unknown:        oklch(0.660 0.010 280);
-  --unknown-bg:     oklch(0.660 0.010 280 / 0.10);
-  --unknown-border: oklch(0.660 0.010 280 / 0.25);
-
-  /* ── Layer 4 · Categorical hues ─────────────────────────────────────
-     Equal lightness/chroma → equal visual weight. Keep in sync with
-     OWNER_COLORS in src/palette.ts. */
-
-  --cat-physical: var(--accent);
-  --cat-vpn:      oklch(0.720 0.170 315);
-  --cat-virtual:  oklch(0.780 0.120 205);
-  --cat-system:   oklch(0.680 0.010 280);
-  --cat-tunnel:   oklch(0.760 0.150 55);
-  --cat-filter:   oklch(0.720 0.170 350);
-
-  /* Interface kind badges */
-  --physical:        var(--cat-physical);
-  --physical-bg:     oklch(0.720 0.160 277 / 0.12);
-  --physical-border: oklch(0.720 0.160 277 / 0.32);
-  --virtual:         var(--cat-virtual);
-  --virtual-bg:      oklch(0.780 0.120 205 / 0.12);
-  --virtual-border:  oklch(0.780 0.120 205 / 0.30);
-
-  /* Backend avatar tints */
-  --wg-color:   var(--up);
-  --wg-bg:      var(--up-bg);
-  --ovpn-color: var(--cat-tunnel);
-  --ovpn-bg:    oklch(0.760 0.150 55 / 0.14);
-  --xray-color: var(--cat-vpn);
-  --xray-bg:    oklch(0.720 0.170 315 / 0.14);
-  --none-color: var(--cat-system);
-  --none-bg:    oklch(0.680 0.010 280 / 0.14);
-
   /* ── Typography ───────────────────────────────────────────────────── */
 
   --font-sans: "Inter Variable", Inter, system-ui, -apple-system,
@@ -111,23 +34,8 @@
   --fw-normal: 400;
   --fw-strong: 600;
 
-  /* ── Spacing — 4pt grid ───────────────────────────────────────────── */
-
-  --sp-1: 0.25rem;
-  --sp-2: 0.5rem;
-  --sp-3: 0.75rem;
-  --sp-4: 1rem;
-  --sp-5: 1.25rem;
-  --sp-6: 1.5rem;
-  --sp-8: 2rem;
-
-  /* ── Radii — nested radius rule: inner = outer − gap ─────────────── */
-
-  --r-sm: 6px;
-  --r-md: 8px;
-  --r-lg: 12px;
-  --r-xl: 16px;
-  --r-full: 999px;
+  /* Spacing (--sp-*), radii (--r-*), and layout metrics come from
+     theme.generated.css (design/tokens.json). */
 
   /* ── Shadows ──────────────────────────────────────────────────────── */
 
@@ -147,8 +55,6 @@
 
   /* ── Layout / z-index ─────────────────────────────────────────────── */
 
-  --rail-w: 64px;
-  --page-narrow: 880px;
   --z-menu: 40;
   --z-tooltip: 50;
   --z-panel: 100;

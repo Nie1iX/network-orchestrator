@@ -15,11 +15,16 @@ import Settings from "./components/Settings";
 import { ToastProvider } from "./components/ui/Toast";
 import { TailscaleStatusResult, TunnelStatus } from "./types";
 import { t } from "./i18n";
+import { applyAppearance, readAppearance } from "./theme";
 import "./App.css";
 
 function App() {
   const [tab, setTab] = useState<Tab>("profiles");
   const [activeCount, setActiveCount] = useState(0);
+
+  useEffect(() => {
+    applyAppearance(readAppearance());
+  }, []);
 
   useEffect(() => {
     if (!isTauri()) return;

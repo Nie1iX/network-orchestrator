@@ -7,6 +7,11 @@ import Page from "./Page";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import { usePlatformCapabilities } from "../platform";
 import { setProfileListMode, useProfileListMode } from "../prefs";
+import {
+  readAppearance,
+  saveAppearance,
+  type Appearance,
+} from "../theme";
 import { VpnAuthMode } from "../types";
 import {
   availableLanguages,
@@ -41,6 +46,7 @@ export default function Settings() {
   const [vpnAuthError, setVpnAuthError] = useState<string | null>(null);
   const listMode = useProfileListMode();
   const locale = useLanguage();
+  const [appearance, setAppearance] = useState<Appearance>(readAppearance);
   const t = useT();
 
   useEffect(() => {
@@ -146,6 +152,37 @@ export default function Settings() {
                       {name}
                     </option>
                   ))}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="settings-group">
+            <div className="settings-group-title">
+              {t("settings.appearance")}
+            </div>
+            <div className="settings-group-body">
+              <div className="settings-row">
+                <div className="settings-row-main">
+                  <span className="settings-row-label">
+                    {t("settings.theme")}
+                  </span>
+                  <span className="settings-row-sub">
+                    {t("settings.themeSub")}
+                  </span>
+                </div>
+                <select
+                  aria-label={t("settings.theme")}
+                  value={appearance}
+                  onChange={(e) => {
+                    const value = e.target.value as Appearance;
+                    setAppearance(value);
+                    saveAppearance(value);
+                  }}
+                >
+                  <option value="system">{t("settings.themeSystem")}</option>
+                  <option value="light">{t("settings.themeLight")}</option>
+                  <option value="dark">{t("settings.themeDark")}</option>
                 </select>
               </div>
             </div>

@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { RouteMap as RouteMapData } from "../types";
-import { OWNER_COLORS, OWNER_FALLBACK, FLOW_NEUTRAL, FLOW_NEUTRAL_FAINT, FLOW_TEXT, FLOW_TEXT_DIM } from "../palette";
+import {
+  flowNeutral,
+  flowNeutralFaint,
+  flowText,
+  flowTextDim,
+  ownerColors,
+  ownerFallback,
+  useTheme,
+} from "../palette";
 import { useT } from "../i18n";
 
 // Simple Sankey-style flow: Profile → Interface → Destination prefix group.
@@ -32,6 +40,7 @@ function destGroup(dest: string): string {
 
 export default function RouteFlow() {
   const t = useT();
+  const theme = useTheme();
   const [map, setMap] = useState<RouteMapData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -61,7 +70,8 @@ export default function RouteFlow() {
     const active = map.predicted.filter((r) => r.active);
     const owners = [...new Set(active.map((r) => r.ownerName))];
     const colorMap = new Map<string, string>();
-    owners.forEach((o, i) => colorMap.set(o, OWNER_COLORS[i % OWNER_COLORS.length]));
+    const colors = ownerColors(theme);
+    owners.forEach((o, i) => colorMap.set(o, colors[i % colors.length]));
 
     // Build 3 columns: profiles → interfaces → dest groups
     const profileNodes = new Map<string, number>();
@@ -86,7 +96,7 @@ export default function RouteFlow() {
           label: pKey,
           type: "profile",
           value: 0,
-          color: colorMap.get(pKey) ?? OWNER_FALLBACK,
+          color: colorMap.get(pKey) ?? ownerFallback(theme),
         });
       }
       nodeList[profileNodes.get(pKey)!].value++;
@@ -98,7 +108,7 @@ export default function RouteFlow() {
           label: iKey,
           type: "interface",
           value: 0,
-          color: FLOW_NEUTRAL,
+          color: flowNeutral(theme),
         });
       }
       nodeList[ifaceNodes.get(iKey)!].value++;
@@ -110,7 +120,7 @@ export default function RouteFlow() {
           label: dKey,
           type: "dest",
           value: 0,
-          color: FLOW_NEUTRAL_FAINT,
+          color: flowNeutralFaint(theme),
         });
       }
       nodeList[destNodes.get(dKey)!].value++;
@@ -126,7 +136,7 @@ export default function RouteFlow() {
           source: pIdx,
           target: iIdx,
           value: 1,
-          color: colorMap.get(pKey) ?? OWNER_FALLBACK,
+          color: colorMap.get(pKey) ?? ownerFallback(theme),
         });
       }
 
@@ -140,13 +150,13 @@ export default function RouteFlow() {
           source: iIdx,
           target: dIdx,
           value: 1,
-          color: FLOW_NEUTRAL,
+          color: flowNeutral(theme),
         });
       }
     }
 
     return { nodes: nodeList, links: [...p2iLinks, ...i2dLinks] };
-  }, [map]);
+  }, [map, theme]);
 
   if (loading) return <p>{t("routes.loadingFlow")}</p>;
   if (error) return <p className="error">{t("common.error", { err: error })}</p>;
@@ -250,7 +260,7 @@ export default function RouteFlow() {
                 x={n.x + n.w / 2}
                 y={n.y + n.h / 2 + 4}
                 textAnchor="middle"
-                fill={FLOW_TEXT}
+                fill={flowText(theme)}
                 fontSize={11}
                 fontWeight={n.type === "profile" ? 600 : 400}
               >
@@ -260,7 +270,7 @@ export default function RouteFlow() {
                 x={n.x + n.w - 6}
                 y={n.y + n.h / 2 + 4}
                 textAnchor="end"
-                fill={FLOW_TEXT_DIM}
+                fill={flowTextDim(theme)}
                 fontSize={9}
               >
                 {n.value}
