@@ -51,10 +51,10 @@ def rpc(method, params):
 
 
 print("\n=== WireGuard split tunnel across two containers", flush=True)
-client_private = run("wg", "genkey")
-client_public = run("wg", "pubkey", input_text=client_private + "\n")
-server_private = run("wg", "genkey")
-server_public = run("wg", "pubkey", input_text=server_private + "\n")
+client_private = docker_exec(client_name, "wg", "genkey")
+client_public = docker_exec(client_name, "wg", "pubkey", input_text=client_private + "\n")
+server_private = docker_exec(server_name, "wg", "genkey")
+server_public = docker_exec(server_name, "wg", "pubkey", input_text=server_private + "\n")
 server_ip = docker_exec(
     client_name,
     "python3",

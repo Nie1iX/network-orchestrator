@@ -4,7 +4,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "dev:sandbox": "VITE_NETORCH_SANDBOX=1 vite --port 1422",
+    "build:macos": "bash scripts/build-macos-native.sh",
+    "test:sandbox": "node --experimental-strip-types --test tests/sandbox.test.ts",
+    "test:i18n": "node --experimental-strip-types --test tests/i18n.test.ts && python3 -m unittest discover -s tests -p 'test_localizations.py'",
+    "i18n:generate": "python3 scripts/generate-localizations.py",
+    "i18n:check": "python3 scripts/generate-localizations.py --check",
+    "build": "python3 scripts/generate-ui-theme.py --check && python3 scripts/generate-localizations.py --check && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },

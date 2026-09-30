@@ -933,7 +933,10 @@ export default function ProfileManager() {
       setSaveNotice(
         notes.length > 0
           ? {
-              profileName: editing.name || editing.id,
+              profileName:
+                updated.find((profile) => profile.id === editing.id)?.name ||
+                editing.name ||
+                editing.id,
               inspection,
             }
           : null,

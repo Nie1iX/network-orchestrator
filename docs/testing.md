@@ -1,5 +1,129 @@
 # E2E testing
 
+## Browser sandbox on macOS
+
+```bash
+npm run dev:sandbox
+# Open http://localhost:1422 in a browser.
+npm run test:sandbox
+```
+
+The sandbox uses synthetic WireGuard, OpenVPN, Xray subscription, and static
+route profiles. All IPC calls are intercepted by Tauri's mock transport and
+handled in memory. There is no native-command fallback, VPN process, file
+import, subscription HTTP request, keyring write, OS route, DNS, or proxy
+mutation. Unknown commands, interface changes, elevation, backend installation,
+and process restart are rejected. The installer refuses to run in a native
+Tauri window. Production builds exclude the sandbox.
+
+The green banner identifies this mode. Reload resets the synthetic backend;
+connection snippets use this browser origin's localStorage and survive reload.
+File dialogs and confirmations return synthetic choices. Subscription delays,
+config analysis, conflicts, and traffic counters are fixtures. IPv4 lookup is
+simulated; IPv6 parsing, bulk CIDR parsing, OpenVPN probes, and real config
+generation are covered by Rust tests instead. Do not use sandbox results as
+evidence that real VPN credentials or connectivity work.
+
+## Local verification record — 2026-09-30
+
+The app was launched on macOS with an isolated QA application identifier.
+Browser checks used the sandbox above. Real Linux network checks used disposable
+ARM64 Ubuntu containers in a separate Docker bridge with no published ports,
+host networking, Docker socket mount, or user VPN files. WireGuard keys and
+OpenVPN certificates/credentials were generated for the test peers. The initial
+internal-only bridge prevented the full-tunnel underlay probe; the successful
+run used the private bridge arrangement from the existing E2E contract.
+
+This was a review of the main paths across core, daemon, Tauri commands, and
+React, backed by tests and UI checks. It is not an exhaustive proof that every
+line or every platform-specific path is correct.
+
+| Area | Verification | Result |
+| --- | --- | --- |
+| macOS workspace | fmt, all-target check, strict clippy, workspace tests | 459 Rust tests passed |
+| Linux x86_64 core + daemon | Docker Rust tests, daemon release build | 539 tests passed, including doc tests |
+| Linux ARM64 core + daemon | fmt, strict all-target clippy, Rust tests | 530 tests passed, including doc tests |
+| Frontend | TypeScript + production Vite build; pure sandbox tests | build passed; 6 tests passed; sandbox absent from dist |
+| Native macOS shell | Tauri dev startup with QA identifier | launched; real host VPN connections were not attempted |
+| Profiles UI | create static route, edit WireGuard, import file/subscription, delete, search/group controls | synthetic data only; passed |
+| Connection UI | four concurrent backends, OpenVPN credential prompt, disconnect, save/apply connection snippet | synthetic data only; passed |
+| Subscription UI | endpoint selection, refresh, interval, delay, disabled edits while active | synthetic data only; passed |
+| Network and routes UI | adapters/details, route overview/table/tree/flow/by-interface, IPv4 longest-prefix lookup | synthetic data only; passed; display findings below |
+| Recovery/settings UI | cleanup, diagnostics, always-on enable/disable and edit guard, login autostart, auth mode, executable selection/reset | synthetic data only; passed |
+| Linux daemon | existing scenarios.sh, including IPv4/IPv6, policy rules, polkit/uid isolation, journal, restart/cleanup, 1,000 routes | all 45 checks passed |
+| WireGuard | existing wg_scenarios.py, real split/full traffic, DNS, crash recovery, always-on | all 28 checks passed |
+| OpenVPN | existing ovpn_scenarios.py, real split/full traffic, pushed DNS, crash recovery | all 19 checks passed |
+| OpenVPN authentication/probe | existing ovpn_auth_scenarios.py | all 4 checks passed |
+| Static always-on | existing always_on_scenarios.sh, pause/resume, repair, late interface, uid isolation | passed |
+| Real Xray proxy/TUN | unit tests and sandbox only in this session | real traffic not verified; pinned Linux managed package is x86_64-only |
+| Windows system proxy, DPAPI, UAC, tunnel services; desktop Linux polkit prompts/tray | applicable ordinary unit tests only | VM acceptance still required |
+| Real subscription service / user's VPN | not used | network/provider behavior remains unverified |
+
+### Reproduced and corrected
+
+- macOS compilation accessed a nonexistent `net_route::Route.metric`; use the
+  platform field only on Linux/Windows and an explicit unavailable-metric
+  fallback elsewhere. Route conversion has a regression test.
+- The Linux daemon's orchestration/process modules were exposed on macOS even
+  though their DNS, D-Bus, and libc dependencies were Linux-only. Gate those
+  modules by platform; neutral protocol/store tests still run on macOS.
+- Concurrent `ProfileStore::upsert` operations could lose unrelated profiles
+  or collide on the temporary file. Serialize write transactions on the shared
+  store instance. A 12-thread regression failed before the fix and passed after.
+  This lock does not provide coordination between separate processes or store
+  instances pointing at the same file.
+- Profile documents lacked private Unix permissions. Protect their directory
+  and temporary document before atomic rename. The permission regression failed
+  before the fix and now verifies modes 0700/0600.
+- Xray profile validation accepted HTTP port 0 and identical SOCKS/HTTP ports.
+  The regression failed before the fix; both invalid states are now rejected.
+- Linux ARM64 daemon compilation referenced x86_64-only managed Xray helpers.
+  ARM64 now builds and returns `Unsupported` for that managed executable;
+  this does not add an ARM64 Xray package. Architecture-specific regression passed.
+- Strict Linux clippy found three nonminimal boolean conditions in DNS/staging
+  cleanup. Apply equivalent expressions and re-run the Linux tests.
+- WireGuard E2E required a host `wg` tool although the documented prerequisite
+  is Docker. Generate test keys through `wg` inside the disposable containers;
+  the full integration suite passed with no host installation.
+- Saved-profile warnings showed the old name or a new profile ID. Resolve the
+  name from the returned saved profiles. Route lookup now asks for an IP literal
+  rather than a hostname the backend does not resolve. The adapter panel close
+  control has an accessible name.
+
+### Remaining logic/display findings
+
+1. **Linux local Xray auto-connect depends unnecessarily on the daemon.**
+   `src-tauri/src/auto_connect.rs::connect_on_startup` calls `hello` and
+   `owned.list` before starting any saved profile, even when all selected profiles
+   are SOCKS Xray (`daemon_owner == None`). If the daemon is unavailable, local
+   proxy auto-connect is skipped although the manual local process path does not
+   require it. Separate local profiles from daemon-owned profiles and add an
+   unavailable-daemon regression. Found by code inspection; not injected into a
+   desktop Linux app during this session.
+2. **Adapter details can display stale routes and hide read failures.**
+   `src/components/InterfaceDetail.tsx` fetches only when `iface.ifIndex` changes,
+   omits the `route-changed` subscription, and ignores errors. An open panel can
+   keep an old route count; a failed initial read looks like an empty table.
+   Subscribe and expose a read error. Found by code inspection.
+3. **Traffic-flow profile identities and destination labels can mislead.**
+   `src/components/RouteFlow.tsx` keys profiles by `ownerName`, so different
+   profiles with the same permitted name merge. `destGroup` changes any IPv4
+   prefix to `/16`, including broader routes such as `10.0.0.0/8`; this can show
+   the wrong apparent coverage. The `/24` fixture rendered as `/16` in the UI.
+   Use `ownerProfileId` for identity and mark aggregates clearly while preserving
+   broader prefixes. Duplicate-name and broad-prefix cases were found by inspection.
+4. **Occupied Xray HTTP listeners do not receive the SOCKS conflict handling.**
+   `src-tauri/src/commands/tunnels.rs::connect_profile` checks/reassigns an
+   occupied SOCKS listener but has no equivalent HTTP preflight, while creation
+   reserves both ports. A program occupying the saved HTTP port can cause a
+   later Xray startup failure. Add a dual-listener regression before extending
+   replacement/rollback logic. Found by code inspection, not a real Xray run.
+
+Sandbox browser logs included Tauri mock callback warnings during development
+reloads/React effect cleanup; no browser error was observed in the completed
+flows. These warnings are a mock-event limitation, not evidence of a native
+backend failure. Production event behavior still needs platform UI acceptance.
+
 ## Linux daemon in a disposable container
 
 `e2e/linux/run.sh` builds the daemon, starts an Ubuntu 26.04 (default) or
@@ -44,6 +168,80 @@ e2e/linux/run_app_gui.sh target/release/bundle/rpm/*.rpm
 This uses a container-only polkit rule for its headless user session, then
 checks save/connect/disconnect through the installed app's WebView and the
 kernel route table. It does not verify a visible polkit prompt or Wayland.
+
+## macOS 27 native client
+
+The native SwiftUI client is built with `npm run build:macos` (or
+`bash scripts/build-macos-native.sh`). It uses the Rust core directly rather
+than the Tauri IPC/browser sandbox. Build and test commands, the independent
+data directory and current feature boundaries are documented in
+[`../macos/README.md`](../macos/README.md).
+
+On 2026-09-30 the arm64 release bundle was built and launched on macOS 27.0
+with Xcode 27.0. Its Mach-O load command and Info.plist both specify 27.0 as
+the minimum OS; local ad-hoc signing verifies. The binary links SwiftUI/AppKit
+and does not link WebKit. RSS samples were 84.3 MiB for the initial instance
+and 137.4 MiB immediately after launching the final foreground bundle; these
+are not a comparative memory benchmark. The full macOS Rust workspace gate passed
+(467 tests), along with four Swift integration tests and the TypeScript/Vite
+production build. Native window interaction/screenshot acceptance remains
+pending: the Computer Use helper repeatedly closed its pipe, including after
+reset. Automated integration tests are not a substitute for visible UI checks.
+
+Native bridge tests cover persisted profiles, CIDR validation/aggregation,
+managed imports, failed-import cleanup, bounded C ABI buffers and refusal of
+network mutations. Swift tests cover actual FFI decoding, persisted profiles,
+imported-config analysis and read-only Darwin loopback inventory/route lookup.
+Ordinary macOS tests never start real VPNs or apply routes, DNS or proxies.
+
+### Shared dark/light design verification
+
+On 2026-09-30 the native screens were restyled to match the Tauri icon rail,
+cards, typography, filters, route tabs and dialogs. Both clients use generated
+colors and core layout metrics from `design/tokens.json`, with a stale-output
+check in their build commands. Native vector assets preserve the original
+`src/icons.tsx` geometry and have a checked source hash.
+
+The redesign passed fmt, all-target workspace check, strict clippy and all
+467 ordinary Rust tests, TypeScript/Vite build and six sandbox tests. Six Swift
+tests passed with `NETORCH_DESIGN_PREVIEWS` enabled, including packaged-icon
+verification and 28 offscreen SwiftUI renders: five pages, six route tabs and
+three creation/import dialogs in each theme. The native renderer uses an
+injected temporary store and synthetic network data. The Tauri browser preview
+was also checked by switching its Settings theme between Light and Dark.
+
+PNG renders are under `target/macos/design-preview`, with `dark`/`light`
+subdirectories and `tauri-dark.png`/`tauri-light.png` browser references. Exact
+pixel parity and foreground native window interaction remain unverified;
+the Computer Use helper was unavailable. OS-native chrome and unavailable
+backend actions intentionally reflect macOS capabilities. No real VPN was
+started and no host network settings were changed.
+
+### Shared language verification
+
+On 2026-09-30 English/Russian/System selectors were added to Tauri and SwiftUI.
+Catalogs and plural rules are shared in `locales/*.json`; generated outputs
+and native bundle language metadata are checked/derived during builds. Adding
+a catalog does not require editing either client's language list. See
+[`../locales/README.md`](../locales/README.md) for the translator workflow and
+the boundary between UI translations and raw backend diagnostics.
+
+RED: initial runtime tests failed before the translation helper existed.
+GREEN: four translation runtime tests and six Python catalog-validation tests
+passed, together with nine Swift tests (including 56 English/Russian renders
+in dark/light), six sandbox tests and the full required Rust/web quality gate
+(467 ordinary Rust tests). The ad-hoc signed native release bundle includes
+both catalogs and declares the language tags in Info.plist.
+
+Browser acceptance checked English persisting after reload, live Russian
+switching across windows and an open profile form keeping its `Language check`
+name and static-routes backend when its labels changed to Russian. The draft
+was discarded without saving; the second test tab was closed. The browser
+was left on Russian Settings. Native foreground interaction remains limited
+by the unavailable Computer Use helper; native localization/persistence are
+verified through tests and offscreen renders. The PNGs are under
+`target/macos/i18n-preview/{en,ru}/{dark,light}`, with a browser reference at
+`target/macos/i18n-preview/tauri-ru-settings.png`. No real VPN was started.
 
 ## Windows on a disposable VM
 

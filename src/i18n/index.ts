@@ -1,77 +1,86 @@
 import { useSyncExternalStore } from "react";
-import en from "./en";
-import ru from "./ru";
+import { catalogs } from "./catalog.generated.ts";
+import { resolveLanguage, translateMessage, type Arguments } from "./engine.ts";
 
-export type Language = "en" | "ru";
-export type Lang = Language;
-export type TranslationKey = keyof typeof en;
-
-/** Languages shown in Settings → General. `label` stays native on purpose. */
-export const LANGS: { id: Language; label: string }[] = [
-  { id: "en", label: "English" },
-  { id: "ru", label: "Русский" },
-];
-
-const LANG_KEY = "netmanager.ui.language";
-const EVENT = "language-changed";
-
-const dicts: Record<Language, Partial<Record<TranslationKey, string>>> = {
-  en,
-  ru,
-};
-
-function detect(): Language {
+const STORAGE_KEY = "netmanager.language";
+const listeners = new Set<() => void>();
+function readPreference(): string {
   try {
-    const stored = localStorage.getItem(LANG_KEY);
-    if (stored === "en" || stored === "ru") return stored;
-  } catch {
-    // private mode — fall through to navigator
+    const saved = localStorage.getItem(STORAGE_KEY);
+    return saved && (saved === "system" || Object.prototype.hasOwnProperty.call(catalogs, saved)) ? saved : "system";
+  } catch { return "system"; }
+}
+let preference = readPreference();
+export const availableLanguages = Object.entries(catalogs).map(([code, catalog]) => ({ code, name: catalog.name }));
+export function currentLanguage(): string {
+  return resolveLanguage(preference, typeof navigator === "undefined" ? ["en"] : navigator.languages, catalogs);
+}
+export function tr(key: string, args?: Arguments): string {
+  return translateMessage(catalogs, currentLanguage(), key, args);
+}
+function notify(): void {
+  if (typeof document !== "undefined") {
+    const language = currentLanguage();
+    document.documentElement.lang = language;
+    document.documentElement.dir = catalogs[language].direction;
   }
-  return navigator.language.toLowerCase().startsWith("ru") ? "ru" : "en";
+  listeners.forEach((listener) => listener());
+}
+export function setLanguage(value: string): void {
+  if (value !== "system" && !Object.prototype.hasOwnProperty.call(catalogs, value)) return;
+  preference = value;
+  try { localStorage.setItem(STORAGE_KEY, value); } catch { /* Session selection still works. */ }
+  notify();
+}
+function storageChanged(event: StorageEvent): void {
+  if (event.key === STORAGE_KEY || event.key === null) { preference = readPreference(); notify(); }
+}
+function subscribe(listener: () => void): () => void {
+  if (listeners.size === 0) {
+    window.addEventListener("storage", storageChanged);
+    window.addEventListener("languagechange", notify);
+    notify();
+  }
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) {
+      window.removeEventListener("storage", storageChanged);
+      window.removeEventListener("languagechange", notify);
+    }
+  };
+}
+const snapshot = () => `${preference}:${currentLanguage()}`;
+export function useLanguage() {
+  useSyncExternalStore(subscribe, snapshot);
+  return { preference, language: currentLanguage(), setLanguage };
 }
 
-let current: Language = detect();
+// Compatibility layer for the dotted-key t()/useT() call sites; the same
+// strings live in locales/*.json under their dotted keys.
+
+export type Language = string;
+export type Lang = Language;
+export type TranslationKey = string;
+
+/** Languages shown in Settings → General. `label` stays native on purpose. */
+export const LANGS: { id: Language; label: string }[] = availableLanguages.map(
+  ({ code, name }) => ({ id: code, label: name }),
+);
 
 export function getLanguage(): Language {
-  return current;
+  return currentLanguage();
 }
 
 export const getLang = getLanguage;
 export const setLang = setLanguage;
-export const useLang = useLanguage;
 
-export function setLanguage(lang: Language) {
-  if (lang === current) return;
-  current = lang;
-  try {
-    localStorage.setItem(LANG_KEY, lang);
-  } catch {
-    // private mode — keep the in-memory choice
-  }
-  window.dispatchEvent(new Event(EVENT));
+export function useLang(): Language {
+  return useLanguage().language;
 }
 
-export function useLanguage(): Language {
-  return useSyncExternalStore(
-    (callback) => {
-      window.addEventListener(EVENT, callback);
-      return () => window.removeEventListener(EVENT, callback);
-    },
-    () => current,
-  );
-}
-
-export function t(
-  key: TranslationKey,
-  params?: Record<string, string | number>,
-): string {
-  let text: string = dicts[current][key] ?? en[key] ?? key;
-  if (params) {
-    for (const [name, value] of Object.entries(params)) {
-      text = text.split(`{${name}}`).join(String(value));
-    }
-  }
-  return text;
+export function t(key: TranslationKey, params?: Arguments): string {
+  return tr(key, params);
 }
 
 export function useT() {
@@ -97,7 +106,7 @@ export function pluralize(
   ruForms: [string, string, string],
   enForms: [string, string],
 ): string {
-  return current === "ru"
+  return currentLanguage() === "ru"
     ? pluralRu(n, ruForms)
     : n === 1
       ? enForms[0]

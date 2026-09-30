@@ -1,3 +1,4 @@
+import { tr } from "../../i18n";
 interface ToggleSwitchProps {
   checked: boolean;
   onChange: () => void;
@@ -21,7 +22,7 @@ export default function ToggleSwitch({
       className={`toggle-switch ${checked ? "on" : "off"} ${busy ? "busy" : ""}`}
       onClick={onChange}
       disabled={disabled || busy}
-      title={title}
+      title={title === undefined ? undefined : tr(title)}
     >
       <span className="toggle-switch-thumb" />
     </button>

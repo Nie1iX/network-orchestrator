@@ -278,14 +278,7 @@ export default function Monitor() {
             {running.length > 0 ? (
               <RateText rx={totalRate.rx} tx={totalRate.tx} live />
             ) : (
-              t("monitor.profilesConfigured", {
-                n: profiles.length,
-                word: pluralize(
-                  profiles.length,
-                  ["профиль", "профиля", "профилей"],
-                  ["profile", "profiles"],
-                ),
-              })
+              t("monitor.profilesConfigured", { count: profiles.length })
             )}
             {failed.length > 0 && running.length > 0 && (
               <span className="monitor-failed-note">

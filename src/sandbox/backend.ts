@@ -1,0 +1,231 @@
+import type {
+  AlwaysOnListResult, BackendAvailability, ConfigAnalysis, NetworkInterface,
+  Profile, ProfileInspection, RouteEntry, RouteMap, TunnelStatus, VpnAuthMode,
+} from "../types.ts";
+
+// This module intentionally has no I/O imports, fetch, or process calls.
+// It models UI transitions only; Rust tests verify actual backend behavior.
+function profile(id: string, name: string, backend: Profile["backend"], cidr?: string): Profile {
+  return {
+    id, name, backend, configPath: backend === "none" ? "" : `/sandbox/${id}.${backend === "xray" ? "json" : backend === "openVpn" ? "ovpn" : "conf"}`,
+    interfaceName: backend === "none" ? "qa-ethernet" : `qa-${id}`,
+    routes: cidr ? [{ destination: cidr, metric: 5, via: null }] : [],
+    autoConnect: false, domainPolicies: [], privateLanDirect: false,
+    xraySocksPort: backend === "xray" ? 10808 : null,
+    xrayHttpPort: backend === "xray" ? 10809 : null,
+    useSystemProxy: false, proxyBypass: [], subscription: null,
+    xrayMode: "socks", xrayTunInterface: null, xrayTunIp: null,
+  };
+}
+
+function iface(name: string, index: number, physical: boolean, state: NetworkInterface["state"], kind: NetworkInterface["kind"] = "ethernet"): NetworkInterface {
+  return {
+    name, friendlyName: name, ifIndex: index, physical, state,
+    kind, category: physical ? "physical" : "vpn",
+    addresses: [{ address: physical ? "192.0.2.2" : kind === "openVpn" ? "10.88.0.2" : "10.77.0.2", prefixLen: 24, family: "Ipv4" }],
+    dnsServers: ["192.0.2.53"], dnsSuffix: null, mtu: 1500, mac: null,
+    gateway: physical ? "192.0.2.1" : null, ipv6Gateway: null,
+    rxBytes: 1048576, txBytes: 524288, linkSpeedMbps: 1000,
+    description: "Synthetic interface; no OS adapter", ifType: 6, tunnelType: null,
+  };
+}
+
+export class SandboxBackend {
+  private profiles: Profile[] = [
+    profile("wg", "QA WireGuard", "wireGuard", "10.77.0.0/24"),
+    profile("ovpn", "QA OpenVPN", "openVpn", "10.88.0.0/24"),
+    profile("xray", "QA Xray subscription", "xray"),
+    profile("static", "QA Static routes", "none", "203.0.113.0/24"),
+  ];
+  private running = new Set<string>();
+  private enrollment: AlwaysOnListResult = { profiles: [], paused: false, supportedKinds: ["wireGuard", "staticRoutes"] };
+  private loginAutostart = false;
+  private authMode: VpnAuthMode = "fullTunnelOnly";
+  private recovered = false;
+  private endpoints = ["QA Europe", "QA Asia"];
+  private backendPaths = new Map<string, string>();
+
+  constructor() {
+    this.profiles[2].subscription = {
+      url: "", hwid: "", endpointCount: 2, activeIndex: 0,
+      refreshIntervalMinutes: null, lastRefreshAtUnix: null, lastRefreshError: null,
+      userInfo: { uploadBytes: 1048576, downloadBytes: 2097152, totalBytes: 1073741824, expiresAtUnix: null },
+    };
+  }
+
+  private find(id: unknown): Profile {
+    const found = this.profiles.find((p) => p.id === id);
+    if (!found) throw new Error("Sandbox profile not found");
+    return found;
+  }
+
+  private stopped(p: Profile) {
+    if (this.running.has(p.id)) throw new Error("Disconnect the profile before editing or deleting");
+  }
+
+  private allocateProxyPorts(p: Profile) {
+    const used = new Set(this.profiles.filter((other) => other.id !== p.id).flatMap((other) => [other.xraySocksPort, other.xrayHttpPort]));
+    let port = 10808;
+    while (used.has(port) || used.has(port + 1)) port += 2;
+    p.xraySocksPort = port;
+    p.xrayHttpPort = port + 1;
+  }
+
+  private statuses(): TunnelStatus[] {
+    return this.profiles.map((p) => ({ profileId: p.id, state: this.running.has(p.id) ? "running" : "stopped", message: null }));
+  }
+
+  private interfaces(): NetworkInterface[] {
+    return [iface("qa-ethernet", 1, true, "Up"), ...this.profiles.filter((p) => p.backend !== "none" && !(p.backend === "xray" && p.xrayMode === "socks")).map((p, i) => iface(p.interfaceName, i + 2, false, this.running.has(p.id) ? "Up" : "Down", p.backend === "none" ? "ethernet" : p.backend))];
+  }
+
+  private routes(): RouteEntry[] {
+    return [
+      { destination: "0.0.0.0", prefixLen: 0, gateway: "192.0.2.1", interfaceIndex: 1, interfaceName: "qa-ethernet", metric: 100 },
+      ...this.profiles.filter((p) => this.running.has(p.id)).flatMap((p) => p.routes.map((r) => {
+        const [destination, prefix] = r.destination.split("/");
+        return { destination, prefixLen: Number(prefix), gateway: r.via ?? null, interfaceIndex: this.interfaces().find((i) => i.name === p.interfaceName)?.ifIndex ?? 1, interfaceName: p.interfaceName, metric: r.metric };
+      })),
+    ];
+  }
+
+  private inspect(p: Profile): ProfileInspection {
+    const analysis: ConfigAnalysis = {
+      profileId: p.id, osRoutes: p.routes.map((r) => ({ destination: r.destination, source: "profile" })),
+      internalRoutes: [], listeners: p.backend === "xray" ? [{ address: "127.0.0.1", port: p.xraySocksPort ?? 10808, protocol: "socks" }] : [],
+      endpoints: p.backend === "none" ? [] : [{ address: "vpn.example.invalid", port: 443, protocol: p.backend }],
+      domainPatterns: p.domainPolicies.flatMap((d) => d.domains), warnings: ["Synthetic configuration: no network traffic is sent."], routeKnowledgeComplete: true,
+    };
+    return { analysis, conflicts: [], managedConfig: true };
+  }
+
+  private routeMap(includeInactive: unknown): RouteMap {
+    return {
+      predicted: this.profiles.filter((p) => includeInactive || this.running.has(p.id)).flatMap((p) => p.routes.map((r) => ({ destination: r.destination, ownerProfileId: p.id, ownerName: p.name, source: "profile", interfaceName: p.interfaceName, metric: r.metric, active: this.running.has(p.id) }))),
+      effective: this.routes(), diffs: [], warnings: ["Sandbox route table; the host routing table is unchanged."], pushedRoutes: [],
+    };
+  }
+
+  invoke(command: string, args: Record<string, unknown> = {}): unknown {
+    // Clone responses to prevent UI edits from mutating backend state by reference.
+    return structuredClone(this.dispatch(command, args));
+  }
+
+  private dispatch(command: string, args: Record<string, unknown>): unknown {
+    switch (command) {
+      case "get_platform_capabilities": return { os: "linux", systemProxy: false, wireguardStandardImport: false, managedXrayInstall: false, elevationRelaunch: false, appUpdates: false, executableExtensions: [] };
+      case "get_profiles": return this.profiles;
+      case "get_interfaces": return this.interfaces();
+      case "get_routes": return this.routes();
+      case "get_tunnel_statuses": return this.statuses();
+      case "daemon_status": return { state: "ready", message: "Simulated daemon: host network is never modified." };
+      case "is_elevated": return false;
+      case "get_auto_connect_result": return null;
+      case "get_always_on_profiles": return this.enrollment;
+      case "set_always_on_profile": {
+        const p = this.find(args.id);
+        if (!["wireGuard", "none"].includes(p.backend)) throw new Error("This backend does not support always-on");
+        this.enrollment.profiles = this.enrollment.profiles.filter((e) => e.profileId !== p.id);
+        this.enrollment.profiles.push({ kind: p.backend === "none" ? "staticRoutes" : "wireGuard", profileId: p.id, enabled: true });
+        return { stored: true, active: this.running.has(p.id) };
+      }
+      case "remove_always_on_profile": this.enrollment.profiles = this.enrollment.profiles.filter((e) => e.profileId !== args.profileId || e.kind !== args.kind); return { removed: true };
+      case "resume_always_on": this.enrollment.paused = false; return { resumed: true };
+      case "get_login_autostart": return this.loginAutostart;
+      case "set_login_autostart": this.loginAutostart = Boolean(args.enabled); return this.loginAutostart;
+      case "get_vpn_auth_mode": return this.authMode;
+      case "set_vpn_auth_mode": this.authMode = args.mode as VpnAuthMode; return this.authMode;
+      case "get_recovery_report": return { issues: this.recovered ? [] : [{ kind: "ownedRoutes", profileId: "static", message: "Synthetic stale route from a previous sandbox session." }], requiresElevation: false };
+      case "cleanup_recovery": this.recovered = true; return { issues: [], requiresElevation: false };
+      case "connect_profile":
+      case "connect_openvpn_with_credentials": {
+        const p = this.find(args.id);
+        if (this.running.has(p.id)) throw new Error("Profile is already running");
+        if (p.backend === "none" && !p.routes.length) throw new Error("Static-routes profile has no routes");
+        if (p.backend === "openVpn" && command === "connect_profile") throw "OpenVPN credentials required";
+        this.running.add(p.id);
+        return this.statuses().find((s) => s.profileId === p.id);
+      }
+      case "disconnect_profile": this.running.delete(this.find(args.id).id); return this.statuses().find((s) => s.profileId === args.id);
+      case "save_profile":
+      case "save_vless_profile":
+      case "save_wireguard_profile": {
+        const p = structuredClone(args.profile) as Profile;
+        if (!p.id || !p.name?.trim()) throw new Error("Profile name is required");
+        const existing = this.profiles.find((e) => e.id === p.id);
+        if (existing) this.stopped(existing);
+        if (command === "save_vless_profile") { p.configPath = `/sandbox/${p.id}.json`; this.allocateProxyPorts(p); }
+        if (command === "save_wireguard_profile") p.configPath = `/sandbox/${p.id}.conf`;
+        this.profiles = [...this.profiles.filter((e) => e.id !== p.id), p];
+        return this.profiles;
+      }
+      case "delete_profile": this.stopped(this.find(args.id)); this.profiles = this.profiles.filter((p) => p.id !== args.id); return this.profiles;
+      case "inspect_profiles": return this.profiles.map((p) => this.inspect(p));
+      case "inspect_profile_by_id": return this.inspect(this.find(args.id));
+      case "diagnose_profile": {
+        const p = this.find(args.id);
+        return { profileId: p.id, status: this.statuses().find((s) => s.profileId === p.id), inspection: this.inspect(p), checks: [{ name: "Sandbox isolation", level: "healthy", message: "All actions run in memory. No VPN process is started." }] };
+      }
+      case "get_route_map": return this.routeMap(args.includeInactive);
+      case "lookup_destination": {
+        const dest = String(args.dest);
+        const ip = dest.split(".").map(Number);
+        if (ip.length !== 4 || ip.some((b) => !Number.isInteger(b) || b < 0 || b > 255)) throw new Error("Sandbox lookup supports IPv4 literals only");
+        const bits = ip.reduce((n, b) => (n << 8) | b, 0) >>> 0;
+        const matched = this.routes().filter((r) => {
+          const network = r.destination.split(".").map(Number).reduce((n, b) => (n << 8) | b, 0) >>> 0;
+          const mask = r.prefixLen === 0 ? 0 : (0xffffffff << (32 - r.prefixLen)) >>> 0;
+          return ((network & mask) >>> 0) === ((bits & mask) >>> 0);
+        }).sort((a, b) => b.prefixLen - a.prefixLen || a.metric - b.metric)[0];
+        return { destination: dest, matchedRoute: matched, interfaceName: matched.interfaceName, table: "sandbox" };
+      }
+      case "set_interface_state": throw new Error("Interface mutations are disabled in sandbox");
+      case "get_subscription_endpoints": {
+        const p = this.find(args.profileId);
+        return this.endpoints.map((name, i) => ({ name, active: p.subscription?.activeIndex === i }));
+      }
+      case "switch_subscription_endpoint": {
+        const p = this.find(args.profileId); this.stopped(p);
+        if (!p.subscription || !Number.isInteger(args.endpointIndex) || Number(args.endpointIndex) < 0 || Number(args.endpointIndex) >= this.endpoints.length) throw new Error("Invalid endpoint index");
+        p.subscription.activeIndex = Number(args.endpointIndex); return this.profiles;
+      }
+      case "set_subscription_refresh_interval": {
+        const p = this.find(args.profileId);
+        if (!p.subscription) throw new Error("Not a subscription profile");
+        p.subscription.refreshIntervalMinutes = args.refreshIntervalMinutes as number | null; return this.profiles;
+      }
+      case "refresh_subscription": {
+        const p = this.find(args.id); this.stopped(p);
+        if (!p.subscription) throw new Error("Not a subscription profile");
+        p.subscription.lastRefreshAtUnix = Math.floor(Date.now() / 1000);
+        return { endpointCount: 2, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false };
+      }
+      case "measure_subscription_endpoint_delay": return { delayMs: 42, error: null };
+      case "import_subscription": {
+        const p = profile(`subscription-${this.profiles.length}`, "QA Imported subscription", "xray");
+        this.allocateProxyPorts(p);
+        p.subscription = structuredClone(this.profiles.find((p) => p.subscription)?.subscription ?? null);
+        this.profiles.push(p); return { profiles: [p], errors: [] };
+      }
+      case "import_configs_batch": {
+        const imported = [profile(`import-${this.profiles.length}`, "QA Imported WireGuard", "wireGuard", "10.99.0.0/24")];
+        this.profiles.push(...imported); return { profiles: imported, errors: [] };
+      }
+      case "get_backend_availability": return (["wireGuard", "openVpn", "xray"] as const).map((backend): BackendAvailability => ({ backend, available: true, path: this.backendPaths.get(backend) ?? `/sandbox/bin/${backend}`, source: this.backendPaths.has(backend) ? "configured" : "autoDetected", version: null, message: "Simulated executable; nothing is launched." }));
+      case "get_managed_xray_offer": return { version: "sandbox", sourceUrl: "https://example.invalid/disabled", sha256: "", maxDownloadBytes: 0 };
+      case "set_backend_executable": this.backendPaths.set(String(args.backend), String(args.path)); return null;
+      case "reset_backend_executable": this.backendPaths.delete(String(args.backend)); return null;
+      case "plugin:app|version": return "Sandbox";
+      case "plugin:dialog|open": return (args.options as { multiple?: boolean })?.multiple ? ["/sandbox/sample.conf"] : "/sandbox/sample.conf";
+      case "plugin:dialog|message": {
+        const buttons = args.buttons as string | { OkCancelCustom?: string[]; OkCustom?: string; YesNoCancelCustom?: string[] } | undefined;
+        return buttons === "YesNo" ? "Yes" : typeof buttons === "object"
+          ? buttons.OkCancelCustom?.[0] ?? buttons.OkCustom ?? buttons.YesNoCancelCustom?.[0] ?? "Ok"
+          : "Ok";
+      }
+      case "plugin:dialog|ask":
+      case "plugin:dialog|confirm": return true;
+      default: throw new Error(`Command is disabled in sandbox: ${command}`);
+    }
+  }
+}

@@ -9,11 +9,9 @@ import { usePlatformCapabilities } from "../platform";
 import { setProfileListMode, useProfileListMode } from "../prefs";
 import { VpnAuthMode } from "../types";
 import {
-  Lang,
-  LANGS,
-  setLang,
+  availableLanguages,
   TranslationKey,
-  useLang,
+  useLanguage,
   useT,
 } from "../i18n";
 
@@ -42,7 +40,7 @@ export default function Settings() {
   const [vpnAuthBusy, setVpnAuthBusy] = useState(false);
   const [vpnAuthError, setVpnAuthError] = useState<string | null>(null);
   const listMode = useProfileListMode();
-  const lang = useLang();
+  const locale = useLanguage();
   const t = useT();
 
   useEffect(() => {
@@ -138,12 +136,14 @@ export default function Settings() {
                   </span>
                 </div>
                 <select
-                  value={lang}
-                  onChange={(e) => setLang(e.target.value as Lang)}
+                  aria-label={t("settings.language")}
+                  value={locale.preference}
+                  onChange={(e) => locale.setLanguage(e.target.value)}
                 >
-                  {LANGS.map((l) => (
-                    <option key={l.id} value={l.id}>
-                      {l.label}
+                  <option value="system">{t("System")}</option>
+                  {availableLanguages.map(({ code, name }) => (
+                    <option key={code} value={code}>
+                      {name}
                     </option>
                   ))}
                 </select>

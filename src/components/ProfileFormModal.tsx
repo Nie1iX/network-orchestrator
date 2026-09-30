@@ -295,7 +295,7 @@ export default function ProfileFormModal({
       setProbeNotice(
         routes.length === 0
           ? tr("form.probeNone")
-          : tr("form.probeFound", { n: routes.length }),
+          : tr("form.probeFound", { count: routes.length }),
       );
     } catch (err) {
       setProbeNotice(String(err));
@@ -318,7 +318,7 @@ export default function ProfileFormModal({
       return;
     }
     update({ routes: [...current.routes, ...toAdd] });
-    setProbeNotice(tr("form.probeAdded", { n: toAdd.length }));
+    setProbeNotice(tr("form.probeAdded", { count: toAdd.length }));
   };
 
   const updateRoute = (index: number, patch: Partial<PolicyRoute>) =>

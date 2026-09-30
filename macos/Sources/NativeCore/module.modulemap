@@ -1,0 +1,4 @@
+module NativeCore {
+    header "include/NativeCore.h"
+    export *
+}

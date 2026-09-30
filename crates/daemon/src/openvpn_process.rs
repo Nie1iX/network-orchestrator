@@ -503,9 +503,9 @@ fn cleanup_stage_at(root: &Path, uid: u32, name: &str) -> io::Result<()> {
             .ok_or_else(|| io::Error::other("OpenVPN staging cleanup failed"))?;
         if name != "config.ovpn"
             && name != "management.sock"
-            && !name
+            && name
                 .strip_prefix("asset-")
-                .is_some_and(|suffix| suffix.parse::<usize>().is_ok())
+                .is_none_or(|suffix| suffix.parse::<usize>().is_err())
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -514,7 +514,7 @@ fn cleanup_stage_at(root: &Path, uid: u32, name: &str) -> io::Result<()> {
         }
         let metadata = fs::symlink_metadata(entry.path())
             .map_err(|_| io::Error::other("OpenVPN staging cleanup failed"))?;
-        if !metadata.is_file() && !(name == "management.sock" && metadata.file_type().is_socket()) {
+        if !(metadata.is_file() || name == "management.sock" && metadata.file_type().is_socket()) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "OpenVPN staging contains unsafe file",

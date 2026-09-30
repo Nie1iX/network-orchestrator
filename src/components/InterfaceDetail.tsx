@@ -63,7 +63,12 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
             {kindIcon(iface.kind, 22)}
             <span>{iface.friendlyName}</span>
           </div>
-          <button className="close-btn" onClick={onClose} title={t("common.close")}>
+          <button
+            className="close-btn"
+            onClick={onClose}
+            title={t("common.close")}
+            aria-label={t("Close interface details")}
+          >
             <CloseIcon size={20} />
           </button>
         </div>
