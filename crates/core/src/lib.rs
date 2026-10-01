@@ -6,6 +6,7 @@ pub mod config_vault;
 pub mod daemon_protocol;
 pub mod explorer;
 pub mod journal;
+pub mod log_sanitize;
 #[cfg(target_os = "macos")]
 mod macos_inventory;
 pub mod managed_xray;

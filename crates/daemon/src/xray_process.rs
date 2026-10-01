@@ -160,6 +160,7 @@ impl TrustedXrayProcess {
             return Err(if tail.is_empty() {
                 error
             } else {
+                let tail = net_manager_core::vpn::redact_runtime_log(&tail);
                 io::Error::new(error.kind(), format!("{error}; xray log: {tail}"))
             });
         }

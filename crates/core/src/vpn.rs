@@ -705,7 +705,9 @@ pub fn redact_runtime_log(text: &str) -> String {
         out.push_str(&text[i..i + len]);
         i += len;
     }
-    out
+    // Second pass: mask public IPs and hostnames — runtimes log remote
+    // endpoints freely, and a surfaced tail should not reveal them.
+    crate::log_sanitize::sanitize_log_text(&out)
 }
 
 fn utf8_len(lead: u8) -> usize {
