@@ -1,5 +1,6 @@
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -184,6 +185,129 @@ pub struct PolicyRoute {
     pub via: Option<IpAddr>,
 }
 
+/// Xray `routing.domainStrategy`: when the router resolves a domain name
+/// before testing it against IP rules.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum XrayDomainStrategy {
+    /// Domains stay unresolved; IP rules only see literal-IP destinations.
+    AsIs,
+    /// Unmatched domains are resolved and re-tested against IP rules.
+    IpIfNonMatch,
+    /// Every domain is resolved before routing (slowest, most precise).
+    IpOnDemand,
+}
+
+impl XrayDomainStrategy {
+    pub fn as_xray_str(self) -> &'static str {
+        match self {
+            Self::AsIs => "AsIs",
+            Self::IpIfNonMatch => "IPIfNonMatch",
+            Self::IpOnDemand => "IPOnDemand",
+        }
+    }
+}
+
+/// Xray `routing.domainMatcher` algorithm: `mph` (minimal perfect hash)
+/// trades startup time for lookup speed, `hybrid` is its accepted alias,
+/// `linear` is the classic matcher.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum XrayDomainMatcher {
+    Mph,
+    Hybrid,
+    Linear,
+}
+
+impl XrayDomainMatcher {
+    pub fn as_xray_str(self) -> &'static str {
+        match self {
+            Self::Mph => "mph",
+            Self::Hybrid => "hybrid",
+            Self::Linear => "linear",
+        }
+    }
+}
+
+/// Xray `dns.queryStrategy` — which A/AAAA answers the built-in resolver
+/// requests.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum XrayDnsQueryStrategy {
+    UseIp,
+    UseIpv4,
+    UseIpv6,
+}
+
+impl XrayDnsQueryStrategy {
+    pub fn as_xray_str(self) -> &'static str {
+        match self {
+            Self::UseIp => "UseIP",
+            Self::UseIpv4 => "UseIPv4",
+            Self::UseIpv6 => "UseIPv6",
+        }
+    }
+}
+
+/// Whether a DNS server's own address is pinned to an outbound — the
+/// split-DNS pattern where the "remote" resolver is reached through the
+/// proxy and the "domestic" one goes direct.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum XrayDnsRoute {
+    /// No dedicated rule; normal routing decides.
+    #[default]
+    None,
+    /// Route the resolver address through the proxy outbound.
+    Proxy,
+    /// Route the resolver address through the direct outbound.
+    Direct,
+}
+
+/// One `dns.servers` entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayDnsServer {
+    /// `udp://`/`tcp://`/`tls://`/`https://`/`https+local://`/
+    /// `quic+local://` URL, `localhost`, `fakedns`, or a bare IP/hostname
+    /// (plain values are treated as `udp://`).
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Restrict the resolver to these domain selectors (`geosite:` allowed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub skip_fallback: bool,
+    /// Pin the resolver's own address to an outbound.
+    #[serde(default)]
+    pub route: XrayDnsRoute,
+}
+
+/// Profile-level Xray `dns` policy: ordered resolvers, static host
+/// overrides and fake-DNS capture.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayDnsConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<XrayDnsServer>,
+    /// Static host overrides: hostname → one or more IPs (or a domain).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hosts: BTreeMap<String, Vec<String>>,
+    /// Intercept DNS answers with fake pool IPs (`198.18.0.0/16`); the TUN
+    /// inbound's sniffing translates them back to the original names.
+    #[serde(default)]
+    pub fake_dns: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_strategy: Option<XrayDnsQueryStrategy>,
+}
+
+impl XrayDnsConfig {
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty() && self.hosts.is_empty() && !self.fake_dns
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
@@ -227,6 +351,17 @@ pub struct Profile {
     /// rules as `xray_geoip_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xray_geosite_url: Option<String>,
+    /// `routing.domainStrategy` override; `None` keeps the base config's
+    /// (our generated configs ship `AsIs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_domain_strategy: Option<XrayDomainStrategy>,
+    /// `routing.domainMatcher` override (`mph` is the fast path for large
+    /// geosite lists).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xray_domain_matcher: Option<XrayDomainMatcher>,
+    /// Profile DNS policy: resolver list, static hosts and fake-DNS capture.
+    #[serde(default, skip_serializing_if = "XrayDnsConfig::is_empty")]
+    pub xray_dns: XrayDnsConfig,
 }
 
 impl Default for Profile {
@@ -251,6 +386,9 @@ impl Default for Profile {
             xray_tun_ip: None,
             xray_geoip_url: None,
             xray_geosite_url: None,
+            xray_domain_strategy: None,
+            xray_domain_matcher: None,
+            xray_dns: XrayDnsConfig::default(),
         }
     }
 }
