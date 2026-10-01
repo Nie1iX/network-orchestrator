@@ -98,6 +98,7 @@ interface ProfileDetailProps {
   onSwitchEndpoint: (index: number) => void;
   onMeasureAllEndpoints: () => void;
   onSetRefreshInterval: (minutes: number | null) => void;
+  onCopyTerminalProxy: () => void;
 }
 
 export default function ProfileDetail({
@@ -133,6 +134,7 @@ export default function ProfileDetail({
   onSwitchEndpoint,
   onMeasureAllEndpoints,
   onSetRefreshInterval,
+  onCopyTerminalProxy,
 }: ProfileDetailProps) {
   const t = useT();
   const alwaysOnKind: AlwaysOnKind | null =
@@ -411,6 +413,20 @@ export default function ProfileDetail({
               <span className="row-value mono">
                 127.0.0.1:{profile.xrayHttpPort}
               </span>
+            </div>
+          )}
+        {profile.backend === "xray" &&
+          profile.xrayMode === "socks" &&
+          profile.xraySocksPort !== null &&
+          status.state === "running" && (
+            <div className="sub-links">
+              <button
+                type="button"
+                className="btn-sm"
+                onClick={onCopyTerminalProxy}
+              >
+                {t("native.copyTerminal")}
+              </button>
             </div>
           )}
         {profile.subscription && endpoints && (

@@ -626,6 +626,7 @@
       "one": "Connected: {count}",
       "other": "Connected: {count}"
     },
+    "native.copyFailed": "Could not copy to the clipboard.",
     "native.copied": "Proxy commands copied to the clipboard.",
     "native.copyTerminal": "Copy terminal proxy commands",
     "native.helperRequired": "Needs the macOS privileged helper (not available yet)",

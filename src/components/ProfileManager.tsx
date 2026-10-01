@@ -4,6 +4,7 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation, requiresElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
 import { useProfileListMode } from "../prefs";
+import { providerPrefix } from "../subscriptions";
 import { useT } from "../i18n";
 import { BACKEND_LABEL_KEYS } from "../i18n/labels";
 import {
@@ -937,6 +938,24 @@ export default function ProfileManager() {
     }
   };
 
+  /** Copy shell proxy exports for a running Xray SOCKS/HTTP profile —
+   * same format as the macOS client's "Copy terminal proxy". */
+  const onCopyTerminalProxy = async (profile: Profile) => {
+    const socks = profile.xraySocksPort;
+    if (profile.backend !== "xray" || socks === null) return;
+    const http =
+      profile.xrayHttpPort !== null
+        ? `http://127.0.0.1:${profile.xrayHttpPort}`
+        : `socks5h://127.0.0.1:${socks}`;
+    const text = `export HTTP_PROXY=${http} HTTPS_PROXY=${http} ALL_PROXY=socks5h://127.0.0.1:${socks} NO_PROXY=localhost,127.0.0.1,.local`;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast("success", t("native.copied"));
+    } catch {
+      toast("error", t("native.copyFailed"));
+    }
+  };
+
   const applySnippet = (snippet: ConnectionSnippet) => {
     const targetIds = new Set(snippet.profileIds);
     for (const profile of profiles) {
@@ -1242,6 +1261,13 @@ export default function ProfileManager() {
     const endpointList = endpoints[profile.id];
     const activeEndpointIdx =
       endpointList?.findIndex((e) => e.active) ?? -1;
+    const endpointDisplay = endpointList
+      ? providerPrefix(endpointList.map((e) => e.name))
+      : null;
+    const serverName =
+      activeEndpointIdx >= 0 && endpointDisplay
+        ? endpointDisplay.names[activeEndpointIdx]
+        : null;
     const delayRes =
       activeEndpointIdx >= 0
         ? delayResults[profile.id]?.[activeEndpointIdx]
@@ -1267,6 +1293,7 @@ export default function ProfileManager() {
                 : null
         }
         isBusy={isBusy}
+        serverName={serverName}
         conflict={ifaceConflictIds.has(profile.id)}
         selected={externalName === null && selected?.id === profile.id}
         dragging={dragState?.profileId === profile.id}
@@ -1686,6 +1713,9 @@ export default function ProfileManager() {
               }
               onSetRefreshInterval={(minutes) =>
                 void onSetRefreshInterval(selected, minutes)
+              }
+              onCopyTerminalProxy={() =>
+                void onCopyTerminalProxy(selected)
               }
             />
           ) : (
