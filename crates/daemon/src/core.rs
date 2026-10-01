@@ -4425,6 +4425,22 @@ impl DaemonCore {
         self.teardown(|entry| entry.uid == uid)
     }
 
+    /// Session cleanup after the uid's last client died: tear down its owners
+    /// except those registered as always-on (`keep` holds `(uid, owner)`
+    /// pairs from `always_on::replayable_owners`) and daemon-managed
+    /// `cond:` owners, which the reconcile loops re-apply on their own.
+    pub fn cleanup_session_uid(
+        &mut self,
+        uid: u32,
+        keep: &std::collections::HashSet<(u32, String)>,
+    ) -> io::Result<CleanupResult> {
+        self.teardown(|entry| {
+            entry.uid == uid
+                && !keep.contains(&(uid, entry.owner.clone()))
+                && !entry.owner.starts_with("cond:")
+        })
+    }
+
     /// Tear down every owner of every uid, newest first (SIGTERM path).
     pub fn shutdown(&mut self) -> io::Result<CleanupResult> {
         self.teardown(|_| true)
@@ -8005,6 +8021,40 @@ mod tests {
         assert_eq!(result.removed_owners, vec!["a".to_string()]);
         assert!(result.failed.is_empty());
         assert!(core.owned(1000).is_empty());
+        assert_eq!(core.owned(1001).len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn session_cleanup_keeps_always_on_and_conditional_owners() {
+        let dir = unique_dir("session-cleanup");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        core.apply_routes(1000, "a", vec![route("10.1.0.0/16")])
+            .unwrap();
+        core.apply_routes(1000, "pinned", vec![route("10.2.0.0/16")])
+            .unwrap();
+        // Conditional owners are daemon-managed, not client-owned; only the
+        // reconciler may create them, so seed the journal directly.
+        core.journal.entries.push(JournalEntry {
+            uid: 1000,
+            owner: "cond:office".into(),
+            state: OwnedState::Applied,
+            resources: vec![OwnedResource::Route(AppliedRoute::on_link(
+                "10.3.0.0/16".parse().unwrap(),
+                42,
+                5,
+            ))],
+        });
+        core.apply_routes(1001, "other", vec![route("10.4.0.0/16")])
+            .unwrap();
+        let keep = std::collections::HashSet::from([(1000_u32, "pinned".to_string())]);
+        let result = core.cleanup_session_uid(1000, &keep).unwrap();
+        assert_eq!(result.removed_owners, vec!["a".to_string()]);
+        assert!(result.failed.is_empty());
+        let mut remaining: Vec<_> = core.owned(1000).into_iter().map(|o| o.owner).collect();
+        remaining.sort();
+        assert_eq!(remaining, ["cond:office", "pinned"]);
         assert_eq!(core.owned(1001).len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
