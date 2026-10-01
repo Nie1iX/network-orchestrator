@@ -2629,13 +2629,16 @@ dependencies = [
 name = "net-manager-core"
 version = "0.3.0"
 dependencies = [
+ "base64 0.22.1",
  "futures",
  "ipnet",
  "libc",
  "net-route",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "url",
  "windows 0.58.0",

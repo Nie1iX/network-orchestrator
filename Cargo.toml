@@ -12,3 +12,7 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+# Build scripts and proc macros must retain the metadata Rust loads at build time.
+[profile.release.build-override]
+strip = "none"
