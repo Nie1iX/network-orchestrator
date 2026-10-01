@@ -177,19 +177,29 @@ pub(crate) fn collect_backend_availability(state: &AppState) -> Vec<BackendAvail
     .collect()
 }
 
+/// `tool_usable` is the daemon's `hello.tools` verdict for the required
+/// system binary (`wg`/`openvpn`): `Some(false)` means the tool is
+/// missing or unsafe on the host, `None` means the daemon is older and
+/// does not report it.
 #[cfg(target_os = "linux")]
 fn linux_wireguard_backend_availability(
     status: crate::daemon_client::DaemonStatus,
     supported: bool,
+    tool_usable: Option<bool>,
 ) -> BackendAvailability {
-    let available = status.state == crate::daemon_client::DaemonState::Ready && supported;
+    let available = status.state == crate::daemon_client::DaemonState::Ready
+        && supported
+        && tool_usable != Some(false);
     BackendAvailability {
         backend: TunnelBackend::WireGuard,
         available,
         path: None,
         source: None,
         version: None,
-        message: if status.state == crate::daemon_client::DaemonState::Ready && !supported {
+        message: if tool_usable == Some(false) {
+            "WireGuard tools are missing on this system: install the wireguard-tools package."
+                .into()
+        } else if status.state == crate::daemon_client::DaemonState::Ready && !supported {
             "Network daemon does not support WireGuard. Update the daemon.".into()
         } else {
             status.message
@@ -201,15 +211,20 @@ fn linux_wireguard_backend_availability(
 fn linux_openvpn_backend_availability(
     status: crate::daemon_client::DaemonStatus,
     supported: bool,
+    tool_usable: Option<bool>,
 ) -> BackendAvailability {
-    let available = status.state == crate::daemon_client::DaemonState::Ready && supported;
+    let available = status.state == crate::daemon_client::DaemonState::Ready
+        && supported
+        && tool_usable != Some(false);
     BackendAvailability {
         backend: TunnelBackend::OpenVpn,
         available,
         path: None,
         source: None,
         version: None,
-        message: if status.state == crate::daemon_client::DaemonState::Ready && !supported {
+        message: if tool_usable == Some(false) {
+            "OpenVPN is missing on this system: install the openvpn package.".into()
+        } else if status.state == crate::daemon_client::DaemonState::Ready && !supported {
             "Network daemon does not support OpenVPN. Update the daemon.".into()
         } else {
             status.message
@@ -286,12 +301,24 @@ pub(crate) async fn get_backend_availability(
                     .iter()
                     .all(|method| result.capabilities.iter().any(|cap| cap == method))
             });
+            let tool_usable = hello.as_ref().ok().and_then(|result| {
+                result
+                    .tools
+                    .get(match entry.backend {
+                        TunnelBackend::WireGuard => {
+                            net_manager_core::daemon_protocol::tool::WIREGUARD
+                        }
+                        TunnelBackend::OpenVpn => net_manager_core::daemon_protocol::tool::OPENVPN,
+                        _ => unreachable!(),
+                    })
+                    .copied()
+            });
             *entry = match entry.backend {
                 TunnelBackend::WireGuard => {
-                    linux_wireguard_backend_availability(status.clone(), supported)
+                    linux_wireguard_backend_availability(status.clone(), supported, tool_usable)
                 }
                 TunnelBackend::OpenVpn => {
-                    linux_openvpn_backend_availability(status.clone(), supported)
+                    linux_openvpn_backend_availability(status.clone(), supported, tool_usable)
                 }
                 _ => unreachable!(),
             };
@@ -1037,6 +1064,7 @@ mod tests {
                 message: "Network daemon is ready.".into(),
             },
             true,
+            Some(true),
         );
         assert!(ready.available);
         assert!(ready.path.is_none());
@@ -1046,6 +1074,7 @@ mod tests {
                 message: "Network daemon is ready.".into(),
             },
             false,
+            Some(true),
         );
         assert!(!old.available);
         assert!(old.message.contains("WireGuard"));
@@ -1055,9 +1084,32 @@ mod tests {
                 message: "Network daemon is not running.".into(),
             },
             false,
+            None,
         );
         assert!(!stopped.available);
         assert!(stopped.message.contains("not running"));
+        let missing_tool = linux_wireguard_backend_availability(
+            DaemonStatus {
+                state: DaemonState::Ready,
+                message: "Network daemon is ready.".into(),
+            },
+            true,
+            Some(false),
+        );
+        assert!(!missing_tool.available);
+        assert!(missing_tool.message.contains("wireguard-tools"));
+        // An old daemon reports no tools: None keeps the entry usable.
+        assert!(
+            linux_wireguard_backend_availability(
+                DaemonStatus {
+                    state: DaemonState::Ready,
+                    message: "Network daemon is ready.".into(),
+                },
+                true,
+                None,
+            )
+            .available
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1081,6 +1133,7 @@ mod tests {
                 message: "Network daemon is ready.".into(),
             },
             true,
+            Some(true),
         );
         assert!(ready.available);
         assert!(ready.path.is_none());
@@ -1090,9 +1143,20 @@ mod tests {
                 message: "Network daemon is ready.".into(),
             },
             false,
+            Some(true),
         );
         assert!(!old.available);
         assert!(old.message.contains("OpenVPN"));
+        let missing_tool = linux_openvpn_backend_availability(
+            DaemonStatus {
+                state: DaemonState::Ready,
+                message: "Network daemon is ready.".into(),
+            },
+            true,
+            Some(false),
+        );
+        assert!(!missing_tool.available);
+        assert!(missing_tool.message.contains("openvpn"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

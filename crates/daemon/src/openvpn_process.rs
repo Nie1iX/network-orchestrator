@@ -292,7 +292,7 @@ fn valid_tun_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-fn trusted_binary() -> io::Result<&'static str> {
+pub(crate) fn trusted_binary() -> io::Result<&'static str> {
     for path in ["/usr/sbin/openvpn", "/usr/bin/openvpn"] {
         if safe_trusted_path(Path::new(path), 0, Path::new("/")) {
             return Ok(path);

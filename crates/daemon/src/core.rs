@@ -5877,7 +5877,7 @@ fn parse_ip_route_device(output: &[u8]) -> io::Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn trusted_wg_binary() -> io::Result<&'static str> {
+pub(crate) fn trusted_wg_binary() -> io::Result<&'static str> {
     use std::os::unix::fs::MetadataExt;
     const PATH: &str = "/usr/bin/wg";
     let metadata = std::fs::symlink_metadata(PATH).map_err(|_| {

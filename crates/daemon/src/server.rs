@@ -65,6 +65,10 @@ pub struct ServerContext<A> {
     /// point it at a tempdir so they never touch the real package tree.
     #[cfg(target_os = "linux")]
     pub xray_package_root: std::path::PathBuf,
+    /// Reports whether each trusted system binary (see `tool::*` in the
+    /// protocol) is usable right now; tests substitute a stub.
+    #[cfg(target_os = "linux")]
+    pub tools_probe: fn() -> std::collections::BTreeMap<String, bool>,
 }
 
 impl<A: Authorizer> ServerContext<A> {
@@ -84,6 +88,8 @@ impl<A: Authorizer> ServerContext<A> {
             settings_store: None,
             #[cfg(target_os = "linux")]
             xray_package_root: Self::default_xray_package_root(),
+            #[cfg(target_os = "linux")]
+            tools_probe: default_tool_presence,
         }
     }
 
@@ -187,6 +193,7 @@ where
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         uid: peer.uid,
         capabilities: method::CAPABILITIES.iter().map(|m| m.to_string()).collect(),
+        tools: (ctx.tools_probe)(),
     };
     write_frame(&mut write, &ok(request_id, &hello)).await?;
 
@@ -1028,6 +1035,23 @@ fn decode_xray_archive(archive_b64: &str) -> io::Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(archive_b64)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed base64 archive"))
+}
+
+/// Whether the daemon could execute each trusted tool binary right now —
+/// the same checks the connect paths apply, so this cannot disagree with
+/// a real connect attempt.
+#[cfg(target_os = "linux")]
+fn default_tool_presence() -> std::collections::BTreeMap<String, bool> {
+    std::collections::BTreeMap::from([
+        (
+            net_manager_core::daemon_protocol::tool::WIREGUARD.to_string(),
+            crate::core::trusted_wg_binary().is_ok(),
+        ),
+        (
+            net_manager_core::daemon_protocol::tool::OPENVPN.to_string(),
+            crate::openvpn_process::trusted_binary().is_ok(),
+        ),
+    ])
 }
 
 fn reject_wireguard_owner(owner: &str) -> Result<(), Failure> {
@@ -2060,6 +2084,26 @@ mod tests {
             reply["result"]["capabilities"],
             json!(net_manager_core::daemon_protocol::method::CAPABILITIES)
         );
+        assert!(reply["result"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn hello_reports_tool_presence_from_probe() {
+        use net_manager_core::daemon_protocol::tool;
+        let harness = Harness::with(AuthDecision::Authorized, |ctx| {
+            ctx.tools_probe = || {
+                std::collections::BTreeMap::from([
+                    (tool::WIREGUARD.to_string(), true),
+                    (tool::OPENVPN.to_string(), false),
+                ])
+            };
+        });
+        let mut client = harness.connect(1000);
+        let reply = client
+            .call(1, "hello", json!({"protocol":1,"client":"test"}))
+            .await;
+        assert_eq!(reply["result"]["tools"]["wireguard"], json!(true));
+        assert_eq!(reply["result"]["tools"]["openvpn"], json!(false));
     }
 
     #[tokio::test]

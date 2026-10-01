@@ -105,6 +105,15 @@ pub mod method {
     ];
 }
 
+/// Tool names reported in `HelloResult::tools`. A `false` value means the
+/// daemon cannot use the required system binary right now; a missing key
+/// (older daemon) means "unknown", not "missing" — callers must treat it
+/// as usable to stay compatible.
+pub mod tool {
+    pub const WIREGUARD: &str = "wireguard";
+    pub const OPENVPN: &str = "openvpn";
+}
+
 /// When connecting a VPN profile asks for an administrator password. Chosen
 /// by an administrator and enforced by the daemon, never by the client.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,6 +282,11 @@ pub struct HelloResult {
     pub daemon_version: String,
     pub uid: u32,
     pub capabilities: Vec<String>,
+    /// Whether each `tool::*` system binary is present and safe for the
+    /// daemon to execute. Absent entirely on daemons older than this
+    /// field — see `tool` for the missing-key contract.
+    #[serde(default)]
+    pub tools: std::collections::BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1167,12 +1181,28 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop"]}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop"],"tools":{}}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);
         assert_eq!(result.daemon_version, "0.1.1");
         assert_eq!(result.capabilities, method::CAPABILITIES);
+
+        // A pre-tools daemon leaves the map empty: missing keys mean
+        // "unknown", which callers treat as usable.
+        let legacy: HelloResult = serde_json::from_str(
+            r#"{"protocol":1,"daemonVersion":"0.1.1","uid":1000,"capabilities":[]}"#,
+        )
+        .unwrap();
+        assert!(legacy.tools.is_empty());
+
+        let (id, result): (_, HelloResult) = ok_response(
+            r#"{"id":2,"ok":true,"result":{"protocol":1,"daemonVersion":"0.3.0","uid":0,
+              "capabilities":[],"tools":{"wireguard":true,"openvpn":false}}}"#,
+        );
+        assert_eq!(id, 2);
+        assert_eq!(result.tools.get(tool::WIREGUARD), Some(&true));
+        assert_eq!(result.tools.get(tool::OPENVPN), Some(&false));
 
         let (_, error) = error_response(
             r#"{"id":1,"ok":false,"error":{"code":"protocolMismatch","message":"daemon speaks protocol 1, client 2"}}"#,
