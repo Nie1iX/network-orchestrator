@@ -256,6 +256,8 @@ pub struct SubscriptionMeta {
     pub last_refresh_error: Option<String>,
     #[serde(default)]
     pub user_info: Option<SubscriptionUserInfo>,
+    #[serde(default)]
+    pub provider_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -279,6 +281,7 @@ impl std::fmt::Debug for SubscriptionMeta {
             .field("last_refresh_at_unix", &self.last_refresh_at_unix)
             .field("last_refresh_error", &self.last_refresh_error)
             .field("user_info", &self.user_info)
+            .field("provider_title", &self.provider_title)
             .finish()
     }
 }
@@ -628,6 +631,7 @@ mod tests {
             last_refresh_at_unix: None,
             last_refresh_error: None,
             user_info: None,
+            provider_title: None,
         };
         let debug = format!("{subscription:?}");
         assert!(!debug.contains("private-token"));

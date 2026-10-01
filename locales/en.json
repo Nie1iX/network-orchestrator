@@ -332,6 +332,7 @@
     "detail.peerN": "Peer {n}",
     "detail.privateLan": "Private/LAN IPs",
     "detail.privateLanValue": "Direct after custom rules",
+    "detail.provider": "Provider",
     "detail.proxy": "Proxy",
     "detail.proxyBypass": "Proxy bypass",
     "detail.rate": "Rate",

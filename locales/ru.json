@@ -379,6 +379,7 @@
     "detail.peerN": "Пир {n}",
     "detail.privateLan": "Частные/LAN IP",
     "detail.privateLanValue": "Напрямую после пользовательских правил",
+    "detail.provider": "Провайдер",
     "detail.proxy": "Прокси",
     "detail.proxyBypass": "Обход прокси",
     "detail.rate": "Скорость",

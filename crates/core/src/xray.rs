@@ -732,7 +732,7 @@ fn resolve_outbound_tag(
     candidate
 }
 
-fn percent_decode(input: &str) -> String {
+pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;

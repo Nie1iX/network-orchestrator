@@ -1,6 +1,7 @@
 import { backendIcon } from "../../icons";
 import { formatBytes } from "../../format";
 import { TranslationKey, useT } from "../../i18n";
+import { providerPrefix } from "../../subscriptions";
 import {
   AlwaysOnKind,
   AlwaysOnListResult,
@@ -146,6 +147,9 @@ export default function ProfileDetail({
     showConfig && !isWireGuard ? (inspection?.analysis.osRoutes ?? []) : [];
   const configEndpoints =
     showConfig && !isWireGuard ? (inspection?.analysis.endpoints ?? []) : [];
+  const endpointDisplay = endpoints
+    ? providerPrefix(endpoints.map((e) => e.name))
+    : null;
 
   return (
     <div className="profile-detail">
@@ -421,7 +425,9 @@ export default function ProfileDetail({
                       <span
                         className={`endpoint-item-dot ${ep.active ? "on" : ""}`}
                       />
-                      <span className="endpoint-item-name">{ep.name}</span>
+                      <span className="endpoint-item-name">
+                        {endpointDisplay?.names[i] ?? ep.name}
+                      </span>
                       <span className="endpoint-item-delay">
                         {measuring
                           ? "…"
@@ -465,6 +471,14 @@ export default function ProfileDetail({
           (profile.backend === "xray" && profile.privateLanDirect) ||
           profile.useSystemProxy) && (
           <div className="connection-card-details">
+            {(profile.subscription?.providerTitle ?? endpointDisplay?.provider) && (
+              <div className="interface-row">
+                <span className="row-label">{t("detail.provider")}</span>
+                <span className="row-value">
+                  {profile.subscription?.providerTitle ?? endpointDisplay?.provider}
+                </span>
+              </div>
+            )}
             {profile.subscription?.userInfo && (
               <div className="interface-row">
                 <span className="row-label">{t("detail.traffic")}</span>

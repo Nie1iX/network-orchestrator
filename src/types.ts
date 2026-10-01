@@ -147,6 +147,7 @@ export interface SubscriptionMeta {
   lastRefreshAtUnix: number | null;
   lastRefreshError: string | null;
   userInfo: SubscriptionUserInfo | null;
+  providerTitle: string | null;
 }
 
 export interface SubscriptionUserInfo {

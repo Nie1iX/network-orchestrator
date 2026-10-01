@@ -35,7 +35,7 @@ export class SandboxBackend {
   private profiles: Profile[] = [
     profile("wg", "QA WireGuard", "wireGuard", "10.77.0.0/24"),
     profile("ovpn", "QA OpenVPN", "openVpn", "10.88.0.0/24"),
-    profile("xray", "QA Xray subscription", "xray"),
+    profile("xray", "AcmeVPN - ⚡ Нидерланды", "xray"),
     profile("static", "QA Static routes", "none", "203.0.113.0/24"),
   ];
   private running = new Set<string>();
@@ -48,7 +48,11 @@ export class SandboxBackend {
   private loginAutostart = false;
   private authMode: VpnAuthMode = "fullTunnelOnly";
   private recovered = false;
-  private endpoints = ["QA Europe", "QA Asia"];
+  private endpoints = [
+    "AcmeVPN - ⚡ Нидерланды",
+    "AcmeVPN - 🇩🇪 Германия",
+    "AcmeVPN - 🇫🇮 Финляндия",
+  ];
   private backendPaths = new Map<string, string>();
   private xrayManaged = false;
   private condRules: ConditionalRuleEntry[] = [
@@ -69,8 +73,9 @@ export class SandboxBackend {
     // demonstrates the "interface occupied" conflict until it is connected.
     this.profiles[0].interfaceName = "wg-home";
     this.profiles[2].subscription = {
-      url: "", hwid: "", endpointCount: 2, activeIndex: 0,
+      url: "", hwid: "", endpointCount: 3, activeIndex: 0,
       refreshIntervalMinutes: null, lastRefreshAtUnix: null, lastRefreshError: null,
+      providerTitle: "AcmeVPN",
       userInfo: { uploadBytes: 1048576, downloadBytes: 2097152, totalBytes: 1073741824, expiresAtUnix: null },
     };
   }
@@ -265,7 +270,7 @@ export class SandboxBackend {
         const p = this.find(args.id); this.stopped(p);
         if (!p.subscription) throw new Error("Not a subscription profile");
         p.subscription.lastRefreshAtUnix = Math.floor(Date.now() / 1000);
-        return { endpointCount: 2, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false };
+        return { endpointCount: 3, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false };
       }
       case "measure_subscription_endpoint_delay": return { delayMs: 42, error: null };
       case "import_subscription": {
