@@ -31,6 +31,12 @@ struct Profile: Decodable, Identifiable, Sendable {
   let xrayHttpPort: UInt16?
   let subscription: SubscriptionMeta?
   let xrayMode: String?
+  var domainPolicies: [DomainPolicy]? = nil
+  var privateLanDirect: Bool? = nil
+  /// Rule lines of one target (block / proxy / direct), comments included.
+  func rules(_ target: String) -> [String] {
+    (domainPolicies ?? []).filter { $0.target == target }.flatMap(\.domains)
+  }
   /// Name shown for the profile: a generated "{provider} - {server}" name
   /// reads as the provider group, a user-chosen name is shown as typed.
   var groupName: String {
@@ -79,6 +85,10 @@ struct SubscriptionMeta: Decodable, Sendable {
   let webPageUrl: String?
   let updateIntervalHours: UInt32?
   let skippedProtocols: [String]?
+}
+struct DomainPolicy: Decodable, Sendable {
+  let domains: [String]
+  let target: String
 }
 struct SubscriptionUsage: Decodable, Sendable {
   let uploadBytes: UInt64

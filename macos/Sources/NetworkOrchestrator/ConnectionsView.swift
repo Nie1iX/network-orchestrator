@@ -322,6 +322,7 @@ struct PanelInfoView: View {
 struct ProfileDetailView: View {
   @Environment(\.palette) private var p
   @Bindable var model: AppModel
+  @State private var editingRules = false
   let profile: Profile
   let onRename: () -> Void
   let onDelete: () -> Void
@@ -409,6 +410,7 @@ struct ProfileDetailView: View {
           }.padding(.vertical, 5)
         }
       }
+      if profile.backend == "xray" { routingRules }
       tunnelConfig
       endpoints
       if !profile.routes.isEmpty {
@@ -427,6 +429,33 @@ struct ProfileDetailView: View {
     }
     .frame(maxWidth: .infinity, alignment: .leading)
     .task(id: profile.id) { await model.loadInspection(profile) }
+    .sheet(isPresented: $editingRules) {
+      RoutingRulesEditor(model: model, profile: profile) { editingRules = false }
+        .environment(\.palette, p).buttonStyle(TauriButtonStyle())
+    }
+  }
+  /// Compact per-set summary; the sets are edited in a full-size sheet.
+  @ViewBuilder private var routingRules: some View {
+    HStack {
+      section("detail.domainRules")
+      Spacer()
+      Button(L10n.text("common.edit")) { editingRules = true }.buttonStyle(
+        TauriButtonStyle(compact: true)
+      ).padding(.top, 6)
+    }
+    ForEach(RoutingRulesEditor.sets, id: \.target) { set in
+      let count = profile.rules(set.target).filter { !$0.hasPrefix("#") }.count
+      HStack(spacing: 7) {
+        Circle().fill(p[set.color]).frame(width: 7, height: 7)
+        Text(L10n.text(set.title)).foregroundStyle(p.muted)
+        Spacer()
+        Text(L10n.text("rules.entryCount", ["count": String(count)]))
+          .foregroundStyle(count == 0 ? p.muted : p.text)
+      }.font(.system(size: 11.9)).padding(.vertical, 2)
+    }
+    if profile.privateLanDirect ?? false {
+      Text(L10n.text("form.privateLanDirect")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+    }
   }
   @ViewBuilder private var tunnelConfig: some View {
     if let inspection = model.inspections[profile.id],
@@ -922,6 +951,83 @@ struct InspectionView: View {
           }
         }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
       }.frame(height: 420)
+    }
+  }
+}
+
+/// Full-size editor for the three Xray rule sets (block → proxy → direct).
+struct RoutingRulesEditor: View {
+  struct RuleSet { let target: String; let title: String; let color: String }
+  static let sets = [
+    RuleSet(target: "block", title: "rules.block", color: "down"),
+    RuleSet(target: "proxy", title: "rules.proxy", color: "accent"),
+    RuleSet(target: "direct", title: "rules.direct", color: "up"),
+  ]
+  @Environment(\.palette) private var p
+  @Bindable var model: AppModel
+  let profile: Profile
+  let onClose: () -> Void
+  @State private var selected = "proxy"
+  @State private var texts: [String: String] = [:]
+  @State private var privateLanDirect = false
+  var body: some View {
+    AppModal(title: "detail.domainRules", width: 720, onClose: onClose) {
+      VStack(alignment: .leading, spacing: 10.5) {
+        HStack(spacing: 6) {
+          ForEach(Self.sets, id: \.target) { set in
+            let count = (texts[set.target] ?? "").split(separator: "\n")
+              .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !$0.hasPrefix("#") }.count
+            Button {
+              selected = set.target
+            } label: {
+              HStack(spacing: 6) {
+                Circle().fill(p[set.color]).frame(width: 7, height: 7)
+                Text(L10n.text(set.title))
+                Text("\(count)").foregroundStyle(p.muted)
+              }.font(.system(size: 11.9, weight: selected == set.target ? .semibold : .regular))
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(
+                  selected == set.target ? p["bg-elev"] : .clear,
+                  in: RoundedRectangle(cornerRadius: 6))
+            }.buttonStyle(.plain)
+          }
+          Spacer()
+        }
+        TextEditor(
+          text: Binding(get: { texts[selected] ?? "" }, set: { texts[selected] = $0 })
+        )
+        .font(.system(size: 11.9, design: .monospaced)).scrollContentBackground(.hidden)
+        .padding(7).frame(height: 340)
+        .background(p.input, in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
+        .accessibilityLabel(L10n.text("detail.domainRules"))
+        Text(L10n.text("form.rulesHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+          .fixedSize(horizontal: false, vertical: true)
+        Toggle(L10n.text("form.privateLanDirect"), isOn: $privateLanDirect)
+          .toggleStyle(.checkbox).font(.system(size: 11.9))
+        if let error = model.error {
+          Text(L10n.text(error)).foregroundStyle(p["down"]).font(.system(size: 11.9))
+        }
+        HStack {
+          Spacer()
+          Button(L10n.text("Cancel"), action: onClose)
+          Button(L10n.text("Save")) {
+            Task {
+              if await model.setRoutingRules(
+                profile, block: texts["block"] ?? "", proxy: texts["proxy"] ?? "",
+                direct: texts["direct"] ?? "", privateLanDirect: privateLanDirect)
+              {
+                onClose()
+              }
+            }
+          }.buttonStyle(TauriButtonStyle(kind: .accent)).disabled(model.busy)
+        }
+      }.padding(14)
+    }
+    .onAppear {
+      model.error = nil
+      for set in Self.sets { texts[set.target] = profile.rules(set.target).joined(separator: "\n") }
+      privateLanDirect = profile.privateLanDirect ?? false
     }
   }
 }

@@ -10,6 +10,12 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ### Added
 
+- Native Xray connections edit their domain/IP rule sets (block → proxy →
+  direct) and the private-LAN-direct switch in a full-size editor, with a
+  per-set summary in the detail pane. Each line is validated with the core
+  selector rules and the offending line is named; a running connection
+  restarts to apply the rules.
+
 - Subscriptions keep the provider's title, announcement and support/account
   links from `profile-title`, `announce` (plain or `base64:`),
   `support-url` and `profile-web-page-url` headers or `#…:` body comments;
