@@ -11,7 +11,7 @@ let package = Package(
       name: "NetworkOrchestrator", dependencies: ["NativeCore"],
       resources: [.process("Resources")],
       linkerSettings: [
-        .unsafeFlags(["-L", "../target/release"]),
+        .unsafeFlags(["-L", "../target/macos-bridge"]),
         .linkedLibrary("net_manager_macos_bridge"),
         .linkedFramework("Security"), .linkedFramework("SystemConfiguration"),
         .linkedLibrary("resolv"),

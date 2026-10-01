@@ -16,3 +16,15 @@ strip = true
 # Build scripts and proc macros must retain the metadata Rust loads at build time.
 [profile.release.build-override]
 strip = "none"
+
+# Dependencies rarely need a debugger; dropping their DWARF keeps target/debug
+# several times smaller. Workspace crates keep full debug info.
+[profile.dev.package."*"]
+debug = false
+
+# Optimized but incremental: native macOS iteration without the release LTO pass.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
