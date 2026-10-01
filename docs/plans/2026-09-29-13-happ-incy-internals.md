@@ -199,6 +199,38 @@ Windows-пакету `Program Files/INCY` + легacy-конфигам в `~/.co
   превью-заполнение, дальше обычный save). Проигнорированные поля
   (`remoteDnsAddresses`, `GlobalProxy:false`, хеши) возвращаются
   предупреждениями, а не проглатываются.
+- **Bypass-маршруты сервера и резолверов** — `add_xray_bypass_routes`
+  ставит `/32`/`/128` на IP upstream-сервера и на `dns_bypass`-хосты
+  (`XrayConnectParams.dns_bypass`: все `xrayDns`-резолверы с
+  `route != proxy` — proxy-резолвер обязан быть достижим внутри туннеля —
+  плюс 1.1.1.1/8.8.8.8/9.9.9.9 при full-capture) через физический шлюз;
+  имена резолвятся best-effort в демоне, записи журналируются и
+  перестраиваются `reconcile_network` при смене uplink-гейтвея.
+  Семейный фильтр: резолвер байпасится, только если его family полностью
+  захвачена туннелем.
+- **Split-default как опция профиля** — `xraySplitDefault` (UI-чекбокс на
+  Linux TUN): вместо `0.0.0.0/0` ставятся `0.0.0.0/1`+`128.0.0.0/1`;
+  `prepare_xray`/`is_full_route`/`full_coverage` считают каноническую пару
+  полным покрытием (та же tunnel-table + policy-rules семантика, `/2` и
+  прочие неканонические разбиения по-прежнему отвергаются).
+- **Grace-очистка по смерти клиента** — `ClientTracker` держит pidfd
+  (`SO_PEERPIDFD`) каждого подключения; `watch_client_sessions` раз в 5 с
+  жнёт умершие pidfd (`pidfd_send_signal(0)`) и после 30-секундного
+  grace-окна без переподключения сносит сессионные owner'ы
+  (`cleanup_session_uid`), исключая always-on (replayable) и `cond:*` —
+  демон-управляемые. Рестарт приложения внутри окна отменяет очистку.
+- **Wake на resume** — `watch_suspend_resume` слушает logind
+  `PrepareForSleep` по system D-Bus: после пробуждения 2-секундный settle,
+  затем общий reconcile (маршруты/DNS/links/bypass-гейтвеи/cond-правила).
+  Без D-Bus фича молча выключена — остаются netlink-watch и 10-с тик.
+- **Xray statsquery** — в генерируемый TUN-конфиг инжектятся
+  `stats`/`api`/`policy.system` + loopback-only `api-in` dokodemo-door на
+  детерминированном порту `xray_api_port(mark)` и routing-правило
+  `api-in → api`; `XrayProcessRunner::query_stats` дергает
+  `xray api statsquery` и парсит `inbound>>>tun-in` downlink/uplink в
+  `XrayStatusResult.rxBytes/txBytes` (None при недоступном API —
+  например, устаревший staged-конфиг), счётчики доезжают до
+  `ProtocolHealth` диагностики.
 
 Не перенесено (осознанно): нативный тримминг `.dat` и MPH-кэш через
 `incycore` (у Incy — закрытая Go-библиотека; стоковый Xray сам строит mph),
