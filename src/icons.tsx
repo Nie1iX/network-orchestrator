@@ -103,6 +103,15 @@ export function RouteIcon({ size = 18, className }: IconProps) {
   );
 }
 
+export function SearchIcon({ size = 18, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <circle cx="11" cy="11" r="8" />
+      <line x1="21" y1="21" x2="16.65" y2="16.65" />
+    </svg>
+  );
+}
+
 export function ChevronIcon({ size = 18, className, collapsed }: IconProps & { collapsed?: boolean }) {
   return (
     <svg
@@ -281,6 +290,16 @@ export function SettingsIcon({ size = 18, className }: IconProps) {
   );
 }
 
+export function AlertTriangleIcon({ size = 18, className }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
+      <path d="M12 9v4" />
+      <path d="M12 17h.01" />
+    </svg>
+  );
+}
+
 import { InterfaceKind } from "./types";
 import { InterfaceCategory } from "./types";
 import { TunnelBackend } from "./types";
@@ -310,6 +329,12 @@ export function backendIcon(backend: TunnelBackend, size = 18): React.ReactEleme
     case "none": return <StaticRoutesIcon {...props} />;
     default: return <NetworkIcon {...props} />;
   }
+}
+
+export function backendAvatarClass(kind: InterfaceKind): string {
+  return kind === "wireGuard" || kind === "openVpn" || kind === "xray"
+    ? `backend-avatar-${kind}`
+    : "backend-avatar-service";
 }
 
 export function categoryIcon(category: InterfaceCategory, size = 18): React.ReactElement {

@@ -1,4 +1,4 @@
-import { backendIcon, GripVerticalIcon } from "../../icons";
+import { AlertTriangleIcon, backendIcon, GripVerticalIcon } from "../../icons";
 import { Profile, TunnelStatus } from "../../types";
 import { useT } from "../../i18n";
 import RateText from "../ui/RateText";
@@ -11,8 +11,12 @@ interface ProfileRowProps {
   /** Delay chip text; null hides the chip (non-subscription profiles). */
   delayText: string | null;
   isBusy: boolean;
+  /** The profile's interface is occupied by a tunnel managed elsewhere. */
+  conflict: boolean;
   selected: boolean;
   dragging: boolean;
+  /** False in grouped mode — the group header already shows the backend. */
+  showBackendBadge?: boolean;
   dropBefore: boolean;
   dropAfter: boolean;
   canReorder: boolean;
@@ -31,8 +35,10 @@ export default function ProfileRow({
   rate,
   delayText,
   isBusy,
+  conflict,
   selected,
   dragging,
+  showBackendBadge = true,
   dropBefore,
   dropAfter,
   canReorder,
@@ -78,26 +84,28 @@ export default function ProfileRow({
         <GripVerticalIcon size={13} />
       </span>
       <span className={`status-dot state-${status.state}`} />
-      <span className={`backend-avatar backend-avatar-${profile.backend}`}>
-        {backendIcon(profile.backend, 14)}
-      </span>
+      {showBackendBadge && (
+        <span className={`backend-avatar backend-avatar-${profile.backend}`}>
+          {backendIcon(profile.backend, 14)}
+        </span>
+      )}
       <span className="profile-row-name">{profile.name}</span>
-      <span
-        className="profile-row-meta"
-        title={
-          status.state === "failed" && status.message
-            ? status.message
-            : undefined
-        }
-      >
-        {status.state === "failed" && status.message ? (
-          status.message
-        ) : rate ? (
+      {(status.state === "failed" && status.message) || conflict ? (
+        <span
+          className={`profile-row-meta${conflict && status.state !== "failed" ? " warn" : ""}`}
+          title={
+            status.state === "failed" && status.message
+              ? status.message
+              : t("profiles.ifaceConflict", { name: profile.interfaceName })
+          }
+        >
+          <AlertTriangleIcon size={13} />
+        </span>
+      ) : rate ? (
+        <span className="profile-row-meta">
           <RateText rx={rate.rxRate} tx={rate.txRate} live />
-        ) : (
-          profile.interfaceName || t("profiles.noIface")
-        )}
-      </span>
+        </span>
+      ) : null}
       {delayText !== null && (
         <span className="profile-row-delay" title={t("profiles.delayTitle")}>
           {delayText}
