@@ -1441,7 +1441,9 @@ export default function ProfileManager() {
               aria-expanded={!isCollapsed}
             >
               <ChevronIcon size={13} collapsed={isCollapsed} />
-              {backendIcon(group.backend, 18)}
+              <span className={`backend-avatar-${group.backend}`}>
+                {backendIcon(group.backend, 18)}
+              </span>
               <span className="profile-group-title">
                 {t(BACKEND_LABEL_KEYS[group.backend])}
               </span>
