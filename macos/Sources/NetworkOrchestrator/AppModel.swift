@@ -233,7 +233,7 @@ import SystemConfiguration
       let endpoints = subscriptionEndpoints[profile.id],
       endpoints.indices.contains(subscription.activeIndex)
     else { return nil }
-    return endpoints[subscription.activeIndex].name
+    return profile.serverLabel(endpoints[subscription.activeIndex].name)
   }
   /// Probes every server, up to eight at once, publishing each result the
   /// moment it arrives so the list fills in live.

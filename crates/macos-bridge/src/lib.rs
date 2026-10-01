@@ -358,7 +358,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 &store,
                 &request,
                 &fetched.body,
-                fetched.user_info,
+                fetched.meta.clone(),
                 local_port_available,
             );
             log_subscription_import(
@@ -375,8 +375,6 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                     message
                 }
             })?;
-            net_manager_core::subscription::set_panel_info(&store, id, fetched.panel.clone())
-                .map_err(store_error)?;
             let skipped_count = imported
                 .errors
                 .iter()
@@ -416,6 +414,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                     .into_iter()
                     .enumerate()
                     .map(|(index, endpoint)| SubscriptionEndpointInfo {
+                        protocol: net_manager_core::xray::endpoint_protocol(&endpoint.url),
                         name: endpoint.name,
                         active: index == active,
                     })
@@ -472,7 +471,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                     &store,
                     id,
                     &fetched.body,
-                    fetched.user_info,
+                    fetched.meta.clone(),
                     local_port_available,
                 );
                 log_subscription_import(
@@ -482,8 +481,6 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                     outcome.as_ref().err().map(|e| e.to_string()),
                 );
                 let outcome = outcome.map_err(subscription_error)?;
-                net_manager_core::subscription::set_panel_info(&store, id, fetched.panel.clone())
-                    .map_err(store_error)?;
                 encode(outcome)
             })
         }
@@ -632,10 +629,11 @@ mod tests {
         .unwrap();
         server.join().unwrap();
         let profiles = dispatch(dir.path(), "profiles", &json!({})).unwrap();
-        let panel = &profiles[0]["subscription"]["panel"];
-        assert_eq!(panel["title"], "Synthetic Panel");
-        assert_eq!(panel["announce"], "Secret-free news");
-        assert_eq!(panel["supportUrl"], "https://support.example.test/");
+        let subscription = &profiles[0]["subscription"];
+        assert_eq!(subscription["providerTitle"], "Synthetic Panel");
+        assert_eq!(subscription["announce"], "Secret-free news");
+        assert_eq!(subscription["supportUrl"], "https://support.example.test/");
+        assert_eq!(profiles[0]["name"], "Mine");
         let log = std::fs::read_to_string(dir.path().join("runtime/logs/subscription-import.log"))
             .unwrap();
         assert!(log.contains("announce") && log.contains("profile-title"));

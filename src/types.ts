@@ -147,6 +147,12 @@ export interface SubscriptionMeta {
   lastRefreshAtUnix: number | null;
   lastRefreshError: string | null;
   userInfo: SubscriptionUserInfo | null;
+  providerTitle: string | null;
+  announce: string | null;
+  supportUrl: string | null;
+  webPageUrl: string | null;
+  updateIntervalHours: number | null;
+  skippedProtocols: string[];
 }
 
 export interface SubscriptionUserInfo {
@@ -159,6 +165,7 @@ export interface SubscriptionUserInfo {
 export interface SubscriptionEndpointInfo {
   name: string;
   active: boolean;
+  protocol: string | null;
 }
 
 export interface SubscriptionRefreshResult {

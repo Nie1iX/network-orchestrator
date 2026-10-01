@@ -35,7 +35,7 @@ export class SandboxBackend {
   private profiles: Profile[] = [
     profile("wg", "QA WireGuard", "wireGuard", "10.77.0.0/24"),
     profile("ovpn", "QA OpenVPN", "openVpn", "10.88.0.0/24"),
-    profile("xray", "QA Xray subscription", "xray"),
+    profile("xray", "AcmeVPN - ⚡ Нидерланды", "xray"),
     profile("static", "QA Static routes", "none", "203.0.113.0/24"),
   ];
   private running = new Set<string>();
@@ -49,8 +49,14 @@ export class SandboxBackend {
   private authMode: VpnAuthMode = "fullTunnelOnly";
   private recovered = false;
   private endpoints = [
-    "QA Europe", "QA Asia", "QA Netherlands", "QA Germany",
-    "QA Finland", "QA Japan", "QA United States", "QA Brazil",
+    "AcmeVPN - ⚡ Нидерланды",
+    "AcmeVPN - 🇩🇪 Германия",
+    "AcmeVPN - 🇫🇮 Финляндия",
+    "AcmeVPN - 🇯🇵 Япония",
+    "AcmeVPN - 🇺🇸 США",
+    "AcmeVPN - 🇧🇷 Бразилия",
+    "AcmeVPN - 🇸🇬 Сингапур",
+    "AcmeVPN - 🇵🇱 Польша",
   ];
   private backendPaths = new Map<string, string>();
   private xrayManaged = false;
@@ -74,7 +80,13 @@ export class SandboxBackend {
     this.profiles[2].subscription = {
       url: "", hwid: "", endpointCount: this.endpoints.length, activeIndex: 0,
       refreshIntervalMinutes: null, lastRefreshAtUnix: null, lastRefreshError: null,
-      userInfo: { uploadBytes: 1048576, downloadBytes: 2097152, totalBytes: 1073741824, expiresAtUnix: null },
+      providerTitle: "AcmeVPN",
+      announce: "Maintenance window on Saturday 03:00–05:00 UTC.\nNL endpoints may flap briefly.",
+      supportUrl: "https://support.example.invalid/chat",
+      webPageUrl: "https://cabinet.example.invalid/dashboard",
+      updateIntervalHours: 12,
+      skippedProtocols: ["trojan", "ss"],
+      userInfo: { uploadBytes: 1048576, downloadBytes: 2097152, totalBytes: 1073741824, expiresAtUnix: Math.floor(Date.now() / 1000) + 5 * 86400 },
     };
   }
 
@@ -255,7 +267,11 @@ export class SandboxBackend {
       }
       case "get_subscription_endpoints": {
         const p = this.find(args.profileId);
-        return this.endpoints.map((name, i) => ({ name, active: p.subscription?.activeIndex === i }));
+        return this.endpoints.map((name, i) => ({
+          name,
+          active: p.subscription?.activeIndex === i,
+          protocol: i === 0 ? "VLESS · Reality" : i === 1 ? "VLESS · TLS" : "Hysteria2",
+        }));
       }
       case "switch_subscription_endpoint": {
         const p = this.find(args.profileId); this.stopped(p);

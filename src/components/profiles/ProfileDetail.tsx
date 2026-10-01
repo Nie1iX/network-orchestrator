@@ -1,6 +1,9 @@
+import { isTauri } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { backendIcon, SpinnerIcon } from "../../icons";
 import { formatBytes } from "../../format";
 import { TranslationKey, useT } from "../../i18n";
+import { providerPrefix } from "../../subscriptions";
 import {
   AlwaysOnKind,
   AlwaysOnListResult,
@@ -160,6 +163,31 @@ export default function ProfileDetail({
     showConfig && !isWireGuard ? (inspection?.analysis.osRoutes ?? []) : [];
   const configEndpoints =
     showConfig && !isWireGuard ? (inspection?.analysis.endpoints ?? []) : [];
+  const endpointDisplay = endpoints
+    ? providerPrefix(endpoints.map((e) => e.name))
+    : null;
+  const subscription = profile.subscription;
+  const trafficUsed =
+    subscription?.userInfo !== null && subscription?.userInfo !== undefined
+      ? subscription.userInfo.uploadBytes + subscription.userInfo.downloadBytes
+      : null;
+  const limitExhausted =
+    trafficUsed !== null &&
+    subscription?.userInfo?.totalBytes !== null &&
+    subscription?.userInfo?.totalBytes !== undefined &&
+    trafficUsed >= subscription.userInfo.totalBytes;
+  const expiresDaysLeft =
+    subscription?.userInfo?.expiresAtUnix != null
+      ? Math.ceil((subscription.userInfo.expiresAtUnix * 1000 - Date.now()) / 86_400_000)
+      : null;
+
+  const openExternal = (url: string) => {
+    if (isTauri()) {
+      void openUrl(url);
+    } else {
+      window.open(url, "_blank", "noopener");
+    }
+  };
 
   return (
     <div className="profile-detail">
@@ -440,7 +468,12 @@ export default function ProfileDetail({
                       <span
                         className={`endpoint-item-dot ${ep.active ? "on" : ""}`}
                       />
-                      <span className="endpoint-item-name">{ep.name}</span>
+                      <span className="endpoint-item-name">
+                        {endpointDisplay?.names[i] ?? ep.name}
+                      </span>
+                      {ep.protocol && (
+                        <span className="endpoint-proto">{ep.protocol}</span>
+                      )}
                       <span
                         className={`endpoint-item-delay ${delayClass(res, measuring)}`}
                         aria-busy={measuring || undefined}
@@ -482,6 +515,14 @@ export default function ProfileDetail({
                 <option value="60">{t("detail.everyHour")}</option>
                 <option value="360">{t("detail.every6h")}</option>
               </select>
+              {subscription?.updateIntervalHours &&
+                subscription.refreshIntervalMinutes === null && (
+                  <span className="row-hint">
+                    {t("detail.providerInterval", {
+                      hours: subscription.updateIntervalHours,
+                    })}
+                  </span>
+                )}
             </span>
           </div>
         )}
@@ -491,28 +532,79 @@ export default function ProfileDetail({
           (profile.backend === "xray" && profile.privateLanDirect) ||
           profile.useSystemProxy) && (
           <div className="connection-card-details">
-            {profile.subscription?.userInfo && (
+            {subscription?.announce && (
+              <div className="sub-announce">{subscription.announce}</div>
+            )}
+            {(subscription?.supportUrl || subscription?.webPageUrl) && (
+              <div className="sub-links">
+                {subscription?.webPageUrl && (
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    onClick={() => openExternal(subscription.webPageUrl!)}
+                  >
+                    {t("detail.cabinet")}
+                  </button>
+                )}
+                {subscription?.supportUrl && (
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    onClick={() => openExternal(subscription.supportUrl!)}
+                  >
+                    {t("detail.support")}
+                  </button>
+                )}
+              </div>
+            )}
+            {(profile.subscription?.providerTitle ?? endpointDisplay?.provider) && (
               <div className="interface-row">
-                <span className="row-label">{t("detail.traffic")}</span>
+                <span className="row-label">{t("detail.provider")}</span>
                 <span className="row-value">
-                  {formatBytes(
-                    profile.subscription.userInfo.uploadBytes +
-                      profile.subscription.userInfo.downloadBytes,
-                  )}{" "}
-                  {t("detail.used")}
-                  {profile.subscription.userInfo.totalBytes !== null
-                    ? ` / ${formatBytes(profile.subscription.userInfo.totalBytes)}`
-                    : ` / ${t("detail.unlimited")}`}
+                  {profile.subscription?.providerTitle ?? endpointDisplay?.provider}
                 </span>
               </div>
             )}
-            {profile.subscription?.userInfo?.expiresAtUnix != null && (
+            {subscription?.userInfo && (
+              <div className="interface-row">
+                <span className="row-label">{t("detail.traffic")}</span>
+                <span className="row-value">
+                  {formatBytes(trafficUsed ?? 0)} {t("detail.used")}
+                  {subscription.userInfo.totalBytes !== null
+                    ? ` / ${formatBytes(subscription.userInfo.totalBytes)}`
+                    : ` / ${t("detail.unlimited")}`}
+                  {limitExhausted && (
+                    <span className="warn-text">
+                      {" · "}
+                      {t("detail.limitExhausted")}
+                    </span>
+                  )}
+                </span>
+              </div>
+            )}
+            {subscription?.userInfo?.expiresAtUnix != null && (
               <div className="interface-row">
                 <span className="row-label">{t("detail.expires")}</span>
                 <span className="row-value">
                   {new Date(
-                    profile.subscription.userInfo.expiresAtUnix * 1000,
+                    subscription.userInfo.expiresAtUnix * 1000,
                   ).toLocaleDateString()}
+                  {expiresDaysLeft !== null && expiresDaysLeft <= 7 && (
+                    <span className="warn-text">
+                      {" · "}
+                      {t("detail.expiresInDays", { count: Math.max(expiresDaysLeft, 0) })}
+                    </span>
+                  )}
+                </span>
+              </div>
+            )}
+            {subscription && subscription.skippedProtocols.length > 0 && (
+              <div className="interface-row">
+                <span className="row-label">{t("detail.unsupported")}</span>
+                <span className="row-value">
+                  {subscription.skippedProtocols
+                    .map((p) => p[0].toUpperCase() + p.slice(1))
+                    .join(", ")}
                 </span>
               </div>
             )}

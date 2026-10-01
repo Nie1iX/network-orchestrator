@@ -38,12 +38,11 @@ import Testing
         "userInfo": [
           "uploadBytes": 0, "downloadBytes": 8_151_449_629, "expiresAtUnix": 1_802_708_026,
         ],
-        "panel": [
-          "title": "QA Panel",
-          "announce": "Servers in Europe were updated. Use the Asia server if Europe is slow.",
-          "supportUrl": "https://support.example.test/",
-          "webPageUrl": "https://account.example.test/",
-        ],
+        "providerTitle": "QA Panel",
+        "announce": "Servers in Europe were updated. Use the Asia server if Europe is slow.",
+        "supportUrl": "https://support.example.test/",
+        "webPageUrl": "https://account.example.test/",
+        "skippedProtocols": ["trojan"],
       ],
     ],
     [
@@ -107,8 +106,8 @@ import Testing
     ]))
   model.subscriptionEndpoints = [
     "design-xray": [
-      SubscriptionEndpoint(name: "QA Europe", active: true),
-      SubscriptionEndpoint(name: "QA Asia", active: false),
+      SubscriptionEndpoint(name: "QA Panel - QA Europe", active: true, protocol: "VLESS · Reality"),
+      SubscriptionEndpoint(name: "QA Panel - QA Asia", active: false, protocol: "Hysteria2"),
     ]
   ]
   model.runtime = RuntimeState(

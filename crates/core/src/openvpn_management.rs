@@ -23,8 +23,11 @@ pub enum ManagementParseError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenVpnState {
     Connecting,
+    Resolve,
+    TcpConnect,
     Wait,
     Auth,
+    AuthPending,
     GetConfig,
     AssignIp,
     AddRoutes,
@@ -257,14 +260,20 @@ pub fn parse_management_line(line: &str) -> Result<Option<ManagementEvent>, Mana
         parse_timestamp(fields.next())?;
         let state = match fields.next() {
             Some("CONNECTING") => OpenVpnState::Connecting,
+            Some("RESOLVE") => OpenVpnState::Resolve,
+            Some("TCP_CONNECT") => OpenVpnState::TcpConnect,
             Some("WAIT") => OpenVpnState::Wait,
             Some("AUTH") => OpenVpnState::Auth,
+            Some("AUTH_PENDING") => OpenVpnState::AuthPending,
             Some("GET_CONFIG") => OpenVpnState::GetConfig,
             Some("ASSIGN_IP") => OpenVpnState::AssignIp,
             Some("ADD_ROUTES") => OpenVpnState::AddRoutes,
             Some("CONNECTED") => OpenVpnState::Connected,
             Some("RECONNECTING") => OpenVpnState::Reconnecting,
             Some("EXITING") => OpenVpnState::Exiting,
+            // Tolerate well-formed state names added by newer OpenVPN
+            // releases instead of aborting the tunnel.
+            Some(name) if state_name(name) => return Ok(None),
             _ => return Err(ManagementParseError::Malformed),
         };
         return Ok(Some(ManagementEvent::State(state)));
@@ -456,6 +465,14 @@ pub fn parse_push_reply(payload: &str) -> Result<PushedNetworkConfig, Management
     }
     config.dns_servers = servers.into_values().collect();
     Ok(config)
+}
+
+/// OpenVPN state names are uppercase snake-case tokens (`TCP_CONNECT`).
+fn state_name(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
 fn parse_timestamp(field: Option<&str>) -> Result<(), ManagementParseError> {
@@ -655,6 +672,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_pre_connect_states_and_ignores_unknown_state_names() {
+        assert!(matches!(
+            parse_management_line(">STATE:1720000000,RESOLVE,,,,,").unwrap(),
+            Some(ManagementEvent::State(OpenVpnState::Resolve))
+        ));
+        assert!(matches!(
+            parse_management_line(">STATE:1720000000,TCP_CONNECT,,,,,").unwrap(),
+            Some(ManagementEvent::State(OpenVpnState::TcpConnect))
+        ));
+        assert!(matches!(
+            parse_management_line(">STATE:1720000000,AUTH_PENDING,3600,,,,").unwrap(),
+            Some(ManagementEvent::State(OpenVpnState::AuthPending))
+        ));
+        // A state introduced by a future OpenVPN release must not abort the tunnel.
+        assert!(parse_management_line(">STATE:1720000000,FUTURE_2,,,,")
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            parse_management_line(">STATE:1720000000,lowercase,,,,"),
+            Err(ManagementParseError::Malformed)
+        ));
+    }
+
+    #[test]
     fn parses_split_def1_legacy_dns_and_modern_dns() {
         let push = parse_push_reply("PUSH_REPLY,route 10.20.0.0 255.255.0.0,route-ipv6 fd00:1::/64,redirect-gateway def1,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example,dns search-domains branch.example,dns server 0 address 10.8.0.2 fd00::53,dns server 0 resolve-domains internal.example,auth-token PRIVATE-SECRET").unwrap();
         assert!(push.routes.contains(&"10.20.0.0/16".parse().unwrap()));
@@ -769,7 +810,8 @@ mod tests {
     fn rejects_malformed_known_events_and_unsupported_auth_challenges() {
         for line in [
             ">STATE:bad,CONNECTED",
-            ">STATE:1,UNKNOWN",
+            ">STATE:1,not-a-state",
+            ">STATE:1,",
             ">BYTECOUNT:1",
             ">BYTECOUNT:1,-2",
             ">PASSWORD:Need 'Auth' username/password SC:1,secret",
