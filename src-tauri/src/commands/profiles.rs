@@ -1826,6 +1826,7 @@ mod tests {
             last_refresh_at_unix: Some(1000),
             last_refresh_error: None,
             user_info: None,
+            panel: None,
         };
         assert!(!subscription_refresh_due(&meta, 1899));
         assert!(subscription_refresh_due(&meta, 1900));
@@ -1881,6 +1882,7 @@ mod tests {
             last_refresh_at_unix: Some(1000),
             last_refresh_error: None,
             user_info: None,
+            panel: None,
         });
         assert!(!should_auto_refresh(&p, 1900, true));
         assert!(should_auto_refresh(&p, 1900, false));
@@ -2385,6 +2387,7 @@ mod tests {
             last_refresh_at_unix: None,
             last_refresh_error: None,
             user_info: None,
+            panel: None,
         });
         let public = redact_profiles_for_ipc(vec![stored.clone()]);
         let json = serde_json::to_string(&public).unwrap();

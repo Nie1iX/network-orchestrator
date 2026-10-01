@@ -270,6 +270,23 @@ pub struct SubscriptionMeta {
     pub last_refresh_error: Option<String>,
     #[serde(default)]
     pub user_info: Option<SubscriptionUserInfo>,
+    /// Provider-supplied title, announcement and links (`profile-title`,
+    /// `announce`, `support-url`, `profile-web-page-url`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel: Option<SubscriptionPanelInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionPanelInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announce: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_page_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -293,6 +310,7 @@ impl std::fmt::Debug for SubscriptionMeta {
             .field("last_refresh_at_unix", &self.last_refresh_at_unix)
             .field("last_refresh_error", &self.last_refresh_error)
             .field("user_info", &self.user_info)
+            .field("panel", &self.panel)
             .finish()
     }
 }
@@ -652,6 +670,7 @@ mod tests {
             last_refresh_at_unix: None,
             last_refresh_error: None,
             user_info: None,
+            panel: None,
         };
         let debug = format!("{subscription:?}");
         assert!(!debug.contains("private-token"));
