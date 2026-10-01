@@ -8,6 +8,8 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-01
+
 ### Added
 
 - Native Connections: saved connection sets applied in one click, drag and
