@@ -1,6 +1,6 @@
 import type {
   AlwaysOnListResult, BackendAvailability, ConditionalRuleEntry, ConditionalRouteRule,
-  ConfigAnalysis, NetworkInterface, Profile, ProfileInspection, RouteEntry, RouteMap,
+  ConfigAnalysis, DomainPolicy, NetworkInterface, Profile, ProfileInspection, RouteEntry, RouteMap,
   TunnelStatus, VpnAuthMode,
 } from "../types.ts";
 
@@ -362,6 +362,36 @@ export class SandboxBackend {
         const idx = this.condRules.findIndex((e) => e.rule.id === args.ruleId);
         if (idx >= 0) this.condRules.splice(idx, 1);
         return { removed: idx >= 0 };
+      }
+      case "parse_happ_routing": {
+        // Sandbox preview only understands raw JSON — base64/deeplink
+        // inputs are a native-parser feature.
+        const raw = JSON.parse(String(args.payload)) as Record<string, unknown>;
+        const pick = (key: string) =>
+          Object.entries(raw).find(([k]) => k.toLowerCase() === key.toLowerCase())?.[1];
+        const list = (v: unknown) =>
+          Array.isArray(v) ? v.filter((s): s is string => typeof s === "string") : [];
+        const policies: DomainPolicy[] = [];
+        for (const [target, sites, ips] of [
+          ["block", "BlockSites", "BlockIp"],
+          ["proxy", "ProxySites", "ProxyIp"],
+          ["direct", "DirectSites", "DirectIp"],
+        ] as const) {
+          const domains = [...list(pick(sites)), ...list(pick(ips))];
+          if (domains.length) policies.push({ domains, target });
+        }
+        if (policies.length === 0) throw new Error("invalid Happ routing profile: no recognizable fields");
+        return {
+          name: typeof pick("Name") === "string" ? pick("Name") : null,
+          domainPolicies: policies,
+          privateLanDirect: typeof pick("bypassPrivateIPs") === "boolean" ? pick("bypassPrivateIPs") : null,
+          domainStrategy: null,
+          domainMatcher: null,
+          dns: { servers: [], hosts: {}, fakeDns: false, queryStrategy: null },
+          geoipUrl: null,
+          geositeUrl: null,
+          warnings: [],
+        };
       }
       case "plugin:dialog|ask":
       case "plugin:dialog|confirm": return true;

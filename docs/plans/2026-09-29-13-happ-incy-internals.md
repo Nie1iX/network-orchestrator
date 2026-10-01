@@ -151,3 +151,58 @@ Windows-пакету `Program Files/INCY` + легacy-конфигам в `~/.co
 - `happ://cryptN/` — шифрованные ссылки подписок; формат не раскрыт
   (строки показывают только схему).
 - INCY хранит серверы/подписки в sqlite; Happ — `subs.db` + JSON-конфиги.
+
+## Перенесено в net_manager
+
+Из находок Incy реализовано (на нашей модели `Profile` + `domain_policies`,
+без заведения отдельной Happ-сущности):
+
+- **`routing.domainStrategy` / `domainMatcher`** — поля `xrayDomainStrategy`
+  (`asIs`/`ipIfNonMatch`/`ipOnDemand`) и `xrayDomainMatcher`
+  (`mph`/`hybrid`/`linear`) на `Profile`, эмитятся в `apply_profile_routing`.
+- **Split-DNS по Incy** — `profile.xrayDns`: `servers[]` (udp/tcp/tls/
+  https/https+local/quic+local/localhost/fakedns, `port`, `domains`,
+  `skipFallback`), `route: proxy|direct` пинает адрес резолвера через
+  соответствующий outbound (remote-через-прокси / domestic-напрямую);
+  пустой `domains` у маршрутизируемого сервера автопривязывается к
+  доменам своей группы политик; если все записи доменные — дублируется
+  голый catch-all. Правило `port:53 → dns-out` + `dns`-outbound.
+- **FakeDNS** — `fakeDns` → секция `fakedns` (`198.18.0.0/16`) +
+  `sniffing.destOverride += "fakedns"` на всех inbound, включая TUN.
+- **DNS-null для block-доменов** — литеральные block-селекторы
+  (`domain:`/`full:`/plain) дополнительно уходят в `dns.hosts → 127.0.0.1`;
+  явные `hosts` побеждают.
+- **Multicast → block** (`224.0.0.0/4`, `ff00::/8`) при активных правилах.
+- **`geosite:cat@attr`** — валидатор теперь пропускает один `@attr`
+  (`*`-wildcards разрешены).
+- **Geo-кэш по паре URL** — `geoassets/<sha256(geoip+geosite)[:16]>/`,
+  профили с одинаковыми URL делят одну копию; при снятых URL кэш не
+  трогаем (общий).
+- **`.sha256`-sidecar** — перед скачиванием пробуется `<url>.sha256`;
+  совпадение с записанным digest пропускает ~20 МБ даунлоада, мисматч
+  держит старую копию (или ошибка, если кэша нет).
+- **Маскирование логов** — `core::log_sanitize` маскирует публичные
+  IPv4/IPv6/домены (`203.0.113.7 → 203.0.x.x`, `api.x.com → *.x.com`),
+  сохраняя приватные/локальные адреса и имена файлов; встроено в
+  `redact_runtime_log` (log tails) и в `xray log:`-ошибку демона.
+- **Импорт Happ-роутинг-профилей** — `core::happ_routing` принимает
+  экспорт Happ/Incy (сырой JSON, base64/base64url, `happ://routing/…`
+  и `incy://routing/…` диплинки), нормализует регистр ключей и
+  lenient-формы (строковые bool, строки вместо массивов) и маппит на
+  нашу модель: `DirectSites/ProxySites/BlockSites`+`*Ip` →
+  `domain_policies` в порядке `RouteOrder`, `Remote*/Domestic*DNS` →
+  `xrayDns.servers` с `route: proxy|direct`, `DnsHosts` → `hosts`,
+  `FakeDNS` → `fakeDns`, `DomainStrategy`/`domainMatcher` → поля
+  профиля, `Geoipurl`/`Geositeurl` → geo-URL, `bypassPrivateIPs` →
+  `privateLanDirect`. UI — «Import Happ routing profile» на вкладке
+  маршрутизации формы профиля (команда `parse_happ_routing`,
+  превью-заполнение, дальше обычный save). Проигнорированные поля
+  (`remoteDnsAddresses`, `GlobalProxy:false`, хеши) возвращаются
+  предупреждениями, а не проглатываются.
+
+Не перенесено (осознанно): нативный тримминг `.dat` и MPH-кэш через
+`incycore` (у Incy — закрытая Go-библиотека; стоковый Xray сам строит mph),
+балансеры/`burstObservatory` (нужна инфраструктура ping/observatory),
+`routeOrder` как перечисление (порядок уже выражается порядком политик),
+`autorouting`-заголовки подписок (канал пуша правил от провайдера —
+спорная фича, у Happ работала нестабильно).

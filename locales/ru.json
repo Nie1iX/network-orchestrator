@@ -864,13 +864,23 @@
     "rules.back": "Назад",
     "rules.block": "Блок",
     "rules.direct": "Напрямую",
+    "rules.dnsSummary": "Свой DNS: резолверов: {servers} · хостов: {hosts}",
+    "rules.domainMatcher": "Domain matcher",
+    "rules.domainStrategy": "Domain strategy",
     "rules.entryCount": {
       "one": "{count} правило",
       "few": "{count} правила",
       "many": "{count} правил",
       "other": "{count} правила"
     },
+    "rules.happApplied": "Профиль маршрутизации применён",
+    "rules.happApply": "Применить",
+    "rules.happApplying": "Применяю…",
+    "rules.happHint": "Вставьте экспорт Happ/Incy — JSON, base64 или ссылку happ://",
+    "rules.importHapp": "Импорт профиля Happ",
+    "rules.matcherDefault": "По умолчанию",
     "rules.proxy": "Прокси",
+    "rules.strategyDefault": "По умолчанию (AsIs)",
     "sets.applyTitle": {
       "one": "Переключиться ровно на {count} подключение",
       "few": "Переключиться ровно на {count} подключения",

@@ -4,6 +4,7 @@ pub(crate) mod cond_rules;
 pub(crate) mod diagnostics;
 pub(crate) mod exit_ips;
 pub(crate) mod explorer;
+pub(crate) mod happ_routing;
 pub(crate) mod logs;
 pub(crate) mod profiles;
 pub(crate) mod recovery;
@@ -23,6 +24,7 @@ pub(crate) use exit_ips::check_exit_ips;
 pub(crate) use explorer::{
     get_interfaces, get_routes, lookup_destination, set_interface_state, stop_external_tunnel,
 };
+pub(crate) use happ_routing::parse_happ_routing;
 pub(crate) use logs::{clear_logs, daemon_log_tail, get_logs};
 pub(crate) use profiles::{
     delete_profile, get_profiles, get_subscription_endpoints, import_configs_batch,
