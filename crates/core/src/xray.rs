@@ -711,6 +711,28 @@ fn dns_server_host(address: &str) -> Option<&str> {
     (!host.is_empty()).then_some(host)
 }
 
+/// Resolver hosts that must stay reachable through the physical uplink when
+/// the tunnel fully captures their family — every configured resolver that
+/// is not pinned to the proxy outbound (a `Proxy` resolver is meant to be
+/// reached *inside* the tunnel, so bypassing it would defeat the point).
+/// Returned as a deduped list of literal IPs or resolvable names.
+pub fn dns_bypass_hosts(dns: &XrayDnsConfig) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for server in &dns.servers {
+        if matches!(server.route, crate::models::XrayDnsRoute::Proxy) {
+            continue;
+        }
+        let Some(host) = dns_server_host(&server.address) else {
+            continue;
+        };
+        if matches!(host, "localhost" | "fakedns") || hosts.iter().any(|item| item == host) {
+            continue;
+        }
+        hosts.push(host.to_string());
+    }
+    hosts
+}
+
 /// The routable destination of a DNS server entry: `None` for
 /// `localhost`/`fakedns`, which Xray handles internally.
 fn dns_server_route_target(address: &str) -> Option<(&'static str, String)> {
@@ -2364,5 +2386,30 @@ mod tests {
             dns_server_route_target("dns.google"),
             Some(("domain", "dns.google".to_string()))
         );
+    }
+
+    #[test]
+    fn dns_bypass_hosts_skip_proxy_routed_and_internal_resolvers() {
+        use crate::models::{XrayDnsConfig, XrayDnsRoute, XrayDnsServer};
+        let server = |address: &str, route: XrayDnsRoute| XrayDnsServer {
+            address: address.to_string(),
+            route,
+            domains: Vec::new(),
+            port: None,
+            skip_fallback: false,
+        };
+        let dns = XrayDnsConfig {
+            servers: vec![
+                server("udp://9.9.9.9:53", XrayDnsRoute::Direct),
+                server("https://dns.resolver.test/dns-query", XrayDnsRoute::Direct),
+                server("udp://8.8.4.4", XrayDnsRoute::Proxy),
+                server("localhost", XrayDnsRoute::Direct),
+                server("fakedns", XrayDnsRoute::Direct),
+                server("udp://9.9.9.9:53", XrayDnsRoute::Direct),
+            ],
+            ..XrayDnsConfig::default()
+        };
+        assert_eq!(dns_bypass_hosts(&dns), ["9.9.9.9", "dns.resolver.test"]);
+        assert!(dns_bypass_hosts(&XrayDnsConfig::default()).is_empty());
     }
 }
