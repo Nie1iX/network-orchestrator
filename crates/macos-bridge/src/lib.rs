@@ -1064,6 +1064,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn import_link(root: &Path, id: &str) {
         dispatch(
             root,
@@ -1074,6 +1075,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn runtime_reports_stopped_profiles_and_missing_xray() {
         let dir = tempfile::tempdir().unwrap();
         import_link(dir.path(), "rt");
@@ -1085,6 +1087,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn connect_requires_managed_xray_and_refuses_privileged_backends() {
         let dir = tempfile::tempdir().unwrap();
         import_link(dir.path(), "rt");
@@ -1101,6 +1104,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn system_proxy_and_disconnect_require_a_running_connection() {
         let dir = tempfile::tempdir().unwrap();
         import_link(dir.path(), "rt");
