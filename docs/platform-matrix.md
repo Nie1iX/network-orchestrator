@@ -30,7 +30,7 @@ for macOS. Android and iOS are out of scope entirely.
 | Xray — SOCKS mode | ✅ | ✅ | ⚠️ | `spawn_xray` is OS-generic, but no standard search paths exist — user must set the executable explicitly; no system-proxy glue |
 | Xray — TUN mode | ✅ manual | ✅ managed | ❌ | Win: user sets iface name/IP; Linux: daemon generates config (`xrayMode: "tun"` default) |
 | Static routes (`none`) | ✅ | ✅ | ❌ | Policy routes only, no tunnel; route mutation is IP Helper / netlink |
-| Managed Xray install | ✅ x86_64 only | — | — | `managedXrayInstall`; fixed-version, hash-pinned download |
+| Managed Xray install | ✅ x86_64 only | ✅ x86_64 only | — | `managedXrayInstall`; fixed-version, hash-pinned download. Win: app-local store; Linux: archive goes to the daemon (`xray.install`), which re-verifies hashes and installs root-owned files under `/usr/lib/network-orchestrator/xray` |
 | WireGuard standard `.conf` import | ✅ | — | — | `wireguardStandardImport` |
 
 ## System integration
