@@ -29,13 +29,7 @@ fn unix_now() -> u64 {
 }
 
 pub(crate) fn subscription_refresh_due(subscription: &SubscriptionMeta, now: u64) -> bool {
-    let Some(minutes) = subscription.refresh_interval_minutes else {
-        return false;
-    };
-    matches!(minutes, 15 | 60 | 360)
-        && subscription
-            .last_refresh_at_unix
-            .is_none_or(|last| now.saturating_sub(last) >= u64::from(minutes) * 60)
+    net_manager_core::subscription::refresh_due(subscription, now)
 }
 
 fn should_auto_refresh(profile: &Profile, now: u64, active: bool) -> bool {
@@ -984,14 +978,9 @@ fn record_subscription_refresh_failure(
     id: &str,
     now: u64,
 ) -> Result<(), String> {
-    let mut profile = subscription_profile(store, id)?;
-    let subscription = profile.subscription.as_mut().unwrap();
-    subscription.last_refresh_at_unix = Some(now);
-    subscription.last_refresh_error = Some("Refresh failed".into());
-    store
-        .upsert(profile)
-        .map_err(|_| "failed to store subscription refresh state".to_string())?;
-    Ok(())
+    subscription_profile(store, id)?;
+    net_manager_core::subscription::record_refresh_failure(store, id, now)
+        .map_err(|_| "failed to store subscription refresh state".to_string())
 }
 
 fn set_subscription_refresh_interval_into(
@@ -1001,13 +990,10 @@ fn set_subscription_refresh_interval_into(
     now: u64,
 ) -> Result<Vec<Profile>, String> {
     validate_refresh_interval(interval_minutes)?;
-    let mut profile = subscription_profile(store, id)?;
-    let subscription = profile.subscription.as_mut().unwrap();
-    subscription.refresh_interval_minutes = interval_minutes;
-    subscription.last_refresh_at_unix = Some(now);
-    let document = store
-        .upsert(profile)
-        .map_err(|_| "failed to store subscription refresh interval".to_string())?;
+    subscription_profile(store, id)?;
+    let document =
+        net_manager_core::subscription::set_refresh_interval(store, id, interval_minutes, now)
+            .map_err(|_| "failed to store subscription refresh interval".to_string())?;
     Ok(redact_profiles_for_ipc(document.profiles))
 }
 
