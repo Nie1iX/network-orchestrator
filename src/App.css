@@ -3711,6 +3711,40 @@ a:focus-visible,
   font-variant-numeric: tabular-nums;
 }
 
+.endpoint-proto {
+  flex-shrink: 0;
+  font-size: var(--fs-2xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 0 var(--sp-1);
+}
+
+.sub-announce {
+  border: 1px solid var(--info-border);
+  background-color: var(--info-bg);
+  border-radius: var(--r-md);
+  padding: var(--sp-3);
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+  white-space: pre-line;
+}
+
+.sub-links {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+.row-hint {
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+}
+
+.warn-text {
+  color: var(--warn);
+}
+
 /* ── Routes · toolbar, summary chips, lookup result ─────────────────── */
 
 .routes-toolbar {

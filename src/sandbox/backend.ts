@@ -76,7 +76,12 @@ export class SandboxBackend {
       url: "", hwid: "", endpointCount: 3, activeIndex: 0,
       refreshIntervalMinutes: null, lastRefreshAtUnix: null, lastRefreshError: null,
       providerTitle: "AcmeVPN",
-      userInfo: { uploadBytes: 1048576, downloadBytes: 2097152, totalBytes: 1073741824, expiresAtUnix: null },
+      announce: "Maintenance window on Saturday 03:00–05:00 UTC.\nNL endpoints may flap briefly.",
+      supportUrl: "https://support.example.invalid/chat",
+      webPageUrl: "https://cabinet.example.invalid/dashboard",
+      updateIntervalHours: 12,
+      skippedProtocols: ["trojan", "ss"],
+      userInfo: { uploadBytes: 1048576, downloadBytes: 2097152, totalBytes: 1073741824, expiresAtUnix: Math.floor(Date.now() / 1000) + 5 * 86400 },
     };
   }
 
@@ -254,7 +259,11 @@ export class SandboxBackend {
       }
       case "get_subscription_endpoints": {
         const p = this.find(args.profileId);
-        return this.endpoints.map((name, i) => ({ name, active: p.subscription?.activeIndex === i }));
+        return this.endpoints.map((name, i) => ({
+          name,
+          active: p.subscription?.activeIndex === i,
+          protocol: i === 0 ? "VLESS · Reality" : i === 1 ? "VLESS · TLS" : "Hysteria2",
+        }));
       }
       case "switch_subscription_endpoint": {
         const p = this.find(args.profileId); this.stopped(p);

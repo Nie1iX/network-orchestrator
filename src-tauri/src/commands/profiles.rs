@@ -770,10 +770,25 @@ pub(crate) async fn import_configs_batch(
 }
 
 /// Decode a v2ray-style subscription body and count unsupported nonblank lines.
-pub(crate) fn parse_subscription_body(body: &str) -> (Vec<String>, usize) {
+fn share_link_scheme(line: &str) -> &str {
+    line.split_once("://")
+        .map(|(scheme, _)| scheme)
+        .unwrap_or("unknown")
+}
+
+fn push_skipped_scheme(skipped: &mut Vec<String>, uri: &str) {
+    let scheme = share_link_scheme(uri);
+    if !skipped.iter().any(|s| s == scheme) {
+        skipped.push(scheme.to_string());
+    }
+}
+
+/// Returns the supported share links and the distinct schemes of lines that
+/// were skipped as unsupported.
+pub(crate) fn parse_subscription_body(body: &str) -> (Vec<String>, Vec<String>) {
     let decoded = base64_decode(body.trim()).unwrap_or_else(|| body.to_string());
     let mut urls = Vec::new();
-    let mut skipped = 0;
+    let mut skipped = Vec::new();
     for line in decoded
         .lines()
         .map(str::trim)
@@ -785,7 +800,7 @@ pub(crate) fn parse_subscription_body(body: &str) -> (Vec<String>, usize) {
         {
             urls.push(line.to_string());
         } else {
-            skipped += 1;
+            push_skipped_scheme(&mut skipped, line);
         }
     }
     (urls, skipped)
@@ -839,13 +854,17 @@ fn base64_decode(input: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-/// Parse the `Profile-Title` header that subscription panels use to announce
-/// the provider name. Panels emit it either plain/percent-encoded or as
-/// `base64:<data>`; returns `None` for missing, malformed, or overlong values.
-fn parse_subscription_provider_title(value: &str) -> Option<String> {
-    const MAX_TITLE_LEN: usize = 200;
+/// Decode a textual subscription header (`Profile-Title`, `Announce`). Panels
+/// emit values either plain/percent-encoded or as `base64:<data>`. Returns
+/// `None` for empty, overlong, or control-character payloads; `Announce` may
+/// legitimately contain newlines, which `allow_newlines` permits.
+fn parse_subscription_text_header(
+    value: &str,
+    max_chars: usize,
+    allow_newlines: bool,
+) -> Option<String> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > MAX_TITLE_LEN {
+    if trimmed.is_empty() || trimmed.len() > max_chars * 2 {
         return None;
     }
     let decoded = if let Some(encoded) = trimmed.strip_prefix("base64:") {
@@ -853,14 +872,48 @@ fn parse_subscription_provider_title(value: &str) -> Option<String> {
     } else {
         net_manager_core::xray::percent_decode(trimmed)
     };
-    let title = decoded.trim();
-    if title.is_empty() || title.chars().count() > MAX_TITLE_LEN {
+    let text = decoded.trim();
+    if text.is_empty() || text.chars().count() > max_chars {
         return None;
     }
-    if title.chars().any(char::is_control) {
+    if text
+        .chars()
+        .any(|c| char::is_control(c) && !(allow_newlines && c == '\n'))
+    {
         return None;
     }
-    Some(title.to_string())
+    Some(text.to_string())
+}
+
+fn parse_subscription_provider_title(value: &str) -> Option<String> {
+    parse_subscription_text_header(value, 200, false)
+}
+
+/// Accept only http(s) links for `Support-Url` / `Profile-Web-Page-Url`;
+/// these end up behind clickable links in the UI.
+fn parse_subscription_url_header(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 300 {
+        return None;
+    }
+    let url = reqwest::Url::parse(trimmed).ok()?;
+    matches!(url.scheme(), "https" | "http").then(|| trimmed.to_string())
+}
+
+/// Collect every supported metadata header a subscription response announces.
+fn subscription_response_meta(headers: &reqwest::header::HeaderMap) -> SubscriptionResponseMeta {
+    let get = |name: &str| headers.get(name).and_then(|h| h.to_str().ok());
+    SubscriptionResponseMeta {
+        user_info: get("subscription-userinfo").and_then(parse_subscription_userinfo),
+        provider_title: get("profile-title").and_then(parse_subscription_provider_title),
+        announce: get("announce")
+            .and_then(|value| parse_subscription_text_header(value, 2000, true)),
+        support_url: get("support-url").and_then(parse_subscription_url_header),
+        web_page_url: get("profile-web-page-url").and_then(parse_subscription_url_header),
+        update_interval_hours: get("profile-update-interval")
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|hours| (1..=24 * 365).contains(hours)),
+    }
 }
 
 /// Compose the profile display name as `{provider} - {endpoint}`. When the
@@ -894,6 +947,10 @@ fn subscription_profile_name(provider_title: Option<&str>, endpoint_name: &str) 
 struct SubscriptionResponseMeta {
     user_info: Option<SubscriptionUserInfo>,
     provider_title: Option<String>,
+    announce: Option<String>,
+    support_url: Option<String>,
+    web_page_url: Option<String>,
+    update_interval_hours: Option<u32>,
 }
 
 /// Fetch a subscription and import its supported share links.
@@ -918,16 +975,7 @@ pub(crate) async fn import_subscription_into(
             response.status()
         ));
     }
-    let user_info = response
-        .headers()
-        .get("subscription-userinfo")
-        .and_then(|header| header.to_str().ok())
-        .and_then(parse_subscription_userinfo);
-    let provider_title = response
-        .headers()
-        .get("profile-title")
-        .and_then(|header| header.to_str().ok())
-        .and_then(parse_subscription_provider_title);
+    let meta = subscription_response_meta(response.headers());
     let body = read_subscription_response(response).await?;
     import_subscription_body_into_with_metadata(
         vault,
@@ -936,10 +984,7 @@ pub(crate) async fn import_subscription_into(
         hwid,
         &body,
         refresh_interval_minutes,
-        SubscriptionResponseMeta {
-            user_info,
-            provider_title,
-        },
+        meta,
     )
 }
 
@@ -986,7 +1031,8 @@ fn import_subscription_body_into_with_metadata(
     refresh_interval_minutes: Option<u32>,
     meta: SubscriptionResponseMeta,
 ) -> Result<BatchImportResult, String> {
-    let (urls, skipped) = parse_subscription_body(body);
+    let (urls, skipped_protocols) = parse_subscription_body(body);
+    let skipped = skipped_protocols.len();
     if urls.is_empty() {
         return Err(format!(
             "subscription contained no supported share links ({skipped} unsupported skipped)"
@@ -1059,6 +1105,11 @@ fn import_subscription_body_into_with_metadata(
             last_refresh_error: None,
             user_info: meta.user_info,
             provider_title: meta.provider_title,
+            announce: meta.announce,
+            support_url: meta.support_url,
+            web_page_url: meta.web_page_url,
+            update_interval_hours: meta.update_interval_hours,
+            skipped_protocols,
         }),
         ..Default::default()
     };
@@ -1145,16 +1196,7 @@ async fn refresh_subscription_into(
             response.status()
         ));
     }
-    let user_info = response
-        .headers()
-        .get("subscription-userinfo")
-        .and_then(|header| header.to_str().ok())
-        .and_then(parse_subscription_userinfo);
-    let provider_title = response
-        .headers()
-        .get("profile-title")
-        .and_then(|header| header.to_str().ok())
-        .and_then(parse_subscription_provider_title);
+    let meta = subscription_response_meta(response.headers());
     let body = read_subscription_response(response).await?;
     if subscription_profile(store, id)? != profile {
         return Err("subscription changed during refresh".into());
@@ -1165,10 +1207,7 @@ async fn refresh_subscription_into(
         id,
         &body,
         loopback_port_available,
-        SubscriptionResponseMeta {
-            user_info,
-            provider_title,
-        },
+        meta,
     )
 }
 
@@ -1233,8 +1272,8 @@ fn refresh_subscription_body_into_with_metadata(
         })
         .unwrap_or(0);
 
-    let (urls, unsupported) = parse_subscription_body(body);
-    let mut skipped_count = unsupported;
+    let (urls, skipped_protocols) = parse_subscription_body(body);
+    let mut skipped_count = skipped_protocols.len();
     let mut endpoints = Vec::new();
     let mut configs = Vec::new();
     for uri in urls {
@@ -1305,6 +1344,19 @@ fn refresh_subscription_body_into_with_metadata(
     if meta.provider_title.is_some() {
         subscription.provider_title = meta.provider_title;
     }
+    if meta.announce.is_some() {
+        subscription.announce = meta.announce;
+    }
+    if meta.support_url.is_some() {
+        subscription.support_url = meta.support_url;
+    }
+    if meta.web_page_url.is_some() {
+        subscription.web_page_url = meta.web_page_url;
+    }
+    if meta.update_interval_hours.is_some() {
+        subscription.update_interval_hours = meta.update_interval_hours;
+    }
+    subscription.skipped_protocols = skipped_protocols;
     if store.upsert(profile).is_err() {
         return Err(if rollback() {
             "failed to store refreshed profile"
@@ -1603,8 +1655,34 @@ pub(crate) async fn get_subscription_endpoints(
         .map(|(i, e)| SubscriptionEndpointInfo {
             name: e.name,
             active: i == active_index,
+            protocol: subscription_endpoint_protocol(&e.url),
         })
         .collect())
+}
+
+/// Human-readable protocol/transport badge for a share link, e.g.
+/// `VLESS · Reality` or `Hysteria2`.
+fn subscription_endpoint_protocol(uri: &str) -> Option<String> {
+    let url = reqwest::Url::parse(uri.trim()).ok()?;
+    let mut label = match url.scheme() {
+        "vless" => "VLESS".to_string(),
+        "hy2" | "hysteria2" => "Hysteria2".to_string(),
+        "trojan" => "Trojan".to_string(),
+        "vmess" => "VMess".to_string(),
+        "ss" => "Shadowsocks".to_string(),
+        other => other.to_uppercase(),
+    };
+    for (key, value) in url.query_pairs() {
+        match (key.as_ref(), value.as_ref()) {
+            ("security", "reality") => label.push_str(" · Reality"),
+            ("security", "tls") => label.push_str(" · TLS"),
+            ("type", transport) if transport != "tcp" && transport != "none" => {
+                label.push_str(&format!(" · {}", transport.to_uppercase()));
+            }
+            _ => {}
+        }
+    }
+    Some(label)
 }
 
 #[tauri::command]
@@ -2213,7 +2291,7 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
         let (urls, skipped) = parse_subscription_body(&encoded);
         assert_eq!(urls.len(), 2);
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped, ["trojan"]);
         assert!(urls[0].starts_with("vless://uuid@host"));
         assert!(urls[1].starts_with("vless://uuid2@host3"));
     }
@@ -2223,7 +2301,7 @@ mod tests {
         let raw = "vless://uuid@host:443?encryption=none\nnot-a-url\nvless://uuid2@host2:443";
         let (urls, skipped) = parse_subscription_body(raw);
         assert_eq!(urls.len(), 2);
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped.len(), 1);
         assert!(urls[0].starts_with("vless://uuid@host"));
         assert!(urls[1].starts_with("vless://uuid2@host2"));
     }
@@ -2233,7 +2311,7 @@ mod tests {
         let raw = "trojan://other@host:443\nss://something@host:443";
         let (urls, skipped) = parse_subscription_body(raw);
         assert!(urls.is_empty());
-        assert_eq!(skipped, 2);
+        assert_eq!(skipped, ["trojan", "ss"]);
     }
 
     #[test]
@@ -2243,7 +2321,7 @@ mod tests {
         let with_whitespace = format!("  \n{}\n  ", encoded);
         let (urls, skipped) = parse_subscription_body(&with_whitespace);
         assert_eq!(urls.len(), 1);
-        assert_eq!(skipped, 0);
+        assert_eq!(skipped.len(), 0);
         assert!(urls[0].starts_with("vless://uuid@host"));
     }
 
@@ -2252,7 +2330,7 @@ mod tests {
         let raw = "vless://id@one.test:443\nhysteria2://pass@two.test:443\nhy2://pass@three.test:443\ntrojan://private@other.test:443";
         let (urls, skipped) = parse_subscription_body(raw);
         assert_eq!(urls.len(), 3);
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped.len(), 1);
         assert!(urls[1].starts_with("hysteria2://"));
         assert!(urls[2].starts_with("hy2://"));
     }
@@ -2294,6 +2372,11 @@ mod tests {
             last_refresh_error: None,
             user_info: None,
             provider_title: None,
+            announce: None,
+            support_url: None,
+            web_page_url: None,
+            update_interval_hours: None,
+            skipped_protocols: Vec::new(),
         };
         assert!(!subscription_refresh_due(&meta, 1899));
         assert!(subscription_refresh_due(&meta, 1900));
@@ -2350,6 +2433,11 @@ mod tests {
             last_refresh_error: None,
             user_info: None,
             provider_title: None,
+            announce: None,
+            support_url: None,
+            web_page_url: None,
+            update_interval_hours: None,
+            skipped_protocols: Vec::new(),
         });
         assert!(!should_auto_refresh(&p, 1900, true));
         assert!(should_auto_refresh(&p, 1900, false));
@@ -2492,7 +2580,10 @@ mod tests {
             total_bytes: Some(100),
             expires_at_unix: None,
         };
-        let result = refresh_subscription_body_into_with_metadata(&vault, &store, &selected.id, "trojan://private-token@other.test:443\nhy2://private-password@two.test:443#Renamed%20Node\nvless://id@one.test:443?security=tls#First", |_| true, SubscriptionResponseMeta { user_info: Some(usage.clone()), provider_title: None }).unwrap();
+        let result = refresh_subscription_body_into_with_metadata(&vault, &store, &selected.id, "trojan://private-token@other.test:443\nhy2://private-password@two.test:443#Renamed%20Node\nvless://id@one.test:443?security=tls#First", |_| true, SubscriptionResponseMeta {
+                user_info: Some(usage.clone()),
+                ..SubscriptionResponseMeta::default()
+            }).unwrap();
         assert_eq!(result.active_index, 0);
         assert_eq!(result.endpoint_count, 2);
         assert_eq!(result.skipped_count, 1);
@@ -2850,7 +2941,7 @@ mod tests {
             &vault,
             &store,
             &selected.id,
-            "hy2://private-password@one.test:443#First\nhy2://private-password@two.test:443#Second",
+            "hy2://private-password@one.test:443#First\nhy2://private-password@two.test:443#Second\nss://b64@three.test:8388#Shadowsocks\ntrojan://p@four.test:443#Trojan",
             |_| true,
             SubscriptionResponseMeta::default(),
         )
@@ -2865,6 +2956,10 @@ mod tests {
                 .as_deref(),
             Some("AcmeVPN")
         );
+        assert_eq!(
+            refreshed.subscription.as_ref().unwrap().skipped_protocols,
+            ["ss", "trojan"]
+        );
         assert_eq!(refreshed.name, "AcmeVPN - First");
         refresh_subscription_body_into_with_metadata(
             &vault,
@@ -2873,8 +2968,8 @@ mod tests {
             "hy2://private-password@one.test:443#First\nhy2://private-password@two.test:443#Second",
             |_| true,
             SubscriptionResponseMeta {
-                user_info: None,
                 provider_title: Some("NewVPN".into()),
+                ..SubscriptionResponseMeta::default()
             },
         )
         .unwrap();
@@ -2902,7 +2997,7 @@ mod tests {
             let _ = stream.read(&mut request).await;
             let body = "hy2://password@node.test:443#Node";
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nProfile-Title: base64:QWNtZVZQTg==\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nProfile-Title: base64:QWNtZVZQTg==\r\nAnnounce: base64:TWFpbnRlbmFuY2Ugb24gU2F0dXJkYXkK\r\nSupport-Url: https://support.example.test/chat\r\nProfile-Web-Page-Url: https://cabinet.example.test/u/123\r\nProfile-Update-Interval: 12\r\n\r\n{body}",
                 body.len()
             );
             stream.write_all(response.as_bytes()).await.unwrap();
@@ -2924,7 +3019,52 @@ mod tests {
         server.await.unwrap();
         let subscription = result.profiles[0].subscription.as_ref().unwrap();
         assert_eq!(subscription.provider_title.as_deref(), Some("AcmeVPN"));
+        assert_eq!(
+            subscription.announce.as_deref(),
+            Some("Maintenance on Saturday")
+        );
+        assert_eq!(
+            subscription.support_url.as_deref(),
+            Some("https://support.example.test/chat")
+        );
+        assert_eq!(
+            subscription.web_page_url.as_deref(),
+            Some("https://cabinet.example.test/u/123")
+        );
+        assert_eq!(subscription.update_interval_hours, Some(12));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn subscription_url_header_accepts_only_http_links() {
+        assert_eq!(
+            parse_subscription_url_header("https://support.example.test").as_deref(),
+            Some("https://support.example.test")
+        );
+        assert!(parse_subscription_url_header("javascript:alert(1)").is_none());
+        assert!(parse_subscription_url_header("ftp://host/path").is_none());
+        assert!(parse_subscription_url_header("not a url").is_none());
+        assert!(parse_subscription_url_header("   ").is_none());
+    }
+
+    #[test]
+    fn endpoint_protocol_label_summarizes_scheme_security_and_transport() {
+        assert_eq!(
+            subscription_endpoint_protocol(
+                "vless://id@host.test:443?security=reality&type=grpc#Node"
+            )
+            .as_deref(),
+            Some("VLESS · Reality · GRPC")
+        );
+        assert_eq!(
+            subscription_endpoint_protocol("vless://id@host.test:443?security=tls#Node").as_deref(),
+            Some("VLESS · TLS")
+        );
+        assert_eq!(
+            subscription_endpoint_protocol("hy2://pass@host.test:443#Node").as_deref(),
+            Some("Hysteria2")
+        );
+        assert!(subscription_endpoint_protocol("not a url").is_none());
     }
 
     #[tokio::test]
@@ -2978,6 +3118,11 @@ mod tests {
             last_refresh_error: None,
             user_info: None,
             provider_title: None,
+            announce: None,
+            support_url: None,
+            web_page_url: None,
+            update_interval_hours: None,
+            skipped_protocols: Vec::new(),
         });
         let public = redact_profiles_for_ipc(vec![stored.clone()]);
         let json = serde_json::to_string(&public).unwrap();

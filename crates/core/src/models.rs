@@ -258,6 +258,16 @@ pub struct SubscriptionMeta {
     pub user_info: Option<SubscriptionUserInfo>,
     #[serde(default)]
     pub provider_title: Option<String>,
+    #[serde(default)]
+    pub announce: Option<String>,
+    #[serde(default)]
+    pub support_url: Option<String>,
+    #[serde(default)]
+    pub web_page_url: Option<String>,
+    #[serde(default)]
+    pub update_interval_hours: Option<u32>,
+    #[serde(default)]
+    pub skipped_protocols: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,6 +292,17 @@ impl std::fmt::Debug for SubscriptionMeta {
             .field("last_refresh_error", &self.last_refresh_error)
             .field("user_info", &self.user_info)
             .field("provider_title", &self.provider_title)
+            .field("announce", &self.announce)
+            .field(
+                "support_url",
+                &self.support_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "web_page_url",
+                &self.web_page_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("update_interval_hours", &self.update_interval_hours)
+            .field("skipped_protocols", &self.skipped_protocols)
             .finish()
     }
 }
@@ -291,6 +312,8 @@ impl std::fmt::Debug for SubscriptionMeta {
 pub struct SubscriptionEndpointInfo {
     pub name: String,
     pub active: bool,
+    #[serde(default)]
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -632,6 +655,11 @@ mod tests {
             last_refresh_error: None,
             user_info: None,
             provider_title: None,
+            announce: None,
+            support_url: None,
+            web_page_url: None,
+            update_interval_hours: None,
+            skipped_protocols: Vec::new(),
         };
         let debug = format!("{subscription:?}");
         assert!(!debug.contains("private-token"));
