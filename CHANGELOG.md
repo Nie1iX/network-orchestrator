@@ -8,6 +8,16 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+### Added
+
+- Subscriptions keep the provider's title, announcement and support/account
+  links from `profile-title`, `announce` (plain or `base64:`),
+  `support-url` and `profile-web-page-url` headers or `#…:` body comments;
+  text is bounded and only https links are kept. The native client shows
+  them at the top of the detail pane, and subscription rows read as a group:
+  your name first, the selected server below in smaller type. Import
+  diagnostics also list response header names (never values).
+
 ## [0.4.0] - 2026-10-01
 
 ### Added

@@ -56,6 +56,14 @@ struct SubscriptionMeta: Decodable, Sendable {
   let endpointCount: Int
   let activeIndex: Int
   let userInfo: SubscriptionUsage?
+  let panel: SubscriptionPanel?
+}
+/// Provider title, announcement and links sent with the subscription.
+struct SubscriptionPanel: Decodable, Sendable {
+  let title: String?
+  let announce: String?
+  let supportUrl: String?
+  let webPageUrl: String?
 }
 struct SubscriptionUsage: Decodable, Sendable {
   let uploadBytes: UInt64

@@ -631,6 +631,8 @@
     "native.linkPlaceholder": "vless://…, hy2://… or https://…",
     "native.ms": "{ms} ms",
     "native.openBrowser": "Open browser via connection",
+    "native.panelAccount": "Account",
+    "native.panelSupport": "Support",
     "native.ping": "Ping",
     "native.pingProgress": "Ping {done}/{total}",
     "native.primaryRoute": "Route: {iface}",

@@ -38,6 +38,12 @@ import Testing
         "userInfo": [
           "uploadBytes": 0, "downloadBytes": 8_151_449_629, "expiresAtUnix": 1_802_708_026,
         ],
+        "panel": [
+          "title": "QA Panel",
+          "announce": "Servers in Europe were updated. Use the Asia server if Europe is slow.",
+          "supportUrl": "https://support.example.test/",
+          "webPageUrl": "https://account.example.test/",
+        ],
       ],
     ],
     [
