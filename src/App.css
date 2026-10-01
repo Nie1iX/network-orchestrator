@@ -3936,6 +3936,12 @@ a:focus-visible,
   gap: var(--sp-4);
 }
 
+.status-bar-active-name {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ── Monitor table ────────────────────────────────────────────────────── */
 
 .monitor-table {
