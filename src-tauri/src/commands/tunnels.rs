@@ -60,18 +60,48 @@ fn openvpn_credential_requirements(
     config: &str,
     assets: &std::collections::BTreeMap<String, Vec<u8>>,
 ) -> OpenVpnCredentialRequirements {
-    let directive = |name: &str| {
-        config.lines().any(|line| {
-            line.split_whitespace()
-                .next()
-                .is_some_and(|word| word.trim_start_matches('-').eq_ignore_ascii_case(name))
-        })
-    };
+    let mut user_pass = false;
+    let mut askpass_prompt = false;
+    let mut askpass_file = false;
+    // Inline block contents are not directives; a credential line inside an
+    // inline block must not be mistaken for a prompt request.
+    let mut in_block = false;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if in_block {
+            if trimmed.starts_with("</") {
+                in_block = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with('<') && !trimmed.starts_with("</") {
+            in_block = true;
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let Some(word) = tokens.next() else { continue };
+        let word = word.trim_start_matches('-');
+        if word.eq_ignore_ascii_case("auth-user-pass") {
+            // `username-only` still prompts; a file argument does not.
+            match tokens.next().map(|arg| arg.trim_matches('"')) {
+                None | Some("username-only") => user_pass = true,
+                Some(_) => {}
+            }
+        } else if word.eq_ignore_ascii_case("askpass") {
+            if tokens.next().is_none() {
+                askpass_prompt = true;
+            } else {
+                askpass_file = true;
+            }
+        }
+    }
+    let encrypted_key = openvpn_encrypted_key(config.as_bytes())
+        || assets.values().any(|asset| openvpn_encrypted_key(asset));
     OpenVpnCredentialRequirements {
-        user_pass: directive("auth-user-pass"),
-        key_passphrase: directive("askpass")
-            || openvpn_encrypted_key(config.as_bytes())
-            || assets.values().any(|asset| openvpn_encrypted_key(asset)),
+        user_pass,
+        // A passphrase file supplies the answer; only a bare `askpass` or
+        // an encrypted key without a file still prompts via management.
+        key_passphrase: (askpass_prompt || encrypted_key) && !askpass_file,
     }
 }
 
@@ -160,7 +190,12 @@ fn prepare_linux_xray_tun_params(
     let config = net_manager_core::xray::apply_profile_routing(
         &base,
         &profile.domain_policies,
-        profile.private_lan_direct,
+        &net_manager_core::xray::ProfileRoutingOptions {
+            private_lan_direct: profile.private_lan_direct,
+            domain_strategy: profile.xray_domain_strategy,
+            domain_matcher: profile.xray_domain_matcher,
+            dns: profile.xray_dns.clone(),
+        },
     )
     .map_err(|_| "invalid Xray routing rules".to_string())?;
     let default_route = profile.routes.is_empty();
@@ -353,16 +388,39 @@ pub(crate) fn linux_openvpn_tunnel_status(status: OpenVpnStatusResult) -> Tunnel
         OpenVpnConnectionState::Connecting => notices.push("OpenVPN is connecting"),
         OpenVpnConnectionState::Reconnecting => notices.push("OpenVPN is reconnecting"),
         OpenVpnConnectionState::Failed => {
-            if status
-                .warnings
-                .contains(&OpenVpnWarning::AuthenticationFailed)
-            {
-                notices.push(
-                    "OpenVPN authentication failed; check username, password, or private key passphrase",
-                );
-            } else {
-                notices.push("OpenVPN connection failed; check credentials or server settings");
-            }
+            use net_manager_core::daemon_protocol::OpenVpnFailure as F;
+            notices.push(match status.failure_reason {
+                Some(F::AuthenticationFailure) => {
+                    "OpenVPN authentication failed; check username, password, or private key passphrase"
+                }
+                Some(F::CredentialsRequired) => {
+                    "OpenVPN server requested credentials that are not stored for this profile"
+                }
+                Some(F::ResolveError) => "OpenVPN could not resolve the server address",
+                Some(F::ConnectError) => {
+                    "OpenVPN could not reach the server (connection refused or timed out)"
+                }
+                Some(F::TlsError) => {
+                    "OpenVPN TLS handshake failed; check CA, certificate, or tls-auth settings"
+                }
+                Some(F::ConnectionLost) => {
+                    "OpenVPN connection was lost (timeout or connection reset)"
+                }
+                Some(F::ExitNotification) => {
+                    "OpenVPN server asked the client to disconnect"
+                }
+                Some(F::Terminated) => "OpenVPN process was terminated",
+                Some(F::ExitWithError) | None => {
+                    if status
+                        .warnings
+                        .contains(&OpenVpnWarning::AuthenticationFailed)
+                    {
+                        "OpenVPN authentication failed; check username, password, or private key passphrase"
+                    } else {
+                        "OpenVPN connection failed; check credentials or server settings"
+                    }
+                }
+            });
         }
         _ => {}
     }
@@ -1761,6 +1819,37 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn credential_files_and_inline_blocks_satisfy_requirements_without_prompts() {
+        let assets: std::collections::BTreeMap<String, Vec<u8>> = [
+            ("assets/up.txt".into(), b"alice\nsecret\n".to_vec()),
+            (
+                "assets/key.pem".into(),
+                b"-----BEGIN ENCRYPTED PRIVATE KEY-----".to_vec(),
+            ),
+            ("assets/pass.txt".into(), b"key-pass\n".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        // File-referenced and inline credentials never reach the
+        // management password prompt.
+        let file = "client\nremote vpn.example\nauth-user-pass \"assets/up.txt\"\nkey assets/key.pem\naskpass assets/pass.txt\n";
+        let requirements = openvpn_credential_requirements(file, &assets);
+        assert!(!requirements.user_pass);
+        assert!(!requirements.key_passphrase);
+        // Inline <auth-user-pass> embeds credentials; the `username-only`
+        // flag still triggers a prompt.
+        let inline =
+            "client\nremote vpn.example\n<auth-user-pass>\nalice\nsecret\n</auth-user-pass>\n";
+        assert!(!openvpn_credential_requirements(inline, &Default::default()).user_pass);
+        let username_only = "client\nremote vpn.example\nauth-user-pass username-only\n";
+        assert!(openvpn_credential_requirements(username_only, &Default::default()).user_pass);
+        // An encrypted key without an askpass file still needs a passphrase.
+        let key_only = "client\nremote vpn.example\nkey assets/key.pem\n";
+        assert!(openvpn_credential_requirements(key_only, &assets).key_passphrase);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn implicit_connect_migrates_plaintext_credentials_into_keyring() {
         use std::os::unix::fs::OpenOptionsExt;
         let dir = unique_dir("ovpn-remember-migrate");
@@ -2317,6 +2406,7 @@ mod tests {
             tx_bytes: 0,
             applied_routes: Vec::new(),
             warnings: Vec::new(),
+            failure_reason: None,
         };
         let message = linux_openvpn_tunnel_status(status).message.unwrap();
         assert!(message.contains("check credentials or server"));
@@ -2334,12 +2424,43 @@ mod tests {
             tx_bytes: 0,
             applied_routes: Vec::new(),
             warnings: vec![OpenVpnWarning::AuthenticationFailed],
+            failure_reason: None,
         };
         let message = linux_openvpn_tunnel_status(status).message.unwrap();
         assert_eq!(
             message,
             "OpenVPN authentication failed; check username, password, or private key passphrase"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openvpn_failure_reason_maps_to_specific_safe_messages() {
+        use net_manager_core::daemon_protocol::OpenVpnFailure as F;
+        for (reason, needle) in [
+            (F::CredentialsRequired, "credentials that are not stored"),
+            (F::ResolveError, "resolve the server address"),
+            (F::ConnectError, "could not reach the server"),
+            (F::TlsError, "TLS handshake failed"),
+            (F::ConnectionLost, "connection was lost"),
+            (F::ExitNotification, "asked the client to disconnect"),
+            (F::Terminated, "terminated"),
+            (F::ExitWithError, "check credentials or server settings"),
+            (F::AuthenticationFailure, "authentication failed"),
+        ] {
+            let status = OpenVpnStatusResult {
+                profile_id: "p1".into(),
+                state: OpenVpnConnectionState::Failed,
+                interface_name: None,
+                rx_bytes: 0,
+                tx_bytes: 0,
+                applied_routes: Vec::new(),
+                warnings: Vec::new(),
+                failure_reason: Some(reason),
+            };
+            let message = linux_openvpn_tunnel_status(status).message.unwrap();
+            assert!(message.contains(needle), "{reason:?}: {message}");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2353,6 +2474,7 @@ mod tests {
             tx_bytes: 0,
             applied_routes: Vec::new(),
             warnings: Vec::new(),
+            failure_reason: None,
         };
         let result = finish_openvpn_connect(
             status,

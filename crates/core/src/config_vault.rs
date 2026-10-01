@@ -391,6 +391,7 @@ const PATH_DIRECTIVES: &[&str] = &[
     "tls-crypt-v2",
     "secret",
     "auth-user-pass",
+    "askpass",
     "crl-verify",
 ];
 
@@ -831,6 +832,35 @@ mod tests {
         );
         fs::remove_dir_all(&dir).unwrap();
         fs::remove_dir_all(&asset_dir).unwrap();
+    }
+
+    #[test]
+    fn import_openvpn_stages_credential_files_and_inline_auth() {
+        let (vault, dir) = vault("ovpn-creds");
+        let cfg_dir = dir.join("cfg");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        fs::write(cfg_dir.join("up.txt"), b"alice\ns3cret\n").unwrap();
+        fs::write(cfg_dir.join("key-pass.txt"), b"key-pass\n").unwrap();
+        let source = cfg_dir.join("client.ovpn");
+        fs::write(
+            &source,
+            "client\nremote vpn.example\nauth-user-pass up.txt\naskpass key-pass.txt\n",
+        )
+        .unwrap();
+
+        let import = vault.import("p", TunnelBackend::OpenVpn, &source).unwrap();
+        let text = fs::read_to_string(&import.config_path).unwrap();
+        assert!(
+            text.contains("auth-user-pass \"assets/0-up.txt\""),
+            "{text}"
+        );
+        assert!(text.contains("askpass \"assets/1-key-pass.txt\""), "{text}");
+        let rev = import.config_path.parent().unwrap();
+        assert_eq!(
+            fs::read(rev.join("assets").join("0-up.txt")).unwrap(),
+            b"alice\ns3cret\n"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

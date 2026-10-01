@@ -1568,6 +1568,7 @@ mod tests {
             tx_bytes: 9,
             applied_routes: vec!["10.7.0.0/24".parse().unwrap()],
             warnings: Vec::new(),
+            failure_reason: None,
         });
         assert_eq!(health.state, ProtocolHealthState::Healthy);
         assert_eq!(health.rx_bytes, Some(7));

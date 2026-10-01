@@ -14,11 +14,11 @@ use crate::xray_process::XrayProcessRunner;
 use ipnet::IpNet;
 use net_manager_core::daemon_protocol::{
     CleanupResult, ConditionalRouteRule, ConditionalRuleState, ConditionalRuleStatus, IpFamily,
-    OpenVpnConnectionState, OpenVpnPlanConflict, OpenVpnPlanResult, OpenVpnProbeResult,
-    OpenVpnProcessResource, OpenVpnStatusResult, OpenVpnWarning, OwnedEntry, OwnedResource,
-    OwnedRuleResource, OwnedState, RouteCondition, WireGuardAddressResource, WireGuardFullResource,
-    WireGuardLinkResource, WireGuardStatusResult, WireGuardWarning, XrayConnectParams,
-    XrayProcessResource, XrayStatusResult,
+    OpenVpnConnectionState, OpenVpnFailure, OpenVpnPlanConflict, OpenVpnPlanResult,
+    OpenVpnProbeResult, OpenVpnProcessResource, OpenVpnStatusResult, OpenVpnWarning, OwnedEntry,
+    OwnedResource, OwnedRuleResource, OwnedState, RouteCondition, WireGuardAddressResource,
+    WireGuardFullResource, WireGuardLinkResource, WireGuardStatusResult, WireGuardWarning,
+    XrayConnectParams, XrayProcessResource, XrayStatusResult,
 };
 use net_manager_core::journal::{JournalDocument, JournalEntry, JournalStore};
 use net_manager_core::models::TunnelState;
@@ -525,6 +525,54 @@ mod openvpn_tests {
             .contains(&OpenVpnWarning::AuthenticationFailed));
         core.connect_openvpn(1000, plan()).unwrap();
         assert!(core.openvpn_status(1000, "home").warnings.is_empty());
+        core.disconnect_openvpn(1000, "home").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn state_detail_survives_teardown_as_failure_reason() {
+        let dir = unique_dir("failure-detail");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::FailureDetail(OpenVpnFailure::TlsError),
+            ManagementEvent::State(OpenVpnState::Exiting),
+        ]);
+        core.reconcile_openvpn().unwrap();
+        let status = core.openvpn_status(1000, "home");
+        assert_eq!(status.state, OpenVpnConnectionState::Failed);
+        assert_eq!(status.failure_reason, Some(OpenVpnFailure::TlsError));
+        // Disconnect and a fresh connect clear the stored reason.
+        core.disconnect_openvpn(1000, "home").unwrap();
+        core.connect_openvpn(1000, plan()).unwrap();
+        assert_eq!(core.openvpn_status(1000, "home").failure_reason, None);
+        core.disconnect_openvpn(1000, "home").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unanswered_password_prompt_fails_as_credentials_required() {
+        let dir = unique_dir("creds-required");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        process
+            .pending
+            .lock()
+            .unwrap()
+            .push_back(vec![ManagementEvent::FailureDetail(
+                OpenVpnFailure::CredentialsRequired,
+            )]);
+        assert!(core.reconcile_openvpn().is_err());
+        let status = core.openvpn_status(1000, "home");
+        assert_eq!(status.state, OpenVpnConnectionState::Failed);
+        assert_eq!(
+            status.failure_reason,
+            Some(OpenVpnFailure::CredentialsRequired)
+        );
         core.disconnect_openvpn(1000, "home").unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1207,6 +1255,7 @@ mod openvpn_tests {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1451,6 +1500,9 @@ pub struct DaemonCore {
     openvpn_runtime: HashMap<(u32, String), OpenVpnRuntime>,
     openvpn_failed: HashSet<(u32, String)>,
     openvpn_auth_failed: HashSet<(u32, String)>,
+    /// Sanitized failure reason per failed owner; survives teardown because
+    /// the runtime snapshot is dropped with the journal entry.
+    openvpn_failures: HashMap<(u32, String), OpenVpnFailure>,
     /// Unix seconds; injectable so handshake ageing is testable.
     clock: Box<dyn Fn() -> u64 + Send>,
     wireguard_handshake: HashMap<(u32, String), HandshakeWatch>,
@@ -1594,6 +1646,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1635,6 +1688,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1674,6 +1728,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1707,6 +1762,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1744,6 +1800,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1786,6 +1843,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -2458,6 +2516,8 @@ impl DaemonCore {
         self.openvpn_failed.remove(&(uid, owner));
         self.openvpn_auth_failed
             .remove(&(uid, format!("ovpn:{}", plan.profile_id)));
+        self.openvpn_failures
+            .remove(&(uid, format!("ovpn:{}", plan.profile_id)));
         Ok(self.openvpn_status(uid, &plan.profile_id))
     }
 
@@ -2591,6 +2651,7 @@ impl DaemonCore {
         let Some(index) = self.position(uid, &owner) else {
             if self.openvpn_failed.remove(&key) {
                 self.openvpn_auth_failed.remove(&key);
+                self.openvpn_failures.remove(&key);
                 return Ok(());
             }
             return Err(io::Error::new(
@@ -2603,6 +2664,7 @@ impl DaemonCore {
         if result.is_ok() {
             self.openvpn_failed.remove(&key);
             self.openvpn_auth_failed.remove(&key);
+            self.openvpn_failures.remove(&key);
         }
         result
     }
@@ -2803,6 +2865,9 @@ impl DaemonCore {
         if state == OpenVpnConnectionState::Failed && self.openvpn_auth_failed.contains(&key) {
             warnings.push(OpenVpnWarning::AuthenticationFailed);
         }
+        let failure_reason = (state == OpenVpnConnectionState::Failed)
+            .then(|| self.openvpn_failures.get(&key).copied())
+            .flatten();
         OpenVpnStatusResult {
             profile_id: profile_id.to_owned(),
             state,
@@ -2811,6 +2876,7 @@ impl DaemonCore {
             tx_bytes: runtime.map_or(0, |runtime| runtime.snapshot.sent),
             applied_routes,
             warnings,
+            failure_reason,
         }
     }
 
@@ -2860,9 +2926,20 @@ impl DaemonCore {
             match &event {
                 ManagementEvent::AuthenticationFailed => {
                     self.openvpn_auth_failed.insert((uid, owner.to_owned()));
+                    self.openvpn_failures.insert(
+                        (uid, owner.to_owned()),
+                        OpenVpnFailure::AuthenticationFailure,
+                    );
                     return self.fail_openvpn(uid, owner);
                 }
                 ManagementEvent::PasswordPrompt(_) => return self.fail_openvpn(uid, owner),
+                ManagementEvent::FailureDetail(reason) => {
+                    self.openvpn_failures
+                        .insert((uid, owner.to_owned()), *reason);
+                    if matches!(reason, OpenVpnFailure::CredentialsRequired) {
+                        return self.fail_openvpn(uid, owner);
+                    }
+                }
                 _ => {}
             }
             if let Some(runtime) = self.openvpn_runtime.get_mut(&(uid, owner.to_owned())) {
@@ -3127,6 +3204,15 @@ impl DaemonCore {
     }
 
     fn fail_openvpn(&mut self, uid: u32, owner: &str) -> io::Result<()> {
+        if let Some(reason) = self
+            .openvpn_runtime
+            .get(&(uid, owner.to_owned()))
+            .and_then(|runtime| runtime.snapshot.last_failure)
+        {
+            self.openvpn_failures
+                .entry((uid, owner.to_owned()))
+                .or_insert(reason);
+        }
         if let Some(index) = self.position(uid, owner) {
             let _ = self.teardown_openvpn_entry(index);
             self.persist();

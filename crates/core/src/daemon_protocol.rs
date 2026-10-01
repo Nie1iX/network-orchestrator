@@ -505,6 +505,34 @@ pub enum OpenVpnWarning {
     AuthenticationFailed,
 }
 
+/// Sanitized reason for a failed OpenVPN session. Values map to fixed
+/// keywords from the management `STATE` detail field and daemon-side
+/// credential checks — no raw log text crosses the wire.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum OpenVpnFailure {
+    /// `auth-failure` detail or a `PASSWORD:Verification Failed` event.
+    AuthenticationFailure,
+    /// The server asked for credentials (or a key passphrase) that the
+    /// profile does not supply.
+    CredentialsRequired,
+    /// `resolve-error` — the remote host could not be resolved.
+    ResolveError,
+    /// `connect-error`/`proxy-reconnect` — the server was unreachable.
+    ConnectError,
+    /// `tls-error`/`tls-failed` — TLS handshake failure.
+    TlsError,
+    /// `connection-reset`, `ping-restart`, `ping-exit`, `inactive-exit`,
+    /// `reconnect`, `suspend`, `network-change`, `primary-changing`.
+    ConnectionLost,
+    /// `exit-with-error` — exited without a more specific reason.
+    ExitWithError,
+    /// `exit-with-notification` — server asked the client to exit.
+    ExitNotification,
+    /// `sigint`/`sigterm`/`sighup`/`sigusr1` — terminated by a signal.
+    Terminated,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenVpnStatusResult {
@@ -515,6 +543,9 @@ pub struct OpenVpnStatusResult {
     pub tx_bytes: u64,
     pub applied_routes: Vec<IpNet>,
     pub warnings: Vec<OpenVpnWarning>,
+    /// Present while `state == "failed"` when a sanitized reason is known.
+    #[serde(default)]
+    pub failure_reason: Option<OpenVpnFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1465,7 +1496,7 @@ mod tests {
         assert_eq!(params.routes[0].destination, "10.9.0.0/16".parse().unwrap());
 
         let (_, result): (_, OpenVpnConnectResult) = ok_response(
-            r#"{"id":11,"ok":true,"result":{"status":{"profileId":"office","state":"connecting","interfaceName":"ovpn-ab12","rxBytes":0,"txBytes":0,"appliedRoutes":[],"warnings":[]}}}"#,
+            r#"{"id":11,"ok":true,"result":{"status":{"profileId":"office","state":"connecting","interfaceName":"ovpn-ab12","rxBytes":0,"txBytes":0,"appliedRoutes":[],"warnings":[],"failureReason":null}}}"#,
         );
         assert_eq!(result.status.state, OpenVpnConnectionState::Connecting);
 
@@ -1474,9 +1505,10 @@ mod tests {
         assert_eq!(frame.method, method::OPENVPN_STATUS);
         assert_eq!(params.profile_id, "office");
         let (_, status): (_, OpenVpnStatusResult) = ok_response(
-            r#"{"id":12,"ok":true,"result":{"profileId":"office","state":"connected","interfaceName":"ovpn-ab12","rxBytes":7,"txBytes":8,"appliedRoutes":["10.9.0.0/16"],"warnings":["dnsNotApplied","ipv6NotCovered"]}}"#,
+            r#"{"id":12,"ok":true,"result":{"profileId":"office","state":"connected","interfaceName":"ovpn-ab12","rxBytes":7,"txBytes":8,"appliedRoutes":["10.9.0.0/16"],"warnings":["dnsNotApplied","ipv6NotCovered"],"failureReason":null}}"#,
         );
         assert_eq!(status.state, OpenVpnConnectionState::Connected);
+        assert_eq!(status.failure_reason, None);
         assert_eq!(status.applied_routes, vec!["10.9.0.0/16".parse().unwrap()]);
         assert_eq!(
             status.warnings,
