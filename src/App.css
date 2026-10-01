@@ -3441,6 +3441,17 @@ a:focus-visible,
   min-width: 0;
 }
 
+.profile-row-server {
+  flex: 0 2 auto;
+  min-width: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
 .profile-row-meta {
   display: inline-flex;
   align-items: center;

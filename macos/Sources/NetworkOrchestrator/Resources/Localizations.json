@@ -492,6 +492,8 @@
       "form.shareLink": "Import share link",
       "form.socksAuto": "SOCKS5 port will be assigned automatically when the profile is saved.",
       "form.socksMode": "SOCKS5 (system proxy)",
+      "form.splitDefault": "Split default route (0.0.0.0/1 + 128.0.0.0/1)",
+      "form.splitDefaultHint": "Two /1 halves instead of a single /0 — same full capture, but friendlier to other tunnel managers and route tools.",
       "form.staticHelp": "Static-routes profiles apply policy routes through an existing interface (e.g. Ethernet) without starting a tunnel.",
       "form.staticNoTunnel": "Static routes (no tunnel)",
       "form.sysProxy": "Use Windows system proxy",
@@ -616,6 +618,7 @@
         "other": "Connected: {count}"
       },
       "native.copied": "Proxy commands copied to the clipboard.",
+      "native.copyFailed": "Could not copy to the clipboard.",
       "native.copyTerminal": "Copy terminal proxy commands",
       "native.helperRequired": "Needs the macOS privileged helper (not available yet)",
       "native.hwidAuto": "Generate automatically",
@@ -1422,6 +1425,8 @@
       "form.shareLink": "Импортировать share-ссылку",
       "form.socksAuto": "Порт SOCKS5 будет назначен автоматически при сохранении профиля.",
       "form.socksMode": "SOCKS5 (системный прокси)",
+      "form.splitDefault": "Дробный default route (0.0.0.0/1 + 128.0.0.0/1)",
+      "form.splitDefaultHint": "Две половинки /1 вместо одного /0 — то же полное перехватывание, но дружелюбнее к другим туннелям и route-менеджерам.",
       "form.staticHelp": "Профили статических маршрутов применяют policy-маршруты через существующий интерфейс (напр. Ethernet) без запуска туннеля.",
       "form.staticNoTunnel": "Статические маршруты (без туннеля)",
       "form.sysProxy": "Использовать системный прокси Windows",
@@ -1554,6 +1559,7 @@
         "other": "Подключено: {count}"
       },
       "native.copied": "Прокси-команды скопированы в буфер обмена.",
+      "native.copyFailed": "Не удалось скопировать в буфер обмена.",
       "native.copyTerminal": "Скопировать прокси-команды для терминала",
       "native.helperRequired": "Нужен привилегированный помощник macOS (пока недоступен)",
       "native.hwidAuto": "Сгенерировать автоматически",
