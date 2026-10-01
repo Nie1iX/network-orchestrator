@@ -90,6 +90,10 @@ echo "==> Installing daemon as a package would"
         /usr/bin/network-orchestrator-daemon
     install -m 0644 /opt/netorch/packaging/network-orchestrator.service /usr/lib/systemd/system/
     install -m 0644 /opt/netorch/packaging/com.netmanager.app.policy /usr/share/polkit-1/actions/
+    install -m 0644 /opt/netorch/packaging/tmpfiles.conf /usr/lib/tmpfiles.d/network-orchestrator.conf
+    # The managed package root must exist before the service starts:
+    # ReadWritePaths is ignored for paths that do not exist yet.
+    systemd-tmpfiles --create network-orchestrator.conf
     systemctl daemon-reload
     systemctl enable --now network-orchestrator.service
 '

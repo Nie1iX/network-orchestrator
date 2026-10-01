@@ -3,6 +3,11 @@ set -e
 
 case "$1" in
     configure|abort-upgrade|abort-remove|abort-deconfigure)
+        # The managed package root must exist before the service starts:
+        # ReadWritePaths is ignored for paths that do not exist yet.
+        if command -v systemd-tmpfiles >/dev/null 2>&1; then
+            systemd-tmpfiles --create network-orchestrator.conf 2>/dev/null || true
+        fi
         if command -v systemctl >/dev/null 2>&1; then
             # enable works offline; reload/start need systemd as PID 1
             # (not the case in chroots, image builds or WSL).

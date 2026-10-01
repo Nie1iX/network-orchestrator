@@ -37,6 +37,10 @@ UMask=0077
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes
 ProtectSystem=strict
+# xray.install writes the managed package root; ProtectSystem makes /usr
+# read-only otherwise. ReadWritePaths only punches a hole for a path that
+# already exists at start — tmpfiles.d creates it (see tmpfiles.conf).
+ReadWritePaths=/usr/lib/network-orchestrator
 ProtectHome=yes
 PrivateTmp=yes
 ProtectControlGroups=yes

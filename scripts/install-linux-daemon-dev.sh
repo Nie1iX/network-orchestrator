@@ -19,12 +19,15 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 UNIT_NAME="network-orchestrator.service"
 UNIT_SRC="$REPO_ROOT/packaging/linux/$UNIT_NAME"
 UNIT_DST="/etc/systemd/system/$UNIT_NAME"
+TMPFILES_SRC="$REPO_ROOT/packaging/linux/tmpfiles.conf"
+TMPFILES_DST="/usr/lib/tmpfiles.d/network-orchestrator.conf"
 POLICY_SRC="$REPO_ROOT/packaging/linux/com.netmanager.app.policy"
 POLICY_DST="/usr/share/polkit-1/actions/com.netmanager.app.policy"
 DAEMON_DIR="/usr/local/bin"
 DAEMON_PATH="$DAEMON_DIR/network-orchestrator-daemon"
 OLD_DAEMON_PATH="/usr/local/lib/network-orchestrator/network-orchestrator-daemon"
 STATE_DIR="/var/lib/network-orchestrator"
+PACKAGE_DIR="/usr/lib/network-orchestrator"
 OLD_HELPER_PATH="/usr/local/libexec/network-orchestrator/linux-helper"
 OLD_POLICY_PATH="/usr/share/polkit-1/actions/com.netmanager.app.linux-helper.policy"
 
@@ -42,10 +45,10 @@ uninstall() {
     sudo systemctl disable --now "$UNIT_NAME" 2>/dev/null || true
 
     echo "==> Removing unit, binary, policy and state (requires root)"
-    sudo rm -f "$UNIT_DST" "$DAEMON_PATH" "$POLICY_DST"
+    sudo rm -f "$UNIT_DST" "$DAEMON_PATH" "$POLICY_DST" "$TMPFILES_DST"
     remove_old_helper
     sudo rmdir "$(dirname "$OLD_DAEMON_PATH")" 2>/dev/null || true
-    sudo rm -rf "$STATE_DIR"
+    sudo rm -rf "$STATE_DIR" "$PACKAGE_DIR"
     sudo systemctl daemon-reload
 
     echo "Done: daemon uninstalled."
@@ -89,6 +92,12 @@ sudo install -m 0644 "$UNIT_TMP" "$UNIT_DST"
 
 echo "==> Installing polkit policy to $POLICY_DST (requires root)"
 sudo install -m 0644 "$POLICY_SRC" "$POLICY_DST"
+
+# The managed package root must exist before the service starts:
+# ReadWritePaths is ignored for paths that do not exist yet.
+echo "==> Installing tmpfiles config to $TMPFILES_DST (requires root)"
+sudo install -m 0644 "$TMPFILES_SRC" "$TMPFILES_DST"
+sudo systemd-tmpfiles --create "$(basename "$TMPFILES_DST")"
 
 remove_old_helper
 

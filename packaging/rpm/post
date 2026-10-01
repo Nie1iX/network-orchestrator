@@ -1,5 +1,10 @@
 #!/bin/sh
 # rpm %post: $1 = 1 on install, >= 2 on upgrade.
+# The managed package root must exist before the service starts:
+# ReadWritePaths is ignored for paths that do not exist yet.
+if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create network-orchestrator.conf 2>/dev/null || :
+fi
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || :
 fi
