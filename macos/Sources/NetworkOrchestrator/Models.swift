@@ -16,6 +16,7 @@ struct Profile: Decodable, Identifiable, Sendable {
   let routes: [PolicyRoute]
   let xraySocksPort: UInt16?
   let xrayHttpPort: UInt16?
+  let subscription: SubscriptionMeta?
   var kind: String {
     switch backend {
     case "wireGuard": "WireGuard"
@@ -32,6 +33,19 @@ struct Profile: Decodable, Identifiable, Sendable {
     default: "arrow.triangle.branch"
     }
   }
+}
+
+struct SubscriptionMeta: Decodable, Sendable {
+  let endpointCount: Int
+  let activeIndex: Int
+}
+struct SubscriptionEndpoint: Decodable, Sendable {
+  let name: String
+  let active: Bool
+}
+struct SubscriptionImportResult: Decodable, Sendable {
+  let profiles: [Profile]
+  let skippedCount: Int
 }
 
 struct PolicyRoute: Decodable, Sendable {

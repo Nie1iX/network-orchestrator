@@ -26,8 +26,18 @@ it is not a Developer ID signature or notarization for distribution.
 - Import WireGuard `.conf`, OpenVPN `.ovpn` or Xray JSON via ConfigVault.
   Imported configurations are private, revisioned copies, not references to
   mutable original files. Keys and configuration contents are not displayed.
+- Import `vless://`, `hysteria2://` and `hy2://` links in Import → Link.
+  The name is optional and defaults to the URL fragment. Generated Xray
+  configurations use managed revisions and distinct loopback proxy ports.
+  Import does not start a VPN, set a system proxy or apply routes.
 - Create static IPv4/IPv6 route profiles, rename/delete profiles, search and
   inspect declared routes and local listeners with the shared Rust analysis.
+- Fetch an HTTP/HTTPS subscription in Import → Subscription, with optional
+  HWID and name. Plain-text and Base64 lists of VLESS/Hysteria2 links are
+  grouped into one profile with a server selector. Responses are bounded to
+  1 MiB and 30 seconds. Cross-origin redirects do not receive the HWID; HTTPS
+  downgrades are rejected. URL tokens, HWID and endpoint credentials stay in
+  the protected store and are removed from all bridge profile responses.
 - Read live Darwin interface names, indexes, operational state and addresses
   using `getifaddrs`; read system IPv4/IPv6 routes through `net-route`.
 - Inspect saved route plans and longest-prefix lookup. macOS interface-scoped
@@ -35,7 +45,7 @@ it is not a Developer ID signature or notarization for distribution.
   Route metrics, DNS, MTU and traffic counters are not claimed when unavailable.
 
 VPN start/stop, route application, DNS, system proxy, interface mutations,
-automatic connection, managed backend installation and VLESS URI generation
+automatic connection, managed backend installation and automatic subscription refresh
 are not implemented in the native client yet. These are not simulated as
 successful operations: the bridge explicitly refuses mutation commands.
 macOS tunnel integration needs a provider, its lifecycle and rollback design,
@@ -95,7 +105,7 @@ NETORCH_DESIGN_PREVIEWS="$PWD/target/macos/design-preview" \
   swift test --package-path macos --scratch-path target/macos-swift
 ```
 
-The optional acceptance test writes 56 native PNG renders across English,
+The optional acceptance test writes 64 native PNG renders across English,
 Russian, dark and light; the normal test
 suite also checks packaged vector icons. These renders check appearance;
 they do not replace interactive testing of a foreground window.

@@ -37,6 +37,14 @@ struct ConnectionsView: View {
           "VPN activation is not implemented in this native version. Profiles, imports, and configuration analysis are available."
         )
       ).font(.system(size: 10.92)).foregroundStyle(p.muted)
+      if model.importSkippedCount > 0 {
+        Text(
+          L10n.text(
+            "Skipped {count} unsupported or invalid endpoints.",
+            ["count": String(model.importSkippedCount)])
+        )
+        .font(.system(size: 11.9)).foregroundStyle(p.secondary)
+      }
       if !(model.snapshot?.profiles.isEmpty ?? true) {
         HStack(spacing: 10.5) {
           Text(L10n.text("SNIPPETS")).font(.system(size: 10.08, weight: .semibold)).tracking(0.7)
@@ -116,6 +124,28 @@ struct ConnectionsView: View {
                       if let port = profile.xraySocksPort { meta("SOCKS5", "127.0.0.1:\(port)") }
                       if let port = profile.xrayHttpPort {
                         meta("HTTP CONNECT", "127.0.0.1:\(port)")
+                      }
+                      if let subscription = profile.subscription,
+                        let endpoints = model.subscriptionEndpoints[profile.id]
+                      {
+                        HStack {
+                          Text(L10n.text("Endpoint")).foregroundStyle(p.muted)
+                          Spacer()
+                          Picker(
+                            L10n.text("Endpoint"),
+                            selection: Binding(
+                              get: { subscription.activeIndex },
+                              set: { index in
+                                Task { await model.switchEndpoint(profile, index: index) }
+                              }
+                            )
+                          ) {
+                            ForEach(Array(endpoints.enumerated()), id: \.offset) {
+                              index, endpoint in
+                              Text(endpoint.name).tag(index)
+                            }
+                          }.labelsHidden().frame(maxWidth: 260).disabled(model.busy)
+                        }.font(.system(size: 11.9))
                       }
                       if !profile.routes.isEmpty {
                         Rectangle().fill(p.border).frame(height: 1)
@@ -258,10 +288,25 @@ struct ImportConfigurationView: View {
   @State private var name = ""
   @State private var backend = "wireGuard"
   @State private var file: URL?
+  @State private var shareLink = ""
+  @State private var subscriptionURL = ""
+  @State private var hwid = ""
+  init(
+    model: AppModel, preferredBackend: String?, onClose: @escaping () -> Void,
+    initialTab: String? = nil
+  ) {
+    self.model = model
+    self.preferredBackend = preferredBackend
+    self.onClose = onClose
+    _tab = State(initialValue: initialTab ?? (preferredBackend == "xray" ? "Link" : "Files"))
+  }
   var body: some View {
     AppModal(title: "Import configurations", width: 520, onClose: onClose) {
       VStack(alignment: .leading, spacing: 10.5) {
-        AppTabs(titles: ["Files", "Subscription URL", "WireGuard location"], selected: $tab)
+        AppTabs(
+          titles: ["Files", "Link", "Subscription", "WireGuard location"], selected: $tab
+        )
+        .disabled(model.busy)
         if tab == "Files" {
           Text(
             L10n.text("Import WireGuard (.conf), OpenVPN (.ovpn), or Xray (.json) configurations.")
@@ -287,13 +332,57 @@ struct ImportConfigurationView: View {
             .font(
               .system(size: 10.92)
             ).foregroundStyle(p.muted)
+        } else if tab == "Link" {
+          Text(
+            L10n.text(
+              "Paste a vless://, hysteria2:// or hy2:// share link. Import saves a connection without starting a VPN."
+            )
+          )
+          .font(.system(size: 11.9)).foregroundStyle(p.secondary)
+          Text(L10n.text("Share link")).font(.system(size: 11.9))
+          SecureField(L10n.text("vless:// or hysteria2://…"), text: $shareLink)
+            .textFieldStyle(.plain).font(.system(size: 11.9)).padding(7)
+            .background(p.input, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
+            .accessibilityLabel(L10n.text("Share link"))
+            .disabled(model.busy)
+            .onChange(of: shareLink) { model.error = nil }
+          Text(L10n.text("Connection name (optional)")).font(.system(size: 11.9))
+          AppInput(placeholder: "Use the name from the link", text: $name).disabled(model.busy)
+        } else if tab == "Subscription" {
+          Text(
+            L10n.text(
+              "Import a subscription URL. Supported vless:// and hysteria2:// endpoints are grouped into a profile with an endpoint selector."
+            )
+          )
+          .font(.system(size: 11.9)).foregroundStyle(p.secondary)
+          Text(L10n.text("Subscription URL")).font(.system(size: 11.9))
+          SecureField(L10n.text("https://example.com/sub"), text: $subscriptionURL)
+            .textFieldStyle(.plain).font(.system(size: 11.9)).padding(7)
+            .background(p.input, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
+            .accessibilityLabel(L10n.text("Subscription URL")).disabled(model.busy)
+            .onChange(of: subscriptionURL) { model.error = nil }
+          Text(L10n.text("HWID (X-HWID header, optional)")).font(.system(size: 11.9))
+          SecureField(L10n.text("device-hwid"), text: $hwid)
+            .textFieldStyle(.plain).font(.system(size: 11.9)).padding(7)
+            .background(p.input, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
+            .accessibilityLabel(L10n.text("HWID (X-HWID header, optional)")).disabled(model.busy)
+          Text(L10n.text("Connection name (optional)")).font(.system(size: 11.9))
+          AppInput(placeholder: "Use the name from the link", text: $name).disabled(model.busy)
+          Text(
+            L10n.text(
+              "Import does not start a VPN. Automatic subscription refresh is not available in this native version yet."
+            )
+          )
+          .font(.system(size: 10.92)).foregroundStyle(p.muted)
         } else {
           AppEmptyState {
             Text(
-              tab == "Subscription URL"
-                ? "Subscription URLs and share links are not implemented in the native version yet. Use Files to import a configuration."
-                : "Automatic discovery is not implemented on macOS yet. Use Files to choose your WireGuard configuration."
-            )
+              L10n.text(
+                "Automatic discovery is not implemented on macOS yet. Use Files to choose your WireGuard configuration."
+              ))
           }
         }
         if let error = model.error {
@@ -302,19 +391,45 @@ struct ImportConfigurationView: View {
         HStack {
           Spacer()
           Button(L10n.text("Cancel"), action: onClose)
-          Button(L10n.text(model.busy ? "Importing…" : "Import")) {
+          Button(
+            L10n.text(
+              model.busy
+                ? (tab == "Subscription" ? "Fetching…" : "Importing…")
+                : (tab == "Subscription" ? "Fetch subscription" : "Import"))
+          ) {
             Task {
-              if let file, await model.importConfig(url: file, backend: backend, name: name) {
+              let imported: Bool
+              if tab == "Link" {
+                imported = await model.importShareLink(
+                  shareLink.trimmingCharacters(in: .whitespacesAndNewlines), name: name)
+              } else if tab == "Subscription" {
+                imported = await model.importSubscription(
+                  url: subscriptionURL, hwid: hwid, name: name)
+              } else if let file {
+                imported = await model.importConfig(url: file, backend: backend, name: name)
+              } else {
+                imported = false
+              }
+              if imported {
                 onClose()
                 model.section = .connections
               }
             }
           }.buttonStyle(TauriButtonStyle(kind: .accent)).disabled(
-            model.busy || tab != "Files" || file == nil
-              || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            model.busy
+              || (tab == "Link"
+                ? shareLink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                : tab == "Subscription"
+                  ? subscriptionURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  : tab != "Files" || file == nil
+                    || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+          )
         }
       }.padding(14)
-    }.onAppear { backend = preferredBackend ?? "wireGuard" }
+    }.onAppear {
+      backend = preferredBackend ?? "wireGuard"
+      model.error = nil
+    }
   }
   private func chooseFile() {
     let panel = NSOpenPanel()

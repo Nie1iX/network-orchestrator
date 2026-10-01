@@ -40,6 +40,19 @@ fn text_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
 fn store_error(_: std::io::Error) -> String {
     "The profile operation could not be completed. Check the input and file permissions.".into()
 }
+fn local_port_available(port: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+}
+fn subscription_error(error: std::io::Error) -> String {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Other
+    ) {
+        error.to_string()
+    } else {
+        store_error(error)
+    }
+}
 fn encode(value: impl serde::Serialize) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|_| "Could not encode the result".into())
 }
@@ -56,9 +69,13 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
         "capabilities" => Ok(json!({"os":"macos", "minimumOS":"27.0", "nativeUI":true,
             "profiles":true,"networkInventory":true,"networkMutations":false,
             "systemVPN":"providerSetupRequired", "version":env!("CARGO_PKG_VERSION")})),
-        "profiles" => encode(store.load().map_err(store_error)?.profiles),
+        "profiles" => encode(net_manager_core::subscription::public_profiles(
+            store.load().map_err(store_error)?.profiles,
+        )),
         "snapshot" => {
-            let profiles = store.load().map_err(store_error)?.profiles;
+            let profiles = net_manager_core::subscription::public_profiles(
+                store.load().map_err(store_error)?.profiles,
+            );
             let interfaces = explorer::list_interfaces();
             let routes = runtime()?.block_on(explorer::list_routes());
             let network_error = (interfaces.is_err() || routes.is_err())
@@ -116,7 +133,9 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                     .collect(),
                 ..Profile::default()
             };
-            encode(store.upsert(profile).map_err(store_error)?.profiles)
+            encode(net_manager_core::subscription::public_profiles(
+                store.upsert(profile).map_err(store_error)?.profiles,
+            ))
         }
         "rename" => {
             let mut p = store
@@ -127,14 +146,130 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 .find(|p| Some(p.id.as_str()) == args["id"].as_str())
                 .ok_or("Profile not found")?;
             p.name = text_arg(args, "name")?.trim().into();
-            encode(store.upsert(p).map_err(store_error)?.profiles)
+            encode(net_manager_core::subscription::public_profiles(
+                store.upsert(p).map_err(store_error)?.profiles,
+            ))
         }
         "delete" => {
             let id = text_arg(args, "id")?;
             // Persist the removal before cleanup: a cleanup error must not leave a stored dangling path.
             let profiles = store.delete(id).map_err(store_error)?.profiles;
             vault.remove_profile(id).map_err(store_error)?;
-            encode(profiles)
+            encode(net_manager_core::subscription::public_profiles(profiles))
+        }
+        "import_subscription" => {
+            let id = text_arg(args, "id")?;
+            let url = text_arg(args, "url")?;
+            let hwid = args["hwid"].as_str().unwrap_or("");
+            let name = args["name"].as_str().unwrap_or("");
+            let client =
+                net_manager_core::subscription::http_client().map_err(subscription_error)?;
+            let fetched = runtime()?
+                .block_on(net_manager_core::subscription::fetch(&client, url, hwid))
+                .map_err(subscription_error)?;
+            let request = net_manager_core::subscription::SubscriptionImport {
+                id,
+                url,
+                hwid,
+                name,
+                refresh_interval_minutes: None,
+            };
+            let imported = net_manager_core::subscription::import_body(
+                &vault,
+                &store,
+                &request,
+                &fetched.body,
+                fetched.user_info,
+                local_port_available,
+            )
+            .map_err(subscription_error)?;
+            let skipped_count = imported
+                .errors
+                .iter()
+                .map(|error| {
+                    if error.path == "Subscription" {
+                        error
+                            .error
+                            .split_whitespace()
+                            .next()
+                            .and_then(|n| n.parse::<usize>().ok())
+                            .unwrap_or(0)
+                    } else {
+                        1
+                    }
+                })
+                .sum::<usize>();
+            Ok(
+                json!({"profiles":net_manager_core::subscription::public_profiles(imported.profiles),"skippedCount":skipped_count}),
+            )
+        }
+        "subscription_endpoints" => {
+            let id = text_arg(args, "id")?;
+            let profile = store
+                .load()
+                .map_err(store_error)?
+                .profiles
+                .into_iter()
+                .find(|p| p.id == id)
+                .ok_or("Profile not found")?;
+            let active = profile
+                .subscription
+                .ok_or("Profile is not a subscription")?
+                .active_index;
+            let endpoints = vault.read_subscription_endpoints(id).map_err(store_error)?;
+            encode(
+                endpoints
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, endpoint)| SubscriptionEndpointInfo {
+                        name: endpoint.name,
+                        active: index == active,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+        "switch_subscription_endpoint" => {
+            let id = text_arg(args, "id")?;
+            let index = text_arg(args, "index")?
+                .parse::<usize>()
+                .map_err(|_| "Invalid endpoint index".to_string())?;
+            let document = net_manager_core::subscription::switch_endpoint(
+                &vault,
+                &store,
+                id,
+                index,
+                local_port_available,
+            )
+            .map_err(subscription_error)?;
+            encode(net_manager_core::subscription::public_profiles(
+                document.profiles,
+            ))
+        }
+        "import_share_link" => {
+            let id = text_arg(args, "id")?;
+            let link = text_arg(args, "link")?;
+            let name = args["name"].as_str().unwrap_or("");
+            let document = net_manager_core::profile_import::import_share_link(
+                &vault,
+                &store,
+                id,
+                name,
+                link,
+                |port| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok(),
+            )
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::InvalidInput => {
+                    "Invalid or unsupported share link. Use vless://, hysteria2:// or hy2://."
+                        .to_string()
+                }
+                std::io::ErrorKind::AlreadyExists => {
+                    "A profile with this identifier already exists".to_string()
+                }
+                _ => store_error(error),
+            })?;
+            encode(net_manager_core::subscription::public_profiles(
+                document.profiles,
+            ))
         }
         "import" => {
             let id = text_arg(args, "id")?;
@@ -165,7 +300,9 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 .map_err(|_| "The configuration could not be analyzed".to_string())
                 .and_then(|_| store.upsert(p).map_err(store_error));
             match result {
-                Ok(doc) => encode(doc.profiles),
+                Ok(doc) => encode(net_manager_core::subscription::public_profiles(
+                    doc.profiles,
+                )),
                 Err(err) => {
                     let _ = vault.remove_revision_for_config(&imported.config_path);
                     Err(err)
@@ -228,6 +365,138 @@ pub unsafe extern "C" fn netorch_free(value: *mut c_char) {
 mod tests {
     use super::*;
     use net_manager_core::profiles::ProfileStore;
+
+    #[test]
+    fn subscription_url_import_fetches_synthetic_body_and_redacts_all_responses() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/private-subscription-token",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let size = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..size])
+                .to_ascii_lowercase()
+                .contains("x-hwid: synthetic-private-hwid"));
+            let body = "vless://synthetic-private-id@one.test:443?security=tls#First\nhy2://synthetic-private-password@two.test:443#Second\ntrojan://unsupported@three.test:443";
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nSubscription-Userinfo: upload=100; download=200; total=1000\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let imported = dispatch(
+            dir.path(),
+            "import_subscription",
+            &json!({"id":"sub", "url":url, "hwid":"synthetic-private-hwid", "name":""}),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(imported["profiles"][0]["subscription"]["endpointCount"], 2);
+        assert_eq!(imported["skippedCount"], 1);
+        for result in [
+            imported,
+            dispatch(dir.path(), "profiles", &json!({})).unwrap(),
+            dispatch(dir.path(), "rename", &json!({"id":"sub", "name":"Renamed"})).unwrap(),
+        ] {
+            let output = result.to_string();
+            for secret in [
+                "private-subscription-token",
+                "synthetic-private-hwid",
+                "synthetic-private-id",
+                "synthetic-private-password",
+            ] {
+                assert!(!output.contains(secret));
+            }
+        }
+        let endpoints =
+            dispatch(dir.path(), "subscription_endpoints", &json!({"id":"sub"})).unwrap();
+        assert_eq!(endpoints[1]["name"], "Second");
+        let switched = dispatch(
+            dir.path(),
+            "switch_subscription_endpoint",
+            &json!({"id":"sub", "index":"1"}),
+        )
+        .unwrap();
+        assert_eq!(switched[0]["subscription"]["activeIndex"], 1);
+        assert!(!switched.to_string().contains("synthetic-private-password"));
+    }
+
+    #[test]
+    fn share_links_create_managed_profiles_without_returning_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        for (id, link, expected_name) in [
+            (
+                "vless-node",
+                "vless://synthetic-private-id@node.test:443?security=tls#Lab%20Node",
+                "Lab Node",
+            ),
+            (
+                "hy2-node",
+                "hy2://synthetic-private-password@node.test:443#Second",
+                "Second",
+            ),
+        ] {
+            let result = dispatch(
+                dir.path(),
+                "import_share_link",
+                &json!({"id":id,"name":"","link":link}),
+            )
+            .unwrap();
+            assert!(!result.to_string().contains("synthetic-private"));
+            let profiles = ProfileStore::new(dir.path().join("profiles.json"))
+                .load()
+                .unwrap()
+                .profiles;
+            let profile = profiles.iter().find(|p| p.id == id).unwrap();
+            assert_eq!(profile.name, expected_name);
+            assert_eq!(profile.backend, TunnelBackend::Xray);
+            assert!(!profile.auto_connect);
+            assert!(!profile.use_system_proxy);
+            assert!(profile.routes.is_empty());
+            assert!(ConfigVault::new(dir.path().join("configs"))
+                .is_managed_profile_path(id, &profile.config_path));
+            let inspection = analysis::analyze_profile(profile).unwrap();
+            assert_eq!(inspection.listeners.len(), 2);
+            assert!(inspection
+                .listeners
+                .iter()
+                .all(|l| l.address == "127.0.0.1"));
+        }
+        let profiles = ProfileStore::new(dir.path().join("profiles.json"))
+            .load()
+            .unwrap()
+            .profiles;
+        let ports = profiles
+            .iter()
+            .flat_map(|p| [p.xray_socks_port.unwrap(), p.xray_http_port.unwrap()])
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ports.len(), 4);
+    }
+
+    #[test]
+    fn rejected_share_links_do_not_leak_secrets_or_write_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        for link in [
+            "https://node.test/private-token",
+            "vless://private-token@:443",
+            "trojan://private-token@node.test:443",
+            "hy2://private-token@node.test?obfs=invalid",
+        ] {
+            let error = dispatch(
+                dir.path(),
+                "import_share_link",
+                &json!({"id":"bad","name":"","link":link}),
+            )
+            .unwrap_err();
+            assert!(!error.contains("private-token"));
+            assert!(!dir.path().join("profiles.json").exists());
+            assert!(!dir.path().join("configs").exists());
+        }
+    }
 
     #[test]
     fn supported_native_capabilities_do_not_advertise_privileged_operations() {
@@ -346,6 +615,22 @@ mod tests {
             "set_system_proxy",
         ] {
             assert!(dispatch(dir.path(), method, &json!({})).is_err());
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// Privileged methods belong to the daemon protocol and, on macOS, to the
+    /// planned launchd helper — never to this in-process bridge
+    /// (docs/plans/2026-09-30-14-macos-privileged-helper.md).
+    #[test]
+    fn daemon_protocol_methods_are_never_served_by_the_bridge() {
+        use net_manager_core::daemon_protocol::method;
+        let dir = tempfile::tempdir().unwrap();
+        for name in method::CAPABILITIES.iter().chain(&[method::HELLO]) {
+            assert!(
+                dispatch(dir.path(), name, &json!({})).is_err(),
+                "bridge must not implement daemon method {name}"
+            );
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }

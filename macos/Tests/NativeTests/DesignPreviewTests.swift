@@ -33,6 +33,7 @@ import Testing
     [
       "id": "design-xray", "name": "Personal proxy", "backend": "xray", "interfaceName": "",
       "routes": [], "xraySocksPort": 10808, "xrayHttpPort": 10809,
+      "subscription": ["endpointCount": 2, "activeIndex": 0],
     ],
     [
       "id": "design-static", "name": "Local network", "backend": "none", "interfaceName": "en0",
@@ -92,6 +93,12 @@ import Testing
       "os": "macos", "minimumOS": "27.0", "nativeUI": true, "networkMutations": false,
       "version": "Preview",
     ]))
+  model.subscriptionEndpoints = [
+    "design-xray": [
+      SubscriptionEndpoint(name: "QA Europe", active: true),
+      SubscriptionEndpoint(name: "QA Asia", active: false),
+    ]
+  ]
   for language in ["en", "ru"] {
     L10n.shared.preference = language
     for theme in [ColorScheme.dark, .light] {
@@ -128,6 +135,21 @@ import Testing
           .environment(\.colorScheme, theme).buttonStyle(TauriButtonStyle())
         try render(view, to: directory.appendingPathComponent("dialog-" + filename + ".png"))
       }
+      let linkView = ImportConfigurationView(
+        model: model, preferredBackend: "xray", onClose: {}, initialTab: "Link"
+      )
+      .frame(maxWidth: .infinity, maxHeight: .infinity).background(palette.app)
+      .foregroundStyle(palette.text).environment(\.palette, palette)
+      .environment(\.colorScheme, theme).buttonStyle(TauriButtonStyle())
+      try render(linkView, to: directory.appendingPathComponent("dialog-import-link.png"))
+      let subscriptionView = ImportConfigurationView(
+        model: model, preferredBackend: nil, onClose: {}, initialTab: "Subscription"
+      )
+      .frame(maxWidth: .infinity, maxHeight: .infinity).background(palette.app)
+      .foregroundStyle(palette.text).environment(\.palette, palette)
+      .environment(\.colorScheme, theme).buttonStyle(TauriButtonStyle())
+      try render(
+        subscriptionView, to: directory.appendingPathComponent("dialog-import-subscription.png"))
     }
   }
 }
