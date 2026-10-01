@@ -311,3 +311,19 @@ struct DesignTable: View {
     }
   }
 }
+
+/// Small indeterminate spinner (browser-tab style) for work in progress.
+struct Spinner: View {
+  @Environment(\.palette) private var p
+  var size: CGFloat = 11
+  @State private var spinning = false
+  var body: some View {
+    Circle().trim(from: 0.12, to: 0.82)
+      .stroke(p.accent, style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+      .frame(width: size, height: size)
+      .rotationEffect(.degrees(spinning ? 360 : 0))
+      .animation(.linear(duration: 0.8).repeatForever(autoreverses: false), value: spinning)
+      .onAppear { spinning = true }
+      .accessibilityLabel(L10n.text("profiles.testing"))
+  }
+}

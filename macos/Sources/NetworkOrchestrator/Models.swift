@@ -5,7 +5,20 @@ struct Capabilities: Decodable, Sendable {
   let minimumOS: String
   let nativeUI: Bool
   let networkMutations: Bool
+  let proxyConnections: Bool?
   let version: String
+}
+
+struct TunnelStatus: Decodable, Sendable {
+  let profileId: String
+  let state: String
+  let message: String?
+}
+struct RuntimeState: Decodable, Sendable {
+  let xrayInstalled: Bool
+  let xrayVersion: String
+  let statuses: [TunnelStatus]
+  let systemProxyOwner: String?
 }
 
 struct Profile: Decodable, Identifiable, Sendable {
@@ -17,6 +30,10 @@ struct Profile: Decodable, Identifiable, Sendable {
   let xraySocksPort: UInt16?
   let xrayHttpPort: UInt16?
   let subscription: SubscriptionMeta?
+  let xrayMode: String?
+  /// Xray in loopback SOCKS/HTTP mode is the only kind this client can start
+  /// without the privileged helper.
+  var startsWithoutHelper: Bool { backend == "xray" && (xrayMode ?? "socks") == "socks" }
   var kind: String {
     switch backend {
     case "wireGuard": "WireGuard"
@@ -38,6 +55,23 @@ struct Profile: Decodable, Identifiable, Sendable {
 struct SubscriptionMeta: Decodable, Sendable {
   let endpointCount: Int
   let activeIndex: Int
+  let userInfo: SubscriptionUsage?
+}
+struct SubscriptionUsage: Decodable, Sendable {
+  let uploadBytes: UInt64
+  let downloadBytes: UInt64
+  let totalBytes: UInt64?
+  let expiresAtUnix: UInt64?
+}
+struct DelayResult: Decodable, Sendable {
+  let index: Int
+  let delayMs: UInt64?
+}
+struct RefreshOutcome: Decodable, Sendable {
+  let endpointCount: Int
+  let activeIndex: Int
+  let skippedCount: Int
+  let fallbackUsed: Bool
 }
 struct SubscriptionEndpoint: Decodable, Sendable {
   let name: String
@@ -149,7 +183,23 @@ struct Listener: Decodable, Sendable {
   let port: UInt16
   let `protocol`: String
 }
+struct RemoteEndpoint: Decodable, Sendable {
+  let address: String
+  let port: UInt16?
+  var label: String { port.map { "\(address):\($0)" } ?? address }
+}
+struct ConfigPeer: Decodable, Sendable {
+  let endpoint: RemoteEndpoint?
+  let routes: [AnalyzedRoute]
+}
+struct ConfigField: Decodable, Sendable {
+  let field: String
+  let value: String
+}
 struct Inspection: Decodable, Sendable {
+  let endpoints: [RemoteEndpoint]
+  let peers: [ConfigPeer]
+  let interfaceDetails: [ConfigField]
   let osRoutes: [AnalyzedRoute]
   let internalRoutes: [AnalyzedRoute]
   let listeners: [Listener]

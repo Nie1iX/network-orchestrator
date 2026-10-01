@@ -68,13 +68,20 @@ import Testing
 }
 
 @Test func nativeMutationsFailWithAProviderMessage() async throws {
-  let core = CoreBridge(
-    root: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let core = CoreBridge(root: directory)
   do {
-    let _: [Profile] = try await core.call("connect")
-    Issue.record("Host networking must remain disabled")
+    let _: [Profile] = try await core.call("apply_routes")
+    Issue.record("Route mutations must stay with the privileged helper")
   } catch {
     #expect(error.localizedDescription.contains("VPN provider"))
+  }
+  do {
+    let _: RuntimeState = try await core.call("connect", args: ["id": "missing"])
+    Issue.record("Connecting an unknown profile must fail")
+  } catch {
+    #expect(error.localizedDescription == "Profile not found")
   }
 }
 
