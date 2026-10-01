@@ -28,6 +28,36 @@ const BACKEND_EXTENSIONS: Record<TunnelBackend, string[]> = {
 
 const PROXY_BYPASS_PLACEHOLDER = "10.*, *.corp.local";
 
+const RULE_SETS = [
+  {
+    id: "proxy",
+    field: "rulesProxy",
+    titleKey: "rules.proxy",
+    placeholder: "geosite:youtube\ndomain:example.com",
+  },
+  {
+    id: "direct",
+    field: "rulesDirect",
+    titleKey: "rules.direct",
+    placeholder: "geosite:private\n# my services\n10.0.0.0/8",
+  },
+  {
+    id: "block",
+    field: "rulesBlock",
+    titleKey: "rules.block",
+    placeholder: "geosite:category-ads\ndomain:tracker.io",
+  },
+] as const;
+
+type RulesSetId = (typeof RULE_SETS)[number]["id"];
+
+/** Selector lines only — blank lines and # comments don't count. */
+function countRuleLines(text: string): number {
+  return text
+    .split("\n")
+    .filter((l) => l.trim() !== "" && !l.trim().startsWith("#")).length;
+}
+
 const EMPTY_WG_FIELDS: WireGuardFields = {
   privateKey: "",
   address: "",
@@ -217,6 +247,7 @@ export default function ProfileFormModal({
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [tab, setTab] = useState<FormTab>("general");
+  const [rulesEditor, setRulesEditor] = useState<RulesSetId | null>(null);
   const tr = useT();
 
   useEffect(() => {
@@ -226,6 +257,7 @@ export default function ProfileFormModal({
       setBulkCidrs("");
       setBulkOpen(false);
       setTab("general");
+      setRulesEditor(null);
       setProbeResults(null);
       setProbeNotice(null);
     }
@@ -258,6 +290,8 @@ export default function ProfileFormModal({
     textToPolicies(current.rulesBlock, current.rulesProxy, current.rulesDirect)
       .reduce((n, p) => n + p.domains.length, 0);
   const routingCount = current.routes.length + policyRuleCount;
+  const rulesEditorSet =
+    RULE_SETS.find((s) => s.id === rulesEditor) ?? null;
 
   const browseConfig = async () => {
     try {
@@ -961,7 +995,42 @@ export default function ProfileFormModal({
       </div>
       )}
 
-      {tab === "routing" && (
+      {tab === "routing" && rulesEditorSet !== null && (
+      <div className="modal-tab-body rules-editor" role="tabpanel">
+        <div className="rules-editor-head">
+          <button
+            type="button"
+            className="rules-back"
+            onClick={() => setRulesEditor(null)}
+          >
+            <span className="rules-back-icon">
+              <ChevronIcon size={13} />
+            </span>
+            {tr("rules.back")}
+          </button>
+          <span className={`rules-editor-title rules-fg-${rulesEditorSet.id}`}>
+            {tr(rulesEditorSet.titleKey)}
+          </span>
+          <span className="rules-summary-count">
+            {tr("rules.entryCount", {
+              count: countRuleLines(current[rulesEditorSet.field]),
+            })}
+          </span>
+        </div>
+        <span className="profile-routes-hint">{tr("form.rulesHint")}</span>
+        <textarea
+          className="rules-editor-textarea"
+          value={current[rulesEditorSet.field]}
+          onChange={(e) =>
+            update({ [rulesEditorSet.field]: e.target.value } as Partial<ProfileFormState>)
+          }
+          placeholder={rulesEditorSet.placeholder}
+          spellCheck={false}
+        />
+      </div>
+      )}
+
+      {tab === "routing" && rulesEditorSet === null && (
       <div className="modal-tab-body" role="tabpanel">
       {!daemonManagedInterface && <label>
         {tr("form.targetIface")}
@@ -1099,37 +1168,24 @@ export default function ProfileFormModal({
           <span className="profile-routes-hint">
             {tr("form.rulesHint")}
           </span>
-          <div className="rules-grid">
-            <label className="rules-pane">
-              <span className="rules-pane-title rules-pane-proxy">{tr("rules.proxy")}</span>
-              <textarea
-                className="rules-textarea"
-                value={current.rulesProxy}
-                onChange={(e) => update({ rulesProxy: e.target.value })}
-                placeholder={"geosite:youtube\ndomain:example.com"}
-                spellCheck={false}
-              />
-            </label>
-            <label className="rules-pane">
-              <span className="rules-pane-title rules-pane-direct">{tr("rules.direct")}</span>
-              <textarea
-                className="rules-textarea"
-                value={current.rulesDirect}
-                onChange={(e) => update({ rulesDirect: e.target.value })}
-                placeholder={"geosite:private\n# my services\n10.0.0.0/8"}
-                spellCheck={false}
-              />
-            </label>
-            <label className="rules-pane">
-              <span className="rules-pane-title rules-pane-block">{tr("rules.block")}</span>
-              <textarea
-                className="rules-textarea"
-                value={current.rulesBlock}
-                onChange={(e) => update({ rulesBlock: e.target.value })}
-                placeholder={"geosite:category-ads\ndomain:tracker.io"}
-                spellCheck={false}
-              />
-            </label>
+          <div className="rules-summary">
+            {RULE_SETS.map((set) => (
+              <button
+                type="button"
+                key={set.id}
+                className="rules-summary-row"
+                onClick={() => setRulesEditor(set.id)}
+              >
+                <span className={`rules-dot rules-dot-${set.id}`} />
+                <span className="rules-summary-title">{tr(set.titleKey)}</span>
+                <span className="rules-summary-count">
+                  {tr("rules.entryCount", {
+                    count: countRuleLines(current[set.field]),
+                  })}
+                </span>
+                <ChevronIcon size={13} collapsed />
+              </button>
+            ))}
           </div>
           <label className="profile-proxy-toggle">
             <input

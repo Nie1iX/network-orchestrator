@@ -694,8 +694,13 @@
       "other": "{count} warnings"
     },
     "routes.warningsTitle": "Route analysis warnings",
+    "rules.back": "Back",
     "rules.block": "Block",
     "rules.direct": "Direct",
+    "rules.entryCount": {
+      "one": "{count} rule",
+      "other": "{count} rules"
+    },
     "rules.proxy": "Proxy",
     "sets.applyTitle": {
       "one": "Switch to exactly {count} connection",

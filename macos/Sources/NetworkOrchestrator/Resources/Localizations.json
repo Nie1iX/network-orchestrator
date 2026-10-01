@@ -683,8 +683,13 @@
         "other": "{count} warnings"
       },
       "routes.warningsTitle": "Route analysis warnings",
+      "rules.back": "Back",
       "rules.block": "Block",
       "rules.direct": "Direct",
+      "rules.entryCount": {
+        "one": "{count} rule",
+        "other": "{count} rules"
+      },
       "rules.proxy": "Proxy",
       "sets.applyTitle": {
         "one": "Switch to exactly {count} connection",
@@ -1511,8 +1516,15 @@
         "other": "{count} предупреждения"
       },
       "routes.warningsTitle": "Предупреждения анализа маршрутов",
+      "rules.back": "Назад",
       "rules.block": "Блок",
       "rules.direct": "Напрямую",
+      "rules.entryCount": {
+        "few": "{count} правила",
+        "many": "{count} правил",
+        "one": "{count} правило",
+        "other": "{count} правила"
+      },
       "rules.proxy": "Прокси",
       "sets.applyTitle": {
         "few": "Переключиться ровно на {count} подключения",

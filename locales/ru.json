@@ -759,8 +759,15 @@
       "other": "{count} предупреждения"
     },
     "routes.warningsTitle": "Предупреждения анализа маршрутов",
+    "rules.back": "Назад",
     "rules.block": "Блок",
     "rules.direct": "Напрямую",
+    "rules.entryCount": {
+      "one": "{count} правило",
+      "few": "{count} правила",
+      "many": "{count} правил",
+      "other": "{count} правила"
+    },
     "rules.proxy": "Прокси",
     "sets.applyTitle": {
       "one": "Переключиться ровно на {count} подключение",
