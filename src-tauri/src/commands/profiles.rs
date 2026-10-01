@@ -2411,18 +2411,18 @@ mod tests {
                 Some("AcmeVPN"),
                 "⚡ Нидерланды"
             ),
-            "AcmeVPN - ⚡ Нидерланды"
+            "AcmeVPN · ⚡ Нидерланды"
         );
         assert_eq!(
             net_manager_core::subscription::subscription_profile_name(
                 Some("AcmeVPN"),
                 "AcmeVPN - ⚡ NL"
             ),
-            "AcmeVPN - ⚡ NL"
+            "AcmeVPN · ⚡ NL"
         );
         assert_eq!(
             net_manager_core::subscription::subscription_profile_name(Some("Acme"), "AcmeVPN - NL"),
-            "Acme - AcmeVPN - NL"
+            "Acme · AcmeVPN - NL"
         );
         assert_eq!(
             net_manager_core::subscription::subscription_profile_name(None, "Node"),
@@ -2477,7 +2477,7 @@ mod tests {
             refreshed.subscription.as_ref().unwrap().skipped_protocols,
             ["ss", "trojan"]
         );
-        assert_eq!(refreshed.name, "AcmeVPN - First");
+        assert_eq!(refreshed.name, "AcmeVPN · First");
         refresh_subscription_body_into_with_metadata(
             &vault,
             &store,
