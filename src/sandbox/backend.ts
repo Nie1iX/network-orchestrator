@@ -268,6 +268,22 @@ export class SandboxBackend {
         return { endpointCount: 2, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false };
       }
       case "measure_subscription_endpoint_delay": return { delayMs: 42, error: null };
+      case "import_share_link": {
+        const link = String(args.link ?? "").trim();
+        const invalid = () => new Error("Invalid or unsupported share link. Use vless://, hysteria2:// or hy2://.");
+        let url: URL;
+        try { url = new URL(link); } catch { throw invalid(); }
+        if (link.length > 65536 || /[\r\n]/.test(link) || !["vless:", "hysteria2:", "hy2:"].includes(url.protocol) || !url.username || !url.hostname || url.port === "0") throw invalid();
+        let name = String(args.name ?? "").trim();
+        if (!name) {
+          try { name = decodeURIComponent(url.hash.slice(1)).trim(); } catch { name = ""; }
+        }
+        const p = profile(`link-${this.profiles.length}`, name || "Imported connection", "xray");
+        this.allocateProxyPorts(p);
+        p.configPath = `/sandbox/${p.id}.json`;
+        this.profiles.push(p);
+        return { profiles: this.profiles, errors: [] };
+      }
       case "import_subscription": {
         const p = profile(`subscription-${this.profiles.length}`, "QA Imported subscription", "xray");
         this.allocateProxyPorts(p);

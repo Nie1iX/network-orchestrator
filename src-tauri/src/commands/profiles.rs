@@ -1,6 +1,5 @@
 use crate::elevation;
 use crate::state::{existing_profile_for_update, find_profile, AppState};
-use net_manager_core::analysis;
 use net_manager_core::config_security;
 use net_manager_core::config_vault::{ConfigImport, ConfigVault};
 use net_manager_core::models::*;
@@ -12,8 +11,6 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 
-const AUTO_SOCKS_PORT_START: u16 = 10808;
-const AUTO_SOCKS_PORT_END: u16 = 10999;
 const MAX_SUBSCRIPTION_BODY_BYTES: usize = 1024 * 1024;
 static SUBSCRIPTION_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -30,19 +27,6 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|time| time.as_secs())
         .unwrap_or(0)
-}
-
-/// Mode assigned to freshly created/imported Xray profiles. On Linux a SOCKS
-/// listener captures no system traffic (no system-proxy consumer exists), so
-/// TUN via the network daemon is the only mode that actually tunnels.
-#[cfg(target_os = "linux")]
-pub(crate) fn default_xray_mode() -> XrayMode {
-    XrayMode::Tun
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn default_xray_mode() -> XrayMode {
-    XrayMode::Socks
 }
 
 pub(crate) fn subscription_refresh_due(subscription: &SubscriptionMeta, now: u64) -> bool {
@@ -70,59 +54,25 @@ pub(crate) fn select_available_socks_port(
     used: &HashSet<u16>,
     available: impl Fn(u16) -> bool,
 ) -> Result<u16, String> {
-    (AUTO_SOCKS_PORT_START..=AUTO_SOCKS_PORT_END)
-        .find(|port| !used.contains(port) && available(*port))
-        .ok_or_else(|| {
-            format!(
-                "no available SOCKS5 port in automatic range {AUTO_SOCKS_PORT_START}-{AUTO_SOCKS_PORT_END}"
-            )
-        })
+    net_manager_core::profile_import::select_available_socks_port(used, available)
+        .map_err(|e| e.to_string())
 }
-
 fn select_generated_ports(
     preferred_socks: Option<u16>,
     preferred_http: Option<u16>,
     used: &HashSet<u16>,
     available: impl Fn(u16) -> bool,
 ) -> Result<(u16, u16), String> {
-    let socks = match preferred_socks {
-        Some(port) if port != 0 && !used.contains(&port) && available(port) => port,
-        Some(_) => return Err("SOCKS5 port is unavailable".into()),
-        None => select_available_socks_port(used, &available)?,
-    };
-    let mut reserved = used.clone();
-    reserved.insert(socks);
-    let http = match preferred_http {
-        Some(port) if port != 0 && !reserved.contains(&port) && available(port) => port,
-        _ => select_available_socks_port(&reserved, &available)?,
-    };
-    Ok((socks, http))
+    net_manager_core::profile_import::select_generated_ports(
+        preferred_socks,
+        preferred_http,
+        used,
+        available,
+    )
+    .map_err(|e| e.to_string())
 }
-
 pub(crate) fn profile_listener_ports(profiles: &[Profile], exclude_id: &str) -> HashSet<u16> {
-    let mut ports = HashSet::new();
-    for profile in profiles {
-        if profile.id == exclude_id {
-            continue;
-        }
-        if let Some(port) = profile.xray_socks_port {
-            ports.insert(port);
-        }
-        if let Some(port) = profile.xray_http_port {
-            ports.insert(port);
-        }
-        if let Ok(analysis) = analysis::analyze_profile(profile) {
-            for listener in &analysis.listeners {
-                if matches!(
-                    listener.address.as_str(),
-                    "127.0.0.1" | "0.0.0.0" | "::" | ""
-                ) {
-                    ports.insert(listener.port);
-                }
-            }
-        }
-    }
-    ports
+    net_manager_core::profile_import::profile_listener_ports(profiles, exclude_id)
 }
 
 pub(crate) fn loopback_port_available(port: u16) -> bool {
@@ -134,18 +84,7 @@ pub(crate) fn store_generated_xray(
     profile_id: &str,
     plaintext_json: &[u8],
 ) -> std::io::Result<ConfigImport> {
-    #[cfg(windows)]
-    {
-        let encrypted = config_security::protect_user_data(
-            plaintext_json,
-            &config_security::xray_context(profile_id),
-        )?;
-        vault.store_protected_xray_config(profile_id, &encrypted)
-    }
-    #[cfg(not(windows))]
-    {
-        vault.store_xray_config(profile_id, plaintext_json)
-    }
+    vault.store_generated_xray(profile_id, plaintext_json)
 }
 
 pub(crate) fn rewrite_generated_socks_port(
@@ -734,7 +673,7 @@ pub(crate) fn import_configs_into(
             name,
             backend,
             config_path,
-            xray_mode: default_xray_mode(),
+            xray_mode: XrayMode::platform_default(),
             ..Default::default()
         };
         if let Err(err) = store.upsert(profile) {
@@ -747,6 +686,34 @@ pub(crate) fn import_configs_into(
     }
     let profiles = store.load()?.profiles;
     Ok(BatchImportResult { profiles, errors })
+}
+
+#[tauri::command]
+pub(crate) async fn import_share_link(
+    link: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<BatchImportResult, String> {
+    let _lock = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    let document = net_manager_core::profile_import::import_share_link(
+        &state.config_vault,
+        &state.profiles,
+        &generate_import_id(0),
+        &name,
+        &link,
+        loopback_port_available,
+    )
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::InvalidInput => {
+            "Invalid or unsupported share link. Use vless://, hysteria2:// or hy2://.".to_string()
+        }
+        _ => "The profile operation could not be completed. Check the input and file permissions."
+            .to_string(),
+    })?;
+    Ok(redact_batch_import_for_ipc(BatchImportResult {
+        profiles: document.profiles,
+        errors: Vec::new(),
+    }))
 }
 
 #[tauri::command]
@@ -769,75 +736,10 @@ pub(crate) async fn import_configs_batch(
     .map_err(|e| e.to_string())
 }
 
-/// Decode a v2ray-style subscription body and count unsupported nonblank lines.
-pub(crate) fn parse_subscription_body(body: &str) -> (Vec<String>, usize) {
-    let decoded = base64_decode(body.trim()).unwrap_or_else(|| body.to_string());
-    let mut urls = Vec::new();
-    let mut skipped = 0;
-    for line in decoded
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        if line.starts_with("vless://")
-            || line.starts_with("hysteria2://")
-            || line.starts_with("hy2://")
-        {
-            urls.push(line.to_string());
-        } else {
-            skipped += 1;
-        }
-    }
-    (urls, skipped)
-}
-
-fn parse_subscription_userinfo(value: &str) -> Option<SubscriptionUserInfo> {
-    if value.len() > 512 {
-        return None;
-    }
-    let mut upload = None;
-    let mut download = None;
-    let mut total = None;
-    let mut expire = None;
-    for field in value.split(';').take(16) {
-        let Some((key, raw)) = field.trim().split_once('=') else {
-            continue;
-        };
-        if !matches!(key.trim(), "upload" | "download" | "total" | "expire") {
-            continue;
-        }
-        let number = raw.trim().parse::<u64>().ok()?;
-        if number > 9_007_199_254_740_991 {
-            return None;
-        }
-        match key.trim() {
-            "upload" => upload = Some(number),
-            "download" => download = Some(number),
-            "total" => total = Some(number),
-            "expire" => expire = Some(number),
-            _ => {}
-        }
-    }
-    Some(SubscriptionUserInfo {
-        upload_bytes: upload?,
-        download_bytes: download?,
-        total_bytes: total.filter(|total| *total > 0),
-        expires_at_unix: expire.filter(|expire| *expire > 0 && *expire <= 253_402_300_799),
-    })
-}
-
-/// Best-effort standard base64 decoder that tolerates missing padding and
-/// whitespace. Returns `None` if the input is not valid base64.
-fn base64_decode(input: &str) -> Option<String> {
-    use base64::Engine;
-    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.is_empty() {
-        return None;
-    }
-    let engine = base64::engine::general_purpose::STANDARD;
-    let decoded = engine.decode(&cleaned).ok()?;
-    String::from_utf8(decoded).ok()
-}
+#[cfg(test)]
+use net_manager_core::subscription::base64_decode;
+pub(crate) use net_manager_core::subscription::parse_subscription_body;
+use net_manager_core::subscription::parse_subscription_userinfo;
 
 /// Fetch a subscription and import its supported share links.
 pub(crate) async fn import_subscription_into(
@@ -849,32 +751,17 @@ pub(crate) async fn import_subscription_into(
     refresh_interval_minutes: Option<u32>,
 ) -> Result<BatchImportResult, String> {
     validate_refresh_interval(refresh_interval_minutes)?;
-    let response = client
-        .get(url)
-        .header("X-HWID", hwid)
-        .send()
+    let fetched = net_manager_core::subscription::fetch(client, url, hwid)
         .await
-        .map_err(|_| "subscription fetch failed".to_string())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "subscription fetch returned HTTP {}",
-            response.status()
-        ));
-    }
-    let user_info = response
-        .headers()
-        .get("subscription-userinfo")
-        .and_then(|header| header.to_str().ok())
-        .and_then(parse_subscription_userinfo);
-    let body = read_subscription_response(response).await?;
+        .map_err(|e| e.to_string())?;
     import_subscription_body_into_with_metadata(
         vault,
         store,
         url,
         hwid,
-        &body,
+        &fetched.body,
         refresh_interval_minutes,
-        user_info,
+        fetched.user_info,
     )
 }
 
@@ -913,89 +800,28 @@ fn import_subscription_body_into_with_metadata(
     refresh_interval_minutes: Option<u32>,
     user_info: Option<SubscriptionUserInfo>,
 ) -> Result<BatchImportResult, String> {
-    let (urls, skipped) = parse_subscription_body(body);
-    if urls.is_empty() {
-        return Err(format!(
-            "subscription contained no supported share links ({skipped} unsupported skipped)"
-        ));
-    }
-
-    let document = store.load().map_err(|e| e.to_string())?;
-    let used_ports = profile_listener_ports(&document.profiles, "");
-    let (socks_port, http_port) =
-        select_generated_ports(None, None, &used_ports, loopback_port_available)?;
-
     let id = generate_import_id(0);
-    let mut errors: Vec<BatchImportError> = Vec::new();
-    let mut endpoints: Vec<net_manager_core::config_vault::SubscriptionEndpoint> = Vec::new();
-    if skipped != 0 {
-        errors.push(BatchImportError {
-            path: "Subscription".into(),
-            error: format!("{skipped} unsupported share link(s) skipped"),
-        });
-    }
-    let mut first_config = None;
-    for (index, uri) in urls.iter().enumerate() {
-        let config = match generate_endpoint_config(uri, socks_port, http_port) {
-            Ok(config) => config,
-            Err(error) => {
-                errors.push(BatchImportError {
-                    path: format!("Endpoint {}", index + 1),
-                    error,
-                });
-                continue;
-            }
-        };
-        if first_config.is_none() {
-            first_config = Some(config);
-        }
-        endpoints.push(net_manager_core::config_vault::SubscriptionEndpoint {
-            url: uri.to_string(),
-            name: net_manager_core::xray::share_link_name(uri)
-                .unwrap_or_else(|| format!("Endpoint {}", endpoints.len() + 1)),
-        });
-    }
-    let first_config =
-        first_config.ok_or_else(|| "no valid share link found in subscription".to_string())?;
-    let config_body = serde_json::to_vec_pretty(&first_config)
-        .map_err(|_| "failed to serialize share link config".to_string())?;
-    let import = store_generated_xray(vault, &id, &config_body)
-        .map_err(|_| "failed to store generated Xray config".to_string())?;
-    let config_path = import.config_path;
-    if vault.store_subscription_endpoints(&id, &endpoints).is_err() {
-        let _ = vault.remove_profile(&id);
-        return Err("failed to store subscription sidecar".into());
-    }
-    let profile_name = net_manager_core::xray::share_link_name(&endpoints[0].url)
-        .unwrap_or_else(|| "Subscription".to_string());
-    let profile = Profile {
-        id: id.clone(),
-        name: profile_name,
-        backend: TunnelBackend::Xray,
-        config_path: config_path.clone(),
-        xray_socks_port: Some(socks_port),
-        xray_http_port: Some(http_port),
-        xray_mode: default_xray_mode(),
-        subscription: Some(SubscriptionMeta {
-            url: url.to_string(),
-            hwid: hwid.to_string(),
-            endpoint_count: endpoints.len(),
-            active_index: 0,
-            refresh_interval_minutes,
-            last_refresh_at_unix: Some(unix_now()),
-            last_refresh_error: None,
-            user_info,
-        }),
-        ..Default::default()
+    let request = net_manager_core::subscription::SubscriptionImport {
+        id: &id,
+        url,
+        hwid,
+        name: "",
+        refresh_interval_minutes,
     };
-    let document = store.upsert(profile).map_err(|_| {
-        let _ = vault.remove_profile(&id);
-        "failed to store subscription profile".to_string()
-    })?;
-
-    Ok(BatchImportResult {
-        profiles: document.profiles,
-        errors,
+    net_manager_core::subscription::import_body(
+        vault,
+        store,
+        &request,
+        body,
+        user_info,
+        loopback_port_available,
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidInput {
+            error.to_string()
+        } else {
+            "failed to store subscription profile".to_string()
+        }
     })
 }
 
@@ -1006,11 +832,8 @@ pub(crate) async fn import_subscription(
     refresh_interval_minutes: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<BatchImportResult, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("v2rayng/1.0")
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+    let _lock = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    let client = net_manager_core::subscription::http_client().map_err(|e| e.to_string())?;
     import_subscription_into(
         &state.config_vault,
         &state.profiles,
@@ -1057,6 +880,16 @@ async fn refresh_subscription_into(
     client: &reqwest::Client,
     id: &str,
 ) -> Result<SubscriptionRefreshResult, String> {
+    refresh_subscription_into_with_ports(vault, store, client, id, loopback_port_available).await
+}
+
+async fn refresh_subscription_into_with_ports(
+    vault: &ConfigVault,
+    store: &net_manager_core::profiles::ProfileStore,
+    client: &reqwest::Client,
+    id: &str,
+    available: impl Fn(u16) -> bool,
+) -> Result<SubscriptionRefreshResult, String> {
     let profile = subscription_profile(store, id)?;
     let subscription = profile.subscription.as_ref().unwrap();
     let response = client
@@ -1080,14 +913,7 @@ async fn refresh_subscription_into(
     if subscription_profile(store, id)? != profile {
         return Err("subscription changed during refresh".into());
     }
-    refresh_subscription_body_into_with_metadata(
-        vault,
-        store,
-        id,
-        &body,
-        loopback_port_available,
-        user_info,
-    )
+    refresh_subscription_body_into_with_metadata(vault, store, id, &body, available, user_info)
 }
 
 fn share_link_key(uri: &str) -> &str {
@@ -1595,14 +1421,6 @@ mod tests {
     use base64::Engine;
     use std::fs;
 
-    #[test]
-    fn default_xray_mode_matches_platform() {
-        #[cfg(target_os = "linux")]
-        assert_eq!(default_xray_mode(), XrayMode::Tun);
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(default_xray_mode(), XrayMode::Socks);
-    }
-
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn linux_wireguard_edit_and_delete_guards_use_daemon_status() {
@@ -1867,7 +1685,7 @@ mod tests {
         assert_eq!(port, 10811);
         assert_eq!(
             select_available_socks_port(&HashSet::new(), |_| true).unwrap(),
-            AUTO_SOCKS_PORT_START
+            10808
         );
     }
 
@@ -2548,9 +2366,15 @@ mod tests {
         .unwrap();
         let old = imported.profiles[0].clone();
         let old_endpoints = vault.read_subscription_endpoints(&old.id).unwrap();
-        let err = refresh_subscription_into(&vault, &store, &reqwest::Client::new(), &old.id)
-            .await
-            .unwrap_err();
+        let err = refresh_subscription_into_with_ports(
+            &vault,
+            &store,
+            &reqwest::Client::new(),
+            &old.id,
+            |_| true,
+        )
+        .await
+        .unwrap_err();
         server.await.unwrap();
         assert!(!err.contains("private-token"));
         assert!(!err.contains("private-hwid"));
@@ -2631,9 +2455,15 @@ mod tests {
         )
         .unwrap();
         let old = &imported.profiles[0];
-        let result = refresh_subscription_into(&vault, &store, &reqwest::Client::new(), &old.id)
-            .await
-            .unwrap();
+        let result = refresh_subscription_into_with_ports(
+            &vault,
+            &store,
+            &reqwest::Client::new(),
+            &old.id,
+            |_| true,
+        )
+        .await
+        .unwrap();
         server.await.unwrap();
         assert_eq!(result.active_index, 1);
         assert_eq!(result.skipped_count, 1);
@@ -2715,9 +2545,15 @@ mod tests {
         )
         .unwrap();
         let old = imported.profiles[0].clone();
-        let err = refresh_subscription_into(&vault, &store, &reqwest::Client::new(), &old.id)
-            .await
-            .unwrap_err();
+        let err = refresh_subscription_into_with_ports(
+            &vault,
+            &store,
+            &reqwest::Client::new(),
+            &old.id,
+            |_| true,
+        )
+        .await
+        .unwrap_err();
         server.await.unwrap();
         assert!(err.contains("size limit"));
         assert!(!err.contains("private-token"));

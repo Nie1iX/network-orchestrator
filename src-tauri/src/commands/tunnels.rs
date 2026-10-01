@@ -28,10 +28,10 @@ fn select_replacement_socks_port(
 use net_manager_core::daemon_protocol::{
     method, OpenVpnConnectParams, OpenVpnConnectRequest, OpenVpnConnectResult,
     OpenVpnConnectionState, OpenVpnCredentials, OpenVpnDisconnectResult, OpenVpnProbeResult,
-    OpenVpnProfileParams, OpenVpnStatusResult, OpenVpnWarning, TailscaleStatusResult,
-    WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
-    WireGuardProfileParams, WireGuardStatusResult, WireGuardWarning, XrayConnectParams,
-    XrayConnectResult, XrayDisconnectResult, XrayProfileParams, XrayStatusResult,
+    OpenVpnProfileParams, OpenVpnStatusResult, OpenVpnWarning, WireGuardConnectParams,
+    WireGuardConnectResult, WireGuardDisconnectResult, WireGuardProfileParams,
+    WireGuardStatusResult, WireGuardWarning, XrayConnectParams, XrayConnectResult,
+    XrayDisconnectResult, XrayProfileParams, XrayStatusResult,
 };
 
 #[cfg(target_os = "linux")]
@@ -1370,7 +1370,7 @@ pub(crate) async fn collect_tunnel_statuses(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let runtime = state.runtime.lock().await;
+        let mut runtime = state.runtime.lock().await;
         Ok(profiles
             .iter()
             .map(|profile| runtime.tunnels.status(profile))
@@ -1453,7 +1453,8 @@ pub(crate) async fn reload_xray_profile(
 /// addresses and the routes peers advertise. `available:false` when the
 /// daemon is absent — that is a state, not an error.
 #[tauri::command]
-pub(crate) async fn tailscale_status() -> Result<TailscaleStatusResult, String> {
+pub(crate) async fn tailscale_status(
+) -> Result<net_manager_core::daemon_protocol::TailscaleStatusResult, String> {
     #[cfg(target_os = "linux")]
     {
         crate::daemon_client::DaemonClient::system()
@@ -1470,7 +1471,9 @@ pub(crate) async fn tailscale_status() -> Result<TailscaleStatusResult, String> 
 /// `tailscale up`/`down` as seen from the daemon: flips tailscaled's
 /// WantRunning pref via LocalAPI and returns the fresh status.
 #[tauri::command]
-pub(crate) async fn tailscale_set_running(running: bool) -> Result<TailscaleStatusResult, String> {
+pub(crate) async fn tailscale_set_running(
+    running: bool,
+) -> Result<net_manager_core::daemon_protocol::TailscaleStatusResult, String> {
     #[cfg(target_os = "linux")]
     {
         crate::daemon_client::DaemonClient::system()

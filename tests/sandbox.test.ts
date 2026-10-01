@@ -3,6 +3,25 @@ import test from "node:test";
 import { SandboxBackend } from "../src/sandbox/backend.ts";
 import type { BackendAvailability, Profile, RouteEntry, RouteLookupResult, TunnelStatus } from "../src/types.ts";
 
+test("share-link import derives a name and keeps networking unchanged", () => {
+  const backend = new SandboxBackend();
+  const routes = backend.invoke("get_routes");
+  const statuses = backend.invoke("get_tunnel_statuses");
+  const result = backend.invoke("import_share_link", {
+    link: "  vless://synthetic-private-id@node.test:443?security=tls#Lab%20Node  ", name: "",
+  }) as { profiles: Profile[] };
+  const imported = result.profiles.at(-1)!;
+  assert.equal(imported.name, "Lab Node");
+  assert.equal(imported.backend, "xray");
+  assert.equal(imported.autoConnect, false);
+  assert.equal(imported.useSystemProxy, false);
+  assert.equal(imported.subscription, null);
+  assert.deepEqual(backend.invoke("get_routes"), routes);
+  assert.deepEqual(backend.invoke("get_tunnel_statuses").filter((s: TunnelStatus) => s.profileId !== imported.id), statuses);
+  assert.equal(JSON.stringify(result).includes("synthetic-private-id"), false);
+  assert.throws(() => backend.invoke("import_share_link", { link: "https://node.test/private-token" }), /unsupported share link/);
+});
+
 test("dialog confirmations and always-on use the same IPC contract as Tauri", () => {
   const backend = new SandboxBackend();
   assert.equal(backend.invoke("plugin:dialog|message", { buttons: "OkCancel" }), "Ok");
