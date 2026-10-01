@@ -671,6 +671,7 @@ pub(crate) fn import_configs_into(
             name,
             backend,
             config_path,
+            routes: import.routes,
             xray_mode: XrayMode::platform_default(),
             ..Default::default()
         };
@@ -1734,6 +1735,35 @@ mod tests {
             assert!(p.config_path.starts_with(vault.root()));
             assert!(p.routes.is_empty());
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn import_configs_into_preserves_openvpn_static_routes() {
+        let dir = unique_dir("batch-ovpn-routes");
+        fs::remove_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let vault = ConfigVault::new(dir.join("configs"));
+        let store = net_manager_core::profiles::ProfileStore::new(dir.join("profiles.json"));
+        let source = dir.join("client.ovpn");
+        fs::write(
+            &source,
+            "client\nremote vpn.example\nroute 10.20.0.0 255.255.0.0\nroute-ipv6 fd00:1::/64\n",
+        )
+        .unwrap();
+        let result = import_configs_into(
+            &vault,
+            &store,
+            &[source.to_string_lossy().to_string()],
+            None,
+        )
+        .unwrap();
+        assert!(result.errors.is_empty());
+        assert_eq!(result.profiles[0].routes.len(), 2);
+        assert_eq!(
+            result.profiles[0].routes[0].destination.to_string(),
+            "10.20.0.0/16"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

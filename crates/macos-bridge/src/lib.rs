@@ -552,14 +552,23 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
             }
             let backend: TunnelBackend = serde_json::from_value(args["backend"].clone())
                 .map_err(|_| "Choose a valid VPN type".to_string())?;
-            let imported = vault
-                .import(id, backend, Path::new(path))
-                .map_err(store_error)?;
+            let imported = vault.import(id, backend, Path::new(path)).map_err(|err| {
+                let message = err.to_string();
+                if matches!(
+                    message.as_str(),
+                    "unsupported OpenVPN route directive" | "OpenVPN referenced asset is missing"
+                ) {
+                    message
+                } else {
+                    store_error(err)
+                }
+            })?;
             let p = Profile {
                 id: id.into(),
                 name: name.into(),
                 backend,
                 config_path: imported.config_path.clone(),
+                routes: imported.routes,
                 ..Profile::default()
             };
             let result = analysis::analyze_profile(&p)
@@ -990,6 +999,49 @@ mod tests {
         assert!(doc.profiles[0]
             .config_path
             .starts_with(dir.path().join("configs")));
+    }
+
+    #[test]
+    fn openvpn_import_preserves_static_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("client.ovpn");
+        std::fs::write(
+            &source,
+            "client\nremote vpn.example\nroute 10.20.0.0 255.255.0.0\n",
+        )
+        .unwrap();
+        let result = dispatch(
+            dir.path(),
+            "import",
+            &json!({"id":"ovpn", "name":"Lab", "backend":"openVpn", "path":source}),
+        )
+        .unwrap();
+        assert_eq!(result[0]["routes"][0]["destination"], "10.20.0.0/16");
+    }
+
+    #[test]
+    fn openvpn_import_reports_unsupported_routes_and_missing_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("client.ovpn");
+        let request = json!({"id":"ovpn", "name":"Lab", "backend":"openVpn", "path":source});
+        std::fs::write(
+            &source,
+            "client\nremote vpn.example\nroute 10.0.0.0 255.0.0.0 net_gateway\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(dir.path(), "import", &request).unwrap_err(),
+            "unsupported OpenVPN route directive"
+        );
+        std::fs::write(
+            &source,
+            "client\nremote vpn.example\npkcs12 missing-secret.p12\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(dir.path(), "import", &request).unwrap_err(),
+            "OpenVPN referenced asset is missing"
+        );
     }
 
     #[test]
