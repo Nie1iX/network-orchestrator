@@ -1,6 +1,6 @@
 use crate::commands::profiles::{
     loopback_port_available, profile_listener_ports, remove_managed_revision,
-    rewrite_generated_socks_port, select_available_socks_port,
+    rewrite_generated_proxy_ports, select_available_socks_port,
 };
 use crate::state::{find_profile, AppState, RuntimeState};
 use net_manager_core::analysis;
@@ -12,16 +12,77 @@ use std::net::{Ipv4Addr, TcpStream};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, State};
 
-fn select_replacement_socks_port(
+fn select_connect_ports(
     profiles: &[Profile],
     profile: &Profile,
     available: impl Fn(u16) -> bool,
-) -> Result<u16, String> {
+) -> Result<Option<(u16, Option<u16>)>, String> {
+    let Some(socks_port) = profile.xray_socks_port else {
+        return Ok(None);
+    };
+    let http_port = profile.xray_http_port;
+    let socks_occupied = !available(socks_port);
+    let http_occupied = http_port.is_some_and(|port| !available(port));
+    if !socks_occupied && !http_occupied {
+        return Ok(None);
+    }
     let mut used = profile_listener_ports(profiles, &profile.id);
-    if let Some(http_port) = profile.xray_http_port {
+    if let Some(http_port) = http_port {
         used.insert(http_port);
     }
-    select_available_socks_port(&used, available)
+    let socks_port = if socks_occupied {
+        select_available_socks_port(&used, &available)?
+    } else {
+        socks_port
+    };
+    used.insert(socks_port);
+    let http_port = if http_occupied {
+        Some(select_available_socks_port(&used, available)?)
+    } else {
+        http_port
+    };
+    Ok(Some((socks_port, http_port)))
+}
+
+fn prepare_xray_listener_ports(
+    state: &AppState,
+    profile: &mut Profile,
+    profiles: &mut [Profile],
+) -> Result<Option<String>, String> {
+    let old_socks = profile.xray_socks_port;
+    let old_http = profile.xray_http_port;
+    let Some((new_socks, new_http)) =
+        select_connect_ports(profiles, profile, loopback_port_available)?
+    else {
+        return Ok(None);
+    };
+    let old_path = profile.config_path.clone();
+    rewrite_generated_proxy_ports(&state.config_vault, profile, new_socks, new_http)?;
+    if let Err(err) = state.profiles.upsert(profile.clone()) {
+        let _ = state
+            .config_vault
+            .remove_revision_for_config(&profile.config_path);
+        return Err(err.to_string());
+    }
+    if let Some(stored) = profiles.iter_mut().find(|stored| stored.id == profile.id) {
+        *stored = profile.clone();
+    }
+    remove_managed_revision(
+        &state.config_vault,
+        &profile.id,
+        &old_path,
+        "connection started",
+    )?;
+    let mut notices = Vec::new();
+    if let Some(port) = old_socks.filter(|port| *port != new_socks) {
+        notices.push(format!("SOCKS5 port changed from {port} to {new_socks}."));
+    }
+    if let (Some(port), Some(new_port)) = (old_http, new_http) {
+        if port != new_port {
+            notices.push(format!("HTTP port changed from {port} to {new_port}."));
+        }
+    }
+    Ok(Some(notices.join(" ")))
 }
 
 #[cfg(target_os = "linux")]
@@ -1052,13 +1113,21 @@ async fn connect_profile_inner(
     }
     #[cfg(target_os = "linux")]
     if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
-        let status = linux_xray_connect(
+        let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+        let port_notice = prepare_xray_listener_ports(state, &mut profile, &mut profiles)?;
+        let mut status = linux_xray_connect(
             &crate::daemon_client::DaemonClient::system(),
             &state.config_vault,
             state,
             &profile,
         )
         .await?;
+        if let Some(notice) = port_notice {
+            status.message = Some(match status.message.take() {
+                Some(existing) => format!("{existing}; {notice}"),
+                None => notice,
+            });
+        }
         let _ = app.emit("route-changed", ());
         return Ok(status);
     }
@@ -1089,39 +1158,11 @@ async fn connect_profile_inner(
     let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let mut runtime = state.runtime.lock().await;
     cleanup_stale_routes_before_connect(&mut runtime, &profile).await?;
-    let mut port_notice: Option<String> = None;
-    if profile.backend == TunnelBackend::Xray {
-        if let Some(port) = profile.xray_socks_port {
-            if !loopback_port_available(port) {
-                let new_port =
-                    select_replacement_socks_port(&profiles, &profile, loopback_port_available)?;
-                let old_path = profile.config_path.clone();
-                rewrite_generated_socks_port(&state.config_vault, &mut profile, new_port)?;
-                match state.profiles.upsert(profile.clone()) {
-                    Ok(_) => {
-                        if let Some(stored) = profiles.iter_mut().find(|p| p.id == id) {
-                            *stored = profile.clone();
-                        }
-                        remove_managed_revision(
-                            &state.config_vault,
-                            &profile.id,
-                            &old_path,
-                            "connection started",
-                        )?;
-                        port_notice = Some(format!(
-                            "SOCKS5 port changed from {port} to {new_port} because the previous port is occupied."
-                        ));
-                    }
-                    Err(err) => {
-                        let _ = state
-                            .config_vault
-                            .remove_revision_for_config(&profile.config_path);
-                        return Err(err.to_string());
-                    }
-                }
-            }
-        }
-    }
+    let port_notice = if profile.backend == TunnelBackend::Xray {
+        prepare_xray_listener_ports(state, &mut profile, &mut profiles)?
+    } else {
+        None
+    };
     let candidate_analysis = analysis::analyze_profile(&profile)
         .map_err(|e| format!("cannot analyze profile config: {e}"))?;
     let conflicts =
@@ -1149,7 +1190,10 @@ async fn connect_profile_inner(
         .connect(&profile)
         .map_err(|e| e.to_string())?;
     if let Some(notice) = port_notice {
-        status.message = Some(notice);
+        status.message = Some(match status.message.take() {
+            Some(existing) => format!("{existing}; {notice}"),
+            None => notice,
+        });
     }
 
     let mut proxy_applied = false;
@@ -2999,7 +3043,7 @@ mod proxy_tests {
     }
 
     #[test]
-    fn socks_reallocation_skips_own_http_port_and_other_listeners() {
+    fn connect_port_reallocation_skips_own_http_port_and_other_listeners() {
         let mut current = profile("current");
         current.id = "current".into();
         current.backend = TunnelBackend::Xray;
@@ -3009,10 +3053,32 @@ mod proxy_tests {
         other.id = "other".into();
         other.backend = TunnelBackend::Xray;
         other.xray_socks_port = Some(10810);
-        let selected = select_replacement_socks_port(&[current.clone(), other], &current, |port| {
-            port != 10808
-        })
-        .unwrap();
-        assert_eq!(selected, 10811);
+        let selected =
+            select_connect_ports(&[current.clone(), other], &current, |port| port != 10808)
+                .unwrap();
+        assert_eq!(selected, Some((10811, Some(10809))));
+    }
+
+    #[test]
+    fn connect_port_reallocation_replaces_occupied_http_and_both_ports() {
+        let mut current = profile("current");
+        current.id = "current".into();
+        current.backend = TunnelBackend::Xray;
+        current.xray_socks_port = Some(10808);
+        current.xray_http_port = Some(10809);
+        let mut other = profile("other");
+        other.id = "other".into();
+        other.backend = TunnelBackend::Xray;
+        other.xray_socks_port = Some(10810);
+        let profiles = [current.clone(), other];
+        assert_eq!(
+            select_connect_ports(&profiles, &current, |port| port != 10809).unwrap(),
+            Some((10808, Some(10811)))
+        );
+        assert_eq!(
+            select_connect_ports(&profiles, &current, |port| !matches!(port, 10808 | 10809))
+                .unwrap(),
+            Some((10811, Some(10812)))
+        );
     }
 }
