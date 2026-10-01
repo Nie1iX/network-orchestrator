@@ -94,6 +94,36 @@ fn delay_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
 
 const DELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// Exit IP as seen by IP-echo services, directly or through a running
+/// connection's SOCKS port; never holds the store lock.
+fn check_exit_ip(root: &Path, args: &Value) -> Result<Value, String> {
+    let via = args["via"].as_str().unwrap_or("direct");
+    let socks = if via == "direct" {
+        None
+    } else {
+        let store = ProfileStore::new(root.join("profiles.json"));
+        let profile = store
+            .load()
+            .map_err(store_error)?
+            .profiles
+            .into_iter()
+            .find(|p| p.id == via)
+            .ok_or("Profile not found")?;
+        if !runtime::is_running(root, &profile)? {
+            return Err("Start the connection first".into());
+        }
+        Some(
+            profile
+                .xray_socks_port
+                .ok_or("This connection has no local proxy port")?,
+        )
+    };
+    let client = net_manager_core::exit_ip::client(socks)
+        .map_err(|_| "Exit IP check could not start".to_string())?;
+    let entries = delay_runtime()?.block_on(net_manager_core::exit_ip::check_all(client));
+    encode(entries)
+}
+
 /// One endpoint, so the UI can show each result as soon as it lands.
 fn measure_delay(root: &Path, args: &Value) -> Result<Value, String> {
     let id = text_arg(args, "id")?;
@@ -222,6 +252,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
     match method {
         "measure_delays" => return measure_delays(root, args),
         "measure_delay" => return measure_delay(root, args),
+        "check_exit_ip" => return check_exit_ip(root, args),
         _ => {}
     }
     let _lock = TRANSACTION
@@ -440,6 +471,12 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 ))
             })
         }
+        "import_log" => {
+            let text = std::fs::read_to_string(root.join("runtime/logs/subscription-import.log"))
+                .unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            Ok(json!(lines[lines.len().saturating_sub(64)..].join("\n")))
+        }
         "set_routing_rules" => {
             let id = text_arg(args, "id")?;
             let mut profile = store
@@ -650,6 +687,16 @@ pub unsafe extern "C" fn netorch_free(value: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exit_ip_through_a_connection_requires_it_to_run() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "rt");
+        let error = dispatch(dir.path(), "check_exit_ip", &json!({"via":"rt"})).unwrap_err();
+        assert_eq!(error, "Start the connection first");
+        let error = dispatch(dir.path(), "check_exit_ip", &json!({"via":"missing"})).unwrap_err();
+        assert_eq!(error, "Profile not found");
+    }
+
     #[test]
     fn routing_rules_are_validated_ordered_and_stored() {
         let dir = tempfile::tempdir().unwrap();

@@ -148,6 +148,12 @@ fn failure_message(session: &TunnelManager, profile: &Profile) -> String {
     }
 }
 
+pub(crate) fn is_running(root: &Path, profile: &Profile) -> Result<bool, String> {
+    with_session(root, |session| {
+        Ok(session.tunnels.status(profile).state == TunnelState::Running)
+    })
+}
+
 /// Start a loopback Xray connection and confirm it survived startup.
 fn start(root: &Path, profile: &Profile) -> Result<(), String> {
     if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Socks {

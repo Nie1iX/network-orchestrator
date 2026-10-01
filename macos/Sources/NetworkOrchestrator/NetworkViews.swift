@@ -589,6 +589,7 @@ struct RouteLookupView: View {
 struct SettingsView: View {
   @Environment(\.palette) private var p
   @Bindable var model: AppModel
+  @State private var showingImportLog = false
   @AppStorage("appearance") private var appearance = "system"
   @Bindable private var localizer = L10n.shared
   var body: some View {
@@ -650,6 +651,19 @@ struct SettingsView: View {
             )
           ).font(.system(size: 10.92)).foregroundStyle(p.muted)
         }.padding(10.5)
+      }
+      settingsGroup("native.diagnostics") {
+        HStack {
+          settingText("native.importLog", "native.importLogHint")
+          Spacer()
+          Button(L10n.text("native.open")) { showingImportLog = true }
+        }.padding(.horizontal, 14).padding(.vertical, 10.5)
+      }
+      .sheet(isPresented: $showingImportLog) {
+        LogSheet(
+          title: L10n.text("native.importLog"), load: { await model.importLog() },
+          onClose: { showingImportLog = false }
+        ).environment(\.palette, p).buttonStyle(TauriButtonStyle())
       }
       settingsGroup("Updates") {
         HStack {
