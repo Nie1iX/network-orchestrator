@@ -199,12 +199,20 @@ fn prepare_linux_xray_tun_params(
     )
     .map_err(|_| "invalid Xray routing rules".to_string())?;
     let default_route = profile.routes.is_empty();
+    let route = |destination: &str| PolicyRoute {
+        destination: destination.parse().unwrap(),
+        metric: 5,
+        via: None,
+    };
     let routes = if default_route {
-        vec![PolicyRoute {
-            destination: "0.0.0.0/0".parse().unwrap(),
-            metric: 5,
-            via: None,
-        }]
+        // Split-default installs the two def1 halves instead of one /0 —
+        // same full coverage, but coexisting tunnel managers that use the
+        // halves see a consistent picture.
+        if profile.xray_split_default {
+            vec![route("0.0.0.0/1"), route("128.0.0.0/1")]
+        } else {
+            vec![route("0.0.0.0/0")]
+        }
     } else {
         profile.routes.clone()
     };
@@ -2363,6 +2371,74 @@ mod tests {
         let err = prepare_linux_xray_tun_params(&vault, &p).unwrap_err();
         assert!(!err.contains("private-uuid"));
         assert!(!err.contains(&p.config_path.display().to_string()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn split_default_profile_emits_def1_halves_and_dns_bypasses() {
+        let dir = unique_dir("xray-split-default");
+        let vault = net_manager_core::config_vault::ConfigVault::new(dir.join("configs"));
+        let mut p = profile("xray-split-def");
+        p.id = "xray-split-def".into();
+        p.backend = TunnelBackend::Xray;
+        p.xray_mode = XrayMode::Tun;
+        p.xray_socks_port = Some(10808);
+        p.xray_http_port = Some(10809);
+        p.xray_split_default = true;
+        p.xray_dns.servers = vec![
+            net_manager_core::models::XrayDnsServer {
+                address: "udp://9.9.9.9:53".into(),
+                route: net_manager_core::models::XrayDnsRoute::Direct,
+                domains: Vec::new(),
+                port: None,
+                skip_fallback: false,
+            },
+            net_manager_core::models::XrayDnsServer {
+                address: "https://dns.resolver.test/dns-query".into(),
+                route: net_manager_core::models::XrayDnsRoute::Direct,
+                domains: Vec::new(),
+                port: None,
+                skip_fallback: false,
+            },
+            net_manager_core::models::XrayDnsServer {
+                address: "udp://8.8.4.4".into(),
+                route: net_manager_core::models::XrayDnsRoute::Proxy,
+                domains: Vec::new(),
+                port: None,
+                skip_fallback: false,
+            },
+        ];
+        let config = net_manager_core::xray::generate_share_link_config_with_http(
+            "vless://11111111-2222-3333-4444-555555555555@node.test:443?security=tls",
+            10808,
+            10809,
+        )
+        .unwrap();
+        p.config_path = vault
+            .store_xray_config(&p.id, &serde_json::to_vec(&config).unwrap())
+            .unwrap()
+            .config_path;
+        let params = prepare_linux_xray_tun_params(&vault, &p).unwrap();
+        assert_eq!(
+            params
+                .routes
+                .iter()
+                .map(|r| r.destination.to_string())
+                .collect::<Vec<_>>(),
+            ["0.0.0.0/1", "128.0.0.0/1"]
+        );
+        // Direct resolvers and the well-known public DNS stay on the
+        // physical uplink; the proxy-routed resolver does not (it must be
+        // reachable *through* the tunnel).
+        for expected in ["1.1.1.1", "8.8.8.8", "9.9.9.9", "dns.resolver.test"] {
+            assert!(
+                params.dns_bypass.iter().any(|h| h == expected),
+                "missing {expected} in {:?}",
+                params.dns_bypass
+            );
+        }
+        assert!(!params.dns_bypass.iter().any(|h| h == "8.8.4.4"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

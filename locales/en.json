@@ -916,6 +916,8 @@
     "{count} total predicted": "{count} total predicted",
     "{value0} Mbps": "{value0} Mbps",
     "{value0} system routes": "{value0} system routes",
-    "{value0} warnings": "{value0} warnings"
+    "{value0} warnings": "{value0} warnings",
+    "form.splitDefault": "Split default route (0.0.0.0/1 + 128.0.0.0/1)",
+    "form.splitDefaultHint": "Two /1 halves instead of a single /0 — same full capture, but friendlier to other tunnel managers and route tools."
   }
 }

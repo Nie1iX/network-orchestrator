@@ -997,6 +997,8 @@
     "{count} total predicted": "Всего в плане: {count}",
     "{value0} Mbps": "{value0} Мбит/с",
     "{value0} system routes": "Системных маршрутов: {value0}",
-    "{value0} warnings": "Предупреждений: {value0}"
+    "{value0} warnings": "Предупреждений: {value0}",
+    "form.splitDefault": "Дробный default route (0.0.0.0/1 + 128.0.0.0/1)",
+    "form.splitDefaultHint": "Две половинки /1 вместо одного /0 — то же полное перехватывание, но дружелюбнее к другим туннелям и route-менеджерам."
   }
 }
