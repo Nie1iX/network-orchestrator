@@ -10,6 +10,12 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ### Added
 
+- Native subscriptions auto-refresh every 15 minutes, hour or 6 hours
+  (running connections are left alone), with the last check time, a failure
+  marker and the provider's suggested interval. Refresh downloads outside
+  the store lock so the UI keeps updating, and failed attempts back off a
+  full interval. Refresh scheduling state moved into the core.
+
 - Native home screen checks the exit IP directly and through every running
   connection (six IP-echo services, country, agreement count), connections
   show their redacted Xray log, and Settings shows the secret-free

@@ -78,6 +78,9 @@ struct SubscriptionMeta: Decodable, Sendable {
   let endpointCount: Int
   let activeIndex: Int
   let userInfo: SubscriptionUsage?
+  var refreshIntervalMinutes: UInt32? = nil
+  var lastRefreshAtUnix: UInt64? = nil
+  var lastRefreshError: String? = nil
   /// What the provider announces about the subscription (response headers).
   let providerTitle: String?
   let announce: String?
