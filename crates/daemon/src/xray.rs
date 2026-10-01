@@ -92,12 +92,21 @@ fn one(value: &Value) -> io::Result<&Value> {
 }
 
 fn validate_generated(config: &Value) -> io::Result<()> {
-    let root = object(config, &["log", "inbounds", "outbounds", "routing"])?;
+    let root = object(
+        config,
+        &["log", "inbounds", "outbounds", "routing", "dns", "fakedns"],
+    )?;
     if let Some(log) = root.get("log") {
         object(log, &["loglevel"])?;
         if !matches!(log["loglevel"].as_str(), Some("warning" | "error" | "none")) {
             return Err(rejected());
         }
+    }
+    if let Some(dns) = root.get("dns") {
+        validate_dns(dns)?;
+    }
+    if let Some(fakedns) = root.get("fakedns") {
+        validate_fakedns(fakedns)?;
     }
     let inbounds = root
         .get("inbounds")
@@ -130,7 +139,7 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         .get("outbounds")
         .and_then(Value::as_array)
         .ok_or_else(rejected)?;
-    if outbounds.len() < 2 || outbounds.len() > 3 {
+    if outbounds.len() < 2 || outbounds.len() > 4 {
         return Err(rejected());
     }
     let mut tags = HashSet::new();
@@ -167,7 +176,7 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                 port(&outbound["settings"]["port"])?;
                 validate_hysteria_stream(&outbound["streamSettings"])?;
             }
-            "freedom" | "blackhole"
+            "freedom" | "blackhole" | "dns"
                 if index > 0
                     && !map.contains_key("settings")
                     && !map.contains_key("streamSettings") => {}
@@ -177,9 +186,20 @@ fn validate_generated(config: &Value) -> io::Result<()> {
     if outbounds[1]["protocol"] != "freedom" {
         return Err(rejected());
     }
-    let routing = object(&config["routing"], &["domainStrategy", "rules"])?;
+    let routing = object(
+        &config["routing"],
+        &["domainStrategy", "domainMatcher", "rules"],
+    )?;
     if let Some(strategy) = routing.get("domainStrategy") {
-        if strategy != "AsIs" {
+        if !matches!(
+            strategy.as_str(),
+            Some("AsIs" | "IPIfNonMatch" | "IPOnDemand")
+        ) {
+            return Err(rejected());
+        }
+    }
+    if let Some(matcher) = routing.get("domainMatcher") {
+        if !matches!(matcher.as_str(), Some("mph" | "hybrid" | "linear")) {
             return Err(rejected());
         }
     }
@@ -188,9 +208,33 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         return Err(rejected());
     }
     for rule in rules {
-        object(rule, &["type", "domain", "ip", "outboundTag"])?;
+        object(
+            rule,
+            &["type", "domain", "ip", "port", "network", "outboundTag"],
+        )?;
         if rule["type"] != "field" || !tags.contains(string(&rule["outboundTag"])?) {
             return Err(rejected());
+        }
+        if let Some(rule_port) = rule.get("port") {
+            match rule_port {
+                Value::String(list) => {
+                    if list.len() > 128
+                        || !list.split(',').all(|item| {
+                            let mut bounds = item.splitn(2, '-');
+                            bounds.all(|bound| bound.parse::<u16>().is_ok() && bound.len() <= 5)
+                        })
+                    {
+                        return Err(rejected());
+                    }
+                }
+                Value::Number(_) => port(rule_port)?,
+                _ => return Err(rejected()),
+            }
+        }
+        if let Some(network) = rule.get("network") {
+            if !matches!(network.as_str(), Some("tcp" | "udp" | "tcp,udp")) {
+                return Err(rejected());
+            }
         }
         for key in ["domain", "ip"] {
             if let Some(items) = rule.get(key) {
@@ -202,6 +246,110 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                     routing_selector(key, string(item)?)?;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// The generated `dns` section: resolver entries may be bare address strings
+/// or `{address, port, domains, skipFallback}` objects; hosts map names to
+/// one or more literal addresses.
+fn validate_dns(dns: &Value) -> io::Result<()> {
+    let dns = object(dns, &["hosts", "servers", "queryStrategy"])?;
+    if let Some(query) = dns.get("queryStrategy") {
+        string(query)?;
+    }
+    if let Some(hosts) = dns.get("hosts") {
+        let hosts = hosts.as_object().ok_or_else(rejected)?;
+        if hosts.len() > 128 {
+            return Err(rejected());
+        }
+        for (name, value) in hosts {
+            if name.is_empty() || name.len() > 253 {
+                return Err(rejected());
+            }
+            match value {
+                Value::String(entry) if !entry.is_empty() && entry.len() <= 256 => {}
+                Value::Array(entries) => {
+                    if entries.is_empty() || entries.len() > 8 {
+                        return Err(rejected());
+                    }
+                    for entry in entries {
+                        string(entry)?;
+                    }
+                }
+                _ => return Err(rejected()),
+            }
+        }
+    }
+    if let Some(servers) = dns.get("servers") {
+        let servers = servers.as_array().ok_or_else(rejected)?;
+        if servers.is_empty() || servers.len() > 16 {
+            return Err(rejected());
+        }
+        for server in servers {
+            match server {
+                Value::String(address) => {
+                    if address.is_empty() || address.len() > 256 {
+                        return Err(rejected());
+                    }
+                }
+                Value::Object(_) => {
+                    let entry = object(
+                        server,
+                        &[
+                            "address",
+                            "port",
+                            "domains",
+                            "skipFallback",
+                            "queryStrategy",
+                        ],
+                    )?;
+                    string(&entry["address"])?;
+                    if let Some(server_port) = entry.get("port") {
+                        port(server_port)?;
+                    }
+                    if let Some(domains) = entry.get("domains") {
+                        let domains = domains.as_array().ok_or_else(rejected)?;
+                        if domains.is_empty() || domains.len() > 64 {
+                            return Err(rejected());
+                        }
+                        for domain in domains {
+                            string(domain)?;
+                        }
+                    }
+                    if let Some(skip) = entry.get("skipFallback") {
+                        if !skip.is_boolean() {
+                            return Err(rejected());
+                        }
+                    }
+                    if let Some(query) = entry.get("queryStrategy") {
+                        string(query)?;
+                    }
+                }
+                _ => return Err(rejected()),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_fakedns(fakedns: &Value) -> io::Result<()> {
+    let pools = fakedns.as_array().ok_or_else(rejected)?;
+    if pools.is_empty() || pools.len() > 4 {
+        return Err(rejected());
+    }
+    for pool in pools {
+        let pool = object(pool, &["ipPool", "poolSize"])?;
+        let cidr = string(&pool["ipPool"])?;
+        if cidr.parse::<ipnet::IpNet>().is_err() {
+            return Err(rejected());
+        }
+        if pool["poolSize"]
+            .as_u64()
+            .is_none_or(|size| size == 0 || size > 65535)
+        {
+            return Err(rejected());
         }
     }
     Ok(())
@@ -227,11 +375,25 @@ fn routing_selector(key: &str, item: &str) -> io::Result<()> {
     } else {
         match item.split_once(':') {
             Some(("geosite", category)) => {
-                !category.is_empty()
-                    && category.len() <= 64
-                    && category
+                // `geosite:category@attr` filters on asset attributes (the
+                // `*` wildcard is allowed inside the attribute only).
+                let mut parts = category.splitn(2, '@');
+                let (name, attr) = (parts.next().unwrap_or_default(), parts.next());
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                    && attr.is_none_or(|attr| {
+                        !attr.is_empty()
+                            && attr.len() <= 64
+                            && attr.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric()
+                                    || byte == b'-'
+                                    || byte == b'_'
+                                    || byte == b'*'
+                            })
+                    })
             }
             Some(("domain" | "full" | "keyword" | "regexp", value)) => !value.is_empty(),
             Some(_) => false,
@@ -444,14 +606,25 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
     .parse()
     .map_err(|_| rejected())?;
     let mtu = 1500;
-    config["inbounds"] = json!([{
-        "tag": "tun-in",
-        "protocol": "tun",
-        "settings": { "name": name, "mtu": mtu },
-        // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
-        // SNI / HTTP Host so domain and geosite routing rules can match.
-        "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
-    }]);
+    let mut dest_override = vec!["http", "tls", "quic"];
+    // Fake-IP answers need the sniffing stage to keep the fake destination so
+    // routing can match it against domain policies.
+    if config["fakedns"]
+        .as_array()
+        .is_some_and(|pools| !pools.is_empty())
+    {
+        dest_override.push("fakedns");
+    }
+    config["inbounds"] = json!([
+        {
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": { "name": name, "mtu": mtu },
+            // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
+            // SNI / HTTP Host so domain and geosite routing rules can match.
+            "sniffing": { "enabled": true, "destOverride": dest_override },
+        },
+    ]);
     config["log"] = json!({"loglevel":"warning"});
     for outbound in config["outbounds"].as_array_mut().ok_or_else(rejected)? {
         if outbound["protocol"] != "blackhole" {
@@ -686,6 +859,73 @@ mod tests {
                 via: None,
             })
             .collect();
+        assert!(prepare_xray(1000, input, 51820).is_err());
+    }
+
+    #[test]
+    fn plan_accepts_generated_split_dns_and_strategy_sections() {
+        // Mirror of what `apply_profile_routing` emits for a profile with
+        // xrayDns + strategy overrides — the daemon must not reject it.
+        let mut input = params();
+        input.config = json!({
+            "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[
+                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"proxy.test","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                {"tag":"direct","protocol":"freedom"},
+                {"tag":"blocked","protocol":"blackhole"},
+                {"tag":"dns-out","protocol":"dns"}
+            ],
+            "dns":{
+                "hosts":{"domain:ads.test":["127.0.0.1"]},
+                "servers":[
+                    "fakedns",
+                    {"address":"https://1.1.1.1/dns-query","domains":["geosite:category-ru@attr"],"skipFallback":true},
+                    "udp://9.9.9.9:53"
+                ],
+                "queryStrategy":"UseIPv4"
+            },
+            "fakedns":[{"ipPool":"198.18.0.0/16","poolSize":65535}],
+            "routing":{
+                "domainStrategy":"IPIfNonMatch",
+                "domainMatcher":"mph",
+                "rules":[
+                    {"type":"field","port":"53","outboundTag":"dns-out"},
+                    {"type":"field","ip":["1.1.1.1"],"outboundTag":"direct"},
+                    {"type":"field","domain":["geosite:category-ru@attr"],"outboundTag":"proxy"},
+                    {"type":"field","network":"udp","domain":["ntp.test"],"outboundTag":"blocked"}
+                ]
+            }
+        })
+        .to_string();
+        let plan = prepare_xray(1000, input, 51820).unwrap();
+        let config: Value = serde_json::from_str(&plan.config).unwrap();
+        assert_eq!(
+            config["inbounds"][0]["sniffing"]["destOverride"],
+            json!(["http", "tls", "quic", "fakedns"])
+        );
+        assert_eq!(config["outbounds"][3]["protocol"], "dns");
+        assert_eq!(
+            config["outbounds"][3]["streamSettings"]["sockopt"]["mark"],
+            51820
+        );
+    }
+
+    #[test]
+    fn plan_rejects_malformed_dns_sections() {
+        let with_dns = |dns: Value| {
+            let mut config: Value = serde_json::from_str(&params().config).unwrap();
+            config["dns"] = dns;
+            let mut input = params();
+            input.config = config.to_string();
+            prepare_xray(1000, input, 51820)
+        };
+        assert!(with_dns(json!({"servers": [{"address": "ok.test", "exec": "sh"}]})).is_err());
+        assert!(with_dns(json!({"servers": [{"address": "ok.test", "port": 99999}]})).is_err());
+        assert!(with_dns(json!({"hosts": {"x.test": 42}})).is_err());
+        let mut config: Value = serde_json::from_str(&params().config).unwrap();
+        config["fakedns"] = json!([{"ipPool": "not-a-cidr", "poolSize": 16}]);
+        let mut input = params();
+        input.config = config.to_string();
         assert!(prepare_xray(1000, input, 51820).is_err());
     }
 }
