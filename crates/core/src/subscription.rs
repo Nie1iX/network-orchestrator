@@ -669,6 +669,56 @@ pub fn switch_endpoint(
     }
 }
 
+/// Auto-refresh cadences the clients offer, in minutes.
+pub const REFRESH_INTERVALS: [u32; 3] = [15, 60, 360];
+
+/// Whether an auto-refreshing subscription is due (its interval elapsed since
+/// the last attempt, successful or not).
+pub fn refresh_due(subscription: &SubscriptionMeta, now: u64) -> bool {
+    let Some(minutes) = subscription.refresh_interval_minutes else {
+        return false;
+    };
+    REFRESH_INTERVALS.contains(&minutes)
+        && subscription
+            .last_refresh_at_unix
+            .is_none_or(|last| now.saturating_sub(last) >= u64::from(minutes) * 60)
+}
+
+fn subscription_profile(store: &ProfileStore, id: &str) -> io::Result<Profile> {
+    store
+        .load()?
+        .profiles
+        .into_iter()
+        .find(|p| p.id == id && p.subscription.is_some())
+        .ok_or_else(|| invalid("Profile is not a subscription"))
+}
+
+/// Set (or clear) the auto-refresh interval; the clock restarts now.
+pub fn set_refresh_interval(
+    store: &ProfileStore,
+    id: &str,
+    minutes: Option<u32>,
+    now: u64,
+) -> io::Result<ProfileDocument> {
+    if minutes.is_some_and(|m| !REFRESH_INTERVALS.contains(&m)) {
+        return Err(invalid("unsupported subscription refresh interval"));
+    }
+    let mut profile = subscription_profile(store, id)?;
+    let subscription = profile.subscription.as_mut().expect("checked above");
+    subscription.refresh_interval_minutes = minutes;
+    subscription.last_refresh_at_unix = Some(now);
+    store.upsert(profile)
+}
+
+/// Remember a failed refresh so auto-refresh waits a full interval.
+pub fn record_refresh_failure(store: &ProfileStore, id: &str, now: u64) -> io::Result<()> {
+    let mut profile = subscription_profile(store, id)?;
+    let subscription = profile.subscription.as_mut().expect("checked above");
+    subscription.last_refresh_at_unix = Some(now);
+    subscription.last_refresh_error = Some("Refresh failed".into());
+    store.upsert(profile).map(|_| ())
+}
+
 /// Identity of an endpoint across refreshes: the share link without its
 /// display fragment, or the server name for full Xray JSON entries (their
 /// serialized config may change between fetches).
