@@ -1814,12 +1814,19 @@ mod tests {
         assert_eq!(parsed.download_bytes, 2048);
         assert_eq!(parsed.total_bytes, Some(4096));
         assert_eq!(parsed.expires_at_unix, Some(1798761600));
-        let unlimited =
-            net_manager_core::subscription::parse_subscription_userinfo("upload=0; download=42; total=0; expire=0").unwrap();
+        let unlimited = net_manager_core::subscription::parse_subscription_userinfo(
+            "upload=0; download=42; total=0; expire=0",
+        )
+        .unwrap();
         assert_eq!(unlimited.total_bytes, None);
         assert_eq!(unlimited.expires_at_unix, None);
-        assert!(net_manager_core::subscription::parse_subscription_userinfo("upload=private-secret; download=3").is_none());
-        assert!(net_manager_core::subscription::parse_subscription_userinfo(&"x".repeat(513)).is_none());
+        assert!(net_manager_core::subscription::parse_subscription_userinfo(
+            "upload=private-secret; download=3"
+        )
+        .is_none());
+        assert!(
+            net_manager_core::subscription::parse_subscription_userinfo(&"x".repeat(513)).is_none()
+        );
     }
 
     #[test]
@@ -2363,39 +2370,68 @@ mod tests {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode("AcmeVPN 🇳🇱");
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_provider_title(&format!("base64:{encoded}")).as_deref(),
+            net_manager_core::subscription::parse_subscription_provider_title(&format!(
+                "base64:{encoded}"
+            ))
+            .as_deref(),
             Some("AcmeVPN 🇳🇱")
         );
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_provider_title("Acme%20VPN").as_deref(),
+            net_manager_core::subscription::parse_subscription_provider_title("Acme%20VPN")
+                .as_deref(),
             Some("Acme VPN")
         );
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_provider_title("  AcmeVPN  ").as_deref(),
+            net_manager_core::subscription::parse_subscription_provider_title("  AcmeVPN  ")
+                .as_deref(),
             Some("AcmeVPN")
         );
-        assert_eq!(net_manager_core::subscription::parse_subscription_provider_title("   "), None);
-        assert_eq!(net_manager_core::subscription::parse_subscription_provider_title("base64:%%%"), None);
-        assert_eq!(net_manager_core::subscription::parse_subscription_provider_title("bad\nheader"), None);
-        assert_eq!(net_manager_core::subscription::parse_subscription_provider_title(&"x".repeat(300)), None);
+        assert_eq!(
+            net_manager_core::subscription::parse_subscription_provider_title("   "),
+            None
+        );
+        assert_eq!(
+            net_manager_core::subscription::parse_subscription_provider_title("base64:%%%"),
+            None
+        );
+        assert_eq!(
+            net_manager_core::subscription::parse_subscription_provider_title("bad\nheader"),
+            None
+        );
+        assert_eq!(
+            net_manager_core::subscription::parse_subscription_provider_title(&"x".repeat(300)),
+            None
+        );
     }
 
     #[test]
     fn subscription_profile_name_combines_provider_and_endpoint() {
         assert_eq!(
-            net_manager_core::subscription::subscription_profile_name(Some("AcmeVPN"), "⚡ Нидерланды"),
+            net_manager_core::subscription::subscription_profile_name(
+                Some("AcmeVPN"),
+                "⚡ Нидерланды"
+            ),
             "AcmeVPN - ⚡ Нидерланды"
         );
         assert_eq!(
-            net_manager_core::subscription::subscription_profile_name(Some("AcmeVPN"), "AcmeVPN - ⚡ NL"),
+            net_manager_core::subscription::subscription_profile_name(
+                Some("AcmeVPN"),
+                "AcmeVPN - ⚡ NL"
+            ),
             "AcmeVPN - ⚡ NL"
         );
         assert_eq!(
             net_manager_core::subscription::subscription_profile_name(Some("Acme"), "AcmeVPN - NL"),
             "Acme - AcmeVPN - NL"
         );
-        assert_eq!(net_manager_core::subscription::subscription_profile_name(None, "Node"), "Node");
-        assert_eq!(net_manager_core::subscription::subscription_profile_name(Some("  "), "Node"), "Node");
+        assert_eq!(
+            net_manager_core::subscription::subscription_profile_name(None, "Node"),
+            "Node"
+        );
+        assert_eq!(
+            net_manager_core::subscription::subscription_profile_name(Some("  "), "Node"),
+            "Node"
+        );
         assert_eq!(
             net_manager_core::subscription::subscription_profile_name(Some("AcmeVPN"), "AcmeVPN"),
             "AcmeVPN"
@@ -2519,12 +2555,23 @@ mod tests {
     #[test]
     fn subscription_url_header_accepts_only_http_links() {
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_url_header("https://support.example.test").as_deref(),
+            net_manager_core::subscription::parse_subscription_url_header(
+                "https://support.example.test"
+            )
+            .as_deref(),
             Some("https://support.example.test")
         );
-        assert!(net_manager_core::subscription::parse_subscription_url_header("javascript:alert(1)").is_none());
-        assert!(net_manager_core::subscription::parse_subscription_url_header("ftp://host/path").is_none());
-        assert!(net_manager_core::subscription::parse_subscription_url_header("not a url").is_none());
+        assert!(
+            net_manager_core::subscription::parse_subscription_url_header("javascript:alert(1)")
+                .is_none()
+        );
+        assert!(
+            net_manager_core::subscription::parse_subscription_url_header("ftp://host/path")
+                .is_none()
+        );
+        assert!(
+            net_manager_core::subscription::parse_subscription_url_header("not a url").is_none()
+        );
         assert!(net_manager_core::subscription::parse_subscription_url_header("   ").is_none());
     }
 
@@ -2538,11 +2585,15 @@ mod tests {
             Some("VLESS · Reality · GRPC")
         );
         assert_eq!(
-            net_manager_core::subscription::endpoint_protocol("vless://id@host.test:443?security=tls#Node").as_deref(),
+            net_manager_core::subscription::endpoint_protocol(
+                "vless://id@host.test:443?security=tls#Node"
+            )
+            .as_deref(),
             Some("VLESS · TLS")
         );
         assert_eq!(
-            net_manager_core::subscription::endpoint_protocol("hy2://pass@host.test:443#Node").as_deref(),
+            net_manager_core::subscription::endpoint_protocol("hy2://pass@host.test:443#Node")
+                .as_deref(),
             Some("Hysteria2")
         );
         assert!(net_manager_core::subscription::endpoint_protocol("not a url").is_none());

@@ -524,10 +524,7 @@ pub fn import_body(
         let profile = Profile {
             id: request.id.into(),
             name: if request.name.trim().is_empty() {
-                subscription_profile_name(
-                    meta.provider_title.as_deref(),
-                    &endpoints[0].name,
-                )
+                subscription_profile_name(meta.provider_title.as_deref(), &endpoints[0].name)
             } else {
                 request.name.trim().into()
             },
@@ -792,16 +789,14 @@ pub fn refresh_body(
         return Err(failure_message("failed to store refreshed endpoints"));
     }
     let old_path = profile.config_path.clone();
-    let provider_title = meta
-        .provider_title
-        .as_deref()
-        .or(profile
-            .subscription
-            .as_ref()
-            .and_then(|s| s.provider_title.as_deref()));
-    if previous.iter().any(|known| {
-        auto_profile_name_matches(provider_title, &known.name, &profile.name)
-    }) {
+    let provider_title = meta.provider_title.as_deref().or(profile
+        .subscription
+        .as_ref()
+        .and_then(|s| s.provider_title.as_deref()));
+    if previous
+        .iter()
+        .any(|known| auto_profile_name_matches(provider_title, &known.name, &profile.name))
+    {
         profile.name = subscription_profile_name(provider_title, &endpoints[active_index].name);
     }
     profile.config_path = new_path.clone();
@@ -994,7 +989,15 @@ mod tests {
             name: "My VPN",
             refresh_interval_minutes: None,
         };
-        import_body(&vault, &store, &request, &panel_body(names), &SubscriptionResponseMeta::default(), |_| true).unwrap();
+        import_body(
+            &vault,
+            &store,
+            &request,
+            &panel_body(names),
+            &SubscriptionResponseMeta::default(),
+            |_| true,
+        )
+        .unwrap();
         (vault, store)
     }
 
@@ -1039,7 +1042,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (vault, store) = import_panel(dir.path(), &["NL", "DE"]);
         let stub = "vless://id@0.0.0.0:1?security=none#App%20not%20supported";
-        let error = refresh_body(&vault, &store, "panel", stub, &SubscriptionResponseMeta::default(), |_| true).unwrap_err();
+        let error = refresh_body(
+            &vault,
+            &store,
+            "panel",
+            stub,
+            &SubscriptionResponseMeta::default(),
+            |_| true,
+        )
+        .unwrap_err();
         assert_eq!(error.to_string(), UNSUPPORTED_CLIENT_MESSAGE);
         assert_eq!(vault.read_subscription_endpoints("panel").unwrap().len(), 2);
     }
@@ -1076,8 +1087,15 @@ mod tests {
             name: "",
             refresh_interval_minutes: None,
         };
-        let result =
-            import_body(&vault, &store, &request, &panel_json_body(), &SubscriptionResponseMeta::default(), |_| true).unwrap();
+        let result = import_body(
+            &vault,
+            &store,
+            &request,
+            &panel_json_body(),
+            &SubscriptionResponseMeta::default(),
+            |_| true,
+        )
+        .unwrap();
         let profile = &result.profiles[0];
         assert_eq!(profile.subscription.as_ref().unwrap().endpoint_count, 2);
         let names: Vec<String> = vault
@@ -1165,7 +1183,15 @@ mod tests {
             refresh_interval_minutes: None,
         };
         let body = "vless://00000000-0000-4000-8000-000000000000@0.0.0.0:1?security=none#App%20not%20supported";
-        let error = import_body(&vault, &store, &request, body, &SubscriptionResponseMeta::default(), |_| true).unwrap_err();
+        let error = import_body(
+            &vault,
+            &store,
+            &request,
+            body,
+            &SubscriptionResponseMeta::default(),
+            |_| true,
+        )
+        .unwrap_err();
         assert_eq!(error.to_string(), UNSUPPORTED_CLIENT_MESSAGE);
         assert!(store.load().unwrap().profiles.is_empty());
     }
@@ -1191,7 +1217,15 @@ mod tests {
                 name: "Custom name",
                 refresh_interval_minutes: Some(60),
             };
-            let result = import_body(&vault, &store, &request, &body, &SubscriptionResponseMeta::default(), |_| true).unwrap();
+            let result = import_body(
+                &vault,
+                &store,
+                &request,
+                &body,
+                &SubscriptionResponseMeta::default(),
+                |_| true,
+            )
+            .unwrap();
             let profile = &result.profiles[0];
             assert_eq!(profile.name, "Custom name");
             assert_eq!(profile.xray_mode, XrayMode::platform_default());
@@ -1248,11 +1282,27 @@ mod tests {
             "vless://private-secret@:443",
             "<html>not a subscription</html>",
         ] {
-            assert!(import_body(&vault, &store, &request, body, &SubscriptionResponseMeta::default(), |_| true).is_err());
+            assert!(import_body(
+                &vault,
+                &store,
+                &request,
+                body,
+                &SubscriptionResponseMeta::default(),
+                |_| true
+            )
+            .is_err());
             assert!(!dir.path().join("configs").exists());
         }
         std::fs::create_dir(dir.path().join("profiles.json.tmp")).unwrap();
-        assert!(import_body(&vault, &store, &request, BODY, &SubscriptionResponseMeta::default(), |_| true).is_err());
+        assert!(import_body(
+            &vault,
+            &store,
+            &request,
+            BODY,
+            &SubscriptionResponseMeta::default(),
+            |_| true
+        )
+        .is_err());
         assert!(!vault.root().join("sub").exists());
     }
 
