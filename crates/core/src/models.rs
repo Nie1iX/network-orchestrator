@@ -126,6 +126,20 @@ pub enum XrayMode {
     Tun,
 }
 
+impl XrayMode {
+    /// Mode assigned to freshly created/imported Xray profiles. On Linux a
+    /// SOCKS listener captures no system traffic (no system-proxy consumer
+    /// exists), so TUN via the network daemon is the only mode that actually
+    /// tunnels.
+    pub fn platform_default() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Tun
+        } else {
+            Self::Socks
+        }
+    }
+}
+
 /// User-supplied WireGuard tunnel fields for manual profile creation.
 /// All values are written verbatim into the generated `.conf`; the vault
 /// directory ACL protects the resulting file.
@@ -612,6 +626,16 @@ pub struct BatchImportResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xray_platform_default_is_tun_only_on_linux() {
+        let expected = if cfg!(target_os = "linux") {
+            XrayMode::Tun
+        } else {
+            XrayMode::Socks
+        };
+        assert_eq!(XrayMode::platform_default(), expected);
+    }
 
     #[test]
     fn interface_serializes_to_camel_case() {

@@ -196,6 +196,26 @@ impl ConfigVault {
         }
     }
 
+    /// Store generated Xray data through the vault, with DPAPI on Windows.
+    pub fn store_generated_xray(
+        &self,
+        profile_id: &str,
+        plaintext_json: &[u8],
+    ) -> io::Result<ConfigImport> {
+        #[cfg(windows)]
+        {
+            let encrypted = crate::config_security::protect_user_data(
+                plaintext_json,
+                &crate::config_security::xray_context(profile_id),
+            )?;
+            self.store_protected_xray_config(profile_id, &encrypted)
+        }
+        #[cfg(not(windows))]
+        {
+            self.store_xray_config(profile_id, plaintext_json)
+        }
+    }
+
     pub fn store_xray_config(&self, profile_id: &str, bytes: &[u8]) -> io::Result<ConfigImport> {
         self.store_xray_file(profile_id, bytes, "config.json")
     }

@@ -2603,7 +2603,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-app"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "dbus-secret-service",
@@ -2627,15 +2627,18 @@ dependencies = [
 
 [[package]]
 name = "net-manager-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "base64 0.22.1",
  "futures",
  "ipnet",
  "libc",
  "net-route",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "url",
  "windows 0.58.0",
@@ -2644,7 +2647,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-macos-bridge"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "net-manager-core",
  "serde",
@@ -2736,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "network-orchestrator-daemon"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "futures",

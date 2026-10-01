@@ -5,7 +5,10 @@ struct ContentView: View {
   @Environment(\.colorScheme) private var scheme
   @State private var modal: ConnectionModal?
   var loadsOnAppear = true
+  /// Test hook: present a dialog as soon as the view appears.
+  var initialModal: ConnectionModal?
   var body: some View {
+    VStack(spacing: 0) {
     HStack(spacing: 0) {
       NavigationRail(selection: $model.section)
       ScrollView {
@@ -28,6 +31,7 @@ struct ContentView: View {
           }
         }.frame(
           maxWidth: model.section == .network || model.section == .routes
+            || model.section == .connections
             ? .infinity : DesignMetrics.pageNarrow, alignment: .leading
         )
         .frame(maxWidth: .infinity, alignment: .top).padding(
@@ -35,13 +39,24 @@ struct ContentView: View {
         ).padding(.vertical, DesignMetrics.contentVertical)
       }.background(AppPalette(scheme: scheme).app)
     }
+    StatusBar(model: model)
+    }
     .font(.system(size: 14)).foregroundStyle(AppPalette(scheme: scheme).text).tint(
       AppPalette(scheme: scheme).accent
     )
     .environment(\.palette, AppPalette(scheme: scheme)).buttonStyle(TauriButtonStyle())
     .environment(\.locale, Locale(identifier: L10n.shared.language))
     .environment(\.layoutDirection, L10n.shared.direction)
-    .task { if loadsOnAppear { await model.refresh() } }
+    .task {
+      if let initialModal { modal = initialModal }
+      guard loadsOnAppear else { return }
+      await model.refresh()
+      // Xray can exit on its own (bad server, port taken); keep the UI honest.
+      while !Task.isCancelled {
+        try? await Task.sleep(for: .seconds(3))
+        await model.refreshRuntime()
+      }
+    }
     .sheet(item: $modal) { value in
       ConnectionModalView(
         model: model, modal: value, onClose: { modal = nil }, onChoose: { modal = $0 }
@@ -108,25 +123,32 @@ struct HomeView: View {
   @Binding var modal: ConnectionModal?
   var body: some View {
     VStack(alignment: .leading, spacing: 21) {
+      let running = (model.snapshot?.profiles ?? []).filter { model.isRunning($0) }
       HStack(spacing: 10.5) {
-        Circle().fill(p["unknown"]).frame(width: 12, height: 12)
-        Text(L10n.text("All disconnected")).font(.system(size: 14.7, weight: .bold))
+        Circle().fill(running.isEmpty ? p["unknown"] : p["up"]).frame(width: 12, height: 12)
+        Text(
+          running.isEmpty
+            ? L10n.text("All disconnected")
+            : L10n.text("native.connectedCount", ["count": String(running.count)])
+        ).font(.system(size: 14.7, weight: .bold))
         Spacer()
       }
       .padding(.horizontal, 17.5).padding(.vertical, 14).background(
         p.card, in: RoundedRectangle(cornerRadius: 12)
       ).overlay(RoundedRectangle(cornerRadius: 12).stroke(p.border, lineWidth: 1))
-      VStack(spacing: 0) {
+      VStack(alignment: .leading, spacing: 0) {
         AppHeading(title: "Active now")
-        AppEmptyState {
-          HStack(spacing: 4) {
-            Text(L10n.text("No tunnels are running."))
-            Button(L10n.text("Open Connections")) { model.section = .connections }.buttonStyle(
-              .plain
-            )
-            .foregroundStyle(p.accent).underline()
-            Text(L10n.text("to view your profiles."))
-          }.font(.system(size: 13.3))
+        if running.isEmpty {
+          AppEmptyState {
+            HStack(spacing: 4) {
+              Text(L10n.text("No tunnels are running."))
+              Button(L10n.text("Open Connections")) { model.section = .connections }
+                .buttonStyle(.plain).foregroundStyle(p.accent).underline()
+              Text(L10n.text("to view your profiles."))
+            }.font(.system(size: 13.3))
+          }
+        } else {
+          ForEach(running) { profile in activeRow(profile) }
         }
       }
       VStack(alignment: .leading, spacing: 0) {
@@ -147,6 +169,37 @@ struct HomeView: View {
       }
     }
   }
+  private func activeRow(_ profile: Profile) -> some View {
+    HStack(spacing: 10) {
+      StateDot(state: "running")
+      NativeIcon(name: NativeIcon.backend(profile.backend), size: 16).foregroundStyle(
+        p[backendTint(profile.backend)])
+      VStack(alignment: .leading, spacing: 2) {
+        HStack(spacing: 7) {
+          Text(profile.name).font(.system(size: 13.3, weight: .semibold)).lineLimit(1)
+          if model.runtime?.systemProxyOwner == profile.id {
+            AppBadge(text: "native.systemProxy", color: "up")
+          }
+        }
+        Text(
+          [model.activeServer(profile), profile.xraySocksPort.map { "SOCKS 127.0.0.1:\($0)" }]
+            .compactMap { $0 }.joined(separator: " · ")
+        ).font(.system(size: 11.2)).foregroundStyle(p.secondary).lineLimit(1)
+      }
+      Spacer()
+      Button(L10n.text("Open")) {
+        model.selectedProfileID = profile.id
+        model.section = .connections
+      }.buttonStyle(TauriButtonStyle(compact: true))
+      Button(L10n.text("common.disconnect")) { Task { await model.toggle(profile) } }
+        .buttonStyle(TauriButtonStyle(kind: .danger, compact: true))
+        .disabled(model.pending.contains(profile.id))
+    }
+    .padding(.horizontal, 14).padding(.vertical, 10)
+    .background(p.card, in: RoundedRectangle(cornerRadius: 10))
+    .overlay(RoundedRectangle(cornerRadius: 10).stroke(p.border, lineWidth: 1))
+    .padding(.bottom, 7)
+  }
   private func shortcut(_ title: String, _ detail: String, _ section: Section) -> some View {
     Button {
       model.section = section
@@ -161,5 +214,48 @@ struct HomeView: View {
       .background(p.card, in: RoundedRectangle(cornerRadius: 12)).overlay(
         RoundedRectangle(cornerRadius: 12).stroke(p.border, lineWidth: 1))
     }.buttonStyle(.plain)
+  }
+}
+
+/// Bottom status strip mirroring the Tauri shell: backend readiness, system
+/// proxy ownership, the interface macOS currently routes through, and the
+/// number of running connections.
+struct StatusBar: View {
+  @Environment(\.palette) private var p
+  @Bindable var model: AppModel
+  var body: some View {
+    HStack(spacing: 14) {
+      if let runtime = model.runtime {
+        cell(
+          runtime.xrayInstalled ? "up" : "unknown",
+          "Xray: " + (runtime.xrayInstalled
+            ? runtime.xrayVersion : L10n.text("statusbar.state.absent")))
+        let owner = model.snapshot?.profiles.first { $0.id == runtime.systemProxyOwner }
+        cell(
+          owner == nil ? "unknown" : model.systemProxyOverridden ? "warn" : "up",
+          L10n.text("native.systemProxy") + ": "
+            + (owner?.name ?? L10n.text("common.off")))
+      }
+      if let primary = model.primaryInterface {
+        cell(
+          model.systemProxyOverridden ? "warn" : "up",
+          L10n.text("native.primaryRoute", ["iface": primary])
+        ).help(model.systemProxyOverridden ? L10n.text("native.proxyOverridden", ["iface": primary]) : "")
+      }
+      Spacer()
+      if let active = model.snapshot?.profiles.first(where: { model.isRunning($0) }) {
+        cell("up", [active.name, model.activeServer(active)].compactMap { $0 }.joined(separator: " · "))
+      }
+      Text(L10n.text("statusbar.active", ["count": String(model.activeCount)]))
+    }
+    .font(.system(size: 10.5)).foregroundStyle(p.secondary).padding(.horizontal, 12)
+    .frame(height: 24).frame(maxWidth: .infinity).background(p.sidebar)
+    .overlay(alignment: .top) { Rectangle().fill(p.border).frame(height: 1) }
+  }
+  private func cell(_ color: String, _ text: String) -> some View {
+    HStack(spacing: 5) {
+      Circle().fill(p[color]).frame(width: 6, height: 6)
+      Text(text).font(.system(size: 10.5, design: .monospaced))
+    }
   }
 }

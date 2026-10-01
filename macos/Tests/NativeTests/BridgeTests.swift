@@ -3,6 +3,52 @@ import Testing
 
 @testable import NetworkOrchestrator
 
+@Test func nativeSubscriptionRejectsInvalidUrlsWithoutPersistingAnything() async throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let core = CoreBridge(root: directory)
+  do {
+    let _: SubscriptionImportResult = try await core.call(
+      "import_subscription",
+      args: [
+        "id": "invalid-sub", "url": "file:///synthetic-private-token", "hwid": "", "name": "",
+      ])
+    Issue.record("A non-HTTP subscription URL must be rejected")
+  } catch {
+    #expect(error.localizedDescription.contains("HTTP or HTTPS"))
+    #expect(!error.localizedDescription.contains("synthetic-private-token"))
+  }
+  #expect(!FileManager.default.fileExists(atPath: directory.path))
+  let result = try JSONDecoder().decode(
+    SubscriptionImportResult.self,
+    from: Data(
+      #"{"profiles":[{"id":"sub","name":"Lab","backend":"xray","interfaceName":"","routes":[],"subscription":{"endpointCount":2,"activeIndex":1}}],"skippedCount":1}"#
+        .utf8))
+  #expect(result.profiles.first?.subscription?.activeIndex == 1)
+  #expect(result.profiles.first?.subscription?.endpointCount == 2)
+  #expect(result.skippedCount == 1)
+}
+
+@Test func nativeShareLinkImportCanBeInspectedWithoutActivatingNetworking() async throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let core = CoreBridge(root: directory)
+  let profiles: [Profile] = try await core.call(
+    "import_share_link",
+    args: [
+      "id": "share-link", "name": "",
+      "link": "vless://synthetic-private-id@node.test:443?security=tls#Swift%20Node",
+    ])
+  let profile = try #require(profiles.first)
+  #expect(profile.name == "Swift Node")
+  #expect(profile.kind == "Xray")
+  let inspection: Inspection = try await core.call("inspect", args: ["id": profile.id])
+  #expect(inspection.listeners.count == 2)
+  #expect(inspection.listeners.allSatisfy { $0.address == "127.0.0.1" })
+  let saved: [Profile] = try await core.call("profiles")
+  #expect(saved.first?.name == "Swift Node")
+}
+
 @Test func nativeBridgePreservesProfilesAcrossRequests() async throws {
   let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: directory) }
@@ -22,13 +68,20 @@ import Testing
 }
 
 @Test func nativeMutationsFailWithAProviderMessage() async throws {
-  let core = CoreBridge(
-    root: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let core = CoreBridge(root: directory)
   do {
-    let _: [Profile] = try await core.call("connect")
-    Issue.record("Host networking must remain disabled")
+    let _: [Profile] = try await core.call("apply_routes")
+    Issue.record("Route mutations must stay with the privileged helper")
   } catch {
     #expect(error.localizedDescription.contains("VPN provider"))
+  }
+  do {
+    let _: RuntimeState = try await core.call("connect", args: ["id": "missing"])
+    Issue.record("Connecting an unknown profile must fail")
+  } catch {
+    #expect(error.localizedDescription == "Profile not found")
   }
 }
 

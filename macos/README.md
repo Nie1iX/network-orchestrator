@@ -2,7 +2,7 @@
 
 SwiftUI/AppKit application for macOS 27.0 or later. Rust core operations run
 through an owned JSON C ABI (`crates/macos-bridge`) on a Swift actor, away from
-the main UI actor. There is no HTTP server, child daemon or WebView in this
+the main UI actor. There is no HTTP server, child daemon or WebView in thishttps://sub.sportzal-moscow.ru/RnJyyuaXsaT6fZx9https://sub.sportzal-moscow.ru/RnJyyuaXsaT6fZx9
 client. The existing Windows/Linux Tauri shell remains separate.
 
 ## Build and run
@@ -21,26 +21,51 @@ it is not a Developer ID signature or notarization for distribution.
 ## Available in this stage
 
 - Home, connections, network, routes and settings screens styled after Tauri:
-  icon rail, grouped connection cards, interface filters, six route tabs and
+  icon rail, dense master-detail connection list, bottom status bar, interface filters, six route tabs and
   themed dialogs. Native file picker, menus, sheets and Command-R refresh.
 - Import WireGuard `.conf`, OpenVPN `.ovpn` or Xray JSON via ConfigVault.
   Imported configurations are private, revisioned copies, not references to
   mutable original files. Keys and configuration contents are not displayed.
+- Import `vless://`, `hysteria2://` and `hy2://` links in Import → Link.
+  The name is optional and defaults to the URL fragment. Generated Xray
+  configurations use managed revisions and distinct loopback proxy ports.
+  Import does not start a VPN, set a system proxy or apply routes.
 - Create static IPv4/IPv6 route profiles, rename/delete profiles, search and
   inspect declared routes and local listeners with the shared Rust analysis.
+- Fetch an HTTP/HTTPS subscription in Import → Subscription, with optional
+  HWID and name. Plain-text and Base64 lists of VLESS/Hysteria2 links are
+  grouped into one profile with a server selector. Responses are bounded to
+  1 MiB and 30 seconds. Cross-origin redirects do not receive the HWID; HTTPS
+  downgrades are rejected. URL tokens, HWID and endpoint credentials stay in
+  the protected store and are removed from all bridge profile responses.
 - Read live Darwin interface names, indexes, operational state and addresses
   using `getifaddrs`; read system IPv4/IPv6 routes through `net-route`.
 - Inspect saved route plans and longest-prefix lookup. macOS interface-scoped
   policy can affect actual kernel selection; the lookup is a table preview.
   Route metrics, DNS, MTU and traffic counters are not claimed when unavailable.
 
-VPN start/stop, route application, DNS, system proxy, interface mutations,
-automatic connection, managed backend installation and VLESS URI generation
-are not implemented in the native client yet. These are not simulated as
-successful operations: the bridge explicitly refuses mutation commands.
-macOS tunnel integration needs a provider, its lifecycle and rollback design,
-and the corresponding Apple signing/entitlement setup. No tunnel executable
-is started by this client.
+- Start and stop Xray connections in loopback SOCKS/HTTP mode (no root).
+  Settings or the Connections notice install the pinned Xray v26.7.28
+  (Apple Silicon): by download, or from a local copy of the official
+  `Xray-macos-arm64-v8a.zip` for closed networks. Both paths are SHA-256
+  verified before use.
+- Per connection: drive the macOS system proxy, open a separate Chrome
+  profile through the connection (`--proxy-server=socks5://…`, remote DNS),
+  or copy `HTTP(S)_PROXY`/`ALL_PROXY` exports for a terminal.
+- The system proxy is written only to enabled hardware services (Wi-Fi,
+  Ethernet) via `networksetup`, after a snapshot persisted in
+  `runtime/system-proxy.json`. Disconnect, quit, or the next launch after a
+  crash restores the snapshot and stops stale managed Xray processes.
+
+When a packet-tunnel VPN such as incy is connected, it owns the primary
+service and macOS takes proxy settings from it, so the system proxy toggle has
+no effect; the status bar and a notice say so. Use "Open browser via
+connection" or the terminal exports in that case.
+
+WireGuard, OpenVPN, Xray TUN mode, static routes, DNS and interface changes
+still need the privileged launchd helper
+(`docs/plans/2026-09-30-14-macos-privileged-helper.md`); the bridge refuses
+them instead of simulating success.
 
 ## Storage and isolation
 
@@ -59,12 +84,25 @@ The override should not point to another running client's data directory.
 
 ## Tests
 
-Build the Rust library before Swift tests:
+```bash
+scripts/macos-dev.sh test      # core + bridge Rust tests, then Swift tests
+scripts/macos-dev.sh preview   # offscreen renders: target/macos/preview/<lang>/<theme>
+scripts/macos-dev.sh run       # dev bundle in the foreground, isolated QA data
+scripts/macos-dev.sh du        # what occupies target/
+scripts/macos-dev.sh clean     # drop incremental caches; --all for cargo clean
+```
+
+`macos/Package.swift` links the bridge from `target/macos-bridge`, which
+`scripts/stage-macos-bridge.sh <profile>` fills (`release` for the bundle,
+`release-fast` for development).
+
+Opt-in live proxy acceptance (downloads Xray unless an official zip is given;
+runs a loopback VLESS server; never touches the system proxy):
 
 ```bash
-cargo test -p net-manager-macos-bridge
-cargo build --release -p net-manager-macos-bridge
-swift test --package-path macos --scratch-path target/macos-swift
+NETORCH_XRAY_ARCHIVE=/path/Xray-macos-arm64-v8a.zip \
+NETORCH_LIVE_XRAY=https://www.youtube.com/ \
+  swift test --package-path macos --scratch-path target/macos-swift --filter liveProxy
 ```
 
 Tests use temporary stores and synthetic configurations. Native integration
@@ -95,7 +133,7 @@ NETORCH_DESIGN_PREVIEWS="$PWD/target/macos/design-preview" \
   swift test --package-path macos --scratch-path target/macos-swift
 ```
 
-The optional acceptance test writes 56 native PNG renders across English,
+The optional acceptance test writes 64 native PNG renders across English,
 Russian, dark and light; the normal test
 suite also checks packaged vector icons. These renders check appearance;
 they do not replace interactive testing of a foreground window.

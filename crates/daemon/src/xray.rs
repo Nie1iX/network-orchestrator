@@ -427,7 +427,7 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let (name, _) = crate::core::tunnel_link_names(
+    let (name, _) = crate::link_names::tunnel_link_names(
         "xray-",
         uid,
         &params.profile_id,

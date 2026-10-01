@@ -5,9 +5,9 @@ import Modal from "./Modal";
 import { ensureElevation } from "../elevation";
 import { BatchImportResult } from "../types";
 import { usePlatformCapabilities } from "../platform";
-import { useT } from "../i18n";
+import { tr, useT } from "../i18n";
 
-type ImportTab = "files" | "subscription" | "wireguard";
+type ImportTab = "files" | "link" | "subscription" | "wireguard";
 
 interface ImportModalProps {
   open: boolean;
@@ -25,10 +25,32 @@ export default function ImportModal({
   const [tab, setTab] = useState<ImportTab>("files");
   const caps = usePlatformCapabilities();
   const [busy, setBusy] = useState(false);
+  const [shareLink, setShareLink] = useState("");
+  const [linkName, setLinkName] = useState("");
+  const [linkError, setLinkError] = useState<string | null>(null);
   const [subUrl, setSubUrl] = useState("");
   const [subHwid, setSubHwid] = useState("");
   const [subRefreshMinutes, setSubRefreshMinutes] = useState<number | null>(null);
   const t = useT();
+
+  const onImportLink = async () => {
+    if (busy || !shareLink.trim()) return;
+    setBusy(true);
+    setLinkError(null);
+    try {
+      const result = await invoke<BatchImportResult>("import_share_link", {
+        link: shareLink.trim(), name: linkName.trim(),
+      });
+      onImported(result);
+      setShareLink("");
+      setLinkName("");
+      onClose();
+    } catch (err) {
+      setLinkError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const onImportFiles = async () => {
     setBusy(true);
@@ -124,6 +146,14 @@ export default function ImportModal({
         </button>
         <button
           type="button"
+          className={`modal-tab ${tab === "link" ? "active" : ""}`}
+          onClick={() => setTab("link")}
+          disabled={busy}
+        >
+          {tr("Link")}
+        </button>
+        <button
+          type="button"
           className={`modal-tab ${tab === "subscription" ? "active" : ""}`}
           onClick={() => setTab("subscription")}
         >
@@ -139,6 +169,34 @@ export default function ImportModal({
           </button>
         )}
       </div>
+
+      {tab === "link" && (
+        <form className="modal-tab-body" onSubmit={(event) => { event.preventDefault(); void onImportLink(); }}>
+          <p className="profile-help">{tr("Paste a vless://, hysteria2:// or hy2:// share link. Import saves a connection without starting a VPN.")}</p>
+          <label>
+            {tr("Share link")}
+            <input
+              type="password"
+              value={shareLink}
+              onChange={(event) => { setShareLink(event.target.value); setLinkError(null); }}
+              placeholder={tr("vless:// or hysteria2://…")}
+              autoComplete="off"
+              spellCheck={false}
+              maxLength={65536}
+              disabled={busy}
+            />
+          </label>
+          <label>
+            {tr("Connection name (optional)")}
+            <input type="text" value={linkName} onChange={(event) => setLinkName(event.target.value)}
+              placeholder={tr("Use the name from the link")} disabled={busy} />
+          </label>
+          {linkError && <p role="alert" className="error">{tr(linkError)}</p>}
+          <button type="submit" className="profile-import-btn" disabled={busy || !shareLink.trim()}>
+            {busy ? tr("Importing…") : tr("Import link")}
+          </button>
+        </form>
+      )}
 
       {tab === "files" && (
         <div className="modal-tab-body">

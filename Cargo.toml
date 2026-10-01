@@ -3,7 +3,7 @@ members = ["crates/core", "crates/daemon", "crates/macos-bridge", "src-tauri"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [profile.release]
@@ -12,3 +12,19 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+# Build scripts and proc macros must retain the metadata Rust loads at build time.
+[profile.release.build-override]
+strip = "none"
+
+# Dependencies rarely need a debugger; dropping their DWARF keeps target/debug
+# several times smaller. Workspace crates keep full debug info.
+[profile.dev.package."*"]
+debug = false
+
+# Optimized but incremental: native macOS iteration without the release LTO pass.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

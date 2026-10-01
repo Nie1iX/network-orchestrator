@@ -90,6 +90,44 @@ pub const LINUX_REQUIRED_SHA256: [(&str, &str); 3] = [
     ),
 ];
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const MACOS_XRAY_VERSION: &str = MANAGED_XRAY_VERSION;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const MACOS_XRAY_URL: &str =
+    "https://github.com/XTLS/Xray-core/releases/download/v26.7.28/Xray-macos-arm64-v8a.zip";
+// Official XTLS release asset Xray-macos-arm64-v8a.zip.dgst, SHA2-256.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const MACOS_XRAY_SHA256: &str =
+    "9b99a351febe31b7e0c7f22deeb1577a1da0b98aaa51aec7fd17832e68cf63d6";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MACOS_ALLOWLIST: [&str; 5] = ["xray", "geoip.dat", "geosite.dat", "LICENSE", "README.md"];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MACOS_REQUIRED: [&str; 3] = ["xray", "geoip.dat", "geosite.dat"];
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MACOS_LAYOUT: ArchiveLayout = ArchiveLayout {
+    version: MACOS_XRAY_VERSION,
+    executable_name: "xray",
+    allowlist: &MACOS_ALLOWLIST,
+    required_names: &MACOS_REQUIRED,
+};
+// SHA-256 of required files extracted from the archive above; the .dat assets
+// are byte-identical to the Windows package of the same release.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const MACOS_REQUIRED_SHA256: [(&str, &str); 3] = [
+    (
+        "xray",
+        "bd4154efa640c5b8e21f10b68afcc9177c4f1f543be3ec0485b10c499b2a4b27",
+    ),
+    (
+        "geoip.dat",
+        "cdf411fce977a1f48adb6a3b224e3e2bd7eccfcd4d6e2e30c6dc443f1a0e8e52",
+    ),
+    (
+        "geosite.dat",
+        "ea8d817c4782a84db4104ba416329bb14024f69568c666f5cca6c4303ef1942e",
+    ),
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedXrayInstallation {
     pub executable: PathBuf,
@@ -246,6 +284,98 @@ pub fn relax_linux_package_permissions(root: &Path) -> io::Result<()> {
         fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn macos_managed_version_dir(root: &Path) -> PathBuf {
+    root.join(MACOS_XRAY_VERSION)
+}
+
+/// Accept only the pinned macOS executable inside the per-user managed root:
+/// no symlinks, owner-only executable, every required file hash-verified.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn verify_managed_macos_executable(root: &Path, executable: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if fs::symlink_metadata(root)?.file_type().is_symlink() {
+        return Err(invalid_data("managed xray installation contains a symlink"));
+    }
+    let root = root.canonicalize()?;
+    let expected_dir = macos_managed_version_dir(&root);
+    if executable.canonicalize()? != expected_dir.join("xray") {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "executable is outside the managed xray installation",
+        ));
+    }
+    for name in MACOS_REQUIRED {
+        if fs::symlink_metadata(expected_dir.join(name))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(invalid_data("managed xray installation contains a symlink"));
+        }
+    }
+    let mode = fs::metadata(expected_dir.join("xray"))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o700 {
+        return Err(invalid_data(
+            "managed xray executable has unsafe permissions",
+        ));
+    }
+    verify_required_hashes(&expected_dir, &MACOS_REQUIRED_SHA256)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn install_verified_macos_archive(
+    root: &Path,
+    archive: &[u8],
+) -> io::Result<ManagedXrayInstallation> {
+    install_archive_for_platform(
+        root,
+        archive,
+        MACOS_XRAY_SHA256,
+        &MACOS_REQUIRED_SHA256,
+        MACOS_LAYOUT,
+    )
+}
+
+/// Download a pinned archive into memory with a hard size cap. Slow links are
+/// fine; only a stalled connection (no bytes for 30 s) aborts. Integrity is
+/// enforced afterwards by the hash-checking installer.
+pub async fn download_archive(url: &str) -> io::Result<Vec<u8>> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .user_agent(concat!("Network-Orchestrator/", env!("CARGO_PKG_VERSION")))
+        .https_only(true)
+        .build()
+        .map_err(io::Error::other)?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .and_then(|response| response.error_for_status())
+        .map_err(|_| io::Error::other("managed Xray download failed"))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_XRAY_ARCHIVE_BYTES as u64)
+    {
+        return Err(invalid_data("managed Xray archive is larger than allowed"));
+    }
+    let mut buffer = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| io::Error::other("managed Xray download failed"))?
+    {
+        if buffer.len() + chunk.len() > MAX_XRAY_ARCHIVE_BYTES {
+            return Err(invalid_data("managed Xray archive is larger than allowed"));
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
 }
 
 pub fn is_managed_executable(root: &Path, executable: &Path) -> io::Result<bool> {
@@ -1142,6 +1272,102 @@ mod tests {
         assert!(is_managed_executable_location(&dir.join("noroot"), &missing_exe).is_err());
         let missing_parent = version.join("nosuchdir").join("xray.exe");
         assert!(is_managed_executable_location(&root, &missing_parent).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn macos_required_entries() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("xray", b"Mach-O fake xray".to_vec()),
+            ("geoip.dat", b"geoip".to_vec()),
+            ("geosite.dat", b"geosite".to_vec()),
+        ]
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn install_macos_synthetic(root: &Path, archive: &[u8]) -> io::Result<ManagedXrayInstallation> {
+        let file_hashes: Vec<(String, String)> = macos_required_entries()
+            .iter()
+            .map(|(name, data)| (name.to_string(), sha256_hex(data)))
+            .collect();
+        let refs: Vec<(&str, &str)> = file_hashes
+            .iter()
+            .map(|(n, h)| (n.as_str(), h.as_str()))
+            .collect();
+        install_archive_for_platform(root, archive, &sha256_hex(archive), &refs, MACOS_LAYOUT)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn macos_manifest_installs_private_executable_and_assets() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_dir("macos-valid");
+        let root = dir.join("xray");
+        let owned = macos_required_entries();
+        let archive = build_archive(&slices(&owned));
+        let installed = install_macos_synthetic(&root, &archive).unwrap();
+        assert!(installed.created);
+        assert_eq!(installed.version_dir, macos_managed_version_dir(&root));
+        assert_eq!(installed.executable, installed.version_dir.join("xray"));
+        let mode = fs::metadata(&installed.executable)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(!install_macos_synthetic(&root, &archive).unwrap().created);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn macos_manifest_rejects_unpinned_archive_without_publishing() {
+        let dir = unique_dir("macos-unpinned");
+        let root = dir.join("xray");
+        let owned = macos_required_entries();
+        let archive = build_archive(&slices(&owned));
+        assert_eq!(
+            install_verified_macos_archive(&root, &archive)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!macos_managed_version_dir(&root).exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn macos_verification_rejects_foreign_path_and_synthetic_payload() {
+        let dir = unique_dir("macos-verify");
+        let root = dir.join("xray");
+        let owned = macos_required_entries();
+        let archive = build_archive(&slices(&owned));
+        let installed = install_macos_synthetic(&root, &archive).unwrap();
+        // Synthetic payload never matches the pinned official hashes.
+        assert!(verify_managed_macos_executable(&root, &installed.executable).is_err());
+        let foreign = dir.join("xray-foreign");
+        fs::write(&foreign, b"Mach-O fake xray").unwrap();
+        assert_eq!(
+            verify_managed_macos_executable(&root, &foreign)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn official_macos_archive_verifies_when_supplied_outside_normal_tests() {
+        let Ok(path) = std::env::var("XRAY_MACOS_ARCHIVE") else {
+            return;
+        };
+        let archive = fs::read(path).unwrap();
+        assert_eq!(sha256_hex(&archive), MACOS_XRAY_SHA256);
+        let dir = unique_dir("macos-official");
+        let root = dir.join("xray");
+        let installed = install_verified_macos_archive(&root, &archive).unwrap();
+        verify_managed_macos_executable(&root, &installed.executable).unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
 }

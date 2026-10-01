@@ -13,24 +13,24 @@ Sources of truth:
 - `#[cfg(target_os = …)]` blocks in `crates/core` and `crates/daemon`
 - `caps.os === "linux"` / `caps.appUpdates` gates in `src/`
 
-macOS is **not a build target**: nothing branches on
-`target_os = "macos"`, the privileged layer is Linux-only (daemon:
-systemd + polkit + netlink) or Windows-only (IP Helper policy routes,
-`wireguard.exe /installtunnelservice`, registry proxy). The macOS
-column below maps where generic code paths would fall out — it is a
-porting-cost estimate, not validation; the app has never been built
-for macOS. Android and iOS are out of scope entirely.
+macOS is served by the **native SwiftUI client** (`macos/`, Rust core via
+`crates/macos-bridge`), not by the Tauri shell. The macOS column describes
+that client. Without a privileged helper it runs only user-level operations:
+profiles, import, analysis, read-only network inventory, Xray in loopback
+SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
+waits for the launchd helper
+(`docs/plans/2026-09-30-14-macos-privileged-helper.md`). Android and iOS are out of scope entirely.
 
 ## Backends
 
 | Feature | Windows | Linux | macOS | Notes |
 |---|---|---|---|---|
 | WireGuard profile | ✅ | ✅ | ❌ | Win: embedded tunnel lib + service install; Linux: `wireguard-tools` + daemon; macOS has neither path |
-| OpenVPN profile | ✅ | ✅ | ⚠️ | Generic `Command` spawn compiles, but route/DNS plumbing and credential flow are OS-specific; never verified |
-| Xray — SOCKS mode | ✅ | ✅ | ⚠️ | `spawn_xray` is OS-generic, but no standard search paths exist — user must set the executable explicitly; no system-proxy glue |
+| OpenVPN profile | ✅ | ✅ | ❌ helper | Generic `Command` spawn compiles, but route/DNS plumbing and credential flow are OS-specific; never verified |
+| Xray — SOCKS mode | ✅ | ✅ | ✅ native, arm64 | macOS: native client runs managed Xray via `TunnelManager` in `crates/macos-bridge/src/runtime.rs` |
 | Xray — TUN mode | ✅ manual | ✅ managed | ❌ | Win: user sets iface name/IP; Linux: daemon generates config (`xrayMode: "tun"` default) |
-| Static routes (`none`) | ✅ | ✅ | ❌ | Policy routes only, no tunnel; route mutation is IP Helper / netlink |
-| Managed Xray install | ✅ x86_64 only | ✅ x86_64 only | — | `managedXrayInstall`; fixed-version, hash-pinned download. Win: app-local store; Linux: archive goes to the daemon (`xray.install`), which re-verifies hashes and installs root-owned files under `/usr/lib/network-orchestrator/xray` |
+| Static routes (`none`) | ✅ | ✅ | ❌ helper | Policy routes only, no tunnel; route mutation is IP Helper / netlink |
+| Managed Xray install | ✅ x86_64 only | ✅ x86_64 only | ✅ arm64, download or local zip | `managedXrayInstall`; fixed-version, hash-pinned download. Win: app-local store; Linux: archive goes to the daemon (`xray.install`), which re-verifies hashes and installs root-owned files under `/usr/lib/network-orchestrator/xray`; macOS: per-user managed root |
 | WireGuard standard `.conf` import | ✅ | — | — | `wireguardStandardImport` |
 
 ## System integration
@@ -43,7 +43,7 @@ for macOS. Android and iOS are out of scope entirely.
 | Start at login | — | ✅ | — | `get/set_login_autostart` |
 | Conditional routes | — | ✅ | — | `CondRules` UI; condition = interface address in prefix; applied via daemon |
 | Tailscale service row | — | ✅ | — | `tailscaled` proxied through the daemon's LocalAPI client; surfaced under Profiles → Services |
-| System proxy toggle | ✅ | — | ❌ | `systemProxy`; `UnsupportedProxyAdapter` on non-Windows — a macOS port would need `networksetup` |
+| System proxy toggle | ✅ | — | ✅ `networksetup`, hardware services; ignored while a packet-tunnel VPN is primary | Win: registry; macOS: `system_proxy::macos::MacProxyAdapter`; `UnsupportedProxyAdapter` on Linux |
 | In-app updater | ✅ | — | ❌ | `appUpdates` is `windows`-only; Linux ships `.deb`/`.rpm`/AUR → package manager |
 | Per-link DNS | — | ✅ | — | `crates/daemon/src/dns.rs`, systemd-resolved; Windows relies on pushed/adapter DNS |
 | Recovery prompt (leftover resources) | ✅ | ✅ | ⚠️ | Win: orphaned adapters/routes; Linux: stale daemon owners; macOS would find nothing to recover |

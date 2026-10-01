@@ -7,6 +7,15 @@ use net_manager_core::openvpn_management::validate_openvpn_credentials;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::io;
+use std::path::{Path, PathBuf};
+
+/// Root of per-user runtime staging directories on the daemon host.
+pub(crate) const RUNTIME_ROOT: &str = "/run/network-orchestrator";
+
+/// The deterministic runtime staging directory for a (uid, name) pair.
+pub fn stage_dir(uid: u32, name: &str) -> PathBuf {
+    Path::new(RUNTIME_ROOT).join(uid.to_string()).join(name)
+}
 
 pub struct OpenVpnPlan {
     pub profile_id: String,
@@ -70,13 +79,13 @@ pub fn prepare_openvpn(
     {
         return Err(rejected());
     }
-    let (name, fallback_name) = crate::core::tunnel_link_names(
+    let (name, fallback_name) = crate::link_names::tunnel_link_names(
         "ovpn-",
         uid,
         &params.profile_id,
         params.interface_name.as_deref(),
     );
-    let staging = crate::openvpn_process::stage_dir(uid, &name);
+    let staging = stage_dir(uid, &name);
     if params.assets.len() > 32 {
         return Err(rejected());
     }
@@ -175,7 +184,7 @@ mod tests {
         assert_eq!(first.fallback_name, second.fallback_name);
         assert!(first.name.starts_with("ovpn-"));
         assert!(first.name.len() <= 15);
-        let staged = crate::openvpn_process::stage_dir(1000, &first.name);
+        let staged = stage_dir(1000, &first.name);
         let sanitized = first.sanitized_config(&staged).unwrap();
         assert!(sanitized
             .config
@@ -246,7 +255,7 @@ mod tests {
             private_key_passphrase: Some("SECRET-KEY".into()),
         });
         let plan = prepare_openvpn(1000, request).unwrap();
-        let staged = crate::openvpn_process::stage_dir(1000, &plan.name);
+        let staged = stage_dir(1000, &plan.name);
         let sanitized = plan.sanitized_config(&staged).unwrap();
         assert!(sanitized.config.contains("auth-user-pass\n"));
         assert!(!sanitized.config.contains("SECRET-AUTH"));
