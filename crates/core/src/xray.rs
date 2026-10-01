@@ -370,6 +370,51 @@ pub fn generate_share_link_config_with_http(
     Ok(config)
 }
 
+/// Short protocol label for an endpoint, e.g. `VLESS · Reality` or
+/// `Hysteria2`; for full Xray JSON entries it is read from the first outbound.
+pub fn endpoint_protocol(uri: &str) -> Option<String> {
+    let name = |scheme: &str| match scheme {
+        "vless" => "VLESS".to_string(),
+        "hy2" | "hysteria2" => "Hysteria2".to_string(),
+        "trojan" => "Trojan".to_string(),
+        "vmess" => "VMess".to_string(),
+        "ss" | "shadowsocks" => "Shadowsocks".to_string(),
+        other => other.to_uppercase(),
+    };
+    let mut label;
+    let (security, transport) = if uri.trim().starts_with(XRAY_JSON_PREFIX) {
+        let entry = decode_xray_json_entry(uri).ok()?;
+        let outbound = entry.get("outbounds")?.as_array()?.first()?.clone();
+        label = name(outbound.get("protocol")?.as_str()?);
+        let stream = outbound
+            .get("streamSettings")
+            .cloned()
+            .unwrap_or(Value::Null);
+        (
+            stream["security"].as_str().map(str::to_string),
+            stream["network"].as_str().map(str::to_string),
+        )
+    } else {
+        let url = reqwest::Url::parse(uri.trim()).ok()?;
+        label = name(url.scheme());
+        let query = |key: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        };
+        (query("security"), query("type"))
+    };
+    match security.as_deref() {
+        Some("reality") => label.push_str(" · Reality"),
+        Some("tls") => label.push_str(" · TLS"),
+        _ => {}
+    }
+    if let Some(transport) = transport.filter(|t| t != "tcp" && t != "none" && t != "raw") {
+        label.push_str(&format!(" · {}", transport.to_uppercase()));
+    }
+    Some(label)
+}
+
 pub fn share_link_name(uri: &str) -> Option<String> {
     if uri.trim().starts_with(XRAY_JSON_PREFIX) {
         return decode_xray_json_entry(uri)
@@ -833,7 +878,7 @@ fn resolve_outbound_tag(
     candidate
 }
 
-fn percent_decode(input: &str) -> String {
+pub fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -863,6 +908,27 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn endpoint_protocol_labels_links_and_json_entries() {
+        assert_eq!(
+            endpoint_protocol("vless://id@h:443?security=reality&type=grpc#A").as_deref(),
+            Some("VLESS · Reality · GRPC")
+        );
+        assert_eq!(
+            endpoint_protocol("hy2://p@h:443#B").as_deref(),
+            Some("Hysteria2")
+        );
+        let entry = xray_json_entry(&json!({
+            "remarks": "NL",
+            "outbounds": [{"protocol": "vless", "streamSettings": {"network": "xhttp", "security": "reality"}}]
+        }))
+        .unwrap();
+        assert_eq!(
+            endpoint_protocol(&entry).as_deref(),
+            Some("VLESS · Reality · XHTTP")
+        );
+    }
+
     /// Opt-in: XRAY_TEST_BIN=/path/to/xray validates a panel-style JSON entry.
     #[test]
     fn xray_accepts_generated_panel_json_config_when_binary_supplied() {

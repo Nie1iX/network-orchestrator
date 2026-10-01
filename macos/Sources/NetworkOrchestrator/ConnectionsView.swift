@@ -160,9 +160,11 @@ struct ConnectionsView: View {
         p[backendTint(profile.backend)])
       // A subscription reads as a group: its name, then the chosen server.
       VStack(alignment: .leading, spacing: 1) {
-        Text(profile.name).font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
-        if let server = model.activeServer(profile), server != profile.name {
-          Text(server).font(.system(size: 10.5)).foregroundStyle(p.secondary).lineLimit(1)
+        Text(profile.groupName).font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
+        if let server = model.activeServer(profile), server != profile.groupName {
+          Text(profile.serverLabel(server)).font(.system(size: 10.5)).foregroundStyle(
+            p.secondary
+          ).lineLimit(1)
         }
       }
       Spacer(minLength: 8)
@@ -273,23 +275,32 @@ struct ConnectionSwitch: View {
 /// support / account links (https only, opened in the default browser).
 struct PanelInfoView: View {
   @Environment(\.palette) private var p
-  let panel: SubscriptionPanel
+  let subscription: SubscriptionMeta
   let profileName: String
   var body: some View {
     let links: [(String, URL)] = [
-      ("native.panelSupport", panel.supportUrl), ("native.panelAccount", panel.webPageUrl),
+      ("native.panelSupport", subscription.supportUrl),
+      ("native.panelAccount", subscription.webPageUrl),
     ].compactMap { label, value in
-      guard let value, let url = URL(string: value), url.scheme == "https" else { return nil }
+      guard let value, let url = URL(string: value), ["https", "http"].contains(url.scheme ?? "")
+      else { return nil }
       return (label, url)
     }
-    if panel.title != nil || panel.announce != nil || !links.isEmpty {
+    let skipped = subscription.skippedProtocols ?? []
+    if subscription.providerTitle != nil || subscription.announce != nil || !links.isEmpty
+      || !skipped.isEmpty
+    {
       VStack(alignment: .leading, spacing: 5) {
-        if let title = panel.title, title != profileName {
+        if let title = subscription.providerTitle, title != profileName {
           Text(title).font(.system(size: 11.9, weight: .semibold))
         }
-        if let announce = panel.announce {
+        if let announce = subscription.announce {
           Text(announce).font(.system(size: 11.9)).foregroundStyle(p.secondary)
             .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        }
+        if !skipped.isEmpty {
+          Text(L10n.text("native.skippedProtocols", ["list": skipped.joined(separator: ", ")]))
+            .font(.system(size: 10.92)).foregroundStyle(p.muted)
         }
         if !links.isEmpty {
           HStack(spacing: 7) {
@@ -353,8 +364,9 @@ struct ProfileDetailView: View {
         ).frame(width: 28).help(L10n.text("detail.actions"))
       }.padding(.bottom, 10.5)
       Rectangle().fill(p.border).frame(height: 1).padding(.bottom, 7)
-      if let panel = profile.subscription?.panel {
-        PanelInfoView(panel: panel, profileName: profile.name).padding(.bottom, 7)
+      if let subscription = profile.subscription {
+        PanelInfoView(subscription: subscription, profileName: profile.groupName)
+          .padding(.bottom, 7)
       }
       row("detail.backend", L10n.text(profile.kind), mono: false)
       if let server = model.activeServer(profile) {
@@ -487,8 +499,14 @@ struct ProfileDetailView: View {
         } label: {
           HStack(spacing: 7) {
             Circle().fill(active ? p.accent : .clear).frame(width: 6, height: 6)
-            Text(endpoint.name).font(.system(size: 11.9, weight: active ? .semibold : .regular))
-              .lineLimit(1)
+            Text(profile.serverLabel(endpoint.name)).font(
+              .system(size: 11.9, weight: active ? .semibold : .regular)
+            ).lineLimit(1)
+            if let proto = endpoint.protocol {
+              Text(proto).font(.system(size: 9.8, design: .monospaced)).foregroundStyle(p.muted)
+                .padding(.horizontal, 4).padding(.vertical, 1)
+                .overlay(RoundedRectangle(cornerRadius: 3).stroke(p.border, lineWidth: 1))
+            }
             Spacer()
             if model.probing[profile.id]?.contains(index) ?? false {
               Spinner(size: 10)

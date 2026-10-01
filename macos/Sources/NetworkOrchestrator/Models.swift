@@ -31,6 +31,22 @@ struct Profile: Decodable, Identifiable, Sendable {
   let xrayHttpPort: UInt16?
   let subscription: SubscriptionMeta?
   let xrayMode: String?
+  /// Name shown for the profile: a generated "{provider} - {server}" name
+  /// reads as the provider group, a user-chosen name is shown as typed.
+  var groupName: String {
+    guard let title = subscription?.providerTitle, !title.isEmpty,
+      name == title || name.hasPrefix(title + " - ")
+    else { return name }
+    return title
+  }
+  /// A server name without the provider prefix the panel repeats on each.
+  func serverLabel(_ server: String) -> String {
+    guard let title = subscription?.providerTitle, !title.isEmpty else { return server }
+    for separator in [" - ", " – ", " — ", " | "] where server.hasPrefix(title + separator) {
+      return String(server.dropFirst(title.count + separator.count))
+    }
+    return server
+  }
   /// Xray in loopback SOCKS/HTTP mode is the only kind this client can start
   /// without the privileged helper.
   var startsWithoutHelper: Bool { backend == "xray" && (xrayMode ?? "socks") == "socks" }
@@ -56,14 +72,13 @@ struct SubscriptionMeta: Decodable, Sendable {
   let endpointCount: Int
   let activeIndex: Int
   let userInfo: SubscriptionUsage?
-  let panel: SubscriptionPanel?
-}
-/// Provider title, announcement and links sent with the subscription.
-struct SubscriptionPanel: Decodable, Sendable {
-  let title: String?
+  /// What the provider announces about the subscription (response headers).
+  let providerTitle: String?
   let announce: String?
   let supportUrl: String?
   let webPageUrl: String?
+  let updateIntervalHours: UInt32?
+  let skippedProtocols: [String]?
 }
 struct SubscriptionUsage: Decodable, Sendable {
   let uploadBytes: UInt64
@@ -84,6 +99,7 @@ struct RefreshOutcome: Decodable, Sendable {
 struct SubscriptionEndpoint: Decodable, Sendable {
   let name: String
   let active: Bool
+  var `protocol`: String? = nil
 }
 struct SubscriptionImportResult: Decodable, Sendable {
   let profiles: [Profile]
