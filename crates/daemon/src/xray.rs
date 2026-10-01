@@ -540,12 +540,6 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
             return Err(rejected());
         }
     }
-    if (seen.contains(&"0.0.0.0/1".parse().unwrap())
-        && seen.contains(&"128.0.0.0/1".parse().unwrap()))
-        || (seen.contains(&"::/1".parse().unwrap()) && seen.contains(&"8000::/1".parse().unwrap()))
-    {
-        return Err(rejected());
-    }
     if params
         .dns_servers
         .iter()
@@ -565,14 +559,13 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
     {
         return Err(rejected());
     }
-    let full_ipv4 = params
-        .routes
-        .iter()
-        .any(|r| r.destination.to_string() == "0.0.0.0/0");
-    let full_ipv6 = params
-        .routes
-        .iter()
-        .any(|r| r.destination.to_string() == "::/0");
+    // Both the single default route and its def1 halves mean the family is
+    // fully captured; the halves live in the same tunnel table.
+    let net = |network: &str| network.parse::<ipnet::IpNet>().unwrap();
+    let full_ipv4 = seen.contains(&net("0.0.0.0/0"))
+        || (seen.contains(&net("0.0.0.0/1")) && seen.contains(&net("128.0.0.0/1")));
+    let full_ipv6 = seen.contains(&net("::/0"))
+        || (seen.contains(&net("::/1")) && seen.contains(&net("8000::/1")));
     let (covers_ipv4, covers_ipv6) = full_coverage(params.routes.iter().map(|r| r.destination));
     if (covers_ipv4 && !full_ipv4) || (covers_ipv6 && !full_ipv6) {
         return Err(rejected());
@@ -850,7 +843,10 @@ mod tests {
     }
 
     #[test]
-    fn def1_style_routes_cannot_bypass_full_tunnel_marking() {
+    fn def1_style_route_pair_counts_as_full_coverage() {
+        // The split-default halves are full capture, applied through the
+        // tunnel table and mark rules like a single default route — never
+        // through the main table, where they would capture marked traffic.
         let mut input = params();
         input.routes = ["0.0.0.0/1", "128.0.0.0/1"]
             .into_iter()
@@ -860,7 +856,9 @@ mod tests {
                 via: None,
             })
             .collect();
-        assert!(prepare_xray(1000, input, 51820).is_err());
+        let plan = prepare_xray(1000, input, 51820).unwrap();
+        assert!(plan.full_ipv4);
+        assert!(!plan.full_ipv6);
     }
 
     #[test]
@@ -875,6 +873,18 @@ mod tests {
             })
             .collect();
         assert!(prepare_xray(1000, input, 51820).is_err());
+    }
+
+    #[test]
+    fn a_lone_def1_half_is_a_normal_route_not_full_coverage() {
+        let mut input = params();
+        input.routes = vec![PolicyRoute {
+            destination: "0.0.0.0/1".parse().unwrap(),
+            metric: 5,
+            via: None,
+        }];
+        let plan = prepare_xray(1000, input, 51820).unwrap();
+        assert!(!plan.full_ipv4);
     }
 
     #[test]

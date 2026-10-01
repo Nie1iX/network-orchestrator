@@ -253,6 +253,8 @@ export interface Profile {
   xrayDomainStrategy?: XrayDomainStrategy | null;
   xrayDomainMatcher?: XrayDomainMatcher | null;
   xrayDns?: XrayDnsConfig;
+  /** Linux TUN: def1 halves instead of a single default route. */
+  xraySplitDefault?: boolean;
 }
 
 export type TunnelState = "stopped" | "running" | "failed";

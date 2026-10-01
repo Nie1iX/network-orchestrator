@@ -2073,6 +2073,10 @@ impl DaemonCore {
             })
             .collect();
         journaled.sort();
+        let full = process
+            .full
+            .as_ref()
+            .map(|full| (full.table, full.ipv4, full.ipv6));
         let mut desired: Vec<_> = plan
             .routes
             .iter()
@@ -2080,8 +2084,10 @@ impl DaemonCore {
                 (
                     route.destination,
                     route.metric,
-                    if route.destination.prefix_len() == 0 {
-                        process.full.as_ref().map(|full| full.table)
+                    if full
+                        .is_some_and(|(_, ipv4, ipv6)| is_full_route(ipv4, ipv6, route.destination))
+                    {
+                        full.map(|(table, _, _)| table)
                     } else {
                         None
                     },
@@ -2204,7 +2210,7 @@ impl DaemonCore {
         self.add_xray_bypass_routes(index, plan)?;
         for route in &plan.routes {
             let mut applied = AppliedRoute::on_link(route.destination, link_index, route.metric);
-            if route.destination.prefix_len() == 0 {
+            if is_full_route(plan.full_ipv4, plan.full_ipv6, route.destination) {
                 applied.table = full.map(|full| full.table);
             }
             self.journal.entries[index]

@@ -362,6 +362,12 @@ pub struct Profile {
     /// Profile DNS policy: resolver list, static hosts and fake-DNS capture.
     #[serde(default, skip_serializing_if = "XrayDnsConfig::is_empty")]
     pub xray_dns: XrayDnsConfig,
+    /// In TUN full-capture mode, install the def1 halves `0.0.0.0/1` +
+    /// `128.0.0.0/1` instead of a single `0.0.0.0/0` default route — the same
+    /// trick other route managers use, so tunnels coexist more politely.
+    /// Ignored in SOCKS mode and when explicit profile routes are set.
+    #[serde(default)]
+    pub xray_split_default: bool,
 }
 
 impl Default for Profile {
@@ -389,6 +395,7 @@ impl Default for Profile {
             xray_domain_strategy: None,
             xray_domain_matcher: None,
             xray_dns: XrayDnsConfig::default(),
+            xray_split_default: false,
         }
     }
 }

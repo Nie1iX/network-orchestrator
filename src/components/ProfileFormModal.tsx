@@ -125,6 +125,8 @@ export interface ProfileFormState {
   xrayDomainMatcher: XrayDomainMatcher | "";
   /** Opaque pass-through: no editor yet, but a save must not wipe it. */
   xrayDns: XrayDnsConfig | null;
+  /** Linux TUN: def1 halves (0.0.0.0/1 + 128.0.0.0/1) instead of 0.0.0.0/0. */
+  xraySplitDefault: boolean;
 }
 
 /** Group a profile's policies into per-target text (comments preserved). */
@@ -195,6 +197,7 @@ export function newFormState(
     xrayDomainStrategy: "",
     xrayDomainMatcher: "",
     xrayDns: null,
+    xraySplitDefault: false,
   };
 }
 
@@ -229,6 +232,7 @@ export function editFormState(profile: Profile): ProfileFormState {
     xrayDomainStrategy: profile.xrayDomainStrategy ?? "",
     xrayDomainMatcher: profile.xrayDomainMatcher ?? "",
     xrayDns: profile.xrayDns ?? null,
+    xraySplitDefault: profile.xraySplitDefault ?? false,
   };
 }
 
@@ -564,6 +568,7 @@ export default function ProfileFormModal({
       xrayDomainStrategy: isXray && current.xrayDomainStrategy ? current.xrayDomainStrategy : null,
       xrayDomainMatcher: isXray && current.xrayDomainMatcher ? current.xrayDomainMatcher : null,
       xrayDns: isXray ? (current.xrayDns ?? undefined) : undefined,
+      xraySplitDefault: isXray && current.xrayMode === "tun" && current.xraySplitDefault,
     };
     setSaving(true);
     try {
@@ -973,9 +978,24 @@ export default function ProfileFormModal({
         current.xrayMode === "tun" && (
           <div className="profile-tun-fields">
             {caps?.os === "linux" ? (
+              <>
               <span className="profile-help">
                 {tr("form.tunHelpLinux")}
               </span>
+              <label className="profile-proxy-toggle">
+                <input
+                  type="checkbox"
+                  checked={current.xraySplitDefault}
+                  onChange={(e) =>
+                    update({ xraySplitDefault: e.target.checked })
+                  }
+                />
+                <span>{tr("form.splitDefault")}</span>
+              </label>
+              <span className="profile-help">
+                {tr("form.splitDefaultHint")}
+              </span>
+              </>
             ) : (
             <>
             <label>
