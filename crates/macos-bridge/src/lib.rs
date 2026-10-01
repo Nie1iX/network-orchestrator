@@ -345,9 +345,13 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 name,
                 refresh_interval_minutes: None,
             };
-            let summary = net_manager_core::subscription::summarize_subscription_body(
-                &fetched.body,
-                fetched.content_type.as_deref(),
+            let summary = format!(
+                "{} headers: {}",
+                net_manager_core::subscription::summarize_subscription_body(
+                    &fetched.body,
+                    fetched.content_type.as_deref(),
+                ),
+                fetched.header_names.join(",")
             );
             let imported = net_manager_core::subscription::import_body(
                 &vault,
@@ -371,6 +375,8 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                     message
                 }
             })?;
+            net_manager_core::subscription::set_panel_info(&store, id, fetched.panel.clone())
+                .map_err(store_error)?;
             let skipped_count = imported
                 .errors
                 .iter()
@@ -452,9 +458,13 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                     &client, &meta.url, &meta.hwid,
                 ))
                 .map_err(subscription_error)?;
-            let summary = net_manager_core::subscription::summarize_subscription_body(
-                &fetched.body,
-                fetched.content_type.as_deref(),
+            let summary = format!(
+                "{} headers: {}",
+                net_manager_core::subscription::summarize_subscription_body(
+                    &fetched.body,
+                    fetched.content_type.as_deref(),
+                ),
+                fetched.header_names.join(",")
             );
             runtime::restart_around(root, &store, id, || {
                 let outcome = net_manager_core::subscription::refresh_body(
@@ -471,7 +481,10 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                     !meta.hwid.is_empty(),
                     outcome.as_ref().err().map(|e| e.to_string()),
                 );
-                encode(outcome.map_err(subscription_error)?)
+                let outcome = outcome.map_err(subscription_error)?;
+                net_manager_core::subscription::set_panel_info(&store, id, fetched.panel.clone())
+                    .map_err(store_error)?;
+                encode(outcome)
             })
         }
         "import_share_link" => {
@@ -592,6 +605,43 @@ pub unsafe extern "C" fn netorch_free(value: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subscription_panel_title_and_announce_are_stored_and_logged_by_name_only() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let body = "vless://synthetic@nl.test:443?security=tls#NL";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nprofile-title: Synthetic Panel\r\nannounce: base64:U2VjcmV0LWZyZWUgbmV3cw==\r\nsupport-url: https://support.example.test/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        dispatch(
+            dir.path(),
+            "import_subscription",
+            &json!({"id":"sub", "url":url, "hwid":"", "name":"Mine"}),
+        )
+        .unwrap();
+        server.join().unwrap();
+        let profiles = dispatch(dir.path(), "profiles", &json!({})).unwrap();
+        let panel = &profiles[0]["subscription"]["panel"];
+        assert_eq!(panel["title"], "Synthetic Panel");
+        assert_eq!(panel["announce"], "Secret-free news");
+        assert_eq!(panel["supportUrl"], "https://support.example.test/");
+        let log = std::fs::read_to_string(dir.path().join("runtime/logs/subscription-import.log"))
+            .unwrap();
+        assert!(log.contains("announce") && log.contains("profile-title"));
+        assert!(!log.contains("Synthetic Panel") && !log.contains("news"));
+    }
+
     #[test]
     fn single_delay_probe_validates_index_and_requires_xray() {
         let first = "vless://synthetic@nl.test:443?security=tls#NL".to_string();
