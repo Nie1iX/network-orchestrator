@@ -17,6 +17,10 @@ pub struct XrayPlan {
     pub mtu: u32,
     pub dns_servers: Vec<IpAddr>,
     pub dns_domains: Vec<String>,
+    /// Additional hosts that get a physical-gateway host route when their
+    /// family is fully captured (see [`dns_bypass_addrs`]): upstream DNS
+    /// resolvers chosen in the profile, which may be literal IPs or names.
+    pub dns_bypass: Vec<String>,
     pub full_ipv4: bool,
     pub full_ipv6: bool,
     pub mark: u32,
@@ -41,6 +45,7 @@ impl std::fmt::Debug for XrayPlan {
             .field("mtu", &self.mtu)
             .field("dns_servers", &self.dns_servers)
             .field("dns_domains", &self.dns_domains)
+            .field("dns_bypass", &self.dns_bypass)
             .field("full_ipv4", &self.full_ipv4)
             .field("full_ipv6", &self.full_ipv6)
             .field("mark", &self.mark)
@@ -549,6 +554,14 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         || params.dns_domains.iter().any(|domain| {
             domain.is_empty() || domain.len() > 253 || domain.chars().any(char::is_control)
         })
+        || params.dns_bypass.len() > 16
+        || params.dns_bypass.iter().any(|host| {
+            host.is_empty()
+                || host.len() > 253
+                || host
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '@' | '%'))
+        })
     {
         return Err(rejected());
     }
@@ -643,6 +656,7 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         mtu,
         dns_servers: params.dns_servers,
         dns_domains: params.dns_domains,
+        dns_bypass: params.dns_bypass,
         full_ipv4,
         full_ipv6,
         mark,
@@ -693,6 +707,7 @@ mod tests {
             }],
             dns_servers: vec![],
             dns_domains: vec![],
+            dns_bypass: vec![],
             interface_name: None,
             geo_assets: None,
         }
@@ -926,6 +941,20 @@ mod tests {
         config["fakedns"] = json!([{"ipPool": "not-a-cidr", "poolSize": 16}]);
         let mut input = params();
         input.config = config.to_string();
+        assert!(prepare_xray(1000, input, 51820).is_err());
+    }
+    #[test]
+    fn dns_bypass_hosts_are_carried_into_the_plan() {
+        let mut input = params();
+        input.dns_bypass = vec!["8.8.8.8".into(), "dns.example.test".into()];
+        let plan = prepare_xray(1000, input, 51820).unwrap();
+        assert_eq!(plan.dns_bypass, ["8.8.8.8", "dns.example.test"]);
+
+        let mut input = params();
+        input.dns_bypass = vec!["1.1.1.1".into(); 17];
+        assert!(prepare_xray(1000, input, 51820).is_err());
+        let mut input = params();
+        input.dns_bypass = vec!["bad host/name".into()];
         assert!(prepare_xray(1000, input, 51820).is_err());
     }
 }

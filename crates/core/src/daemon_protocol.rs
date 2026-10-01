@@ -612,6 +612,12 @@ pub struct XrayConnectParams {
     pub dns_servers: Vec<std::net::IpAddr>,
     #[serde(default)]
     pub dns_domains: Vec<String>,
+    /// Hosts (literal IPs or resolvable names) that must stay reachable
+    /// through the physical gateway while the tunnel captures the family:
+    /// upstream DNS resolvers and well-known resolvers clients may point
+    /// at. The daemon installs `/32`/`/128` host routes for them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_bypass: Vec<String>,
     /// Optional kernel interface-name hint; sanitized by the daemon, which
     /// falls back to the deterministic hash name when absent or unusable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -644,6 +650,7 @@ impl std::fmt::Debug for XrayConnectParams {
             .field("routes", &self.routes)
             .field("dns_servers", &self.dns_servers)
             .field("dns_domains", &self.dns_domains)
+            .field("dns_bypass", &self.dns_bypass)
             .field("interface_name", &self.interface_name)
             .field(
                 "geo_assets",

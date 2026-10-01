@@ -208,6 +208,14 @@ fn prepare_linux_xray_tun_params(
     } else {
         profile.routes.clone()
     };
+    let mut dns_bypass = net_manager_core::xray::dns_bypass_hosts(&profile.xray_dns);
+    if default_route {
+        for ip in ["1.1.1.1", "8.8.8.8", "9.9.9.9"] {
+            dns_bypass.push(ip.to_string());
+        }
+    }
+    dns_bypass.sort();
+    dns_bypass.dedup();
     let params = XrayConnectParams {
         profile_id: profile.id.clone(),
         config: serde_json::to_string(&config)
@@ -219,6 +227,7 @@ fn prepare_linux_xray_tun_params(
             Vec::new()
         },
         dns_domains: Vec::new(),
+        dns_bypass,
         interface_name: link_name_hint(profile),
         geo_assets: None,
     };

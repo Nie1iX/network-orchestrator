@@ -2108,6 +2108,17 @@ impl DaemonCore {
                 targets.push(ip);
             }
         }
+        for host in &plan.dns_bypass {
+            for ip in crate::xray::dns_bypass_addrs(
+                &resolve_host_addrs(Some(host.as_str())),
+                plan.full_ipv4,
+                plan.full_ipv6,
+            ) {
+                if !targets.contains(&ip) {
+                    targets.push(ip);
+                }
+            }
+        }
         let mut wanted: Vec<_> = targets
             .iter()
             .filter_map(|ip| {
@@ -2280,6 +2291,17 @@ impl DaemonCore {
         for ip in crate::xray::dns_bypass_addrs(&plan.dns_servers, plan.full_ipv4, plan.full_ipv6) {
             if !targets.contains(&ip) {
                 targets.push(ip);
+            }
+        }
+        for host in &plan.dns_bypass {
+            for ip in crate::xray::dns_bypass_addrs(
+                &resolve_host_addrs(Some(host.as_str())),
+                plan.full_ipv4,
+                plan.full_ipv6,
+            ) {
+                if !targets.contains(&ip) {
+                    targets.push(ip);
+                }
             }
         }
         if targets.is_empty() {
@@ -5016,6 +5038,7 @@ mod xray_core_tests {
             }).to_string(),
             routes: vec![PolicyRoute { destination: "10.20.0.0/16".parse().unwrap(), metric: 5, via: None }],
             dns_servers: vec![], dns_domains: vec![],
+            dns_bypass: vec![],
             interface_name: None,
             geo_assets: None,
         }
