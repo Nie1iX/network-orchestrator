@@ -138,6 +138,41 @@ export interface DomainPolicy {
   target: DomainRouteTarget;
 }
 
+export type XrayDomainStrategy = "asIs" | "ipIfNonMatch" | "ipOnDemand";
+export type XrayDomainMatcher = "mph" | "hybrid" | "linear";
+export type XrayDnsQueryStrategy = "useIp" | "useIpv4" | "useIpv6";
+export type XrayDnsRoute = "none" | "proxy" | "direct";
+
+export interface XrayDnsServer {
+  address: string;
+  port: number | null;
+  domains: string[];
+  skipFallback: boolean;
+  route: XrayDnsRoute;
+}
+
+export interface XrayDnsConfig {
+  servers: XrayDnsServer[];
+  hosts: Record<string, string[]>;
+  fakeDns: boolean;
+  queryStrategy: XrayDnsQueryStrategy | null;
+}
+
+/** Result of `parse_happ_routing`: fields recovered from a Happ/Incy
+ * routing-profile export. Absent fields mean "not mentioned in the
+ * payload" — the form keeps its current values. */
+export interface HappRoutingImport {
+  name: string | null;
+  domainPolicies: DomainPolicy[];
+  privateLanDirect: boolean | null;
+  domainStrategy: XrayDomainStrategy | null;
+  domainMatcher: XrayDomainMatcher | null;
+  dns: XrayDnsConfig;
+  geoipUrl: string | null;
+  geositeUrl: string | null;
+  warnings: string[];
+}
+
 export interface SubscriptionMeta {
   url: string;
   hwid: string;
@@ -215,6 +250,9 @@ export interface Profile {
   /** Optional HTTPS URLs overriding the bundled geoip.dat / geosite.dat. */
   xrayGeoipUrl?: string | null;
   xrayGeositeUrl?: string | null;
+  xrayDomainStrategy?: XrayDomainStrategy | null;
+  xrayDomainMatcher?: XrayDomainMatcher | null;
+  xrayDns?: XrayDnsConfig;
 }
 
 export type TunnelState = "stopped" | "running" | "failed";

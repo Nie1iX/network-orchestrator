@@ -1,4 +1,7 @@
-use crate::models::{DomainPolicy, DomainRouteTarget};
+use crate::models::{
+    DomainPolicy, DomainRouteTarget, XrayDnsConfig, XrayDnsRoute, XrayDnsServer, XrayDomainMatcher,
+    XrayDomainStrategy,
+};
 use ipnet::IpNet;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -545,8 +548,21 @@ fn config_with_proxy(proxy: Value, socks_port: u16) -> Value {
     })
 }
 
+/// Profile-level routing/DNS options applied alongside the domain policy
+/// lists: strategy, matcher, split DNS, static hosts and fake-DNS capture.
+#[derive(Debug, Default)]
+pub struct ProfileRoutingOptions {
+    pub private_lan_direct: bool,
+    /// `routing.domainStrategy` override (`None` keeps the base value).
+    pub domain_strategy: Option<XrayDomainStrategy>,
+    /// `routing.domainMatcher` override.
+    pub domain_matcher: Option<XrayDomainMatcher>,
+    /// Profile `dns` section policy.
+    pub dns: XrayDnsConfig,
+}
+
 pub fn apply_domain_policies(base: &Value, policies: &[DomainPolicy]) -> io::Result<Value> {
-    apply_profile_routing(base, policies, false)
+    apply_profile_routing(base, policies, &ProfileRoutingOptions::default())
 }
 
 pub fn validate_routing_policy_selectors(policies: &[DomainPolicy]) -> io::Result<()> {
@@ -569,12 +585,25 @@ fn classify_routing_selector(selector: &str) -> io::Result<Option<(&'static str,
         return Ok(None);
     }
     if let Some(category) = selector.strip_prefix("geosite:") {
-        if category.is_empty()
-            || category.len() > 64
-            || !category
+        // `category@attr` filters records by attribute (`@cn`, `*`
+        // wildcards allowed); a single `@` separates name and attribute.
+        let (name, attr) = match category.split_once('@') {
+            Some((name, attr)) => (name, Some(attr)),
+            None => (category, None),
+        };
+        let valid_name = !name.is_empty()
+            && name.len() <= 64
+            && name
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-        {
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+        let valid_attr = attr.is_none_or(|attr| {
+            !attr.is_empty()
+                && attr.len() <= 32
+                && attr.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'*' | b'.')
+                })
+        });
+        if !valid_name || !valid_attr {
             return Err(invalid_input("invalid geosite category"));
         }
         return Ok(Some(("domain", selector.to_string())));
@@ -602,15 +631,196 @@ fn classify_routing_selector(selector: &str) -> io::Result<Option<(&'static str,
     Ok(Some(("domain", selector.to_string())))
 }
 
+const DNS_SCHEMES: &[&str] = &["udp", "tcp", "tls", "https", "https+local", "quic+local"];
+
+fn validate_dns_config(dns: &XrayDnsConfig) -> io::Result<()> {
+    for server in &dns.servers {
+        let address = server.address.trim();
+        if address.is_empty()
+            || address.len() > 256
+            || !address.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(invalid_input("invalid dns server address"));
+        }
+        match address {
+            "localhost" => {}
+            "fakedns" if dns.fake_dns => {}
+            "fakedns" => return Err(invalid_input("fakedns server requires fakeDns")),
+            _ => {
+                if let Some((scheme, _)) = address.split_once("://") {
+                    if !DNS_SCHEMES.contains(&scheme) {
+                        return Err(invalid_input("unsupported dns server scheme"));
+                    }
+                }
+                if dns_server_host(address).is_none() {
+                    return Err(invalid_input("invalid dns server address"));
+                }
+            }
+        }
+        if server.port == Some(0) {
+            return Err(invalid_input("dns server port must be nonzero"));
+        }
+        for selector in &server.domains {
+            // dns.servers `domains` takes domain matchers only — geosite
+            // categories and literal domain forms, never IP selectors.
+            if matches!(classify_routing_selector(selector)?, Some(("ip", _))) {
+                return Err(invalid_input("dns server domains must be domain selectors"));
+            }
+        }
+    }
+    for (name, values) in &dns.hosts {
+        let name = name.trim();
+        if name.is_empty() || name.len() > 253 || !name.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(invalid_input("invalid dns hosts entry"));
+        }
+        if values.is_empty() {
+            return Err(invalid_input("dns hosts entry must map to an address"));
+        }
+        for value in values {
+            let value = value.trim();
+            let ok = value.parse::<IpAddr>().is_ok()
+                || (!value.is_empty()
+                    && value.len() <= 253
+                    && value.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'*')
+                    }));
+            if !ok {
+                return Err(invalid_input("invalid dns hosts value"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Host part of a DNS server entry, dropping scheme/userinfo/port/path.
+/// `udp://` and bare values share the same `host[:port]` shape.
+fn dns_server_host(address: &str) -> Option<&str> {
+    let rest = match address.split_once("://") {
+        Some((_, rest)) => rest,
+        None => address,
+    };
+    let host = rest.split(['/', '?', '#']).next()?.trim();
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = if let Some(inner) = host.strip_prefix('[') {
+        inner.split(']').next()?
+    } else if host.matches(':').count() == 1 {
+        host.split(':').next().unwrap_or(host)
+    } else {
+        host
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// The routable destination of a DNS server entry: `None` for
+/// `localhost`/`fakedns`, which Xray handles internally.
+fn dns_server_route_target(address: &str) -> Option<(&'static str, String)> {
+    let host = dns_server_host(address)?;
+    if matches!(host, "localhost" | "fakedns") {
+        return None;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(("ip", ip.to_string()));
+    }
+    Some(("domain", host.to_string()))
+}
+
+/// Block-target selectors that can also be null-routed through the DNS
+/// `hosts` table — plain names and `domain:`/`full:` literals only (a
+/// geosite/keyword/regexp matcher cannot be expressed as a hosts key).
+fn dns_hosts_key(selector: &str) -> Option<String> {
+    let selector = selector.trim();
+    if selector.is_empty() || selector.starts_with('#') {
+        return None;
+    }
+    for prefix in ["domain:", "full:"] {
+        if let Some(rest) = selector.strip_prefix(prefix) {
+            let rest = rest.trim();
+            return (!rest.is_empty()).then(|| rest.to_string());
+        }
+    }
+    if selector.contains(':') || selector.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    Some(selector.to_string())
+}
+
+fn dns_server_entry(server: &XrayDnsServer, policies: &[DomainPolicy]) -> Value {
+    let mut entry = Map::new();
+    entry.insert("address".into(), json!(server.address.trim()));
+    if let Some(port) = server.port {
+        entry.insert("port".into(), json!(port));
+    }
+    let mut domains = server.domains.clone();
+    // Split-DNS default: a resolver pinned to an outbound also answers the
+    // domains routed through it — remote/proxy lists and domestic/direct
+    // lists stay on their own resolver.
+    if domains.is_empty() {
+        let target = match server.route {
+            XrayDnsRoute::Proxy => Some(DomainRouteTarget::Proxy),
+            XrayDnsRoute::Direct => Some(DomainRouteTarget::Direct),
+            XrayDnsRoute::None => None,
+        };
+        if let Some(target) = target {
+            for policy in policies.iter().filter(|policy| policy.target == target) {
+                for selector in &policy.domains {
+                    if let Ok(Some(("domain", value))) = classify_routing_selector(selector) {
+                        domains.push(value);
+                    }
+                }
+            }
+        }
+    }
+    if !domains.is_empty() {
+        entry.insert("domains".into(), json!(domains));
+    }
+    if server.skip_fallback {
+        entry.insert("skipFallback".into(), json!(true));
+    }
+    Value::Object(entry)
+}
+
+fn dns_servers_json(dns: &XrayDnsConfig, policies: &[DomainPolicy]) -> Vec<Value> {
+    let mut servers = Vec::new();
+    if dns.fake_dns {
+        servers.push(json!("fakedns"));
+    }
+    for server in &dns.servers {
+        servers.push(dns_server_entry(server, policies));
+    }
+    // Xray walks servers in order and domain-bound entries only answer
+    // their own list — when nothing is left as a catch-all, mirror the
+    // first proxy-routed (else first) server as a bare fallback.
+    let has_catch_all = servers
+        .iter()
+        .any(|s| s.as_str().is_some() || s.get("domains").is_none());
+    if !has_catch_all {
+        let catch_all = dns
+            .servers
+            .iter()
+            .find(|server| server.route == XrayDnsRoute::Proxy)
+            .or_else(|| dns.servers.first());
+        if let Some(catch_all) = catch_all {
+            servers.insert(
+                usize::from(dns.fake_dns),
+                json!({"address": catch_all.address.trim()}),
+            );
+        }
+    }
+    servers
+}
+
 pub fn apply_profile_routing(
     base: &Value,
     policies: &[DomainPolicy],
-    private_lan_direct: bool,
+    options: &ProfileRoutingOptions,
 ) -> io::Result<Value> {
-    if policies.is_empty() && !private_lan_direct {
+    let dns_active = !options.dns.is_empty();
+    let rules_active = !policies.is_empty() || options.private_lan_direct || dns_active;
+    if !rules_active && options.domain_strategy.is_none() && options.domain_matcher.is_none() {
         return Ok(base.clone());
     }
     validate_routing_policy_selectors(policies)?;
+    validate_dns_config(&options.dns)?;
     let mut doc = base.clone();
     let root = doc
         .as_object_mut()
@@ -622,14 +832,24 @@ pub fn apply_profile_routing(
 
     let needs_proxy = policies
         .iter()
-        .any(|policy| policy.target == DomainRouteTarget::Proxy);
-    let needs_direct = private_lan_direct
+        .any(|policy| policy.target == DomainRouteTarget::Proxy)
+        || options
+            .dns
+            .servers
+            .iter()
+            .any(|server| server.route == XrayDnsRoute::Proxy);
+    let needs_direct = options.private_lan_direct
         || policies
             .iter()
-            .any(|policy| policy.target == DomainRouteTarget::Direct);
-    let needs_block = policies
-        .iter()
-        .any(|policy| policy.target == DomainRouteTarget::Block);
+            .any(|policy| policy.target == DomainRouteTarget::Direct)
+        || options
+            .dns
+            .servers
+            .iter()
+            .any(|server| server.route == XrayDnsRoute::Direct);
+    // Any customised rule set also drops multicast, so the blackhole
+    // outbound is always required once rules are emitted.
+    let needs_block = rules_active;
 
     let mut counts: HashMap<String, usize> = HashMap::new();
     for tag in outbounds
@@ -705,16 +925,49 @@ pub fn apply_profile_routing(
         None
     };
 
+    let dns_tag = if dns_active {
+        let index = match outbounds
+            .iter()
+            .position(|outbound| outbound["protocol"].as_str() == Some("dns"))
+        {
+            Some(index) => index,
+            None => {
+                outbounds.push(json!({ "protocol": "dns" }));
+                outbounds.len() - 1
+            }
+        };
+        Some(resolve_outbound_tag(
+            &mut outbounds[index],
+            "dns-out",
+            &counts,
+            &mut used,
+        ))
+    } else {
+        None
+    };
+
     let routing = root.entry("routing").or_insert_with(|| json!({}));
     let routing = routing
         .as_object_mut()
         .ok_or_else(|| invalid_data("xray config routing must be an object"))?;
+    if let Some(strategy) = options.domain_strategy {
+        routing.insert("domainStrategy".into(), json!(strategy.as_xray_str()));
+    }
+    if let Some(matcher) = options.domain_matcher {
+        routing.insert("domainMatcher".into(), json!(matcher.as_xray_str()));
+    }
     let rules = routing.entry("rules").or_insert_with(|| json!([]));
     let rules = rules
         .as_array_mut()
         .ok_or_else(|| invalid_data("xray config routing.rules must be an array"))?;
 
     let mut merged = Vec::new();
+    // DNS capture comes first: port-53 traffic is answered by the dns
+    // outbound so static hosts / split resolvers / fake-DNS apply even to
+    // plain system resolvers (TUN mode).
+    if let Some(tag) = dns_tag.as_deref() {
+        merged.push(json!({"type": "field", "port": "53", "outboundTag": tag}));
+    }
     for policy in policies {
         let tag = match policy.target {
             DomainRouteTarget::Proxy => proxy_tag.as_deref().unwrap_or_default(),
@@ -740,7 +993,35 @@ pub fn apply_profile_routing(
             merged.push(json!({"type": "field", "ip": ips, "outboundTag": tag}));
         }
     }
-    if private_lan_direct {
+    // Keep each resolver reachable on its own side of the tunnel: the
+    // resolver pinned to `proxy` must not resolve via the local network and
+    // vice versa.
+    for server in &options.dns.servers {
+        let tag = match server.route {
+            XrayDnsRoute::Proxy => proxy_tag.as_deref().unwrap_or_default(),
+            XrayDnsRoute::Direct => direct_tag.as_deref().unwrap_or_default(),
+            XrayDnsRoute::None => continue,
+        };
+        match dns_server_route_target(&server.address) {
+            Some(("ip", value)) => {
+                merged.push(json!({"type": "field", "ip": [value], "outboundTag": tag}));
+            }
+            Some(("domain", value)) => {
+                merged.push(json!({"type": "field", "domain": [value], "outboundTag": tag}));
+            }
+            _ => {}
+        }
+    }
+    // Multicast is never routed through the tunnel — emit only when some
+    // other rule set exists so a comment-only policy stays a no-op.
+    if !merged.is_empty() || options.private_lan_direct {
+        merged.push(json!({
+            "type": "field",
+            "ip": ["224.0.0.0/4", "ff00::/8"],
+            "outboundTag": block_tag.as_deref().unwrap_or_default(),
+        }));
+    }
+    if options.private_lan_direct {
         merged.push(json!({
             "type": "field",
             "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "fc00::/7", "fe80::/10", "::1/128"],
@@ -749,6 +1030,63 @@ pub fn apply_profile_routing(
     }
     merged.append(rules);
     *rules = merged;
+
+    if dns_active {
+        let mut hosts = Map::new();
+        // Blocked literal domains are also null-routed at the resolver —
+        // a client ignoring routing still gets a dead answer.
+        for policy in policies
+            .iter()
+            .filter(|policy| policy.target == DomainRouteTarget::Block)
+        {
+            for selector in &policy.domains {
+                if let Some(host) = dns_hosts_key(selector) {
+                    hosts.entry(host).or_insert_with(|| json!(["127.0.0.1"]));
+                }
+            }
+        }
+        // Explicit host overrides win over the generated null routes.
+        for (name, values) in &options.dns.hosts {
+            hosts.insert(name.clone(), json!(values));
+        }
+        let mut dns_obj = Map::new();
+        if !hosts.is_empty() {
+            dns_obj.insert("hosts".into(), Value::Object(hosts));
+        }
+        let servers = dns_servers_json(&options.dns, policies);
+        if !servers.is_empty() {
+            dns_obj.insert("servers".into(), json!(servers));
+        }
+        if let Some(strategy) = options.dns.query_strategy {
+            dns_obj.insert("queryStrategy".into(), json!(strategy.as_xray_str()));
+        }
+        root.insert("dns".into(), Value::Object(dns_obj));
+
+        if options.dns.fake_dns {
+            root.insert(
+                "fakedns".into(),
+                json!([{ "ipPool": "198.18.0.0/16", "poolSize": 65535 }]),
+            );
+            // Sniffing must translate fake pool answers back to the real
+            // name on every inbound that sees them.
+            if let Some(inbounds) = root.get_mut("inbounds").and_then(Value::as_array_mut) {
+                for inbound in inbounds.iter_mut() {
+                    let sniffing = inbound
+                        .as_object_mut()
+                        .map(|obj| obj.entry("sniffing").or_insert_with(|| json!({})))
+                        .and_then(|s| s.as_object_mut());
+                    let Some(sniffing) = sniffing else { continue };
+                    sniffing.insert("enabled".into(), json!(true));
+                    let overrides = sniffing.entry("destOverride").or_insert_with(|| json!([]));
+                    if let Some(list) = overrides.as_array_mut() {
+                        if !list.iter().any(|v| v == "fakedns") {
+                            list.push(json!("fakedns"));
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(doc)
 }
 
@@ -776,6 +1114,17 @@ pub fn apply_tun_inbound(
     // traffic capture with interface-level capture.
     inbounds.retain(|inbound| inbound["protocol"].as_str() != Some("socks"));
 
+    // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
+    // SNI / HTTP Host so domain and geosite routing rules can match. With
+    // fake-DNS enabled it also translates pool answers back to real names.
+    let mut dest_override = vec!["http", "tls", "quic"];
+    if base["fakedns"]
+        .as_array()
+        .is_some_and(|fakedns| !fakedns.is_empty())
+    {
+        dest_override.push("fakedns");
+    }
+
     let tun_inbound = json!({
         "tag": "tun-in",
         "protocol": "tun",
@@ -784,11 +1133,9 @@ pub fn apply_tun_inbound(
             "ip": ip.unwrap_or("172.19.0.1/30"),
             "mtu": 1500,
         },
-        // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
-        // SNI / HTTP Host so domain and geosite routing rules can match.
         "sniffing": {
             "enabled": true,
-            "destOverride": ["http", "tls", "quic"],
+            "destOverride": dest_override,
         },
     });
     inbounds.insert(0, tun_inbound);
@@ -1290,7 +1637,17 @@ mod tests {
                     target: DomainRouteTarget::Block,
                 },
             ];
-            configs.push(apply_profile_routing(&configs[0], &policies, true).unwrap());
+            configs.push(
+                apply_profile_routing(
+                    &configs[0],
+                    &policies,
+                    &ProfileRoutingOptions {
+                        private_lan_direct: true,
+                        ..ProfileRoutingOptions::default()
+                    },
+                )
+                .unwrap(),
+            );
         }
         for (index, config) in configs.iter().enumerate() {
             let path = std::env::temp_dir().join(format!(
@@ -1339,9 +1696,17 @@ mod tests {
                 target: DomainRouteTarget::Block,
             },
         ];
-        let config = apply_profile_routing(&base, &policies, true).unwrap();
+        let config = apply_profile_routing(
+            &base,
+            &policies,
+            &ProfileRoutingOptions {
+                private_lan_direct: true,
+                ..ProfileRoutingOptions::default()
+            },
+        )
+        .unwrap();
         let rules = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(rules.len(), 4);
+        assert_eq!(rules.len(), 5);
         assert_eq!(rules[0]["domain"], json!(["geosite:cn"]));
         assert_eq!(rules[0]["outboundTag"], "direct");
         assert_eq!(rules[1]["ip"], json!(["geoip:us"]));
@@ -1356,9 +1721,37 @@ mod tests {
                 .unwrap()["protocol"],
             "blackhole"
         );
-        assert_eq!(rules[2]["ip"][0], "10.0.0.0/8");
-        assert_eq!(rules[2]["outboundTag"], "direct");
-        assert_eq!(rules[3]["domain"], json!(["domain:existing.test"]));
+        assert_eq!(rules[2]["ip"], json!(["224.0.0.0/4", "ff00::/8"]));
+        assert_eq!(rules[2]["outboundTag"], block);
+        assert_eq!(rules[3]["ip"][0], "10.0.0.0/8");
+        assert_eq!(rules[3]["outboundTag"], "direct");
+        assert_eq!(rules[4]["domain"], json!(["domain:existing.test"]));
+    }
+
+    #[test]
+    fn geosite_attribute_selectors_are_domain_rules() {
+        let policies = [DomainPolicy {
+            domains: vec!["geosite:category-ru@cdn".into(), "geosite:cn@*".into()],
+            target: DomainRouteTarget::Direct,
+        }];
+        let result = apply_domain_policies(&base_config(), &policies).unwrap();
+        assert_eq!(
+            result["routing"]["rules"][0]["domain"],
+            json!(["geosite:category-ru@cdn", "geosite:cn@*"])
+        );
+        for bad in ["geosite:@cn", "geosite:cat@", "geosite:a@b@c"] {
+            let policies = [DomainPolicy {
+                domains: vec![bad.into()],
+                target: DomainRouteTarget::Direct,
+            }];
+            assert_eq!(
+                apply_domain_policies(&base_config(), &policies)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput,
+                "accepted {bad}"
+            );
+        }
     }
 
     #[test]
@@ -1427,7 +1820,9 @@ mod tests {
                 domains: vec![selector.into()],
                 target: DomainRouteTarget::Proxy,
             }];
-            let err = apply_profile_routing(&base_config(), &policies, false).unwrap_err();
+            let err =
+                apply_profile_routing(&base_config(), &policies, &ProfileRoutingOptions::default())
+                    .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             assert!(!err.to_string().contains("secret"));
             assert!(!err.to_string().contains(selector));
@@ -1455,7 +1850,7 @@ mod tests {
         ];
         let result = apply_domain_policies(&base, &policies).unwrap();
         let rules = result["routing"]["rules"].as_array().unwrap();
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 4);
         assert_eq!(
             rules[0],
             json!({"type": "field", "domain": ["ads.example", "tracker.io"], "outboundTag": "direct"})
@@ -1464,7 +1859,8 @@ mod tests {
             rules[1],
             json!({"type": "field", "domain": ["example.com"], "outboundTag": "proxy"})
         );
-        assert_eq!(rules[2]["ip"], json!(["geoip:private"]));
+        assert_eq!(rules[2]["ip"], json!(["224.0.0.0/4", "ff00::/8"]));
+        assert_eq!(rules[3]["ip"], json!(["geoip:private"]));
     }
 
     #[test]
@@ -1724,5 +2120,249 @@ mod tests {
         assert_eq!(percent_decode("a%41"), "aA");
         assert_eq!(percent_decode("%D0%9C%D0%BE"), "Мо");
         assert_eq!(percent_decode("%FF"), "\u{FFFD}");
+    }
+
+    fn dns_options(dns: XrayDnsConfig) -> ProfileRoutingOptions {
+        ProfileRoutingOptions {
+            dns,
+            ..ProfileRoutingOptions::default()
+        }
+    }
+
+    fn dns_server(address: &str, route: XrayDnsRoute) -> XrayDnsServer {
+        XrayDnsServer {
+            address: address.into(),
+            port: None,
+            domains: Vec::new(),
+            skip_fallback: false,
+            route,
+        }
+    }
+
+    #[test]
+    fn domain_strategy_and_matcher_override_base_values() {
+        let config = apply_profile_routing(
+            &base_config(),
+            &[],
+            &ProfileRoutingOptions {
+                domain_strategy: Some(XrayDomainStrategy::IpIfNonMatch),
+                domain_matcher: Some(XrayDomainMatcher::Mph),
+                ..ProfileRoutingOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config["routing"]["domainStrategy"], "IPIfNonMatch");
+        assert_eq!(config["routing"]["domainMatcher"], "mph");
+        // No rule set configured → no rules, no extra outbounds.
+        assert_eq!(config["routing"]["rules"], json!([]));
+    }
+
+    #[test]
+    fn split_dns_emits_section_servers_and_route_rules() {
+        let mut dns = XrayDnsConfig {
+            servers: vec![
+                dns_server("https://8.8.8.8/dns-query", XrayDnsRoute::Proxy),
+                dns_server("https://77.88.8.8/dns-query", XrayDnsRoute::Direct),
+            ],
+            query_strategy: Some(crate::models::XrayDnsQueryStrategy::UseIpv4),
+            ..XrayDnsConfig::default()
+        };
+        dns.hosts
+            .insert("lk.nalog.ru".into(), vec!["213.24.64.1".into()]);
+        let config = apply_profile_routing(&base_config(), &[], &dns_options(dns)).unwrap();
+
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        // port-53 capture, remote DNS → proxy, domestic DNS → direct,
+        // multicast block.
+        assert_eq!(rules[0]["port"], "53");
+        let dns_tag = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["protocol"] == "dns")
+            .unwrap()["tag"]
+            .clone();
+        assert_eq!(rules[0]["outboundTag"], dns_tag);
+        assert_eq!(rules[1]["ip"], json!(["8.8.8.8"]));
+        assert_eq!(rules[1]["outboundTag"], "proxy");
+        assert_eq!(rules[2]["ip"], json!(["77.88.8.8"]));
+        assert_eq!(rules[2]["outboundTag"], "direct");
+        assert_eq!(rules[3]["ip"], json!(["224.0.0.0/4", "ff00::/8"]));
+
+        assert_eq!(
+            config["dns"]["hosts"]["lk.nalog.ru"],
+            json!(["213.24.64.1"])
+        );
+        assert_eq!(config["dns"]["queryStrategy"], "UseIPv4");
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0]["address"], "https://8.8.8.8/dns-query");
+        assert_eq!(servers[1]["address"], "https://77.88.8.8/dns-query");
+    }
+
+    #[test]
+    fn route_bound_dns_servers_autobind_policy_domains() {
+        let policies = [DomainPolicy {
+            domains: vec!["geosite:youtube".into(), "domain:example.com".into()],
+            target: DomainRouteTarget::Proxy,
+        }];
+        let dns = XrayDnsConfig {
+            servers: vec![dns_server(
+                "https://dns.google/dns-query",
+                XrayDnsRoute::Proxy,
+            )],
+            ..XrayDnsConfig::default()
+        };
+        let config = apply_profile_routing(&base_config(), &policies, &dns_options(dns)).unwrap();
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        // Bare catch-all comes first, then the domain-bound entry.
+        assert_eq!(servers.len(), 2);
+        assert_eq!(
+            servers[0],
+            json!({"address": "https://dns.google/dns-query"})
+        );
+        assert_eq!(servers[0].get("domains"), None);
+        assert_eq!(
+            servers[1]["domains"],
+            json!(["geosite:youtube", "domain:example.com"])
+        );
+        // The resolver host itself is pinned to the proxy outbound.
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        let dns_rule = rules
+            .iter()
+            .find(|rule| rule["domain"] == json!(["dns.google"]))
+            .expect("dns server route rule");
+        assert_eq!(dns_rule["outboundTag"], "proxy");
+    }
+
+    #[test]
+    fn block_domains_are_null_routed_through_dns_hosts() {
+        let policies = [DomainPolicy {
+            domains: vec![
+                "domain:ads.example".into(),
+                "geosite:category-ads".into(),
+                "full:telemetry.example".into(),
+            ],
+            target: DomainRouteTarget::Block,
+        }];
+        let mut dns = XrayDnsConfig {
+            servers: vec![dns_server("8.8.8.8", XrayDnsRoute::None)],
+            ..XrayDnsConfig::default()
+        };
+        // An explicit hosts entry beats the generated null route.
+        dns.hosts
+            .insert("telemetry.example".into(), vec!["10.0.0.7".into()]);
+        let config = apply_profile_routing(&base_config(), &policies, &dns_options(dns)).unwrap();
+        let hosts = &config["dns"]["hosts"];
+        assert_eq!(hosts["ads.example"], json!(["127.0.0.1"]));
+        assert_eq!(hosts["telemetry.example"], json!(["10.0.0.7"]));
+        // geosite categories cannot be expressed as hosts keys.
+        assert!(hosts.get("geosite:category-ads").is_none());
+    }
+
+    #[test]
+    fn fake_dns_emits_section_and_sniffing_override() {
+        let dns = XrayDnsConfig {
+            fake_dns: true,
+            servers: vec![dns_server("1.1.1.1", XrayDnsRoute::None)],
+            ..XrayDnsConfig::default()
+        };
+        let config = apply_profile_routing(&base_config(), &[], &dns_options(dns)).unwrap();
+        assert_eq!(config["fakedns"][0]["ipPool"], "198.18.0.0/16");
+        assert_eq!(config["dns"]["servers"][0], json!("fakedns"));
+        let sniffing = &config["inbounds"][0]["sniffing"];
+        assert_eq!(sniffing["enabled"], true);
+        assert!(sniffing["destOverride"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("fakedns")));
+
+        // TUN inbound picks up the fakedns override too.
+        let tun = apply_tun_inbound(&config, None, None).unwrap();
+        let overrides = tun["inbounds"][0]["sniffing"]["destOverride"]
+            .as_array()
+            .unwrap();
+        for expected in ["http", "tls", "quic", "fakedns"] {
+            assert!(overrides.contains(&json!(expected)));
+        }
+    }
+
+    #[test]
+    fn dns_validation_rejects_bad_servers() {
+        for bad in [
+            // Unknown scheme.
+            "quic://dns.example",
+            // Empty host after scheme.
+            "https://",
+            // fakedns entry without the fakedns section enabled.
+            "fakedns",
+        ] {
+            let dns = XrayDnsConfig {
+                servers: vec![dns_server(bad, XrayDnsRoute::None)],
+                ..XrayDnsConfig::default()
+            };
+            assert_eq!(
+                apply_profile_routing(&base_config(), &[], &dns_options(dns))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput,
+                "accepted {bad}"
+            );
+        }
+        let mut server = dns_server("1.1.1.1", XrayDnsRoute::None);
+        server.port = Some(0);
+        let dns = XrayDnsConfig {
+            servers: vec![server],
+            ..XrayDnsConfig::default()
+        };
+        assert_eq!(
+            apply_profile_routing(&base_config(), &[], &dns_options(dns))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // IP selectors are meaningless in dns.servers `domains`.
+        let mut server = dns_server("1.1.1.1", XrayDnsRoute::None);
+        server.domains = vec!["geoip:cn".into()];
+        let dns = XrayDnsConfig {
+            servers: vec![server],
+            ..XrayDnsConfig::default()
+        };
+        assert_eq!(
+            apply_profile_routing(&base_config(), &[], &dns_options(dns))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn dns_server_host_extracts_routable_host() {
+        assert_eq!(dns_server_host("8.8.8.8"), Some("8.8.8.8"));
+        assert_eq!(dns_server_host("8.8.8.8:53"), Some("8.8.8.8"));
+        assert_eq!(
+            dns_server_host("https://dns.google/dns-query"),
+            Some("dns.google")
+        );
+        assert_eq!(
+            dns_server_host("tls://one.one.one:853"),
+            Some("one.one.one")
+        );
+        assert_eq!(
+            dns_server_host("udp://[2001:db8::1]:53"),
+            Some("2001:db8::1")
+        );
+        assert_eq!(dns_server_host("::1"), Some("::1"));
+        assert_eq!(dns_server_host("https://"), None);
+        assert_eq!(dns_server_route_target("localhost"), None);
+        assert_eq!(dns_server_route_target("fakedns"), None);
+        assert_eq!(
+            dns_server_route_target("https://1.1.1.1/dns-query"),
+            Some(("ip", "1.1.1.1".to_string()))
+        );
+        assert_eq!(
+            dns_server_route_target("dns.google"),
+            Some(("domain", "dns.google".to_string()))
+        );
     }
 }
