@@ -228,8 +228,9 @@ pub fn subscription_response_meta(
     }
 }
 
-/// Compose the profile display name as `{provider} - {endpoint}`. When the
-/// endpoint name already carries the provider prefix it is used as-is.
+/// Compose the profile display name as `{provider} · {endpoint}`. When the
+/// endpoint name already carries the provider prefix (with any separator)
+/// it is re-joined with ` · `.
 pub fn subscription_profile_name(provider_title: Option<&str>, endpoint_name: &str) -> String {
     let Some(title) = provider_title
         .map(str::trim)
@@ -239,23 +240,41 @@ pub fn subscription_profile_name(provider_title: Option<&str>, endpoint_name: &s
     };
     if let Some(rest) = endpoint_name.strip_prefix(title) {
         let rest = rest.trim_start();
-        if rest.starts_with(['-', '–', '—', '|']) {
-            let stripped = rest.trim_start_matches(['-', '–', '—', '|', ' ']).trim();
+        if rest.starts_with(['-', '–', '—', '|', '·', '•']) {
+            let stripped = rest
+                .trim_start_matches(['-', '–', '—', '|', '·', '•', ' '])
+                .trim();
             return if stripped.is_empty() {
                 title.to_string()
             } else {
-                format!("{title} - {stripped}")
+                format!("{title} · {stripped}")
             };
         }
     }
     if endpoint_name == title {
         return title.to_string();
     }
-    format!("{title} - {endpoint_name}")
+    format!("{title} · {endpoint_name}")
 }
 
-/// True when `profile_name` is the auto-generated name of `endpoint_name`
-/// (bare or provider-prefixed), i.e. it should follow endpoint selection.
+/// The last ` · ` / ` - ` / ` – ` / ` — ` / ` | `-delimited segment of an
+/// endpoint name — "AcmeVPN · ⚡ NL" → "⚡ NL". Returns the whole name when
+/// no separator is present.
+fn endpoint_tail(endpoint_name: &str) -> &str {
+    for sep in [" · ", " • ", " - ", " – ", " — ", " | "] {
+        if let Some((_, tail)) = endpoint_name.rsplit_once(sep) {
+            let tail = tail.trim();
+            if !tail.is_empty() {
+                return tail;
+            }
+        }
+    }
+    endpoint_name
+}
+
+/// True when `profile_name` is the auto-generated name of `endpoint_name` —
+/// bare, provider-prefixed, or the provider-less tail of a prefixed name
+/// (a profile imported before the panel started advertising its title).
 fn auto_profile_name_matches(
     provider_title: Option<&str>,
     endpoint_name: &str,
@@ -263,6 +282,11 @@ fn auto_profile_name_matches(
 ) -> bool {
     endpoint_name == profile_name
         || subscription_profile_name(provider_title, endpoint_name) == profile_name
+        || endpoint_tail(endpoint_name) == profile_name
+        // Separator-insensitive: "AcmeVPN - NL" (older release) still counts
+        // as the auto name of "AcmeVPN · NL".
+        || subscription_profile_name(provider_title, profile_name)
+            == subscription_profile_name(provider_title, endpoint_name)
 }
 
 /// Best-effort standard base64 decoder that tolerates missing padding and
@@ -1013,6 +1037,27 @@ mod tests {
         .unwrap();
         assert_eq!(endpoint_key(&a), endpoint_key(&b));
         assert_eq!(endpoint_key("vless://id@h:1#Name"), "vless://id@h:1");
+    }
+
+    #[test]
+    fn auto_name_match_accepts_bare_names_after_provider_appears() {
+        // Profile imported as "⚡ NL" before the panel started sending
+        // Profile-Title: today's endpoint is "AcmeVPN - ⚡ NL" and the old
+        // bare name still counts as auto-generated, so it may be re-prefixed.
+        assert!(auto_profile_name_matches(
+            Some("AcmeVPN"),
+            "AcmeVPN - ⚡ NL",
+            "⚡ NL"
+        ));
+        // Same without a header: a name matching the last "- "-delimited
+        // endpoint segment is still auto-generated.
+        assert!(auto_profile_name_matches(None, "Geodema - ⚡ NL", "⚡ NL"));
+        // A hand-picked name stays custom.
+        assert!(!auto_profile_name_matches(
+            Some("AcmeVPN"),
+            "AcmeVPN - ⚡ NL",
+            "My VPN"
+        ));
     }
 
     #[test]

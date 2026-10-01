@@ -35,7 +35,7 @@ export class SandboxBackend {
   private profiles: Profile[] = [
     profile("wg", "QA WireGuard", "wireGuard", "10.77.0.0/24"),
     profile("ovpn", "QA OpenVPN", "openVpn", "10.88.0.0/24"),
-    profile("xray", "AcmeVPN - ⚡ Нидерланды", "xray"),
+    profile("xray", "AcmeVPN · ⚡ Нидерланды", "xray"),
     profile("static", "QA Static routes", "none", "203.0.113.0/24"),
   ];
   private running = new Set<string>();
@@ -49,9 +49,9 @@ export class SandboxBackend {
   private authMode: VpnAuthMode = "fullTunnelOnly";
   private recovered = false;
   private endpoints = [
-    "AcmeVPN - ⚡ Нидерланды", "AcmeVPN - 🇩🇪 Германия", "AcmeVPN - 🇫🇮 Финляндия",
-    "AcmeVPN - 🇯🇵 Япония", "AcmeVPN - 🇺🇸 США", "AcmeVPN - 🇧🇷 Бразилия",
-    "AcmeVPN - 🇸🇬 Сингапур", "AcmeVPN - 🇬🇧 Великобритания",
+    "AcmeVPN · ⚡ Нидерланды", "AcmeVPN · 🇩🇪 Германия", "AcmeVPN · 🇫🇮 Финляндия",
+    "AcmeVPN · 🇯🇵 Япония", "AcmeVPN · 🇺🇸 США", "AcmeVPN · 🇧🇷 Бразилия",
+    "AcmeVPN · 🇸🇬 Сингапур", "AcmeVPN · 🇬🇧 Великобритания",
   ];
   private backendPaths = new Map<string, string>();
   private xrayManaged = false;

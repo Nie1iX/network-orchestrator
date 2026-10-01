@@ -1,4 +1,4 @@
-const SEPARATOR = /[\s\-–—|]+$/;
+const SEPARATOR = /[\s\-–—|·•]+$/;
 
 /**
  * Subscription endpoints frequently embed the provider name as a shared
