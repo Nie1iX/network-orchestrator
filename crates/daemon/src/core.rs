@@ -2397,10 +2397,29 @@ impl DaemonCore {
             }
             _ => TunnelState::Failed,
         };
+        // Live counters come from the stats api only while running; a failure
+        // (old staged config, missing listener) degrades to absent counters.
+        let stats_target = process.map(|process| (process.name.clone(), process.transport_mark));
+        let (rx_bytes, tx_bytes) = if state == TunnelState::Running {
+            stats_target
+                .and_then(|(name, mark)| {
+                    self.xray.as_mut().and_then(|runner| {
+                        runner
+                            .query_stats(&name, crate::xray::xray_api_port(mark))
+                            .ok()
+                    })
+                })
+                .map(|(rx, tx)| (Some(rx), Some(tx)))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
         XrayStatusResult {
             profile_id: profile_id.to_owned(),
             state,
             interface_name: process.map(|process| process.name.clone()),
+            rx_bytes,
+            tx_bytes,
             dns_applied: entry.is_some_and(|entry| {
                 entry
                     .resources

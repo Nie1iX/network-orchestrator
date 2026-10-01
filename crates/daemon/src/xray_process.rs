@@ -78,6 +78,16 @@ pub trait XrayProcessRunner: Send {
         ))
     }
     fn health(&mut self, name: &str) -> io::Result<bool>;
+    /// `(rx, tx)` bytes seen by the TUN inbound, queried over the local
+    /// StatsService dokodemo door on `api_port`. Runners without stats
+    /// support keep the default failure and the caller reports `None`.
+    fn query_stats(&mut self, name: &str, api_port: u16) -> io::Result<(u64, u64)> {
+        let _ = (name, api_port);
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "Xray statsquery is unsupported",
+        ))
+    }
     fn stop(&mut self, name: &str) -> io::Result<()>;
     fn cleanup(&mut self, uid: u32, name: &str) -> io::Result<()>;
 }
@@ -352,6 +362,18 @@ impl XrayProcessRunner for TrustedXrayProcess {
             && self.link_index(name)?.is_some())
     }
 
+    fn query_stats(&mut self, name: &str, api_port: u16) -> io::Result<(u64, u64)> {
+        if !self.children.contains_key(name) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Xray child is not tracked",
+            ));
+        }
+        let output = run_statsquery(&trusted_binary()?, api_port)?;
+        let stats = parse_statsquery(&output);
+        Ok(stats)
+    }
+
     fn stop(&mut self, name: &str) -> io::Result<()> {
         let (_, child) = self
             .children
@@ -529,6 +551,87 @@ fn ensure_runtime_root() -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const STATSQUERY_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// `xray api statsquery -server=127.0.0.1:<port>` against the managed
+/// binary; the counter list is small enough to read after exit.
+#[cfg(target_os = "linux")]
+fn run_statsquery(binary: &Path, api_port: u16) -> io::Result<String> {
+    let mut child = Command::new(binary)
+        .args([
+            "api",
+            "statsquery",
+            "-server",
+            &format!("127.0.0.1:{api_port}"),
+        ])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| io::Error::other("Xray statsquery launch failed"))?;
+    let deadline = Instant::now() + STATSQUERY_TIMEOUT;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|_| io::Error::other("Xray statsquery wait failed"))?
+        {
+            let mut output = String::new();
+            child
+                .stdout
+                .take()
+                .expect("piped stdout")
+                .read_to_string(&mut output)
+                .map_err(|_| io::Error::other("Xray statsquery read failed"))?;
+            if !status.success() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "Xray statsquery failed",
+                ));
+            }
+            return Ok(output);
+        }
+        if Instant::now() >= deadline {
+            let _ = terminate_child(&mut child);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Xray statsquery timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `statsquery` prints one `name>>>...>>>direction  value` line per counter;
+/// the TUN inbound's downlink is what the apps received (rx) and uplink is
+/// what they sent (tx). Other inbounds (api-in) and outbound counters are
+/// intentionally ignored here.
+#[cfg(target_os = "linux")]
+fn parse_statsquery(output: &str) -> (u64, u64) {
+    let (mut rx, mut tx) = (0_u64, 0_u64);
+    for line in output.lines() {
+        let mut fields = line
+            .split([':', '\t', ' ', '='])
+            .filter(|field| !field.is_empty());
+        let Some(name) = fields.find(|field| field.contains(">>>")) else {
+            continue;
+        };
+        if !name.starts_with("inbound>>>tun-in>>>") {
+            continue;
+        }
+        let Some(value) = fields.find_map(|field| field.parse::<u64>().ok()) else {
+            continue;
+        };
+        if name.ends_with(">>>downlink") {
+            rx += value;
+        } else if name.ends_with(">>>uplink") {
+            tx += value;
+        }
+    }
+    (rx, tx)
 }
 
 #[cfg(target_os = "linux")]
@@ -1303,5 +1406,27 @@ mod tests {
         fs::set_permissions(&geo, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(safe_owned_file(&geo, owner, false));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn statsquery_output_parses_tun_inbound_counters() {
+        let output = "inbound>>>tun-in>>>traffic>>>uplink	2048
+\
+                      inbound>>>tun-in>>>traffic>>>downlink   1024
+\
+                      inbound>>>api-in>>>traffic>>>uplink	10
+\
+                      outbound>>>proxy>>>traffic>>>uplink	2048
+";
+        assert_eq!(parse_statsquery(output), (1024, 2048));
+        assert_eq!(parse_statsquery(""), (0, 0));
+        assert_eq!(
+            parse_statsquery(
+                "inbound>>>tun-in>>>traffic>>>uplink: 7
+"
+            ),
+            (0, 7)
+        );
     }
 }

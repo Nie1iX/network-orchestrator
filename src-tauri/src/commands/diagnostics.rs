@@ -914,7 +914,7 @@ pub(crate) async fn diagnose_profile(
     let xray_status =
         if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
             Some(
-                crate::commands::tunnels::linux_xray_status(
+                crate::commands::tunnels::linux_xray_status_result(
                     &crate::daemon_client::DaemonClient::system(),
                     &profile,
                 )
@@ -997,12 +997,15 @@ pub(crate) async fn diagnose_profile(
                         state: if status.state == TunnelState::Failed { ProtocolHealthState::Failed } else { ProtocolHealthState::Unknown },
                         summary: "Xray TUN state reported by network daemon; proxy traffic is not verified".into(),
                         last_handshake_unix: None,
-                        rx_bytes: None,
-                        tx_bytes: None,
+                        rx_bytes: status.rx_bytes,
+                        tx_bytes: status.tx_bytes,
                         log_tail: None,
                         pushed_routes: Vec::new(),
                     };
-                    (status, health)
+                    (
+                        crate::commands::tunnels::linux_xray_tunnel_status(status, &profile),
+                        health,
+                    )
                 }
                 Some(Err(err)) => (
                     TunnelStatus {
