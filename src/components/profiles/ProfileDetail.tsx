@@ -1,4 +1,4 @@
-import { backendIcon } from "../../icons";
+import { backendIcon, SpinnerIcon } from "../../icons";
 import { formatBytes } from "../../format";
 import { TranslationKey, useT } from "../../i18n";
 import {
@@ -46,6 +46,20 @@ function countPolicyRules(
     .filter((p) => target === undefined || p.target === target)
     .flatMap((p) => p.domains)
     .filter((d) => !d.trimStart().startsWith("#")).length;
+}
+
+/** Same thresholds as the native client: <300 ms good, <800 ms fair. */
+function delayClass(
+  result: SubscriptionDelayResult | undefined,
+  measuring: boolean,
+): string {
+  if (measuring || !result) return "";
+  if (result.delayMs === null) return "delay-bad";
+  return result.delayMs < 300
+    ? "delay-good"
+    : result.delayMs < 800
+      ? "delay-fair"
+      : "delay-bad";
 }
 
 interface ProfileDetailProps {
@@ -380,7 +394,7 @@ export default function ProfileDetail({
               </span>
               <button
                 type="button"
-                className="btn-sm"
+                className="btn-sm btn-with-icon"
                 onClick={onMeasureAllEndpoints}
                 disabled={
                   measuringAll ||
@@ -390,7 +404,13 @@ export default function ProfileDetail({
                 }
                 title={t("detail.testAllTitle")}
               >
-                {measuringAll ? t("profiles.testing") : t("detail.testAll")}
+                {measuringAll && <SpinnerIcon size={12} />}
+                {measuringAll
+                  ? t("detail.testingProgress", {
+                      done: Object.keys(delayResults ?? {}).length,
+                      total: endpoints.length,
+                    })
+                  : t("detail.testAll")}
               </button>
             </div>
             <ul className="endpoint-list">
@@ -407,14 +427,13 @@ export default function ProfileDetail({
                         switching ||
                         refreshingSubscription ||
                         isBusy ||
-                        status.state === "running" ||
                         ep.active
                       }
                       title={
-                        status.state === "running"
-                          ? t("detail.disconnectToSwitch")
-                          : ep.active
-                            ? t("detail.activeEndpoint")
+                        ep.active
+                          ? t("detail.activeEndpoint")
+                          : status.state === "running"
+                            ? t("detail.switchEndpointReconnect")
                             : t("detail.switchEndpoint")
                       }
                     >
@@ -422,14 +441,21 @@ export default function ProfileDetail({
                         className={`endpoint-item-dot ${ep.active ? "on" : ""}`}
                       />
                       <span className="endpoint-item-name">{ep.name}</span>
-                      <span className="endpoint-item-delay">
-                        {measuring
-                          ? "…"
-                          : res
-                            ? res.delayMs !== null
-                              ? `${res.delayMs} ms`
-                              : t("detail.unreachable")
-                            : "—"}
+                      <span
+                        className={`endpoint-item-delay ${delayClass(res, measuring)}`}
+                        aria-busy={measuring || undefined}
+                      >
+                        {measuring ? (
+                          <SpinnerIcon size={12} />
+                        ) : res ? (
+                          res.delayMs !== null ? (
+                            t("detail.delayMs", { ms: res.delayMs })
+                          ) : (
+                            t("detail.unreachable")
+                          )
+                        ) : (
+                          "—"
+                        )}
                       </span>
                     </button>
                   </li>

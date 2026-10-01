@@ -48,7 +48,10 @@ export class SandboxBackend {
   private loginAutostart = false;
   private authMode: VpnAuthMode = "fullTunnelOnly";
   private recovered = false;
-  private endpoints = ["QA Europe", "QA Asia"];
+  private endpoints = [
+    "QA Europe", "QA Asia", "QA Netherlands", "QA Germany",
+    "QA Finland", "QA Japan", "QA United States", "QA Brazil",
+  ];
   private backendPaths = new Map<string, string>();
   private xrayManaged = false;
   private condRules: ConditionalRuleEntry[] = [
@@ -69,7 +72,7 @@ export class SandboxBackend {
     // demonstrates the "interface occupied" conflict until it is connected.
     this.profiles[0].interfaceName = "wg-home";
     this.profiles[2].subscription = {
-      url: "", hwid: "", endpointCount: 2, activeIndex: 0,
+      url: "", hwid: "", endpointCount: this.endpoints.length, activeIndex: 0,
       refreshIntervalMinutes: null, lastRefreshAtUnix: null, lastRefreshError: null,
       userInfo: { uploadBytes: 1048576, downloadBytes: 2097152, totalBytes: 1073741824, expiresAtUnix: null },
     };
@@ -156,7 +159,10 @@ export class SandboxBackend {
 
   invoke(command: string, args: Record<string, unknown> = {}): unknown {
     // Clone responses to prevent UI edits from mutating backend state by reference.
-    return structuredClone(this.dispatch(command, args));
+    const result = this.dispatch(command, args);
+    // Slow synthetic commands (delay probes) resolve later; clone on arrival.
+    if (result instanceof Promise) return result.then((value) => structuredClone(value));
+    return structuredClone(result);
   }
 
   private dispatch(command: string, args: Record<string, unknown>): unknown {
@@ -265,9 +271,20 @@ export class SandboxBackend {
         const p = this.find(args.id); this.stopped(p);
         if (!p.subscription) throw new Error("Not a subscription profile");
         p.subscription.lastRefreshAtUnix = Math.floor(Date.now() / 1000);
-        return { endpointCount: 2, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false };
+        return { endpointCount: this.endpoints.length, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false };
       }
-      case "measure_subscription_endpoint_delay": return { delayMs: 42, error: null };
+      case "measure_subscription_endpoint_delay": {
+        // Deterministic synthetic latency with a real wait, so the browser
+        // preview shows probes landing one by one; every fourth one times out.
+        const index = Number(args.endpointIndex);
+        const delayMs = 60 + ((index * 263) % 900);
+        const unreachable = index % 4 === 3;
+        return new Promise((resolve) =>
+          setTimeout(
+            () => resolve(unreachable ? { delayMs: null, error: "delay probe timed out" } : { delayMs, error: null }),
+            unreachable ? 2500 : delayMs * 2,
+          ));
+      }
       case "import_share_link": {
         const link = String(args.link ?? "").trim();
         const invalid = () => new Error("Invalid or unsupported share link. Use vless://, hysteria2:// or hy2://.");
