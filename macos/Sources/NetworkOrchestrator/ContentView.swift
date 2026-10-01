@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct ContentView: View {
@@ -151,6 +152,7 @@ struct HomeView: View {
           ForEach(running) { profile in activeRow(profile) }
         }
       }
+      ExitIPSection(model: model)
       VStack(alignment: .leading, spacing: 0) {
         AppHeading(title: "Quick actions")
         HStack(spacing: 7) {
@@ -257,5 +259,102 @@ struct StatusBar: View {
       Circle().fill(p[color]).frame(width: 6, height: 6)
       Text(text).font(.system(size: 10.5, design: .monospaced))
     }
+  }
+}
+
+/// Exit IP directly and through each running connection: the address most
+/// checkers agree on, its country and how many of the services agree.
+struct ExitIPSection: View {
+  @Environment(\.palette) private var p
+  @Bindable var model: AppModel
+  var body: some View {
+    let running = (model.snapshot?.profiles ?? []).filter { model.isRunning($0) }
+    VStack(alignment: .leading, spacing: 0) {
+      HStack {
+        AppHeading(title: "monitor.exitAddresses")
+      }
+      .overlay(alignment: .topTrailing) {
+        Button {
+          Task { await model.checkExitIPs() }
+        } label: {
+          HStack(spacing: 6) {
+            if !model.checkingExitIP.isEmpty { Spinner(size: 10) }
+            Text(
+              L10n.text(
+                !model.checkingExitIP.isEmpty
+                  ? "exitIp.checking" : model.exitIPs.isEmpty ? "exitIp.check" : "exitIp.recheck"))
+          }
+        }.buttonStyle(TauriButtonStyle(compact: true)).disabled(!model.checkingExitIP.isEmpty)
+      }
+      row("direct", L10n.text("rules.direct"))
+      ForEach(running) { profile in
+        row(
+          profile.id,
+          [profile.groupName, model.activeServer(profile)].compactMap { $0 }.joined(
+            separator: " · "))
+      }
+    }
+  }
+  @ViewBuilder private func row(_ route: String, _ label: String) -> some View {
+    let entries = model.exitIPs[route]
+    HStack(spacing: 10) {
+      Text(label).foregroundStyle(p.secondary).lineLimit(1)
+      Spacer()
+      if model.checkingExitIP.contains(route) {
+        Spinner(size: 11)
+      } else if let entries {
+        let answered = entries.compactMap(\.ip)
+        let counts = Dictionary(grouping: answered, by: { $0 }).mapValues(\.count)
+        if let (ip, agree) = counts.max(by: { $0.value < $1.value }) {
+          let country = entries.first { $0.ip == ip }?.country ?? ""
+          Text(ip).font(.system(size: 11.9, weight: .medium, design: .monospaced))
+            .textSelection(.enabled)
+          if !country.isEmpty {
+            Text(country).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(p.muted)
+          }
+          Text("\(agree)/\(entries.count)").font(.system(size: 10.5, design: .monospaced))
+            .foregroundStyle(counts.count > 1 ? p["warn"] : p.muted)
+            .help(entries.map { "\($0.name): \($0.ip ?? L10n.text("exitIp.noResponse"))" }.joined(separator: "\n"))
+        } else {
+          Text(L10n.text("exitIp.noResponse")).foregroundStyle(p["down"])
+        }
+      } else {
+        Text("—").foregroundStyle(p.muted)
+      }
+    }
+    .font(.system(size: 11.9)).padding(.horizontal, 14).padding(.vertical, 9)
+    .background(p.card, in: RoundedRectangle(cornerRadius: 8))
+    .overlay(RoundedRectangle(cornerRadius: 8).stroke(p.border, lineWidth: 1))
+    .padding(.bottom, 6)
+  }
+}
+
+/// Read-only, already-redacted log text with refresh and copy actions.
+struct LogSheet: View {
+  @Environment(\.palette) private var p
+  let title: String
+  let load: () async -> String
+  let onClose: () -> Void
+  @State private var text = ""
+  var body: some View {
+    AppModal(title: title, width: 760, onClose: onClose, translatesTitle: false) {
+      VStack(alignment: .leading, spacing: 10.5) {
+        ScrollView {
+          Text(text.isEmpty ? L10n.text("logs.empty") : text)
+            .font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+        }.frame(height: 380).background(p.input, in: RoundedRectangle(cornerRadius: 6))
+          .overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
+        HStack {
+          Button(L10n.text("common.refresh")) { Task { text = await load() } }
+          Button(L10n.text("native.copyLog")) {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+          }.disabled(text.isEmpty)
+          Spacer()
+          Button(L10n.text("common.close"), action: onClose)
+        }
+      }.padding(14)
+    }.task { text = await load() }
   }
 }

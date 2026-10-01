@@ -323,6 +323,7 @@ struct ProfileDetailView: View {
   @Environment(\.palette) private var p
   @Bindable var model: AppModel
   @State private var editingRules = false
+  @State private var showingLog = false
   let profile: Profile
   let onRename: () -> Void
   let onDelete: () -> Void
@@ -351,6 +352,7 @@ struct ProfileDetailView: View {
           Button(L10n.text("Rename"), action: onRename)
           Button(L10n.text("Inspect configuration")) { Task { await model.inspect(profile) } }
           if profile.backend == "xray" {
+            Button(L10n.text("native.connectionLog")) { showingLog = true }
             Divider()
             Button(L10n.text("native.openBrowser")) { model.openBrowser(profile) }.disabled(
               !running)
@@ -429,6 +431,12 @@ struct ProfileDetailView: View {
     }
     .frame(maxWidth: .infinity, alignment: .leading)
     .task(id: profile.id) { await model.loadInspection(profile) }
+    .sheet(isPresented: $showingLog) {
+      LogSheet(
+        title: L10n.text("diag.title", ["name": profile.groupName]),
+        load: { await model.connectionLog(profile) }, onClose: { showingLog = false }
+      ).environment(\.palette, p).buttonStyle(TauriButtonStyle())
+    }
     .sheet(isPresented: $editingRules) {
       RoutingRulesEditor(model: model, profile: profile) { editingRules = false }
         .environment(\.palette, p).buttonStyle(TauriButtonStyle())

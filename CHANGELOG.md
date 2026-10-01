@@ -10,6 +10,12 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ### Added
 
+- Native home screen checks the exit IP directly and through every running
+  connection (six IP-echo services, country, agreement count), connections
+  show their redacted Xray log, and Settings shows the secret-free
+  subscription import log. The exit-IP checkers moved into the core and can
+  run through a loopback SOCKS proxy; the Tauri panel uses the same code.
+
 - Native Xray connections edit their domain/IP rule sets (block → proxy →
   direct) and the private-LAN-direct switch in a full-size editor, with a
   per-set summary in the detail pane. Each line is validated with the core

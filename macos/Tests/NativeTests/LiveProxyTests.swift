@@ -91,6 +91,13 @@ func liveProxyConnectionCarriesTraffic() async throws {
   }
   #expect(["200", "301", "302", "303"].contains(code))
 
+  let viaProxy: [ExitIpEntry] = try await core.callConcurrently(
+    "check_exit_ip", args: ["via": "live"])
+  let direct: [ExitIpEntry] = try await core.callConcurrently(
+    "check_exit_ip", args: ["via": "direct"])
+  print("live exit ip via proxy:", viaProxy.compactMap(\.ip).count, "of", viaProxy.count, "answered")
+  print("live exit ip direct:", direct.compactMap(\.ip).count, "of", direct.count, "answered")
+  #expect(!viaProxy.compactMap(\.ip).isEmpty)
   // Delay probes are only offered for subscriptions; a single link is refused.
   do {
     let _: [DelayResult] = try await core.call("measure_delays", args: ["id": "live"])

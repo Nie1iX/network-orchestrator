@@ -14,6 +14,9 @@ import SystemConfiguration
   /// Endpoint indices still being measured, per profile.
   var probing: [String: Set<Int>] = [:]
   var refreshing = Set<String>()
+  /// Exit-IP results per route: "direct" or a running profile id.
+  var exitIPs: [String: [ExitIpEntry]] = [:]
+  var checkingExitIP = Set<String>()
   var snapshot: Snapshot?
   var capabilities: Capabilities?
   var section: Section = .home
@@ -301,6 +304,33 @@ import SystemConfiguration
       await refreshSubscription(profile)
     }
     await refresh()
+  }
+  /// Checks the exit IP directly and through every running connection at
+  /// once; each route's result appears as soon as its checkers finish.
+  func checkExitIPs() async {
+    let routes = ["direct"] + (snapshot?.profiles ?? []).filter { isRunning($0) }.map(\.id)
+    exitIPs = exitIPs.filter { routes.contains($0.key) }
+    let core = probeCore
+    await withTaskGroup(of: (String, [ExitIpEntry]?).self) { group in
+      for route in routes where !checkingExitIP.contains(route) {
+        checkingExitIP.insert(route)
+        group.addTask {
+          let entries: [ExitIpEntry]? = try? await core.callConcurrently(
+            "check_exit_ip", args: ["via": route])
+          return (route, entries)
+        }
+      }
+      for await (route, entries) in group {
+        exitIPs[route] = entries ?? []
+        checkingExitIP.remove(route)
+      }
+    }
+  }
+  func connectionLog(_ profile: Profile) async -> String {
+    (try? await core.call("log", args: ["id": profile.id]) as String) ?? ""
+  }
+  func importLog() async -> String {
+    (try? await core.call("import_log") as String) ?? ""
   }
   /// Saves the three rule sets; a running connection restarts to apply them.
   func setRoutingRules(

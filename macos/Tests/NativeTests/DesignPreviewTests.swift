@@ -125,6 +125,17 @@ import Testing
   model.primaryInterface = "en0"
   model.delays["design-xray"] = [0: UInt64?.some(142)]
   model.probing["design-xray"] = [1]
+  model.exitIPs = [
+    "direct": [
+      ExitIpEntry(name: "ipify", ip: "198.51.100.20", country: "RU", error: nil),
+      ExitIpEntry(name: "icanhazip", ip: "198.51.100.20", country: "RU", error: nil),
+    ],
+    "design-xray": [
+      ExitIpEntry(name: "ipify", ip: "203.0.113.7", country: "NL", error: nil),
+      ExitIpEntry(name: "icanhazip", ip: "203.0.113.7", country: "NL", error: nil),
+      ExitIpEntry(name: "2ip.io", ip: nil, country: nil, error: "unreachable"),
+    ],
+  ]
   model.inspections["design-wg"] = try JSONDecoder().decode(
     Inspection.self,
     from: JSONSerialization.data(withJSONObject: [

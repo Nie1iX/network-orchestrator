@@ -267,3 +267,10 @@ enum Section: String, CaseIterable, Identifiable {
     }
   }
 }
+
+struct ExitIpEntry: Decodable, Sendable {
+  let name: String
+  let ip: String?
+  let country: String?
+  let error: String?
+}
