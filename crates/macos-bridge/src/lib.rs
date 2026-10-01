@@ -94,6 +94,72 @@ fn delay_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
 
 const DELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Fetch outside the store lock (it can take seconds), then apply the body
+/// under the lock; a failed attempt is recorded so auto-refresh backs off.
+fn refresh_subscription(root: &Path, args: &Value) -> Result<Value, String> {
+    let id = text_arg(args, "id")?;
+    let store = ProfileStore::new(root.join("profiles.json"));
+    let meta = store
+        .load()
+        .map_err(store_error)?
+        .profiles
+        .into_iter()
+        .find(|p| p.id == id)
+        .and_then(|p| p.subscription)
+        .ok_or("Profile is not a subscription")?;
+    let record_failure = |message: String| {
+        let _lock = TRANSACTION.lock();
+        let _ = net_manager_core::subscription::record_refresh_failure(&store, id, unix_now());
+        message
+    };
+    let client = net_manager_core::subscription::http_client().map_err(subscription_error)?;
+    let fetched = runtime_executor()?
+        .block_on(net_manager_core::subscription::fetch(
+            &client, &meta.url, &meta.hwid,
+        ))
+        .map_err(|error| record_failure(subscription_error(error)))?;
+    let summary = format!(
+        "{} headers: {}",
+        net_manager_core::subscription::summarize_subscription_body(
+            &fetched.body,
+            fetched.content_type.as_deref(),
+        ),
+        fetched.header_names.join(",")
+    );
+    let _lock = TRANSACTION
+        .lock()
+        .map_err(|_| "Profile service is unavailable".to_string())?;
+    let vault = ConfigVault::new(root.join("configs"));
+    let result = runtime::restart_around(root, &store, id, || {
+        let outcome = net_manager_core::subscription::refresh_body(
+            &vault,
+            &store,
+            id,
+            &fetched.body,
+            fetched.meta.clone(),
+            local_port_available,
+        );
+        log_subscription_import(
+            root,
+            &summary,
+            !meta.hwid.is_empty(),
+            outcome.as_ref().err().map(|e| e.to_string()),
+        );
+        encode(outcome.map_err(subscription_error)?)
+    });
+    if result.is_err() {
+        let _ = net_manager_core::subscription::record_refresh_failure(&store, id, unix_now());
+    }
+    result
+}
+
 /// Exit IP as seen by IP-echo services, directly or through a running
 /// connection's SOCKS port; never holds the store lock.
 fn check_exit_ip(root: &Path, args: &Value) -> Result<Value, String> {
@@ -250,6 +316,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
     // Delay probes take seconds; they only read the store, so they run
     // outside the transaction lock and never stall other calls.
     match method {
+        "refresh_subscription" => return refresh_subscription(root, args),
         "measure_delays" => return measure_delays(root, args),
         "measure_delay" => return measure_delay(root, args),
         "check_exit_ip" => return check_exit_ip(root, args),
@@ -525,49 +592,26 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 ))
             })
         }
-        "refresh_subscription" => {
+        "set_refresh_interval" => {
             let id = text_arg(args, "id")?;
-            let meta = store
-                .load()
-                .map_err(store_error)?
-                .profiles
-                .into_iter()
-                .find(|p| p.id == id)
-                .and_then(|p| p.subscription)
-                .ok_or("Profile is not a subscription")?;
-            let client =
-                net_manager_core::subscription::http_client().map_err(subscription_error)?;
-            let fetched = runtime_executor()?
-                .block_on(net_manager_core::subscription::fetch(
-                    &client, &meta.url, &meta.hwid,
-                ))
-                .map_err(subscription_error)?;
-            let summary = format!(
-                "{} headers: {}",
-                net_manager_core::subscription::summarize_subscription_body(
-                    &fetched.body,
-                    fetched.content_type.as_deref(),
+            let minutes = match args["minutes"].as_str().unwrap_or_default() {
+                "" => None,
+                value => Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| "unsupported subscription refresh interval".to_string())?,
                 ),
-                fetched.header_names.join(",")
-            );
-            runtime::restart_around(root, &store, id, || {
-                let outcome = net_manager_core::subscription::refresh_body(
-                    &vault,
-                    &store,
-                    id,
-                    &fetched.body,
-                    fetched.meta.clone(),
-                    local_port_available,
-                );
-                log_subscription_import(
-                    root,
-                    &summary,
-                    !meta.hwid.is_empty(),
-                    outcome.as_ref().err().map(|e| e.to_string()),
-                );
-                let outcome = outcome.map_err(subscription_error)?;
-                encode(outcome)
-            })
+            };
+            let document = net_manager_core::subscription::set_refresh_interval(
+                &store,
+                id,
+                minutes,
+                unix_now(),
+            )
+            .map_err(subscription_error)?;
+            encode(net_manager_core::subscription::public_profiles(
+                document.profiles,
+            ))
         }
         "import_share_link" => {
             let id = text_arg(args, "id")?;
@@ -687,6 +731,47 @@ pub unsafe extern "C" fn netorch_free(value: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refresh_interval_is_validated_and_failures_are_recorded() {
+        let (url, server) =
+            serve_bodies(vec!["vless://synthetic@nl.test:443?security=tls#NL".into()]);
+        let dir = tempfile::tempdir().unwrap();
+        dispatch(
+            dir.path(),
+            "import_subscription",
+            &json!({"id":"sub", "url":url, "hwid":"", "name":""}),
+        )
+        .unwrap();
+        server.join().unwrap();
+        let profiles = dispatch(
+            dir.path(),
+            "set_refresh_interval",
+            &json!({"id":"sub", "minutes":"60"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["subscription"]["refreshIntervalMinutes"], 60);
+        assert!(dispatch(
+            dir.path(),
+            "set_refresh_interval",
+            &json!({"id":"sub", "minutes":"5"}),
+        )
+        .is_err());
+        let off = dispatch(
+            dir.path(),
+            "set_refresh_interval",
+            &json!({"id":"sub", "minutes":""}),
+        )
+        .unwrap();
+        assert!(off[0]["subscription"]["refreshIntervalMinutes"].is_null());
+        // The serving thread is gone, so the refresh fetch fails and is recorded.
+        assert!(dispatch(dir.path(), "refresh_subscription", &json!({"id":"sub"})).is_err());
+        let profiles = dispatch(dir.path(), "profiles", &json!({})).unwrap();
+        assert_eq!(
+            profiles[0]["subscription"]["lastRefreshError"],
+            "Refresh failed"
+        );
+    }
+
     #[test]
     fn exit_ip_through_a_connection_requires_it_to_run() {
         let dir = tempfile::tempdir().unwrap();

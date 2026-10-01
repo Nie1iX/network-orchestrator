@@ -528,6 +528,7 @@ struct ProfileDetailView: View {
         }.buttonStyle(TauriButtonStyle(compact: true)).disabled(
           model.refreshing.contains(profile.id) || model.busy)
       }.padding(.top, 6)
+      autoRefreshRow(subscription)
       let busy = model.busy || model.pending.contains(profile.id)
       ForEach(Array(endpoints.enumerated()), id: \.offset) { index, endpoint in
         let active = index == subscription.activeIndex
@@ -556,6 +557,44 @@ struct ProfileDetailView: View {
         }.buttonStyle(.plain).disabled(active || busy)
           .help(L10n.text(active ? "detail.activeEndpoint" : "detail.switchEndpoint"))
       }
+    }
+  }
+  @ViewBuilder private func autoRefreshRow(_ subscription: SubscriptionMeta) -> some View {
+    HStack(spacing: 10) {
+      Text(L10n.text("detail.autoRefresh")).foregroundStyle(p.muted)
+      Spacer()
+      Picker(
+        L10n.text("detail.autoRefresh"),
+        selection: Binding(
+          get: { subscription.refreshIntervalMinutes ?? 0 },
+          set: { value in
+            Task { await model.setRefreshInterval(profile, minutes: value == 0 ? nil : value) }
+          })
+      ) {
+        Text(L10n.text("common.off")).tag(UInt32(0))
+        Text(L10n.text("detail.every15")).tag(UInt32(15))
+        Text(L10n.text("detail.everyHour")).tag(UInt32(60))
+        Text(L10n.text("detail.every6h")).tag(UInt32(360))
+      }.labelsHidden().frame(width: 190).disabled(model.busy)
+    }.font(.system(size: 11.9)).padding(.vertical, 2)
+    let hints: [String] = [
+      subscription.lastRefreshAtUnix.map {
+        L10n.text("detail.lastChecked") + ": "
+          + Date(timeIntervalSince1970: TimeInterval($0)).formatted(
+            .dateTime.day().month().hour().minute()
+              .locale(Locale(identifier: L10n.shared.language)))
+      },
+      subscription.updateIntervalHours.map {
+        L10n.text("detail.providerInterval", ["hours": String($0)])
+      },
+    ].compactMap { $0 }
+    if !hints.isEmpty || subscription.lastRefreshError != nil {
+      HStack(spacing: 8) {
+        Text(hints.joined(separator: " · ")).foregroundStyle(p.muted)
+        if subscription.lastRefreshError != nil {
+          Text(L10n.text("native.refreshFailed")).foregroundStyle(p["down"])
+        }
+      }.font(.system(size: 10.92)).padding(.bottom, 4)
     }
   }
   /// Delay readout: green under 300 ms, amber under 800 ms, red above or

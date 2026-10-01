@@ -53,9 +53,12 @@ struct ContentView: View {
       guard loadsOnAppear else { return }
       await model.refresh()
       // Xray can exit on its own (bad server, port taken); keep the UI honest.
+      var tick = 0
       while !Task.isCancelled {
         try? await Task.sleep(for: .seconds(3))
         await model.refreshRuntime()
+        tick += 1
+        if tick % 20 == 0 { await model.autoRefreshDue() }
       }
     }
     .sheet(item: $modal) { value in

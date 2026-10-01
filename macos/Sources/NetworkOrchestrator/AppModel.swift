@@ -286,17 +286,42 @@ import SystemConfiguration
       }
     }
   }
-  func refreshSubscription(_ profile: Profile) async {
+  /// Re-fetches a subscription. The download runs off the core actor (the
+  /// bridge only locks the store to apply it), so the UI keeps polling.
+  func refreshSubscription(_ profile: Profile, quiet: Bool = false) async {
     guard !refreshing.contains(profile.id) else { return }
     refreshing.insert(profile.id)
     defer { refreshing.remove(profile.id) }
     do {
-      let outcome: RefreshOutcome = try await core.call(
+      let outcome: RefreshOutcome = try await probeCore.callConcurrently(
         "refresh_subscription", args: ["id": profile.id])
       delays[profile.id] = nil
-      notice = L10n.text("native.refreshed", ["count": String(outcome.endpointCount)])
-      await refresh()
-    } catch { self.error = error.localizedDescription }
+      if !quiet {
+        notice = L10n.text("native.refreshed", ["count": String(outcome.endpointCount)])
+      }
+    } catch {
+      if !quiet { self.error = error.localizedDescription }
+    }
+    await refresh()
+  }
+  func setRefreshInterval(_ profile: Profile, minutes: UInt32?) async {
+    _ = await change(
+      "set_refresh_interval",
+      args: ["id": profile.id, "minutes": minutes.map(String.init) ?? ""])
+  }
+  /// Refreshes subscriptions whose interval elapsed. Running connections are
+  /// left alone so a background refresh never drops traffic.
+  func autoRefreshDue() async {
+    let now = UInt64(Date().timeIntervalSince1970)
+    for profile in snapshot?.profiles ?? [] where !isRunning(profile) {
+      guard let subscription = profile.subscription,
+        let minutes = subscription.refreshIntervalMinutes
+      else { continue }
+      let last = subscription.lastRefreshAtUnix ?? 0
+      if now >= last + UInt64(minutes) * 60 {
+        await refreshSubscription(profile, quiet: true)
+      }
+    }
   }
   /// Toolbar refresh: re-fetch every subscription, then reload everything.
   func refreshAll() async {

@@ -49,6 +49,8 @@ import Testing
         "supportUrl": "https://support.example.test/",
         "webPageUrl": "https://account.example.test/",
         "skippedProtocols": ["trojan"],
+        "refreshIntervalMinutes": 60, "lastRefreshAtUnix": 1_790_850_000,
+        "updateIntervalHours": 12,
       ],
     ],
     [

@@ -645,6 +645,7 @@
       "native.primaryRoute": "Route: {iface}",
       "native.proxyOverridden": "The VPN on {iface} is the primary route, so macOS ignores the system proxy. Use \"Open browser via connection\" or turn that VPN off.",
       "native.refreshAllHint": "Re-fetch every subscription and reload connections",
+      "native.refreshFailed": "last refresh failed",
       "native.refreshed": {
         "one": "Subscription refreshed: {count} server.",
         "other": "Subscription refreshed: {count} servers."
@@ -882,6 +883,7 @@
       "ts.unavailable": "tailscaled unavailable",
       "ts.up": "tailscale up",
       "unknown": "unknown",
+      "unsupported subscription refresh interval": "Unsupported subscription refresh interval",
       "up": "up",
       "update.available": "New version {version} is available. Install now?",
       "update.availableTitle": "Update available",
@@ -1585,6 +1587,7 @@
       "native.primaryRoute": "Маршрут: {iface}",
       "native.proxyOverridden": "VPN на {iface} — основной маршрут, поэтому macOS игнорирует системный прокси. Используйте «Открыть браузер через подключение» или отключите этот VPN.",
       "native.refreshAllHint": "Перезагрузить все подписки и обновить список подключений",
+      "native.refreshFailed": "последнее обновление не удалось",
       "native.refreshed": {
         "few": "Подписка обновлена: {count} сервера.",
         "many": "Подписка обновлена: {count} серверов.",
@@ -1838,6 +1841,7 @@
       "ts.unavailable": "tailscaled недоступен",
       "ts.up": "tailscale up",
       "unknown": "неизвестно",
+      "unsupported subscription refresh interval": "Неподдерживаемый интервал обновления подписки",
       "up": "включён",
       "update.available": "Доступна новая версия {version}. Установить сейчас?",
       "update.availableTitle": "Доступно обновление",

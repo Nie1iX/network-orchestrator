@@ -656,6 +656,7 @@
     "native.primaryRoute": "Route: {iface}",
     "native.proxyOverridden": "The VPN on {iface} is the primary route, so macOS ignores the system proxy. Use \"Open browser via connection\" or turn that VPN off.",
     "native.refreshAllHint": "Re-fetch every subscription and reload connections",
+    "native.refreshFailed": "last refresh failed",
     "native.refreshed": {
       "one": "Subscription refreshed: {count} server.",
       "other": "Subscription refreshed: {count} servers."
@@ -893,6 +894,7 @@
     "ts.unavailable": "tailscaled unavailable",
     "ts.up": "tailscale up",
     "unknown": "unknown",
+    "unsupported subscription refresh interval": "Unsupported subscription refresh interval",
     "up": "up",
     "update.available": "New version {version} is available. Install now?",
     "update.availableTitle": "Update available",

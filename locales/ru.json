@@ -719,6 +719,7 @@
     "native.primaryRoute": "Маршрут: {iface}",
     "native.proxyOverridden": "VPN на {iface} — основной маршрут, поэтому macOS игнорирует системный прокси. Используйте «Открыть браузер через подключение» или отключите этот VPN.",
     "native.refreshAllHint": "Перезагрузить все подписки и обновить список подключений",
+    "native.refreshFailed": "последнее обновление не удалось",
     "native.refreshed": {
       "one": "Подписка обновлена: {count} сервер.",
       "few": "Подписка обновлена: {count} сервера.",
@@ -972,6 +973,7 @@
     "ts.unavailable": "tailscaled недоступен",
     "ts.up": "tailscale up",
     "unknown": "неизвестно",
+    "unsupported subscription refresh interval": "Неподдерживаемый интервал обновления подписки",
     "up": "включён",
     "update.available": "Доступна новая версия {version}. Установить сейчас?",
     "update.availableTitle": "Доступно обновление",
