@@ -7,7 +7,7 @@ export type InterfaceKind =
   | "loopback"
   | { other: string };
 
-export type InterfaceState = "Up" | "Down" | "Unknown";
+export type InterfaceState = "up" | "down" | "unknown";
 
 export interface InterfaceAddress {
   address: string;

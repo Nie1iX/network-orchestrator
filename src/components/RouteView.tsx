@@ -6,6 +6,7 @@ import RouteMap from "./RouteMap";
 import RouteTable from "./RouteTable";
 import { RouteLookupResult, RouteMap as RouteMapData } from "../types";
 import { TranslationKey, useT } from "../i18n";
+import { setRoutesPrefs, useRoutesPrefs } from "../prefs";
 
 type RouteTab = "flow" | "tree" | "table";
 
@@ -17,6 +18,7 @@ const TABS: { id: RouteTab; labelKey: TranslationKey }[] = [
 
 export default function RouteView() {
   const t = useT();
+  const prefs = useRoutesPrefs();
   const [tab, setTab] = useState<RouteTab>("flow");
   const [map, setMap] = useState<RouteMapData | null>(null);
   const [lookupDest, setLookupDest] = useState("");
@@ -103,13 +105,37 @@ export default function RouteView() {
             </button>
           </div>
         )}
+        <div className="routes-options">
+          <label className="route-map-toggle">
+            <input
+              type="checkbox"
+              checked={prefs.hideIpv6}
+              onChange={(e) => setRoutesPrefs({ hideIpv6: e.target.checked })}
+            />
+            {t("routes.hideIpv6")}
+          </label>
+          {tab === "tree" && (
+            <label className="route-map-toggle">
+              <input
+                type="checkbox"
+                checked={prefs.includeStopped}
+                onChange={(e) =>
+                  setRoutesPrefs({ includeStopped: e.target.checked })
+                }
+              />
+              {t("routes.includeStopped")}
+            </label>
+          )}
+        </div>
         <form
           className="lookup-input"
+          title={t("routes.lookupHint")}
           onSubmit={(e) => {
             e.preventDefault();
             void lookup();
           }}
         >
+          <span className="routes-lookup-label">{t("routes.lookupLabel")}</span>
           <input
             type="text"
             value={lookupDest}
@@ -166,9 +192,14 @@ export default function RouteView() {
       )}
 
       <div className="route-tab-content">
-        {tab === "flow" && <RouteFlow />}
-        {tab === "tree" && <RouteMap />}
-        {tab === "table" && <RouteTable />}
+        {tab === "flow" && <RouteFlow hideIpv6={prefs.hideIpv6} />}
+        {tab === "tree" && (
+          <RouteMap
+            hideIpv6={prefs.hideIpv6}
+            includeInactive={prefs.includeStopped}
+          />
+        )}
+        {tab === "table" && <RouteTable hideIpv6={prefs.hideIpv6} />}
       </div>
     </Page>
   );

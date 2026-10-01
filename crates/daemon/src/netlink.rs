@@ -3,7 +3,7 @@
 //! `current_thread` runtime, so synchronous callers never nest `block_on`.
 
 use crate::cond_rules::{IfaceAddr, NetworkObservation};
-use crate::core::{LinkExecutor, PolicyRuleExecutor, WgSystem};
+use crate::core::{ExternalLinkKind, LinkExecutor, PolicyRuleExecutor, WgSystem};
 use futures::TryStreamExt;
 use ipnet::IpNet;
 use net_manager_core::daemon_protocol::{IpFamily, OwnedRuleResource};
@@ -461,6 +461,11 @@ enum Command {
         up: bool,
         reply: mpsc::Sender<io::Result<()>>,
     },
+    /// Delete a netdev the daemon does not journal (foreign tunnels).
+    LinkDel {
+        index: u32,
+        reply: mpsc::Sender<io::Result<()>>,
+    },
     InterfaceAddrs {
         reply: mpsc::Sender<io::Result<Vec<IfaceAddr>>>,
     },
@@ -817,6 +822,16 @@ async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedRecei
                 *request.message_mut() = link_request(index, up);
                 let _ = reply.send(request.execute().await.map_err(netlink_error_to_io));
             }
+            Command::LinkDel { index, reply } => {
+                let _ = reply.send(
+                    handle
+                        .link()
+                        .del(index)
+                        .execute()
+                        .await
+                        .map_err(netlink_error_to_io),
+                );
+            }
             Command::InterfaceAddrs { reply } => {
                 let _ = reply.send(get_interface_addrs(&handle).await);
             }
@@ -1069,6 +1084,46 @@ impl LinkExecutor for NetlinkExecutor {
             ));
         }
         self.call(|reply| Command::Link { index, up, reply })
+    }
+
+    /// Foreign tunnels carry no owner marker; the caller checked the link is
+    /// not journaled before this call. `name` is validated by `DaemonCore`.
+    fn remove_link(&mut self, name: &str) -> io::Result<()> {
+        let c_name = CString::new(name).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "interface name contains NUL")
+        })?;
+        // SAFETY: `c_name` is a valid NUL-terminated string for the call.
+        let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+        if index == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "interface not found",
+            ));
+        }
+        self.call(|reply| Command::LinkDel { index, reply })
+    }
+
+    /// Classify a netdev via sysfs: `DEVTYPE=wireguard` in the device uevent,
+    /// else a `tun_flags` entry marks a TUN/TAP device. Read-only probe.
+    fn link_kind(&mut self, name: &str) -> io::Result<ExternalLinkKind> {
+        let base = format!("/sys/class/net/{name}");
+        if !std::path::Path::new(&base).exists() {
+            return Ok(ExternalLinkKind::Missing);
+        }
+        let devtype = std::fs::read_to_string(format!("{base}/uevent"))
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("DEVTYPE=").map(str::trim))
+                    .map(str::to_string)
+            });
+        if devtype.as_deref() == Some("wireguard") {
+            Ok(ExternalLinkKind::WireGuard)
+        } else if std::path::Path::new(&format!("{base}/tun_flags")).exists() {
+            Ok(ExternalLinkKind::Tun)
+        } else {
+            Ok(ExternalLinkKind::Other)
+        }
     }
 }
 

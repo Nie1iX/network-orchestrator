@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { PlannedRoute, RouteMap as RouteMapData } from "../types";
-import { ChevronIcon } from "../icons";
+import { ChevronIcon, SearchIcon } from "../icons";
 import { useT } from "../i18n";
 
 function parseCidr(cidr: string): { bits: bigint; len: number; family: 4 | 6 } | null {
@@ -49,27 +49,26 @@ function cidrContains(parent: string, child: string): boolean {
   return (p.bits & mask) === (c.bits & mask);
 }
 
-function parentPrefixIndex(index: number, routes: PlannedRoute[]): number | null {
-  const target = routes[index];
+// Tree nesting follows CIDR containment: a route is a child of the nearest
+// earlier route whose prefix strictly contains it (mirrors kernel
+// longest-prefix match). `dests` holds "addr/len" strings for the group.
+function parentPrefixIndex(index: number, dests: string[]): number | null {
   for (let i = index - 1; i >= 0; i--) {
-    if (cidrContains(routes[i].destination, target.destination)) return i;
+    if (cidrContains(dests[i], dests[index])) return i;
   }
   return null;
 }
 
-function hasChildren(index: number, routes: PlannedRoute[]): boolean {
-  const target = routes[index];
-  return routes.some(
-    (r, i) => i > index && cidrContains(target.destination, r.destination),
-  );
+function hasChildren(index: number, dests: string[]): boolean {
+  return dests.some((d, i) => i > index && cidrContains(dests[index], d));
 }
 
-function treeDepth(index: number, routes: PlannedRoute[]): number {
+function treeDepth(index: number, dests: string[]): number {
   let depth = 0;
   let current = index;
   const seen = new Set<number>();
   while (true) {
-    const parent = parentPrefixIndex(current, routes);
+    const parent = parentPrefixIndex(current, dests);
     if (parent === null || seen.has(parent)) return depth;
     seen.add(parent);
     depth += 1;
@@ -77,17 +76,21 @@ function treeDepth(index: number, routes: PlannedRoute[]): number {
   }
 }
 
-function ancestors(index: number, routes: PlannedRoute[]): number[] {
+function ancestors(index: number, dests: string[]): number[] {
   const result: number[] = [];
   let current = index;
   const seen = new Set<number>();
   while (true) {
-    const parent = parentPrefixIndex(current, routes);
+    const parent = parentPrefixIndex(current, dests);
     if (parent === null || seen.has(parent)) return result;
     seen.add(parent);
     result.push(parent);
     current = parent;
   }
+}
+
+function isV6(cidr: string): boolean {
+  return cidr.includes(":");
 }
 
 function nodeKey(route: PlannedRoute): string {
@@ -98,10 +101,14 @@ function groupKey(route: PlannedRoute): string {
   return route.interfaceName ?? "auto";
 }
 
-export default function RouteMap() {
+interface RouteMapProps {
+  hideIpv6: boolean;
+  includeInactive: boolean;
+}
+
+export default function RouteMap({ hideIpv6, includeInactive }: RouteMapProps) {
   const t = useT();
   const [map, setMap] = useState<RouteMapData | null>(null);
-  const [includeInactive, setIncludeInactive] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
@@ -186,24 +193,16 @@ export default function RouteMap() {
 
   return (
     <section className="route-map">
-      <div className="route-map-header">
-        <label className="route-map-toggle">
-          <input
-            type="checkbox"
-            checked={includeInactive}
-            onChange={(e) => setIncludeInactive(e.target.checked)}
-          />
-          {t("routes.includeStopped")}
-        </label>
+      <div className="route-map-filter-wrap">
+        <SearchIcon size={14} className="route-map-filter-icon" />
+        <input
+          className="route-map-filter"
+          type="text"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder={t("routes.filterPlaceholder")}
+        />
       </div>
-
-      <input
-        className="route-map-filter"
-        type="text"
-        value={filter}
-        onChange={(e) => setFilter(e.target.value)}
-        placeholder={t("routes.filterPlaceholder")}
-      />
 
       {loading && <p>{t("routes.loadingMap")}</p>}
       {error && <p className="error">{t("routes.mapError", { err: error })}</p>}
@@ -227,13 +226,16 @@ export default function RouteMap() {
             <div className="route-map-groups">
               {[...predictedGroups.entries()].map(([key, routes]) => {
                 const collapsed = collapsedGroups.has(key);
+                const dests = routes.map((r) => r.destination);
                 const visible = routes.filter((r) => {
+                  if (hideIpv6 && isV6(r.destination)) return false;
                   if (!filterText) return true;
                   return (
                     r.destination.toLowerCase().includes(filterText) ||
                     r.ownerName.toLowerCase().includes(filterText)
                   );
                 });
+                if (visible.length === 0 && hideIpv6) return null;
                 return (
                   <div className="route-map-group" key={key}>
                     <button
@@ -264,11 +266,11 @@ export default function RouteMap() {
                         <tbody>
                           {visible.map((route) => {
                             const index = routes.indexOf(route);
-                            const depth = treeDepth(index, routes);
+                            const depth = treeDepth(index, dests);
                             const key = nodeKey(route);
-                            const branchable = hasChildren(index, routes);
+                            const branchable = hasChildren(index, dests);
                             const isCollapsed = collapsedNodes.has(key);
-                            const hiddenByAncestor = ancestors(index, routes).some(
+                            const hiddenByAncestor = ancestors(index, dests).some(
                               (a) => collapsedNodes.has(nodeKey(routes[a])),
                             );
                             if (hiddenByAncestor) return null;
@@ -336,9 +338,10 @@ export default function RouteMap() {
                   {map.pushedRoutes
                     .filter(
                       (r) =>
-                        !filterText ||
-                        r.destination.toLowerCase().includes(filterText) ||
-                        r.ownerName.toLowerCase().includes(filterText),
+                        !(hideIpv6 && isV6(r.destination)) &&
+                        (!filterText ||
+                          r.destination.toLowerCase().includes(filterText) ||
+                          r.ownerName.toLowerCase().includes(filterText)),
                     )
                     .map((route, i) => (
                       <tr key={i}>
@@ -355,15 +358,18 @@ export default function RouteMap() {
           )}
 
           <h3>{t("routes.differences")}</h3>
-          {map.diffs.length === 0 ? (
+          {map.diffs.filter((d) => !hideIpv6 || !isV6(d.destination)).length ===
+          0 ? (
             <p className="route-map-ok">{t("routes.diffsOk")}</p>
           ) : (
             <ul className="route-map-diffs">
-              {map.diffs.map((diff, i) => (
-                <li key={i} className={`route-diff diff-${diff.kind}`}>
-                  {diff.message}
-                </li>
-              ))}
+              {map.diffs
+                .filter((d) => !hideIpv6 || !isV6(d.destination))
+                .map((diff, i) => (
+                  <li key={i} className={`route-diff diff-${diff.kind}`}>
+                    {diff.message}
+                  </li>
+                ))}
             </ul>
           )}
 
@@ -374,9 +380,17 @@ export default function RouteMap() {
             <div className="route-map-groups">
               {[...effectiveGroups.entries()].map(([key, routes]) => {
                 const collapsed = collapsedGroups.has(`eff::${key}`);
-                const visible = routes.filter((r) =>
-                  filterText ? r.destination.toLowerCase().includes(filterText) : true,
+                const dests = routes.map(
+                  (r) => `${r.destination}/${r.prefixLen}`,
                 );
+                const effKey = (i: number) => `eff::${key}::${dests[i]}`;
+                const visible = routes.filter(
+                  (r) =>
+                    !(hideIpv6 && isV6(r.destination)) &&
+                    (!filterText ||
+                      r.destination.toLowerCase().includes(filterText)),
+                );
+                if (visible.length === 0 && hideIpv6) return null;
                 return (
                   <div className="route-map-group" key={`eff::${key}`}>
                     <button
@@ -400,14 +414,51 @@ export default function RouteMap() {
                           </tr>
                         </thead>
                         <tbody>
-                          {visible.map((route, i) => (
-                            <tr key={i}>
-                              <td className="mono">
-                                {route.destination}/{route.prefixLen}
-                              </td>
-                              <td className="num">{route.metric}</td>
-                            </tr>
-                          ))}
+                          {visible.map((route, row) => {
+                            const index = routes.indexOf(route);
+                            const depth = treeDepth(index, dests);
+                            const nKey = effKey(index);
+                            const branchable = hasChildren(index, dests);
+                            const isCollapsed = collapsedNodes.has(nKey);
+                            const hiddenByAncestor = ancestors(index, dests).some(
+                              (a) => collapsedNodes.has(effKey(a)),
+                            );
+                            if (hiddenByAncestor) return null;
+                            return (
+                              <tr key={`${nKey}::${row}`}>
+                                <td className="mono">
+                                  <span
+                                    className="route-map-indent"
+                                    style={{ paddingLeft: `${depth * 1.25}rem` }}
+                                  >
+                                    {branchable ? (
+                                      <button
+                                        type="button"
+                                        className="route-map-node-toggle"
+                                        onClick={() => toggleNode(nKey)}
+                                        aria-label={
+                                          isCollapsed
+                                            ? t("common.expand")
+                                            : t("common.collapse")
+                                        }
+                                      >
+                                        <ChevronIcon
+                                          size={12}
+                                          collapsed={isCollapsed}
+                                        />
+                                      </button>
+                                    ) : depth > 0 ? (
+                                      "↳ "
+                                    ) : (
+                                      ""
+                                    )}
+                                    {route.destination}/{route.prefixLen}
+                                  </span>
+                                </td>
+                                <td className="num">{route.metric}</td>
+                              </tr>
+                            );
+                          })}
                         </tbody>
                       </table>
                     )}

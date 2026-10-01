@@ -96,6 +96,7 @@ pub fn run() {
             parse_bulk_cidrs,
             lookup_destination,
             set_interface_state,
+            stop_external_tunnel,
             get_always_on_profiles,
             set_always_on_profile,
             remove_always_on_profile,

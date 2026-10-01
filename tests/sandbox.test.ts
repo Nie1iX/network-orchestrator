@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SandboxBackend } from "../src/sandbox/backend.ts";
-import type { Profile, RouteEntry, RouteLookupResult, TunnelStatus } from "../src/types.ts";
+import type { BackendAvailability, Profile, RouteEntry, RouteLookupResult, TunnelStatus } from "../src/types.ts";
 
 test("dialog confirmations and always-on use the same IPC contract as Tauri", () => {
   const backend = new SandboxBackend();
@@ -27,16 +27,30 @@ test("connecting and disconnecting changes only synthetic routes, with longest-p
   backend.invoke("connect_profile", { id: "wg" });
   assert.equal((backend.invoke("get_routes") as RouteEntry[]).length, before.length + 1);
   const lookup = backend.invoke("lookup_destination", { dest: "10.77.0.9" }) as RouteLookupResult;
-  assert.equal(lookup.interfaceName, "qa-wg");
+  assert.equal(lookup.interfaceName, "wg-home");
   backend.invoke("disconnect_profile", { id: "wg" });
   assert.deepEqual(backend.invoke("get_routes"), before);
 });
 
 test("destructive or unknown native commands fail closed", () => {
   const backend = new SandboxBackend();
-  for (const command of ["set_interface_state", "restart_elevated", "install_managed_xray", "plugin:process|restart", "not_a_command"]) {
+  for (const command of ["set_interface_state", "restart_elevated", "plugin:process|restart", "not_a_command"]) {
     assert.throws(() => backend.invoke(command), /disabled in sandbox/);
   }
+});
+
+test("managed Xray install toggles the managed backend without touching the host", () => {
+  const backend = new SandboxBackend();
+  const missing = (backend.invoke("get_backend_availability") as BackendAvailability[]).find((b) => b.backend === "xray");
+  assert.equal(missing?.available, false);
+  const path = backend.invoke("install_managed_xray") as string;
+  assert.match(path, /xray$/);
+  const installed = (backend.invoke("get_backend_availability") as BackendAvailability[]).find((b) => b.backend === "xray");
+  assert.equal(installed?.source, "managed");
+  assert.equal(installed?.available, true);
+  backend.invoke("remove_managed_xray");
+  const removed = (backend.invoke("get_backend_availability") as BackendAvailability[]).find((b) => b.backend === "xray");
+  assert.equal(removed?.source, null);
 });
 
 test("profile responses cannot mutate stored fixtures; active profiles cannot be deleted", () => {

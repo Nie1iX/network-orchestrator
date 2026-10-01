@@ -7,12 +7,15 @@ import { useProfileListMode } from "../prefs";
 import { useT } from "../i18n";
 import { BACKEND_LABEL_KEYS } from "../i18n/labels";
 import {
+  backendAvatarClass,
   backendIcon,
   ChevronIcon,
   InfoIcon,
+  kindIcon,
   PlusIcon,
   TailscaleIcon,
 } from "../icons";
+
 import AddConnectionMenu from "./AddConnectionMenu";
 import DiagnosticsModal from "./DiagnosticsModal";
 import ImportModal from "./ImportModal";
@@ -30,6 +33,7 @@ import {
   storeSnippets,
 } from "./profiles/sets";
 import Skeleton from "./ui/Skeleton";
+import ExternalTunnelPanel from "./ExternalTunnelPanel";
 import TailscalePanel from "./TailscalePanel";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import { useToast } from "./ui/Toast";
@@ -56,6 +60,22 @@ import {
 } from "../types";
 
 const COLLAPSED_GROUPS_KEY = "netmanager.connections.collapsedGroups";
+const LIST_WIDTH_KEY = "netmanager.profiles.listWidth";
+const LIST_WIDTH_MIN = 220;
+const LIST_WIDTH_MAX = 720;
+
+function clampListWidth(w: number): number {
+  return Math.min(LIST_WIDTH_MAX, Math.max(LIST_WIDTH_MIN, Math.round(w)));
+}
+
+function loadListWidth(): number {
+  try {
+    const v = Number(localStorage.getItem(LIST_WIDTH_KEY));
+    return Number.isFinite(v) && v > 0 ? clampListWidth(v) : 360;
+  } catch {
+    return 360;
+  }
+}
 
 function loadCollapsedGroups(): Set<TunnelBackend> {
   try {
@@ -101,24 +121,42 @@ function ProfileRowSkeleton() {
   );
 }
 
+// Remounting this view on every tab switch would otherwise flash skeletons;
+// keep the last fetched snapshot so the list renders instantly.
+let listCache: {
+  profiles: Profile[];
+  statuses: TunnelStatus[];
+  interfaces: NetworkInterface[];
+  alwaysOn: AlwaysOnListResult | null;
+  inspections: Record<string, ProfileInspection>;
+} | null = null;
+
 export default function ProfileManager() {
   const caps = usePlatformCapabilities();
   const toast = useToast();
   const t = useT();
   const listMode = useProfileListMode();
-  const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [statuses, setStatuses] = useState<TunnelStatus[]>([]);
-  const [alwaysOn, setAlwaysOn] = useState<AlwaysOnListResult | null>(null);
+  const [profiles, setProfiles] = useState<Profile[]>(
+    listCache?.profiles ?? [],
+  );
+  const [statuses, setStatuses] = useState<TunnelStatus[]>(
+    listCache?.statuses ?? [],
+  );
+  const [alwaysOn, setAlwaysOn] = useState<AlwaysOnListResult | null>(
+    listCache?.alwaysOn ?? null,
+  );
   const [resumingAlwaysOn, setResumingAlwaysOn] = useState(false);
-  const [interfaces, setInterfaces] = useState<NetworkInterface[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [interfaces, setInterfaces] = useState<NetworkInterface[]>(
+    listCache?.interfaces ?? [],
+  );
+  const [loading, setLoading] = useState(listCache === null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<Set<string>>(new Set());
   const [editing, setEditing] = useState<ProfileFormState | null>(null);
   const [formOpen, setFormOpen] = useState(false);
   const [inspections, setInspections] = useState<
     Record<string, ProfileInspection>
-  >({});
+  >(listCache?.inspections ?? {});
   const [saveNotice, setSaveNotice] = useState<{
     profileName: string;
     inspection: ProfileInspection;
@@ -151,6 +189,7 @@ export default function ProfileManager() {
     Record<string, Record<number, SubscriptionDelayResult>>
   >({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [externalName, setExternalName] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<TunnelBackend>>(
     loadCollapsedGroups,
   );
@@ -180,6 +219,75 @@ export default function ProfileManager() {
     y: number;
     profile: Profile;
   } | null>(null);
+  const [listWidth, setListWidth] = useState(loadListWidth);
+  const [splitDragging, setSplitDragging] = useState(false);
+  const splitDrag = useRef<{ x: number; w: number } | null>(null);
+  const layoutRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    listCache = { profiles, statuses, interfaces, alwaysOn, inspections };
+  }, [profiles, statuses, interfaces, alwaysOn, inspections]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LIST_WIDTH_KEY, String(listWidth));
+    } catch {
+      // ignore storage errors (e.g. storage disabled)
+    }
+  }, [listWidth]);
+
+  useEffect(() => {
+    if (!splitDragging) return;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    return () => {
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [splitDragging]);
+
+  const splitterProps = {
+    role: "separator",
+    "aria-orientation": "vertical",
+    "aria-label": t("profiles.resizeList"),
+    "aria-valuenow": listWidth,
+    "aria-valuemin": LIST_WIDTH_MIN,
+    "aria-valuemax": LIST_WIDTH_MAX,
+    tabIndex: 0,
+    className: `pane-splitter${splitDragging ? " dragging" : ""}`,
+    onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      splitDrag.current = { x: e.clientX, w: listWidth };
+      setSplitDragging(true);
+    },
+    onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
+      const drag = splitDrag.current;
+      if (!drag) return;
+      const max = layoutRef.current
+        ? Math.min(LIST_WIDTH_MAX, layoutRef.current.clientWidth - 400)
+        : LIST_WIDTH_MAX;
+      setListWidth(
+        Math.max(LIST_WIDTH_MIN, Math.min(max, drag.w + e.clientX - drag.x)),
+      );
+    },
+    onPointerUp: () => {
+      splitDrag.current = null;
+      setSplitDragging(false);
+    },
+    onPointerCancel: () => {
+      splitDrag.current = null;
+      setSplitDragging(false);
+    },
+    onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        e.preventDefault();
+        setListWidth(
+          clampListWidth(listWidth + (e.key === "ArrowRight" ? 16 : -16)),
+        );
+      }
+    },
+  } as const;
 
   useEffect(() => {
     try {
@@ -358,6 +466,26 @@ export default function ProfileManager() {
       clearInterval(interval);
     };
   }, [refreshTailscale]);
+
+  const [externalBusy, setExternalBusy] = useState<string | null>(null);
+  // "Off" stops a foreign tunnel for real (wg-quick unit stop / netdev
+  // delete / TUN admin-down via the daemon, polkit-gated). "On" only exists
+  // for a foreign TUN we downed — WG devices are gone after a stop.
+  const onToggleExternal = async (iface: NetworkInterface) => {
+    setExternalBusy(iface.name);
+    try {
+      if (!(await ensureElevation(t("iface.elevationState")))) return;
+      if (iface.state === "up") {
+        await invoke("stop_external_tunnel", { name: iface.name });
+      } else {
+        await invoke("set_interface_state", { name: iface.name, up: true });
+      }
+    } catch (err) {
+      toast("error", String(err));
+    } finally {
+      setExternalBusy(null);
+    }
+  };
 
   const onToggleTailscale = async () => {
     if (!tailscale?.available) return;
@@ -942,12 +1070,16 @@ export default function ProfileManager() {
         <div className="profiles-toolbar">
           <h2>{t("profiles.title")}</h2>
         </div>
-        <div className="profiles-layout">
+        <div
+          className="profiles-layout"
+          style={{ "--profiles-list-w": `${listWidth}px` } as React.CSSProperties}
+        >
           <div className="profiles-list-pane">
             <ProfileRowSkeleton />
             <ProfileRowSkeleton />
             <ProfileRowSkeleton />
           </div>
+          <div className="pane-splitter" aria-hidden="true" />
           <div className="profiles-detail-pane" />
         </div>
       </Page>
@@ -995,16 +1127,50 @@ export default function ProfileManager() {
     profiles[0] ??
     null;
 
+  // Tunnel-kind interfaces that no running managed tunnel owns — raised by
+  // wg-quick, other VPN apps, etc. tailscaled has its own service row.
+  const isTailscaleIface = (i: NetworkInterface) =>
+    i.name.toLowerCase().startsWith("tailscale") ||
+    (typeof i.kind === "object" && i.kind.other === "Tailscale");
+  const isTunnelIface = (i: NetworkInterface) =>
+    typeof i.kind === "string"
+      ? i.kind === "wireGuard" || i.kind === "openVpn" || i.kind === "xray"
+      : i.kind.other === "TUN";
+  const managedIfaces = new Set(
+    profiles
+      .filter((p) => statusFor(p.id).state === "running")
+      .flatMap((p) => [p.interfaceName]),
+  );
+  const externalTunnels = interfaces.filter(
+    (i) =>
+      isTunnelIface(i) &&
+      !isTailscaleIface(i) &&
+      !managedIfaces.has(i.name) &&
+      !managedIfaces.has(i.friendlyName),
+  );
+  const externalNames = new Set(
+    externalTunnels.flatMap((i) => [i.name, i.friendlyName]),
+  );
+  // A profile we cannot bring up because its interface is already occupied
+  // by a tunnel managed elsewhere.
+  const ifaceConflictIds = new Set(
+    profiles
+      .filter(
+        (p) =>
+          p.interfaceName !== "" &&
+          statusFor(p.id).state !== "running" &&
+          externalNames.has(p.interfaceName),
+      )
+      .map((p) => p.id),
+  );
+  const externalSelected =
+    externalTunnels.find((i) => i.name === externalName) ?? null;
+
   const tsRunning =
     tailscale !== null &&
     tailscale.available &&
     tailscale.backendState === "Running";
   const tsNeedsLogin = tailscale?.backendState === "NeedsLogin";
-  const tsMeta = !tailscale?.available
-    ? t("ts.unavailable")
-    : tailscale.selfIps.length > 0
-      ? tailscale.selfIps.join(", ")
-      : tailscale.backendState;
 
   const selGroup = selected
     ? groups.find((g) => g.backend === selected.backend)
@@ -1066,11 +1232,13 @@ export default function ProfileManager() {
                 ? delayRes.delayMs !== null
                   ? `${delayRes.delayMs} ms`
                   : "err"
-                : "—"
+                : null
         }
         isBusy={isBusy}
-        selected={selected?.id === profile.id}
+        conflict={ifaceConflictIds.has(profile.id)}
+        selected={externalName === null && selected?.id === profile.id}
         dragging={dragState?.profileId === profile.id}
+        showBackendBadge={group === null}
         dropBefore={
           dropTarget?.profileId === profile.id && dropTarget.before
         }
@@ -1080,6 +1248,7 @@ export default function ProfileManager() {
         canReorder={canReorder}
         onSelect={() => {
           setServiceSelected(false);
+          setExternalName(null);
           setSelectedId(profile.id);
         }}
         onToggle={() =>
@@ -1090,6 +1259,7 @@ export default function ProfileManager() {
         onContextMenu={(e) => {
           e.preventDefault();
           setServiceSelected(false);
+          setExternalName(null);
           setSelectedId(profile.id);
           setCtxMenu({ x: e.clientX, y: e.clientY, profile });
         }}
@@ -1195,7 +1365,11 @@ export default function ProfileManager() {
         </div>
       )}
 
-      <div className="profiles-layout">
+      <div
+        ref={layoutRef}
+        className="profiles-layout"
+        style={{ "--profiles-list-w": `${listWidth}px` } as React.CSSProperties}
+      >
         <div
           className="profiles-list-pane"
           onKeyDown={(event) => {
@@ -1223,6 +1397,7 @@ export default function ProfileManager() {
               const id = visibleIds[next];
               if (!id) return;
               setServiceSelected(false);
+              setExternalName(null);
               setSelectedId(id);
               document
                 .querySelector(`[data-profile-id="${id}"]`)
@@ -1294,11 +1469,15 @@ export default function ProfileManager() {
               role="button"
               tabIndex={0}
               className={`profile-row${serviceSelected ? " selected" : ""}`}
-              onClick={() => setServiceSelected(true)}
+              onClick={() => {
+                setExternalName(null);
+                setServiceSelected(true);
+              }}
               onKeyDown={(e) => {
                 if (e.target !== e.currentTarget) return;
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
+                  setExternalName(null);
                   setServiceSelected(true);
                 }
               }}
@@ -1316,7 +1495,6 @@ export default function ProfileManager() {
                 <TailscaleIcon size={14} />
               </span>
               <span className="profile-row-name">Tailscale</span>
-              <span className="profile-row-meta">{tsMeta}</span>
               <ToggleSwitch
                 checked={tsRunning}
                 onChange={() => void onToggleTailscale()}
@@ -1338,10 +1516,77 @@ export default function ProfileManager() {
           </div>
         </div>
       )}
+
+      {externalTunnels.length > 0 && (
+        <div className="profile-group">
+          <div className="profile-group-label">{t("profiles.external")}</div>
+          <div className="profile-rows">
+            {externalTunnels.map((iface) => (
+              <div
+                key={iface.name}
+                role="button"
+                tabIndex={0}
+                className={`profile-row profile-row-external${
+                  externalName === iface.name ? " selected" : ""
+                }`}
+                onClick={() => {
+                  setServiceSelected(false);
+                  setSelectedId(null);
+                  setExternalName(iface.name);
+                }}
+                onKeyDown={(e) => {
+                  if (e.target !== e.currentTarget) return;
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setServiceSelected(false);
+                    setSelectedId(null);
+                    setExternalName(iface.name);
+                  }
+                }}
+              >
+                <span
+                  className={`status-dot state-${
+                    iface.state === "up" ? "running" : "stopped"
+                  }`}
+                />
+                <span
+                  className={`backend-avatar ${backendAvatarClass(iface.kind)}`}
+                >
+                  {kindIcon(iface.kind, 14)}
+                </span>
+                <span className="profile-row-name">{iface.name}</span>
+                <span className="badge badge-external">
+                  {t("detail.external")}
+                </span>
+                <ToggleSwitch
+                  checked={iface.state === "up"}
+                  onChange={() => void onToggleExternal(iface)}
+                  disabled={externalBusy === iface.name}
+                  busy={externalBusy === iface.name}
+                  title={
+                    iface.state === "up"
+                      ? t("profiles.externalStop")
+                      : t("iface.bringUp")
+                  }
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
         </div>
 
+        <div {...splitterProps} />
+
         <div className="profiles-detail-pane">
-          {serviceSelected && tailscale ? (
+          {externalSelected ? (
+            <ExternalTunnelPanel
+              iface={externalSelected}
+              rate={throughput[externalSelected.ifIndex] ?? null}
+              busy={externalBusy === externalSelected.name}
+              onToggle={() => void onToggleExternal(externalSelected)}
+            />
+          ) : serviceSelected && tailscale ? (
             <TailscalePanel
               status={tailscale}
               busy={tailscaleBusy}

@@ -38,7 +38,7 @@ function destGroup(dest: string): string {
   return dest;
 }
 
-export default function RouteFlow() {
+export default function RouteFlow({ hideIpv6 }: { hideIpv6: boolean }) {
   const t = useT();
   const theme = useTheme();
   const [map, setMap] = useState<RouteMapData | null>(null);
@@ -67,7 +67,9 @@ export default function RouteFlow() {
   const { nodes, links } = useMemo(() => {
     if (!map) return { nodes: [] as FlowNode[], links: [] as FlowLink[] };
 
-    const active = map.predicted.filter((r) => r.active);
+    const active = map.predicted.filter(
+      (r) => r.active && !(hideIpv6 && r.destination.includes(":")),
+    );
     const owners = [...new Set(active.map((r) => r.ownerName))];
     const colorMap = new Map<string, string>();
     const colors = ownerColors(theme);
@@ -156,7 +158,7 @@ export default function RouteFlow() {
     }
 
     return { nodes: nodeList, links: [...p2iLinks, ...i2dLinks] };
-  }, [map, theme]);
+  }, [map, theme, hideIpv6]);
 
   if (loading) return <p>{t("routes.loadingFlow")}</p>;
   if (error) return <p className="error">{t("common.error", { err: error })}</p>;

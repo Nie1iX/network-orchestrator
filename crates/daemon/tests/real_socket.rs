@@ -6,7 +6,7 @@ use net_manager_core::journal::{JournalStore, JOURNAL_FILE};
 use net_manager_core::models::AppliedRoute;
 use net_manager_core::policy::RouteExecutor;
 use network_orchestrator_daemon::auth::{Action, AuthDecision, Authorizer, PeerIdentity};
-use network_orchestrator_daemon::core::{DaemonCore, LinkExecutor};
+use network_orchestrator_daemon::core::{DaemonCore, ExternalLinkKind, LinkExecutor};
 use network_orchestrator_daemon::server::{bind_socket, serve, ServerContext};
 use serde_json::{json, Value};
 use std::io;
@@ -38,6 +38,20 @@ struct NoLinks;
 
 impl LinkExecutor for NoLinks {
     fn set_link_state(&mut self, _name: &str, _up: bool) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "test never mutates",
+        ))
+    }
+
+    fn remove_link(&mut self, _name: &str) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "test never mutates",
+        ))
+    }
+
+    fn link_kind(&mut self, _name: &str) -> io::Result<ExternalLinkKind> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "test never mutates",

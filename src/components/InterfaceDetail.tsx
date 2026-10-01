@@ -33,7 +33,7 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
     setToggleError(null);
     try {
       if (!(await ensureElevation(t("iface.elevationState")))) return;
-      await invoke("set_interface_state", { name: iface.name, up: iface.state !== "Up" });
+      await invoke("set_interface_state", { name: iface.name, up: iface.state !== "up" });
     } catch (err) {
       setToggleError(String(err));
     } finally {
@@ -93,7 +93,7 @@ export default function InterfaceDetail({ iface, onClose }: Props) {
             disabled={toggling || iface.kind === "loopback"}
             title={iface.kind === "loopback" ? t("iface.loopbackNoToggle") : ""}
           >
-            {toggling ? "…" : iface.state === "Up" ? t("iface.bringDown") : t("iface.bringUp")}
+            {toggling ? "…" : iface.state === "up" ? t("iface.bringDown") : t("iface.bringUp")}
           </button>
           {toggleError && <p className="error toggle-error">{toggleError}</p>}
 

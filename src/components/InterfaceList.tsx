@@ -27,12 +27,18 @@ type TypePreset = "main" | "all" | "osinternal";
 const MAIN_CATS: InterfaceCategory[] = ["physical", "vpn", "virtual", "system"];
 const OSINTERNAL_CATS: InterfaceCategory[] = ["tunnel", "filter"];
 
+// Tabs remount on every switch; keep the last fetched snapshot cached so
+// re-entering the view renders rows instantly instead of flashing skeletons.
+let listCache: { interfaces: NetworkInterface[] } | null = null;
+
 export default function InterfaceList() {
   const t = useT();
-  const [interfaces, setInterfaces] = useState<NetworkInterface[]>([]);
+  const [interfaces, setInterfaces] = useState<NetworkInterface[]>(
+    listCache?.interfaces ?? [],
+  );
   const [throughput, setThroughput] = useState<Record<number, Throughput>>({});
   const [selected, setSelected] = useState<NetworkInterface | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(listCache === null);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [stateFilter, setStateFilter] = useState<StateFilter>("all");
@@ -42,6 +48,10 @@ export default function InterfaceList() {
   );
   const [collapsed, setCollapsed] = useState<Set<InterfaceCategory>>(new Set());
   const prevStats = useRef<Record<number, { rx: number; tx: number; time: number }>>({});
+
+  useEffect(() => {
+    listCache = { interfaces };
+  }, [interfaces]);
 
   const fetchInterfaces = async () => {
     try {
@@ -114,8 +124,8 @@ export default function InterfaceList() {
     const lower = search.toLowerCase();
     const filtered = interfaces.filter((iface) => {
       if (!enabledCats.has(iface.category)) return false;
-      if (stateFilter === "up" && iface.state !== "Up") return false;
-      if (stateFilter === "down" && iface.state === "Up") return false;
+      if (stateFilter === "up" && iface.state !== "up") return false;
+      if (stateFilter === "down" && iface.state === "up") return false;
       if (lower) {
         const haystack = [
           iface.friendlyName,
@@ -304,9 +314,9 @@ export default function InterfaceList() {
                         >
                           <span
                             className={`status-dot state-${
-                              iface.state === "Up"
+                              iface.state === "up"
                                 ? "running"
-                                : iface.state === "Down"
+                                : iface.state === "down"
                                   ? "stopped"
                                   : "unknown"
                             }`}

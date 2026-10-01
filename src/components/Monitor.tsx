@@ -59,13 +59,27 @@ function ThroughputChart({ samples }: { samples: Sample[] }) {
   );
 }
 
+// Tabs remount on every switch; cache the last snapshot so re-entering
+// renders instantly instead of flashing skeletons.
+let monitorCache: {
+  profiles: Profile[];
+  statuses: TunnelStatus[];
+  interfaces: NetworkInterface[];
+} | null = null;
+
 export default function Monitor() {
-  const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [statuses, setStatuses] = useState<TunnelStatus[]>([]);
+  const [profiles, setProfiles] = useState<Profile[]>(
+    monitorCache?.profiles ?? [],
+  );
+  const [statuses, setStatuses] = useState<TunnelStatus[]>(
+    monitorCache?.statuses ?? [],
+  );
   const [throughput, setThroughput] = useState<Record<number, Throughput>>({});
   const [samples, setSamples] = useState<Sample[]>([]);
-  const [interfaces, setInterfaces] = useState<NetworkInterface[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [interfaces, setInterfaces] = useState<NetworkInterface[]>(
+    monitorCache?.interfaces ?? [],
+  );
+  const [loading, setLoading] = useState(monitorCache === null);
   const [busy, setBusy] = useState<Set<string>>(new Set());
   const prevStats = useRef<Record<number, { rx: number; tx: number; time: number }>>({});
   const liveRef = useRef<{ profiles: Profile[]; statuses: TunnelStatus[] }>({
@@ -78,6 +92,10 @@ export default function Monitor() {
   useEffect(() => {
     liveRef.current = { profiles, statuses };
   }, [profiles, statuses]);
+
+  useEffect(() => {
+    monitorCache = { profiles, statuses, interfaces };
+  }, [profiles, statuses, interfaces]);
 
   const refresh = useCallback(async () => {
     try {

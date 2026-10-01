@@ -39,12 +39,18 @@ export class SandboxBackend {
     profile("static", "QA Static routes", "none", "203.0.113.0/24"),
   ];
   private running = new Set<string>();
+  // Foreign tunnels raised outside the app (wg-quick, another VPN app).
+  private externalIfaces = [
+    iface("wg-home", 90, false, "up", "wireGuard"),
+    iface("tun-happ", 91, false, "up", "xray"),
+  ];
   private enrollment: AlwaysOnListResult = { profiles: [], paused: false, supportedKinds: ["wireGuard", "staticRoutes"] };
   private loginAutostart = false;
   private authMode: VpnAuthMode = "fullTunnelOnly";
   private recovered = false;
   private endpoints = ["QA Europe", "QA Asia"];
   private backendPaths = new Map<string, string>();
+  private xrayManaged = false;
   private condRules: ConditionalRuleEntry[] = [
     {
       rule: {
@@ -59,6 +65,9 @@ export class SandboxBackend {
   ];
 
   constructor() {
+    // QA WireGuard wants the same interface the external wg-home tunnel holds:
+    // demonstrates the "interface occupied" conflict until it is connected.
+    this.profiles[0].interfaceName = "wg-home";
     this.profiles[2].subscription = {
       url: "", hwid: "", endpointCount: 2, activeIndex: 0,
       refreshIntervalMinutes: null, lastRefreshAtUnix: null, lastRefreshError: null,
@@ -89,12 +98,33 @@ export class SandboxBackend {
   }
 
   private interfaces(): NetworkInterface[] {
-    return [iface("qa-ethernet", 1, true, "Up"), ...this.profiles.filter((p) => p.backend !== "none" && !(p.backend === "xray" && p.xrayMode === "socks")).map((p, i) => iface(p.interfaceName, i + 2, false, this.running.has(p.id) ? "Up" : "Down", p.backend === "none" ? "ethernet" : p.backend))];
+    // Managed tunnel interfaces exist only while the tunnel runs — same as on
+    // a real system. A foreign device holding the same name stays listed and
+    // surfaces as the external-tunnel conflict in Profiles.
+    const managed = this.profiles.filter((p) => p.backend !== "none" && !(p.backend === "xray" && p.xrayMode === "socks") && this.running.has(p.id)).map((p, i) => iface(p.interfaceName, i + 2, false, "up", p.backend === "none" ? "ethernet" : p.backend));
+    const runningNames = new Set(this.profiles.filter((p) => this.running.has(p.id)).map((p) => p.interfaceName));
+    return [iface("qa-ethernet", 1, true, "up"), ...managed, ...this.externalIfaces.filter((e) => !runningNames.has(e.name))];
   }
 
   private routes(): RouteEntry[] {
+    // Foreign tunnels contribute real-looking overlapping routes while up —
+    // /30 containing /32s and an IPv6 link-local, like a live kernel table.
+    const external = this.externalIfaces.filter((e) => e.state === "up").flatMap((e) => {
+      if (e.name === "tun-happ") return [
+        { destination: "0.0.0.0", prefixLen: 0, gateway: null, interfaceIndex: e.ifIndex, interfaceName: e.name, metric: 1 },
+        { destination: "172.19.0.0", prefixLen: 30, gateway: null, interfaceIndex: e.ifIndex, interfaceName: e.name, metric: 0 },
+        { destination: "172.19.0.1", prefixLen: 32, gateway: null, interfaceIndex: e.ifIndex, interfaceName: e.name, metric: 0 },
+        { destination: "172.19.0.3", prefixLen: 32, gateway: null, interfaceIndex: e.ifIndex, interfaceName: e.name, metric: 0 },
+        { destination: "fe80::", prefixLen: 64, gateway: null, interfaceIndex: e.ifIndex, interfaceName: e.name, metric: 256 },
+      ];
+      if (e.name === "wg-home") return [
+        { destination: "0.0.0.0", prefixLen: 0, gateway: null, interfaceIndex: e.ifIndex, interfaceName: e.name, metric: 5 },
+      ];
+      return [];
+    });
     return [
       { destination: "0.0.0.0", prefixLen: 0, gateway: "192.0.2.1", interfaceIndex: 1, interfaceName: "qa-ethernet", metric: 100 },
+      ...external,
       ...this.profiles.filter((p) => this.running.has(p.id)).flatMap((p) => p.routes.map((r) => {
         const [destination, prefix] = r.destination.split("/");
         return { destination, prefixLen: Number(prefix), gateway: r.via ?? null, interfaceIndex: this.interfaces().find((i) => i.name === p.interfaceName)?.ifIndex ?? 1, interfaceName: p.interfaceName, metric: r.metric };
@@ -131,7 +161,7 @@ export class SandboxBackend {
 
   private dispatch(command: string, args: Record<string, unknown>): unknown {
     switch (command) {
-      case "get_platform_capabilities": return { os: "linux", systemProxy: false, wireguardStandardImport: false, managedXrayInstall: false, elevationRelaunch: false, appUpdates: false, executableExtensions: [] };
+      case "get_platform_capabilities": return { os: "linux", systemProxy: false, wireguardStandardImport: false, managedXrayInstall: true, elevationRelaunch: false, appUpdates: false, executableExtensions: [] };
       case "get_profiles": return this.profiles;
       case "get_interfaces": return this.interfaces();
       case "get_routes": return this.routes();
@@ -197,7 +227,26 @@ export class SandboxBackend {
         }).sort((a, b) => b.prefixLen - a.prefixLen || a.metric - b.metric)[0];
         return { destination: dest, matchedRoute: matched, interfaceName: matched.interfaceName, table: "sandbox" };
       }
-      case "set_interface_state": throw new Error("Interface mutations are disabled in sandbox");
+      case "set_interface_state": {
+        // External fixtures may be flipped to demo the bring-down flow; all
+        // other interface mutations stay read-only.
+        const ext = this.externalIfaces.find((i) => i.name === args.name);
+        if (!ext || typeof args.up !== "boolean") throw new Error("Interface mutations are disabled in sandbox");
+        ext.state = args.up ? "up" : "down";
+        return null;
+      }
+      case "stop_external_tunnel": {
+        // Mirrors the daemon: a foreign WireGuard netdev is deleted, a
+        // foreign TUN is only admin-downed (its owner still holds it).
+        const ext = this.externalIfaces.find((i) => i.name === args.name);
+        if (!ext) throw new Error("Sandbox interface not found");
+        if (ext.kind === "wireGuard") {
+          this.externalIfaces = this.externalIfaces.filter((i) => i.name !== args.name);
+        } else {
+          ext.state = "down";
+        }
+        return null;
+      }
       case "get_subscription_endpoints": {
         const p = this.find(args.profileId);
         return this.endpoints.map((name, i) => ({ name, active: p.subscription?.activeIndex === i }));
@@ -229,8 +278,19 @@ export class SandboxBackend {
         const imported = [profile(`import-${this.profiles.length}`, "QA Imported WireGuard", "wireGuard", "10.99.0.0/24")];
         this.profiles.push(...imported); return { profiles: imported, errors: [] };
       }
-      case "get_backend_availability": return (["wireGuard", "openVpn", "xray"] as const).map((backend): BackendAvailability => ({ backend, available: true, path: this.backendPaths.get(backend) ?? `/sandbox/bin/${backend}`, source: this.backendPaths.has(backend) ? "configured" : "autoDetected", version: null, message: "Simulated executable; nothing is launched." }));
-      case "get_managed_xray_offer": return { version: "sandbox", sourceUrl: "https://example.invalid/disabled", sha256: "", maxDownloadBytes: 0 };
+      case "get_backend_availability": return (["wireGuard", "openVpn", "xray"] as const).map((backend): BackendAvailability => {
+        if (backend === "xray" && this.xrayManaged) {
+          return { backend, available: true, path: "/usr/lib/network-orchestrator/xray/v26.3.27/xray", source: "managed", version: "v26.3.27", message: "Simulated managed package; nothing is launched." };
+        }
+        if (backend === "xray") {
+          return { backend, available: false, path: this.backendPaths.get(backend) ?? null, source: this.backendPaths.has(backend) ? "configured" : null, version: null, message: "Xray unavailable; TUN requires verified package Xray and network daemon." };
+        }
+        return { backend, available: true, path: this.backendPaths.get(backend) ?? `/sandbox/bin/${backend}`, source: this.backendPaths.has(backend) ? "configured" : "autoDetected", version: null, message: "Simulated executable; nothing is launched." };
+      });
+      case "get_managed_xray_offer": return { version: "v26.3.27", sourceUrl: "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip", sha256: "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae", maxDownloadBytes: 64 * 1024 * 1024 };
+      case "install_managed_xray": this.xrayManaged = true; return "/usr/lib/network-orchestrator/xray/v26.3.27/xray";
+      case "remove_managed_xray": this.xrayManaged = false; this.backendPaths.delete("xray"); return null;
+      case "cancel_managed_xray_install": return null;
       case "set_backend_executable": this.backendPaths.set(String(args.backend), String(args.path)); return null;
       case "reset_backend_executable": this.backendPaths.delete(String(args.backend)); return null;
       case "plugin:app|version": return "Sandbox";

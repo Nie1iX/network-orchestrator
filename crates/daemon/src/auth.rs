@@ -64,6 +64,9 @@ pub fn required_action(method_name: &str) -> Option<Action> {
         | method::ALWAYS_ON_RESUME
         | method::COND_RULES_PUT
         | method::COND_RULES_REMOVE
+        | method::EXTERNAL_TUNNEL_STOP
+        | method::XRAY_INSTALL
+        | method::XRAY_REMOVE
         | method::SETTINGS_SET => Some(Action::SystemNetwork),
         method::ROUTES_REMOVE
         | method::RECOVERY_CLEANUP

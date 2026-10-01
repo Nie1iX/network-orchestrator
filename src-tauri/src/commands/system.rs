@@ -2,9 +2,9 @@ use crate::elevation;
 use crate::state::{resolve_backend_path, AppState, ResolvedBackendExecutable, RuntimeState};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 use net_manager_core::managed_xray::ManagedXrayInstallation;
-use net_manager_core::managed_xray::{
-    self, MANAGED_XRAY_URL, MANAGED_XRAY_VERSION, MAX_XRAY_ARCHIVE_BYTES,
-};
+use net_manager_core::managed_xray::{self, MAX_XRAY_ARCHIVE_BYTES};
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+use net_manager_core::managed_xray::{MANAGED_XRAY_URL, MANAGED_XRAY_VERSION};
 use net_manager_core::models::{
     BackendAvailability, BackendExecutableSetting, BackendExecutableSource, Profile, TunnelBackend,
     TunnelState,
@@ -14,7 +14,10 @@ use serde::Serialize;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_os = "windows", target_os = "linux"),
+    target_arch = "x86_64"
+))]
 use tauri::Emitter;
 use tauri::State;
 
@@ -443,11 +446,23 @@ pub(crate) struct ManagedXrayOffer {
 }
 
 fn managed_xray_offer() -> ManagedXrayOffer {
-    ManagedXrayOffer {
-        version: MANAGED_XRAY_VERSION.to_string(),
-        source_url: MANAGED_XRAY_URL.to_string(),
-        sha256: managed_xray::MANAGED_XRAY_SHA256.to_string(),
-        max_download_bytes: MAX_XRAY_ARCHIVE_BYTES as u64,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        ManagedXrayOffer {
+            version: managed_xray::LINUX_XRAY_VERSION.to_string(),
+            source_url: managed_xray::LINUX_XRAY_URL.to_string(),
+            sha256: managed_xray::LINUX_XRAY_SHA256.to_string(),
+            max_download_bytes: MAX_XRAY_ARCHIVE_BYTES as u64,
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        ManagedXrayOffer {
+            version: MANAGED_XRAY_VERSION.to_string(),
+            source_url: MANAGED_XRAY_URL.to_string(),
+            sha256: managed_xray::MANAGED_XRAY_SHA256.to_string(),
+            max_download_bytes: MAX_XRAY_ARCHIVE_BYTES as u64,
+        }
     }
 }
 
@@ -482,7 +497,10 @@ fn platform_capabilities() -> PlatformCapabilities {
         os: std::env::consts::OS,
         system_proxy: windows,
         wireguard_standard_import: windows,
-        managed_xray_install: cfg!(all(target_os = "windows", target_arch = "x86_64")),
+        managed_xray_install: cfg!(all(
+            any(target_os = "windows", target_os = "linux"),
+            target_arch = "x86_64"
+        )),
         elevation_relaunch: windows,
         app_updates: app_updates_available(windows, tauri::utils::platform::bundle_type()),
         executable_extensions: if windows {
@@ -498,7 +516,10 @@ pub(crate) fn get_platform_capabilities() -> PlatformCapabilities {
     platform_capabilities()
 }
 
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_os = "windows", target_os = "linux"),
+    target_arch = "x86_64"
+))]
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BackendInstallProgress {
@@ -508,10 +529,16 @@ struct BackendInstallProgress {
     total: Option<u64>,
 }
 
-// Used by `install_managed_xray_inner` on 64-bit Windows and directly by
-// unit tests on every platform; never used by the plain (non-test,
-// non-Windows) lib build, hence `any(test, ...)`.
-#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+// Used by `install_managed_xray_inner` on 64-bit Windows/Linux and directly
+// by unit tests on every platform; never used by the plain (non-test,
+// non-managed) lib build, hence `any(test, ...)`.
+#[cfg(any(
+    test,
+    all(
+        any(target_os = "windows", target_os = "linux"),
+        target_arch = "x86_64"
+    )
+))]
 fn checked_download_len(current: usize, chunk_len: usize) -> io::Result<usize> {
     match current.checked_add(chunk_len) {
         Some(total) if total <= MAX_XRAY_ARCHIVE_BYTES => Ok(total),
@@ -522,7 +549,13 @@ fn checked_download_len(current: usize, chunk_len: usize) -> io::Result<usize> {
     }
 }
 
-#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+#[cfg(any(
+    test,
+    all(
+        any(target_os = "windows", target_os = "linux"),
+        target_arch = "x86_64"
+    )
+))]
 fn append_download_chunk(buffer: &mut Vec<u8>, chunk: &[u8], cancelled: bool) -> io::Result<()> {
     if cancelled {
         return Err(io::Error::new(
@@ -535,7 +568,13 @@ fn append_download_chunk(buffer: &mut Vec<u8>, chunk: &[u8], cancelled: bool) ->
     Ok(())
 }
 
-#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+#[cfg(any(
+    test,
+    all(
+        any(target_os = "windows", target_os = "linux"),
+        target_arch = "x86_64"
+    )
+))]
 fn validate_download_length(actual: usize, declared: Option<u64>) -> io::Result<()> {
     if let Some(declared) = declared {
         if declared != actual as u64 {
@@ -548,13 +587,26 @@ fn validate_download_length(actual: usize, declared: Option<u64>) -> io::Result<
     Ok(())
 }
 
+/// The pinned managed Xray release for this platform — the Linux and
+/// Windows pins are different versions.
+fn managed_xray_version() -> &'static str {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        managed_xray::LINUX_XRAY_VERSION
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        MANAGED_XRAY_VERSION
+    }
+}
+
 fn require_managed_xray_setting(
     setting: Option<BackendExecutableSetting>,
 ) -> Result<BackendExecutableSetting, String> {
     match setting {
         Some(setting)
             if setting.source == BackendExecutableSource::Managed
-                && setting.version.as_deref() == Some(MANAGED_XRAY_VERSION) =>
+                && setting.version.as_deref() == Some(managed_xray_version()) =>
         {
             Ok(setting)
         }
@@ -581,47 +633,46 @@ fn install_failure_message(primary: String, cleanup: io::Result<()>) -> String {
     }
 }
 
-#[tauri::command]
-pub(crate) async fn install_managed_xray(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    install_managed_xray_inner(app, state.inner()).await
+#[cfg(all(
+    any(target_os = "windows", target_os = "linux"),
+    target_arch = "x86_64"
+))]
+fn emit_install_progress(app: &tauri::AppHandle, stage: &str, downloaded: u64, total: Option<u64>) {
+    let _ = app.emit(
+        "backend-install-progress",
+        BackendInstallProgress {
+            backend: TunnelBackend::Xray,
+            stage: stage.to_string(),
+            downloaded,
+            total,
+        },
+    );
 }
 
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-async fn install_managed_xray_inner(app: tauri::AppHandle, state: &AppState) -> Result<(), String> {
+/// Shared download of the pinned release archive with progress events and
+/// cancellation. The returned bytes are still untrusted: Windows verifies
+/// and installs app-side, Linux hands them to the daemon which re-verifies
+/// the pinned hashes itself before writing root-owned files.
+#[cfg(all(
+    any(target_os = "windows", target_os = "linux"),
+    target_arch = "x86_64"
+))]
+async fn download_managed_xray_archive(
+    app: &tauri::AppHandle,
+    url: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(Vec<u8>, Option<u64>), String> {
     use futures_util::StreamExt;
     use std::time::Duration;
 
-    let _install_guard = state.backend_install_lock.lock().await;
-    state.backend_install_cancel.store(false, Ordering::SeqCst);
-    let progress = |stage: &str, downloaded: u64, total: Option<u64>| {
-        let _ = app.emit(
-            "backend-install-progress",
-            BackendInstallProgress {
-                backend: TunnelBackend::Xray,
-                stage: stage.to_string(),
-                downloaded,
-                total,
-            },
-        );
-    };
-
-    {
-        let mut runtime = state.runtime.lock().await;
-        let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
-        backend_running_error(&mut runtime.tunnels, &profiles, TunnelBackend::Xray)?;
-    }
-
-    progress("downloading", 0, None);
+    emit_install_progress(app, "downloading", 0, None);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .user_agent("Network-Orchestrator/0.1.0")
         .build()
         .map_err(|e| format!("cannot build download client: {e}"))?;
     let response = client
-        .get(MANAGED_XRAY_URL)
+        .get(url)
         .send()
         .await
         .map_err(|e| format!("managed Xray download failed: {e}"))?
@@ -635,24 +686,45 @@ async fn install_managed_xray_inner(app: tauri::AppHandle, state: &AppState) -> 
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("managed Xray download failed: {e}"))?;
-        match append_download_chunk(
-            &mut buffer,
-            &chunk,
-            state.backend_install_cancel.load(Ordering::SeqCst),
-        ) {
-            Ok(()) => progress("downloading", buffer.len() as u64, total),
+        match append_download_chunk(&mut buffer, &chunk, cancel.load(Ordering::SeqCst)) {
+            Ok(()) => emit_install_progress(app, "downloading", buffer.len() as u64, total),
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                progress("cancelled", buffer.len() as u64, total);
+                emit_install_progress(app, "cancelled", buffer.len() as u64, total);
                 return Err(err.to_string());
             }
             Err(err) => return Err(err.to_string()),
         }
     }
     validate_download_length(buffer.len(), total).map_err(|e| e.to_string())?;
+    Ok((buffer, total))
+}
+
+#[tauri::command]
+pub(crate) async fn install_managed_xray(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    install_managed_xray_inner(app, state.inner()).await
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+async fn install_managed_xray_inner(app: tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    let _install_guard = state.backend_install_lock.lock().await;
+    state.backend_install_cancel.store(false, Ordering::SeqCst);
+
+    {
+        let mut runtime = state.runtime.lock().await;
+        let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+        backend_running_error(&mut runtime.tunnels, &profiles, TunnelBackend::Xray)?;
+    }
+
+    let (buffer, total) =
+        download_managed_xray_archive(&app, MANAGED_XRAY_URL, &state.backend_install_cancel)
+            .await?;
 
     let downloaded = buffer.len() as u64;
-    progress("verifying", downloaded, total);
-    progress("installing", downloaded, total);
+    emit_install_progress(&app, "verifying", downloaded, total);
+    emit_install_progress(&app, "installing", downloaded, total);
     let root = state.managed_xray_root.clone();
     let installation =
         tokio::task::spawn_blocking(move || managed_xray::install_verified_archive(&root, &buffer))
@@ -660,7 +732,7 @@ async fn install_managed_xray_inner(app: tauri::AppHandle, state: &AppState) -> 
             .map_err(|e| format!("managed Xray install task failed: {e}"))?
             .map_err(|e| format!("managed Xray install failed: {e}"))?;
 
-    progress("validating", downloaded, total);
+    emit_install_progress(&app, "validating", downloaded, total);
     let validation = async {
         let output = tokio::process::Command::new(&installation.executable)
             .arg("version")
@@ -680,7 +752,7 @@ async fn install_managed_xray_inner(app: tauri::AppHandle, state: &AppState) -> 
         }
         Ok::<(), String>(())
     };
-    match tokio::time::timeout(Duration::from_secs(10), validation).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), validation).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             return Err(install_failure_message(
@@ -697,7 +769,7 @@ async fn install_managed_xray_inner(app: tauri::AppHandle, state: &AppState) -> 
     }
 
     if state.backend_install_cancel.load(Ordering::SeqCst) {
-        progress("cancelled", downloaded, total);
+        emit_install_progress(&app, "cancelled", downloaded, total);
         return Err(install_failure_message(
             "managed Xray install cancelled".to_string(),
             cleanup_created_installation(&installation),
@@ -712,7 +784,7 @@ async fn install_managed_xray_inner(app: tauri::AppHandle, state: &AppState) -> 
         Some(BackendExecutableSetting {
             path: installation.executable.clone(),
             source: BackendExecutableSource::Managed,
-            version: Some(MANAGED_XRAY_VERSION.to_string()),
+            version: Some(managed_xray_version().to_string()),
         }),
         None,
     );
@@ -724,16 +796,95 @@ async fn install_managed_xray_inner(app: tauri::AppHandle, state: &AppState) -> 
         ));
     }
     drop(runtime);
-    progress("ready", downloaded, total);
+    emit_install_progress(&app, "ready", downloaded, total);
     Ok(())
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+/// The verified package doubles as the SOCKS/HTTP executable, so after the
+/// daemon installs it we point the backend setting at the managed path —
+/// both TUN and user-space modes become available with one install.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+async fn install_managed_xray_inner(app: tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    use base64::Engine;
+    use net_manager_core::daemon_protocol::{method, XrayInstallParams, XrayInstallResult};
+
+    let _install_guard = state.backend_install_lock.lock().await;
+    state.backend_install_cancel.store(false, Ordering::SeqCst);
+    {
+        let mut runtime = state.runtime.lock().await;
+        let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+        backend_running_error(&mut runtime.tunnels, &profiles, TunnelBackend::Xray)?;
+    }
+
+    let (buffer, total) = download_managed_xray_archive(
+        &app,
+        managed_xray::LINUX_XRAY_URL,
+        &state.backend_install_cancel,
+    )
+    .await?;
+    let downloaded = buffer.len() as u64;
+    emit_install_progress(&app, "installing", downloaded, total);
+    let archive_b64 = base64::engine::general_purpose::STANDARD.encode(&buffer);
+    drop(buffer);
+    let result: XrayInstallResult = crate::daemon_client::DaemonClient::system()
+        .request(method::XRAY_INSTALL, XrayInstallParams { archive_b64 })
+        .await
+        .map_err(|e| crate::daemon_client::user_message(&e))?;
+
+    if state.backend_install_cancel.load(Ordering::SeqCst) {
+        emit_install_progress(&app, "cancelled", downloaded, total);
+        let _ = remove_managed_xray_via_daemon().await;
+        return Err("managed Xray install cancelled".to_string());
+    }
+
+    let executable = managed_xray::linux_managed_version_dir(std::path::Path::new(
+        managed_xray::LINUX_XRAY_PACKAGE_ROOT,
+    ))
+    .join("xray");
+    let mut runtime = state.runtime.lock().await;
+    let selection = select_backend_executable(
+        &mut runtime,
+        state,
+        TunnelBackend::Xray,
+        Some(BackendExecutableSetting {
+            path: executable,
+            source: BackendExecutableSource::Managed,
+            version: Some(result.version),
+        }),
+        None,
+    );
+    if let Err(err) = selection {
+        drop(runtime);
+        let _ = remove_managed_xray_via_daemon().await;
+        return Err(err);
+    }
+    drop(runtime);
+    emit_install_progress(&app, "ready", downloaded, total);
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+async fn remove_managed_xray_via_daemon() -> Result<bool, String> {
+    let result: net_manager_core::daemon_protocol::XrayRemoveResult =
+        crate::daemon_client::DaemonClient::system()
+            .request(
+                net_manager_core::daemon_protocol::method::XRAY_REMOVE,
+                serde_json::Value::Null,
+            )
+            .await
+            .map_err(|e| crate::daemon_client::user_message(&e))?;
+    Ok(result.removed)
+}
+
+#[cfg(not(all(
+    any(target_os = "windows", target_os = "linux"),
+    target_arch = "x86_64"
+)))]
 async fn install_managed_xray_inner(
     _app: tauri::AppHandle,
     _state: &AppState,
 ) -> Result<(), String> {
-    Err("managed Xray installation is only supported on 64-bit Windows".to_string())
+    Err("managed Xray installation is only supported on 64-bit Windows or Linux".to_string())
 }
 
 #[tauri::command]
@@ -744,6 +895,48 @@ pub(crate) async fn cancel_managed_xray_install(state: State<'_, AppState>) -> R
 
 #[tauri::command]
 pub(crate) async fn remove_managed_xray(state: State<'_, AppState>) -> Result<(), String> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return remove_managed_xray_linux(state.inner()).await;
+
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        remove_managed_xray_inner(state.inner()).await
+    }
+}
+
+/// On Linux the managed files are root-owned under the daemon's package
+/// root, so removal goes through `xray.remove` — the app cannot unlink
+/// them itself.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+async fn remove_managed_xray_linux(state: &AppState) -> Result<(), String> {
+    let _install_guard = state.backend_install_lock.lock().await;
+    let mut runtime = state.runtime.lock().await;
+    let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+    backend_running_error(&mut runtime.tunnels, &profiles, TunnelBackend::Xray)?;
+    let setting = require_managed_xray_setting(
+        state
+            .backend_settings
+            .get(TunnelBackend::Xray)
+            .map_err(|e| e.to_string())?,
+    )?;
+    let expected = managed_xray::linux_managed_version_dir(std::path::Path::new(
+        managed_xray::LINUX_XRAY_PACKAGE_ROOT,
+    ))
+    .join("xray");
+    if setting.path != expected {
+        return Err("selected Xray executable is not inside the managed installation".to_string());
+    }
+    remove_managed_xray_via_daemon().await?;
+    state
+        .backend_settings
+        .set(TunnelBackend::Xray, None)
+        .map_err(|e| e.to_string())?;
+    runtime.tunnels.set_executable(TunnelBackend::Xray, None);
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+async fn remove_managed_xray_inner(state: &AppState) -> Result<(), String> {
     let _install_guard = state.backend_install_lock.lock().await;
     let mut runtime = state.runtime.lock().await;
     let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
@@ -816,7 +1009,9 @@ mod tests {
         assert_eq!(caps.os, "linux");
         assert!(!caps.system_proxy);
         assert!(!caps.wireguard_standard_import);
-        assert!(!caps.managed_xray_install);
+        // Managed Xray is offered on 64-bit Linux too — the daemon installs
+        // the pinned package root-owned.
+        assert_eq!(caps.managed_xray_install, cfg!(target_arch = "x86_64"));
         assert!(!caps.elevation_relaunch);
         assert!(!caps.app_updates);
         assert!(caps.executable_extensions.is_empty());
@@ -1109,18 +1304,36 @@ mod tests {
     #[test]
     fn managed_offer_matches_pinned_core_constants() {
         let offer = managed_xray_offer();
-        assert_eq!(
-            offer.version,
-            net_manager_core::managed_xray::MANAGED_XRAY_VERSION
-        );
-        assert_eq!(
-            offer.source_url,
-            net_manager_core::managed_xray::MANAGED_XRAY_URL
-        );
-        assert_eq!(
-            offer.sha256,
-            net_manager_core::managed_xray::MANAGED_XRAY_SHA256
-        );
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            assert_eq!(
+                offer.version,
+                net_manager_core::managed_xray::LINUX_XRAY_VERSION
+            );
+            assert_eq!(
+                offer.source_url,
+                net_manager_core::managed_xray::LINUX_XRAY_URL
+            );
+            assert_eq!(
+                offer.sha256,
+                net_manager_core::managed_xray::LINUX_XRAY_SHA256
+            );
+        }
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        {
+            assert_eq!(
+                offer.version,
+                net_manager_core::managed_xray::MANAGED_XRAY_VERSION
+            );
+            assert_eq!(
+                offer.source_url,
+                net_manager_core::managed_xray::MANAGED_XRAY_URL
+            );
+            assert_eq!(
+                offer.sha256,
+                net_manager_core::managed_xray::MANAGED_XRAY_SHA256
+            );
+        }
         assert_eq!(
             offer.max_download_bytes,
             net_manager_core::managed_xray::MAX_XRAY_ARCHIVE_BYTES as u64

@@ -30,8 +30,24 @@ use net_manager_core::policy::{
 use std::collections::{HashMap, HashSet};
 use std::io;
 
+/// What a netdev the daemon does not own is, decided via sysfs by the
+/// executor. Drives `stop_external_link`: WireGuard can be unlinked, foreign
+/// TUN can only be admin-downed, everything else is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalLinkKind {
+    WireGuard,
+    Tun,
+    Missing,
+    Other,
+}
+
 pub trait LinkExecutor: Send {
     fn set_link_state(&mut self, name: &str, up: bool) -> io::Result<()>;
+    /// Delete a netdev by name; used for foreign tunnels, which carry no
+    /// owner marker (that is why this is not `WgSystem::delete_link`).
+    fn remove_link(&mut self, name: &str) -> io::Result<()>;
+    /// Probe a netdev's tunnel kind without mutating it.
+    fn link_kind(&mut self, name: &str) -> io::Result<ExternalLinkKind>;
 }
 
 #[cfg(test)]
@@ -4286,6 +4302,50 @@ impl DaemonCore {
         self.links.set_link_state(name, up)
     }
 
+    /// Stop a tunnel netdev this daemon does not own (wg-quick, another VPN
+    /// app). A live `wg-quick@<name>` unit is stopped first so its routes and
+    /// DNS tear down cleanly; otherwise a WireGuard device is deleted via
+    /// netlink. Foreign TUN devices cannot be unlinked from outside, so they
+    /// are admin-downed — traffic stops even though the device stays.
+    pub fn stop_external_link(&mut self, name: &str) -> io::Result<()> {
+        validate_iface_name(name).map_err(invalid_input)?;
+        if self.journal_owns_iface(name) {
+            return Err(invalid_input(
+                "interface is managed by a profile — disconnect it instead".into(),
+            ));
+        }
+        match self.links.link_kind(name)? {
+            ExternalLinkKind::Missing => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "interface not found",
+            )),
+            ExternalLinkKind::Other => Err(invalid_input(
+                "only tunnel interfaces can be stopped".into(),
+            )),
+            ExternalLinkKind::Tun => self.links.set_link_state(name, false),
+            ExternalLinkKind::WireGuard => {
+                if stop_wg_quick_unit(name) {
+                    Ok(())
+                } else {
+                    self.links.remove_link(name)
+                }
+            }
+        }
+    }
+
+    /// The journal references interface names for every link/process it owns;
+    /// if a name appears there it is managed and must not be stopped here.
+    fn journal_owns_iface(&self, name: &str) -> bool {
+        self.journal.entries.iter().any(|entry| {
+            entry.resources.iter().any(|res| match res {
+                OwnedResource::WireGuardLink(link) => link.name == name,
+                OwnedResource::OpenVpnProcess(proc) => proc.name == name,
+                OwnedResource::XrayProcess(proc) => proc.name == name,
+                _ => false,
+            })
+        })
+    }
+
     fn position(&self, uid: u32, owner: &str) -> Option<usize> {
         self.journal
             .entries
@@ -4794,6 +4854,12 @@ mod xray_core_tests {
     impl LinkExecutor for Links {
         fn set_link_state(&mut self, _: &str, _: bool) -> io::Result<()> {
             Ok(())
+        }
+        fn remove_link(&mut self, _: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn link_kind(&mut self, _: &str) -> io::Result<ExternalLinkKind> {
+            Ok(ExternalLinkKind::Missing)
         }
     }
     struct Tun(Events);
@@ -5853,6 +5919,37 @@ fn trusted_ip_binary() -> io::Result<&'static str> {
     Ok(PATH)
 }
 
+/// Stop `wg-quick@<name>` when an active unit owns the device — it removes
+/// the link along with its routes and DNS. `name` comes from
+/// `validate_iface_name`, so the unit name cannot escape the template.
+/// Returns true once the link is gone.
+fn stop_wg_quick_unit(name: &str) -> bool {
+    use std::process::{Command, Stdio};
+    let unit = format!("wg-quick@{name}");
+    let quiet = |args: &[&str]| {
+        Command::new("/usr/bin/systemctl")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if !quiet(&["is-active", "--quiet", &unit]) {
+        return false;
+    }
+    let _ = quiet(&["stop", "--no-block", &unit]);
+    // wg-quick's down pass is fast; give it a short window before the caller
+    // falls back to a plain link delete.
+    for _ in 0..20 {
+        if !std::path::Path::new(&format!("/sys/class/net/{name}")).exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
 #[cfg(target_os = "linux")]
 fn wg_dump(name: &str) -> io::Result<String> {
     use std::process::{Command, Stdio};
@@ -6027,9 +6124,10 @@ impl WgConfigExecutor for TrustedWgCommand {
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::LinkExecutor;
+    use super::{ExternalLinkKind, LinkExecutor};
     use net_manager_core::models::AppliedRoute;
     use net_manager_core::policy::RouteExecutor;
+    use std::collections::HashMap;
     use std::io;
     use std::sync::{Arc, Mutex};
 
@@ -6038,6 +6136,7 @@ pub(crate) mod testing {
         Add(String),
         Remove(String),
         Link(String, bool),
+        LinkDel(String),
     }
 
     /// Shared recorder for fake executors; failure knobs by destination.
@@ -6047,6 +6146,8 @@ pub(crate) mod testing {
         pub fail_add: Arc<Mutex<Vec<String>>>,
         pub fail_remove: Arc<Mutex<Vec<String>>>,
         pub missing_on_remove: Arc<Mutex<Vec<String>>>,
+        /// Foreign-link kinds probed by `FakeLinks::link_kind`; absent = Missing.
+        pub link_kinds: Arc<Mutex<HashMap<String, ExternalLinkKind>>>,
     }
 
     impl Recorder {
@@ -6116,6 +6217,20 @@ pub(crate) mod testing {
         fn set_link_state(&mut self, name: &str, up: bool) -> io::Result<()> {
             self.0.ops.lock().unwrap().push(Op::Link(name.into(), up));
             Ok(())
+        }
+        fn remove_link(&mut self, name: &str) -> io::Result<()> {
+            self.0.ops.lock().unwrap().push(Op::LinkDel(name.into()));
+            Ok(())
+        }
+        fn link_kind(&mut self, name: &str) -> io::Result<ExternalLinkKind> {
+            Ok(self
+                .0
+                .link_kinds
+                .lock()
+                .unwrap()
+                .get(name)
+                .copied()
+                .unwrap_or(ExternalLinkKind::Missing))
         }
     }
 }
@@ -8249,6 +8364,113 @@ mod tests {
             // The journal entry survived — only rule evaluation may move it.
             assert_eq!(core.owned(1000)[0].owner, "cond:office");
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn managed_link_entry(name: &str) -> JournalEntry {
+        JournalEntry {
+            uid: 1000,
+            owner: "wg:test".into(),
+            state: OwnedState::Applied,
+            resources: vec![OwnedResource::WireGuardLink(WireGuardLinkResource {
+                name: name.into(),
+                index: 7,
+                owner_marker: "marker".into(),
+                full: None,
+                warnings: vec![],
+            })],
+        }
+    }
+
+    #[test]
+    fn stop_external_link_rejects_managed_interface() {
+        let dir = unique_dir("stop-ext-managed");
+        let recorder = Recorder::default();
+        recorder
+            .link_kinds
+            .lock()
+            .unwrap()
+            .insert("wg-ours".into(), ExternalLinkKind::WireGuard);
+        let mut core = open_core(&dir, &recorder);
+        core.journal.entries.push(managed_link_entry("wg-ours"));
+        let err = core.stop_external_link("wg-ours").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(recorder.ops().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stop_external_link_deletes_foreign_wireguard() {
+        // No `wg-quick@wg-f4ke-q7x` unit can exist, so the probe falls through
+        // to a plain netdev delete.
+        let dir = unique_dir("stop-ext-wg");
+        let recorder = Recorder::default();
+        recorder
+            .link_kinds
+            .lock()
+            .unwrap()
+            .insert("wg-f4ke-q7x".into(), ExternalLinkKind::WireGuard);
+        let mut core = open_core(&dir, &recorder);
+        core.stop_external_link("wg-f4ke-q7x").unwrap();
+        assert_eq!(recorder.ops(), vec![Op::LinkDel("wg-f4ke-q7x".into())]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stop_external_link_downs_foreign_tun() {
+        let dir = unique_dir("stop-ext-tun");
+        let recorder = Recorder::default();
+        recorder
+            .link_kinds
+            .lock()
+            .unwrap()
+            .insert("tun-happ".into(), ExternalLinkKind::Tun);
+        let mut core = open_core(&dir, &recorder);
+        core.stop_external_link("tun-happ").unwrap();
+        assert_eq!(recorder.ops(), vec![Op::Link("tun-happ".into(), false)]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stop_external_link_rejects_plain_interfaces() {
+        let dir = unique_dir("stop-ext-eth");
+        let recorder = Recorder::default();
+        recorder
+            .link_kinds
+            .lock()
+            .unwrap()
+            .insert("eth9".into(), ExternalLinkKind::Other);
+        let mut core = open_core(&dir, &recorder);
+        let err = core.stop_external_link("eth9").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(recorder.ops().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stop_external_link_reports_missing() {
+        let dir = unique_dir("stop-ext-missing");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        let err = core.stop_external_link("wg-gone").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stop_external_link_validates_name() {
+        let dir = unique_dir("stop-ext-name");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        assert_eq!(
+            core.stop_external_link("bad name!").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            core.stop_external_link("-wg").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(recorder.ops().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -21,9 +21,11 @@ pub const DEFAULT_SOCKET_PATH: &str = "/run/network-orchestrator/daemon.sock";
 pub const SOCKET_ENV: &str = "NETWORK_ORCHESTRATOR_SOCKET";
 /// Hard cap for one frame; read buffers grow with actual bytes, the cap is
 /// only an abort threshold. `xray.connect` may carry inline base64 geo
-/// assets (two ~10 MiB dat files → ~27 MiB frame), so the limit is sized
-/// for that plus the generated config; anything above is `frameTooLarge`.
-pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+/// assets (two ~10 MiB dat files → ~27 MiB frame); `xray.install` carries a
+/// base64 archive bounded by `managed_xray::MAX_XRAY_ARCHIVE_BYTES`
+/// (64 MiB → ~86 MiB on the wire), so the cap covers that plus envelope.
+/// Anything above is `frameTooLarge`.
+pub const MAX_FRAME_BYTES: usize = 96 * 1024 * 1024;
 pub const MAX_ROUTES_PER_REQUEST: usize = 8192;
 pub const MAX_OWNER_BYTES: usize = 128;
 pub const HELLO_TIMEOUT_SECS: u64 = 5;
@@ -49,6 +51,8 @@ pub mod method {
     pub const XRAY_DISCONNECT: &str = "xray.disconnect";
     pub const XRAY_STATUS: &str = "xray.status";
     pub const XRAY_RELOAD: &str = "xray.reload";
+    pub const XRAY_INSTALL: &str = "xray.install";
+    pub const XRAY_REMOVE: &str = "xray.remove";
     pub const TAILSCALE_STATUS: &str = "tailscale.status";
     pub const TAILSCALE_UP: &str = "tailscale.up";
     pub const TAILSCALE_DOWN: &str = "tailscale.down";
@@ -61,9 +65,10 @@ pub mod method {
     pub const COND_RULES_LIST: &str = "condRules.list";
     pub const COND_RULES_PUT: &str = "condRules.put";
     pub const COND_RULES_REMOVE: &str = "condRules.remove";
+    pub const EXTERNAL_TUNNEL_STOP: &str = "externalTunnel.stop";
 
     /// Methods implemented by the daemon and reported in `hello.capabilities`.
-    pub const CAPABILITIES: [&str; 30] = [
+    pub const CAPABILITIES: &[&str] = &[
         ROUTES_APPLY,
         ROUTES_REMOVE,
         LINK_SET_STATE,
@@ -82,6 +87,8 @@ pub mod method {
         XRAY_DISCONNECT,
         XRAY_STATUS,
         XRAY_RELOAD,
+        XRAY_INSTALL,
+        XRAY_REMOVE,
         TAILSCALE_STATUS,
         TAILSCALE_UP,
         TAILSCALE_DOWN,
@@ -94,6 +101,7 @@ pub mod method {
         COND_RULES_LIST,
         COND_RULES_PUT,
         COND_RULES_REMOVE,
+        EXTERNAL_TUNNEL_STOP,
     ];
 }
 
@@ -608,6 +616,31 @@ pub struct XrayProfileParams {
     pub profile_id: String,
 }
 
+/// Install the pinned managed Xray package: `archive_b64` is the raw release
+/// ZIP in base64 — the daemon re-verifies the pinned archive hash and the
+/// per-file hashes itself, then lays down root-owned files. Caller bytes are
+/// never trusted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayInstallParams {
+    pub archive_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayInstallResult {
+    pub version: String,
+    /// `true` when the version tree was created; `false` when the exact
+    /// verified installation already existed.
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayRemoveResult {
+    pub removed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct XrayStatusResult {
@@ -884,6 +917,15 @@ pub struct LinkSetStateParams {
     pub up: bool,
 }
 
+/// Stop a tunnel interface the daemon does not own (wg-quick, another VPN
+/// app's device). WireGuard devices are deleted; foreign TUN devices are
+/// admin-downed since only the owning process can unlink them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalTunnelStopParams {
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum OwnedState {
@@ -1125,7 +1167,7 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove"]}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop"]}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);
@@ -1283,6 +1325,16 @@ mod tests {
         assert_eq!(params.name, "enp0s3");
         assert!(!params.up);
         let (_, result): (_, Value) = ok_response(r#"{"id":4,"ok":true,"result":null}"#);
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn golden_external_tunnel_stop() {
+        let (frame, params): (_, ExternalTunnelStopParams) =
+            request(r#"{"id":41,"method":"externalTunnel.stop","params":{"name":"wg-quick0"}}"#);
+        assert_eq!(frame.method, method::EXTERNAL_TUNNEL_STOP);
+        assert_eq!(params.name, "wg-quick0");
+        let (_, result): (_, Value) = ok_response(r#"{"id":41,"ok":true,"result":null}"#);
         assert_eq!(result, Value::Null);
     }
 

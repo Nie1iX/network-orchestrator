@@ -473,6 +473,49 @@ fn safe_owned_file(path: &Path, owner: u32, executable: bool) -> bool {
         && (!executable || file.mode() & 0o111 != 0)
 }
 
+/// `xray.install`: verify the caller-supplied release archive against the
+/// pinned hashes and lay it down as the managed package. A stale
+/// unverified tree (e.g. left by a removed distro package) is dropped
+/// first; fresh files get distro-package modes (root-owned `0755`/`0644`)
+/// so unprivileged user-space mode can exec them too.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn install_managed_package_at(
+    root: &Path,
+    archive: &[u8],
+) -> io::Result<net_manager_core::managed_xray::ManagedXrayInstallation> {
+    use net_manager_core::managed_xray as managed;
+    managed::remove_incomplete_linux_version(root)?;
+    let installation = managed::install_verified_linux_archive(root, archive)?;
+    managed::relax_linux_package_permissions(root)?;
+    Ok(installation)
+}
+
+/// `xray.remove`: delete the managed version tree. Returns whether anything
+/// was removed.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn remove_managed_package_at(root: &Path) -> io::Result<bool> {
+    net_manager_core::managed_xray::remove_linux_version(root)
+}
+
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+pub fn install_managed_package_at(
+    _root: &Path,
+    _archive: &[u8],
+) -> io::Result<net_manager_core::managed_xray::ManagedXrayInstallation> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "managed Xray is not supported on this architecture",
+    ))
+}
+
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+pub fn remove_managed_package_at(_root: &Path) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "managed Xray is not supported on this architecture",
+    ))
+}
+
 #[cfg(target_os = "linux")]
 fn ensure_runtime_root() -> io::Result<()> {
     let root = Path::new(RUNTIME_ROOT);
@@ -1207,6 +1250,45 @@ mod tests {
             trusted_binary().unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn install_managed_package_drops_stale_tree_and_rejects_bad_hash() {
+        let root = temp_root();
+        let stale = net_manager_core::managed_xray::linux_managed_version_dir(&root);
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("xray"), b"leftover").unwrap();
+        let err = install_managed_package_at(&root, b"not a zip").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!stale.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn install_managed_package_rejects_oversized_archive() {
+        let root = temp_root();
+        let archive = vec![0u8; net_manager_core::managed_xray::MAX_XRAY_ARCHIVE_BYTES + 1];
+        assert_eq!(
+            install_managed_package_at(&root, &archive)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn remove_managed_package_reports_whether_tree_existed() {
+        let root = temp_root();
+        assert!(!remove_managed_package_at(&root).unwrap());
+        let version = net_manager_core::managed_xray::linux_managed_version_dir(&root);
+        fs::create_dir_all(&version).unwrap();
+        assert!(remove_managed_package_at(&root).unwrap());
+        assert!(!version.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

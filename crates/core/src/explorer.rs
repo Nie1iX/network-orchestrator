@@ -949,8 +949,40 @@ fn classify_interface_linux(name: &str) -> InterfaceKind {
     if name == "lo" {
         return InterfaceKind::Loopback;
     }
+    // Kernel-reported link kind beats name heuristics: a WireGuard device can
+    // carry any name (`ip link add dev vpn0 type wireguard`), not only `wg*`.
+    if linux_devtype(name).as_deref() == Some("wireguard") {
+        return InterfaceKind::WireGuard;
+    }
+    // tun/tap devices export `tun_flags` in sysfs; the name then hints at
+    // which userspace daemon owns the device (openvpn, xray, tailscale…).
+    if std::path::Path::new(&format!("/sys/class/net/{name}/tun_flags")).exists() {
+        return classify_linux_tun_name(name);
+    }
+    classify_linux_name(name)
+}
+
+/// DEVTYPE from `/sys/class/net/<name>/uevent` (e.g. "wireguard", "wlan").
+#[cfg(target_os = "linux")]
+fn linux_devtype(name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/sys/class/net/{name}/uevent")).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("DEVTYPE=").map(str::trim))
+        .map(str::to_string)
+}
+
+/// Name-based classification for interfaces the kernel does not tag with an
+/// explicit link kind.
+#[cfg(any(target_os = "linux", test))]
+fn classify_linux_name(name: &str) -> InterfaceKind {
+    if name == "lo" {
+        return InterfaceKind::Loopback;
+    }
     if name.starts_with("wg") || name.contains("wireguard") {
         return InterfaceKind::WireGuard;
+    }
+    if name.contains("tailscale") {
+        return InterfaceKind::Other("Tailscale".into());
     }
     if name.starts_with("tun") || name.starts_with("tap") || name.contains("openvpn") {
         return InterfaceKind::OpenVpn;
@@ -967,6 +999,26 @@ fn classify_interface_linux(name: &str) -> InterfaceKind {
     InterfaceKind::Other(name.to_string())
 }
 
+/// tun/tap device: the name hints at the owning userspace daemon.
+#[cfg(any(target_os = "linux", test))]
+fn classify_linux_tun_name(name: &str) -> InterfaceKind {
+    let lower = name.to_lowercase();
+    if lower.contains("tailscale") {
+        return InterfaceKind::Other("Tailscale".into());
+    }
+    if lower.contains("xray") || lower.contains("sing-box") || lower.contains("singbox") {
+        return InterfaceKind::Xray;
+    }
+    if lower.contains("openvpn")
+        || lower.contains("ovpn")
+        || lower.starts_with("tun")
+        || lower.starts_with("tap")
+    {
+        return InterfaceKind::OpenVpn;
+    }
+    InterfaceKind::Other("TUN".into())
+}
+
 #[cfg(target_os = "linux")]
 fn classify_category_linux(kind: &InterfaceKind, physical: bool, _name: &str) -> InterfaceCategory {
     match kind {
@@ -981,9 +1033,13 @@ fn classify_category_linux(kind: &InterfaceKind, physical: bool, _name: &str) ->
                 InterfaceCategory::Virtual
             }
         }
-        InterfaceKind::Other(_) => {
-            // Virtual interfaces on Linux: docker0, br-*, veth*, virbr*, etc.
-            if physical {
+        InterfaceKind::Other(s) => {
+            // Foreign tunnels we detected but do not manage (system wg-quick,
+            // other apps' tun devices, tailscaled) belong with the VPN group
+            // so conflicts surface next to our own tunnels.
+            if s == "Tailscale" || s == "TUN" {
+                InterfaceCategory::Vpn
+            } else if physical {
                 InterfaceCategory::Physical
             } else {
                 InterfaceCategory::Virtual
@@ -1343,5 +1399,43 @@ garbage line\n";
             &[]
         )
         .is_err());
+    }
+
+    #[test]
+    fn linux_name_classification_recognizes_foreign_tunnels() {
+        // wg-quick names are `wg*`; tailscaled names its device `tailscale0`.
+        assert!(matches!(
+            classify_linux_name("wg-kzn2"),
+            InterfaceKind::WireGuard
+        ));
+        assert!(matches!(
+            classify_linux_name("tailscale0"),
+            InterfaceKind::Other(ref s) if s == "Tailscale"
+        ));
+        assert!(matches!(
+            classify_linux_name("enp3s0"),
+            InterfaceKind::Ethernet
+        ));
+        assert!(matches!(classify_linux_name("lo"), InterfaceKind::Loopback));
+    }
+
+    #[test]
+    fn linux_tun_names_classify_by_owner_hint() {
+        assert!(matches!(
+            classify_linux_tun_name("happ-xray"),
+            InterfaceKind::Xray
+        ));
+        assert!(matches!(
+            classify_linux_tun_name("tailscale0"),
+            InterfaceKind::Other(ref s) if s == "Tailscale"
+        ));
+        assert!(matches!(
+            classify_linux_tun_name("tun0"),
+            InterfaceKind::OpenVpn
+        ));
+        assert!(matches!(
+            classify_linux_tun_name("devpn"),
+            InterfaceKind::Other(ref s) if s == "TUN"
+        ));
     }
 }

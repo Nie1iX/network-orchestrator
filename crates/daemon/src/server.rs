@@ -18,13 +18,14 @@ use net_manager_core::daemon_protocol::{
     AlwaysOnProfileInfo, AlwaysOnRemoveParams, AlwaysOnRemoveResult, AlwaysOnResumeResult,
     AlwaysOnSetParams, AlwaysOnSetResult, CondRulesListResult, CondRulesPutParams,
     CondRulesPutResult, CondRulesRemoveParams, CondRulesRemoveResult, ConditionalRuleEntry,
-    ErrorCode, EventFrame, HelloParams, HelloResult, LinkSetStateParams, OpenVpnConnectRequest,
-    OpenVpnConnectResult, OpenVpnDisconnectResult, OpenVpnProbeResult, OpenVpnProfileParams,
-    OwnedChanged, OwnedListResult, OwnerParams, RequestFrame, ResponseFrame, RoutesApplyParams,
-    RoutesApplyResult, RoutesRemoveResult, SettingsResult, SettingsSetParams, VpnAuthMode,
-    WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
+    ErrorCode, EventFrame, ExternalTunnelStopParams, HelloParams, HelloResult, LinkSetStateParams,
+    OpenVpnConnectRequest, OpenVpnConnectResult, OpenVpnDisconnectResult, OpenVpnProbeResult,
+    OpenVpnProfileParams, OwnedChanged, OwnedListResult, OwnerParams, RequestFrame, ResponseFrame,
+    RoutesApplyParams, RoutesApplyResult, RoutesRemoveResult, SettingsResult, SettingsSetParams,
+    VpnAuthMode, WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
     WireGuardProfileParams, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
-    XrayProfileParams, HELLO_TIMEOUT_SECS, MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    XrayInstallParams, XrayInstallResult, XrayProfileParams, XrayRemoveResult, HELLO_TIMEOUT_SECS,
+    MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -60,6 +61,10 @@ pub struct ServerContext<A> {
     pub settings: Arc<Mutex<DaemonSettings>>,
     /// `None` keeps settings in memory only (tests).
     pub settings_store: Option<Arc<SettingsStore>>,
+    /// Root the `xray.install`/`xray.remove` methods write under; tests
+    /// point it at a tempdir so they never touch the real package tree.
+    #[cfg(target_os = "linux")]
+    pub xray_package_root: std::path::PathBuf,
 }
 
 impl<A: Authorizer> ServerContext<A> {
@@ -77,6 +82,8 @@ impl<A: Authorizer> ServerContext<A> {
             observer: Arc::new(NoObservation),
             settings: Arc::new(Mutex::new(DaemonSettings::default())),
             settings_store: None,
+            #[cfg(target_os = "linux")]
+            xray_package_root: Self::default_xray_package_root(),
         }
     }
 
@@ -84,6 +91,18 @@ impl<A: Authorizer> ServerContext<A> {
         let mut context = Self::new(core, authorizer);
         context.always_on = Some(Arc::new(Mutex::new(store)));
         context
+    }
+
+    #[cfg(target_os = "linux")]
+    fn default_xray_package_root() -> std::path::PathBuf {
+        #[cfg(target_arch = "x86_64")]
+        {
+            net_manager_core::managed_xray::LINUX_XRAY_PACKAGE_ROOT.into()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            std::path::PathBuf::new()
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -621,6 +640,45 @@ async fn handle<A: Authorizer>(
             notify(ctx, uid, owner);
             to_value(&XrayConnectResult { status })
         }
+        #[cfg(target_os = "linux")]
+        method::XRAY_INSTALL => {
+            let params: XrayInstallParams = params(request.params)?;
+            let archive =
+                decode_xray_archive(&params.archive_b64).map_err(|err| invalid(err.to_string()))?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let root = ctx.xray_package_root.clone();
+            let installation = tokio::task::spawn_blocking(move || {
+                crate::xray_process::install_managed_package_at(&root, &archive)
+            })
+            .await
+            .map_err(|_| (ErrorCode::Internal, "Xray install task failed".into()))?
+            .map_err(|err| {
+                (
+                    error_code(&err),
+                    format!("managed Xray install failed: {err}"),
+                )
+            })?;
+            to_value(&XrayInstallResult {
+                version: installation
+                    .version_dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                created: installation.created,
+            })
+        }
+        #[cfg(target_os = "linux")]
+        method::XRAY_REMOVE => {
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let root = ctx.xray_package_root.clone();
+            let removed = tokio::task::spawn_blocking(move || {
+                crate::xray_process::remove_managed_package_at(&root)
+            })
+            .await
+            .map_err(|_| (ErrorCode::Internal, "Xray remove task failed".into()))?
+            .map_err(|err| (error_code(&err), err.to_string()))?;
+            to_value(&XrayRemoveResult { removed })
+        }
         method::TAILSCALE_STATUS => {
             // tailscaled is a foreign daemon — a read-only status proxy with
             // nothing journaled, so no authorization is required.
@@ -722,6 +780,13 @@ async fn handle<A: Authorizer>(
                 core.set_link_state(&params.name, params.up)
             })
             .await?;
+            Ok(Value::Null)
+        }
+        method::EXTERNAL_TUNNEL_STOP => {
+            let params: ExternalTunnelStopParams = params(request.params)?;
+            validate_iface_name(&params.name).map_err(invalid)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            with_core(ctx, move |core| core.stop_external_link(&params.name)).await?;
             Ok(Value::Null)
         }
         method::RECOVERY_CLEANUP => {
@@ -945,6 +1010,24 @@ fn params<T: DeserializeOwned>(value: Value) -> Result<T, Failure> {
 
 fn invalid(message: String) -> Failure {
     (ErrorCode::InvalidParams, message)
+}
+
+/// Decode the base64 release archive for `xray.install`. Bounded by the
+/// pinned archive limit so decoding stops before a maximal frame could
+/// expand further.
+#[cfg(target_os = "linux")]
+fn decode_xray_archive(archive_b64: &str) -> io::Result<Vec<u8>> {
+    use base64::Engine;
+    const MAX_B64_LEN: usize = (net_manager_core::managed_xray::MAX_XRAY_ARCHIVE_BYTES / 3 + 1) * 4;
+    if archive_b64.len() > MAX_B64_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed Xray archive exceeds the size limit",
+        ));
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(archive_b64)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed base64 archive"))
 }
 
 fn reject_wireguard_owner(owner: &str) -> Result<(), Failure> {
@@ -1312,6 +1395,78 @@ mod tests {
             "config": format!("[Interface]\nPrivateKey={KEY}\nAddress=10.77.0.2/32\n[Peer]\nPublicKey={KEY}\nEndpoint=192.0.2.1:51820\nAllowedIPs=0.0.0.0/0\n"),
             "routes": []
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn xray_package_root_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "netmgr-xray-pkg-{}-{name}-{}",
+            std::process::id(),
+            DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn xray_install_validates_archive_then_asks_an_administrator() {
+        use base64::Engine;
+        let package_root = xray_package_root_dir("denied");
+        let harness = Harness::with(AuthDecision::Denied, |ctx| {
+            ctx.xray_package_root = package_root;
+        });
+        let mut client = harness.hello(1000).await;
+        let reply = client
+            .call(2, method::XRAY_INSTALL, json!({"archiveB64": "!!!"}))
+            .await;
+        assert_eq!(error_code(&reply), "invalidParams");
+        assert_eq!(harness.auth_calls(), 0);
+        let reply = client
+            .call(
+                3,
+                method::XRAY_INSTALL,
+                json!({"archiveB64": base64::engine::general_purpose::STANDARD.encode(b"garbage")}),
+            )
+            .await;
+        assert_eq!(error_code(&reply), "notAuthorized");
+        assert_eq!(
+            *harness.ctx.authorizer.actions.lock().unwrap(),
+            [Action::SystemNetwork]
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn xray_install_reports_hash_mismatch_and_remove_roundtrips() {
+        use base64::Engine;
+        let package_root = xray_package_root_dir("roundtrip");
+        let harness = Harness::with(AuthDecision::Authorized, |ctx| {
+            ctx.xray_package_root = package_root.clone();
+        });
+        let mut client = harness.hello(1000).await;
+        let reply = client
+            .call(
+                2,
+                method::XRAY_INSTALL,
+                json!({"archiveB64": base64::engine::general_purpose::STANDARD.encode(b"garbage")}),
+            )
+            .await;
+        assert_eq!(error_code(&reply), "internal");
+        assert!(reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("sha-256"));
+        let reply = client.call(3, method::XRAY_REMOVE, Value::Null).await;
+        assert_eq!(reply["result"]["removed"], json!(false), "{reply}");
+        std::fs::create_dir_all(
+            package_root.join(net_manager_core::managed_xray::LINUX_XRAY_VERSION),
+        )
+        .unwrap();
+        let reply = client.call(4, method::XRAY_REMOVE, Value::Null).await;
+        assert_eq!(reply["result"]["removed"], json!(true), "{reply}");
+        assert!(!package_root
+            .join(net_manager_core::managed_xray::LINUX_XRAY_VERSION)
+            .exists());
+        std::fs::remove_dir_all(package_root).unwrap();
     }
 
     #[tokio::test]

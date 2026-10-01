@@ -181,6 +181,73 @@ pub fn install_verified_linux_archive(
     )
 }
 
+/// Drop a present-but-unverified Linux version tree (e.g. the empty
+/// directory a removed distro package leaves behind) so a fresh install is
+/// not blocked by `AlreadyExists`. Hash-verified trees and missing paths
+/// are left alone; a stray symlink or file is unlinked, never followed.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn remove_incomplete_linux_version(root: &Path) -> io::Result<()> {
+    remove_incomplete_version_dir(&linux_managed_version_dir(root), &LINUX_REQUIRED_SHA256)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn remove_incomplete_version_dir(
+    version_dir: &Path,
+    expected_required: &[(&str, &str)],
+) -> io::Result<()> {
+    match fs::symlink_metadata(version_dir) {
+        Ok(metadata) if metadata.is_dir() => {
+            if version_verified(version_dir, expected_required) {
+                return Ok(());
+            }
+            fs::remove_dir_all(version_dir)
+        }
+        Ok(_) => fs::remove_file(version_dir),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Remove the managed Linux version tree entirely (`xray.remove`).
+/// Returns whether anything was deleted.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn remove_linux_version(root: &Path) -> io::Result<bool> {
+    let version_dir = linux_managed_version_dir(root);
+    match fs::symlink_metadata(&version_dir) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&version_dir)?,
+        Ok(_) => fs::remove_file(&version_dir)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    }
+    Ok(true)
+}
+
+/// Relax a fresh install to distro-package permissions: directories and the
+/// executable become `0755`, data files `0644`. The installer runs as root
+/// so files stay root-owned — `verify_managed_linux_executable` accepts the
+/// package layout, and the binary is additionally usable by unprivileged
+/// user-space (SOCKS/HTTP) mode.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn relax_linux_package_permissions(root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let version_dir = linux_managed_version_dir(root);
+    fs::set_permissions(root, fs::Permissions::from_mode(0o755))?;
+    fs::set_permissions(&version_dir, fs::Permissions::from_mode(0o755))?;
+    for entry in fs::read_dir(&version_dir)? {
+        let path = entry?.path();
+        if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            continue;
+        }
+        let mode = if path.file_name() == Some(std::ffi::OsStr::new("xray")) {
+            0o755
+        } else {
+            0o644
+        };
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
 pub fn is_managed_executable(root: &Path, executable: &Path) -> io::Result<bool> {
     let root = root.canonicalize()?;
     let executable = executable.canonicalize()?;
@@ -635,6 +702,79 @@ mod tests {
         );
         assert!(!linux_managed_version_dir(&root).exists());
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn remove_incomplete_drops_stale_tree_but_keeps_verified() {
+        let dir = unique_dir("linux-incomplete");
+        let root = dir.join("xray");
+        let version_dir = linux_managed_version_dir(&root);
+
+        fs::create_dir_all(&version_dir).unwrap();
+        remove_incomplete_linux_version(&root).unwrap();
+        assert!(!version_dir.exists());
+
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(version_dir.join("xray"), b"stale").unwrap();
+        remove_incomplete_linux_version(&root).unwrap();
+        assert!(!version_dir.exists());
+
+        // A symlinked version dir is unlinked, never traversed.
+        let target = dir.join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("xray"), b"kept").unwrap();
+        std::os::unix::fs::symlink(&target, &version_dir).unwrap();
+        remove_incomplete_linux_version(&root).unwrap();
+        assert!(!version_dir.exists() && target.join("xray").exists());
+
+        let owned = linux_required_entries();
+        let file_hashes: Vec<(String, String)> = owned
+            .iter()
+            .map(|(n, d)| (n.to_string(), sha256_hex(d)))
+            .collect();
+        let refs: Vec<(&str, &str)> = file_hashes
+            .iter()
+            .map(|(n, h)| (n.as_str(), h.as_str()))
+            .collect();
+        fs::create_dir_all(&version_dir).unwrap();
+        for (name, data) in &owned {
+            fs::write(version_dir.join(name), data).unwrap();
+        }
+        remove_incomplete_version_dir(&version_dir, &refs).unwrap();
+        assert!(version_dir.join("xray").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn remove_linux_version_reports_whether_tree_existed() {
+        let dir = unique_dir("linux-remove");
+        let root = dir.join("xray");
+        assert!(!remove_linux_version(&root).unwrap());
+        fs::create_dir_all(linux_managed_version_dir(&root)).unwrap();
+        assert!(remove_linux_version(&root).unwrap());
+        assert!(!linux_managed_version_dir(&root).exists());
+        assert!(!remove_linux_version(&root).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn relax_permissions_produces_distro_package_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_dir("linux-relax");
+        let root = dir.join("xray");
+        let owned = linux_required_entries();
+        let archive = build_archive(&slices(&owned));
+        let installed = install_linux_synthetic(&root, &archive).unwrap();
+        relax_linux_package_permissions(&root).unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&installed.version_dir), 0o755);
+        assert_eq!(mode(&installed.executable), 0o755);
+        assert_eq!(mode(&installed.version_dir.join("geoip.dat")), 0o644);
+        assert_eq!(mode(&installed.version_dir.join("geosite.dat")), 0o644);
         fs::remove_dir_all(&dir).unwrap();
     }
 

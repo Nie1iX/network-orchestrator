@@ -1,7 +1,9 @@
 use crate::route_runtime::RouteRuntime;
 use net_manager_core::backend_settings::BackendSettingsStore;
 use net_manager_core::config_vault::ConfigVault;
-use net_manager_core::managed_xray::{self, MANAGED_XRAY_VERSION};
+use net_manager_core::managed_xray;
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+use net_manager_core::managed_xray::MANAGED_XRAY_VERSION;
 use net_manager_core::models::*;
 use net_manager_core::profiles::{ProfileDocument, ProfileStore};
 use net_manager_core::system_proxy::SystemProxyManager;
@@ -27,6 +29,9 @@ pub(crate) struct AppState {
     pub(crate) profiles: ProfileStore,
     pub(crate) config_vault: ConfigVault,
     pub(crate) backend_settings: BackendSettingsStore,
+    /// Windows managed-install store root; on 64-bit Linux managed Xray
+    /// lives in the daemon-owned package root instead.
+    #[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), allow(dead_code))]
     pub(crate) managed_xray_root: PathBuf,
     /// Per-profile downloaded geoip.dat/geosite.dat overrides
     /// (`geoassets/<profile-id>/`).
@@ -86,16 +91,36 @@ impl AppState {
                             "managed executables are only supported for the Xray backend",
                         ));
                     }
-                    if setting.version.as_deref() != Some(MANAGED_XRAY_VERSION) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "managed Xray setting does not match the managed version",
-                        ));
+                    // Linux managed installs live in the daemon-owned
+                    // package root; Windows keeps a user-owned store under
+                    // `managed_xray_root`. Each verifies against its own
+                    // pinned version and file hashes.
+                    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                    {
+                        if setting.version.as_deref() != Some(managed_xray::LINUX_XRAY_VERSION) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "managed Xray setting does not match the managed version",
+                            ));
+                        }
+                        managed_xray::verify_managed_linux_executable(
+                            Path::new(managed_xray::LINUX_XRAY_PACKAGE_ROOT),
+                            &setting.path,
+                        )?;
                     }
-                    managed_xray::verify_managed_executable(
-                        &self.managed_xray_root,
-                        &setting.path,
-                    )?;
+                    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+                    {
+                        if setting.version.as_deref() != Some(MANAGED_XRAY_VERSION) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "managed Xray setting does not match the managed version",
+                            ));
+                        }
+                        managed_xray::verify_managed_executable(
+                            &self.managed_xray_root,
+                            &setting.path,
+                        )?;
+                    }
                     Ok(ResolvedBackendExecutable {
                         path: vpn::resolve_xray_executable(Some(&setting.path))?,
                         source: BackendExecutableSource::Managed,

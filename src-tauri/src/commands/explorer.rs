@@ -37,3 +37,28 @@ pub(crate) async fn set_interface_state(name: String, up: bool) -> Result<(), St
         explorer::set_interface_state(&name, up).map_err(|e| e.to_string())
     }
 }
+
+/// Stop a tunnel interface the app does not own (wg-quick, another VPN app).
+/// The daemon stops a live wg-quick unit, deletes WireGuard devices and
+/// admin-downs foreign TUN devices. Linux only.
+#[tauri::command]
+pub(crate) async fn stop_external_tunnel(name: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use net_manager_core::daemon_protocol::{method, ExternalTunnelStopParams};
+        let client = crate::daemon_client::DaemonClient::system();
+        let _: serde_json::Value = client
+            .request(
+                method::EXTERNAL_TUNNEL_STOP,
+                ExternalTunnelStopParams { name },
+            )
+            .await
+            .map_err(|e| crate::daemon_client::user_message(&e))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        Err("external tunnel control is only supported on Linux".into())
+    }
+}
