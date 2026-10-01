@@ -76,6 +76,10 @@ npm run build
 - Managed backend downloads must stay fixed-version, hash-pinned, bounded,
   allowlisted, and atomic; tests use synthetic archives and never hit the
   network or install into real app data.
+- `crates/macos-bridge` stays unprivileged: never add `daemon_protocol`
+  methods or network mutations to it. macOS mutations go through a launchd
+  helper speaking `daemon_protocol` over a Unix socket
+  (`docs/plans/2026-09-30-14-macos-privileged-helper.md`).
 - Do not commit unless explicitly asked; do not push to `main`/`master`.
 
 ## Conventions

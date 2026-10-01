@@ -8,6 +8,19 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+### Added
+
+- Native macOS imports HTTP/HTTPS subscription URLs with optional HWID and
+  connection name, using the shared subscription parser and managed Xray
+  storage. Imported profiles offer a server selector. Subscription loading
+  has response and time limits, handles unpadded Base64, and strips private
+  URL/HWID fields from native bridge responses.
+
+- Import individual `vless://`, `hysteria2://` and `hy2://` share links directly
+  in both the Tauri and native macOS import dialogs. An optional connection
+  name overrides the link's name. Import stores a managed Xray configuration
+  without activating a VPN or changing the system network.
+
 ## [0.3.0] - 2026-09-30
 
 ### Added

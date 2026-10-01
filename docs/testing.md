@@ -24,6 +24,57 @@ simulated; IPv6 parsing, bulk CIDR parsing, OpenVPN probes, and real config
 generation are covered by Rust tests instead. Do not use sandbox results as
 evidence that real VPN credentials or connectivity work.
 
+## Native subscription URL verification — 2026-09-30
+
+Import → Subscription now fetches HTTP/HTTPS URLs in the native client, with
+optional HWID and profile name. Tauri and SwiftUI share subscription parsing,
+import and managed configuration storage. Plain-text, padded/unpadded standard
+Base64 and URL-safe Base64 lists are supported. Native connection cards offer
+a server selector; selection only rewrites the saved configuration. Automatic
+subscription refresh remains unavailable in this native stage.
+
+RED: the bridge rejected `import_subscription` as an unknown method. GREEN:
+479 Rust workspace tests and 11 Swift tests passed, including a local fake
+HTTP import, HWID transmission, endpoint switching, redaction, invalid URLs,
+empty/unsupported subscription bodies, save rollback, HTTP errors, the 1 MiB
+response limit and HWID removal on cross-origin redirects. Existing Tauri
+subscription tests passed after the shared import replaced its local copy.
+The total fetch timeout is 30 seconds; redirects are limited to five and
+HTTPS downgrade redirects are rejected. No real subscription URL was used.
+
+Formatting, workspace check, strict Clippy, localization/sandbox tests and
+frontend production build passed. The signed local native app also built.
+Release build tools retain metadata to avoid stripping the `rustversion`
+proc macro; the application remains stripped. Offscreen native acceptance
+rendered 64 images under `target/macos/subscription-preview`, including both
+import dialogs and a subscription server picker in both languages and themes.
+These renders do not claim foreground native UI automation.
+
+## Share-link import verification — 2026-09-30
+
+Both clients offer Import → Link for a single `vless://`, `hysteria2://` or
+`hy2://` connection, with an optional name. The shared Rust import stores a
+private generated Xray revision, assigns distinct loopback proxy ports and
+cleans the revision up if profile persistence fails. The Windows path keeps
+DPAPI protection. Import never starts a tunnel or changes routes, DNS or the
+system proxy. At that stage, HTTPS subscription fetching was only available
+in Tauri; native support is recorded in the subscription verification above.
+
+RED: the native bridge acceptance test initially rejected `import_share_link`
+as an unknown method. GREEN: 473 workspace Rust tests, 10 Swift tests, seven
+sandbox tests and ten localization tests passed, along with formatting,
+workspace check, strict Clippy and the production frontend build. Native
+acceptance rendered 60 images across both languages and themes, including
+the new link dialog, under `target/macos/link-preview`.
+
+Browser acceptance used a temporary sandbox tab: empty input disabled import;
+an HTTPS URL produced a translated validation error; VLESS imported with its
+fragment name; Hysteria2 imported with a custom Russian name. The form cleared
+after success, all connections stayed off, and the temporary tab was closed.
+Actual configuration generation, managed storage, rollback and duplicate IDs
+were checked with synthetic Rust/Swift fixtures, rather than real credentials.
+Native images are offscreen renders, not foreground UI automation.
+
 ## Local verification record — 2026-09-30
 
 The app was launched on macOS with an isolated QA application identifier.
