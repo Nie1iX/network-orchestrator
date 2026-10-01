@@ -9,6 +9,8 @@ use std::ffi::{c_char, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+mod runtime;
+
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 static TRANSACTION: Mutex<()> = Mutex::new(());
 static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, std::io::Error>> = OnceLock::new();
@@ -21,7 +23,7 @@ struct Request {
     args: Value,
 }
 
-fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+fn runtime_executor() -> Result<&'static tokio::runtime::Runtime, String> {
     RUNTIME
         .get_or_init(|| {
             tokio::runtime::Builder::new_current_thread()
@@ -53,6 +55,161 @@ fn subscription_error(error: std::io::Error) -> String {
         store_error(error)
     }
 }
+static DELAY_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, std::io::Error>> = OnceLock::new();
+const DELAY_CONCURRENCY: usize = 8;
+
+/// Share links of a subscription profile, in endpoint order.
+fn subscription_uris(root: &Path, id: &str) -> Result<Vec<String>, String> {
+    let store = ProfileStore::new(root.join("profiles.json"));
+    let vault = ConfigVault::new(root.join("configs"));
+    let profile = store
+        .load()
+        .map_err(store_error)?
+        .profiles
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or("Profile not found")?;
+    if profile.subscription.is_none() {
+        return Err("Delay checks are available for subscriptions".into());
+    }
+    Ok(vault
+        .read_subscription_endpoints(id)
+        .map_err(store_error)?
+        .into_iter()
+        .map(|endpoint| endpoint.url)
+        .collect())
+}
+
+fn delay_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    DELAY_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+        })
+        .as_ref()
+        .map_err(|_| "Delay checks could not start".to_string())
+}
+
+const DELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// One endpoint, so the UI can show each result as soon as it lands.
+fn measure_delay(root: &Path, args: &Value) -> Result<Value, String> {
+    let id = text_arg(args, "id")?;
+    let index = text_arg(args, "index")?
+        .parse::<usize>()
+        .map_err(|_| "Invalid endpoint index".to_string())?;
+    let uri = subscription_uris(root, id)?
+        .into_iter()
+        .nth(index)
+        .ok_or("Invalid endpoint index")?;
+    let executable =
+        runtime::managed_executable(root).ok_or("Install Xray to start this connection")?;
+    let result = delay_runtime()?.block_on(net_manager_core::subscription::measure_endpoint_delay(
+        &executable,
+        &uri,
+        DELAY_TIMEOUT,
+    ));
+    Ok(json!({"index": index, "delayMs": result.ok()}))
+}
+
+/// Every endpoint of a subscription, eight at a time.
+fn measure_delays(root: &Path, args: &Value) -> Result<Value, String> {
+    let id = text_arg(args, "id")?;
+    let uris = subscription_uris(root, id)?;
+    let executable =
+        runtime::managed_executable(root).ok_or("Install Xray to start this connection")?;
+    let results = delay_runtime()?.block_on(async move {
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(DELAY_CONCURRENCY));
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, uri) in uris.into_iter().enumerate() {
+            let permits = permits.clone();
+            let executable = executable.clone();
+            tasks.spawn(async move {
+                let _permit = permits.acquire_owned().await;
+                let result = net_manager_core::subscription::measure_endpoint_delay(
+                    &executable,
+                    &uri,
+                    DELAY_TIMEOUT,
+                )
+                .await;
+                (index, result)
+            });
+        }
+        let mut results = Vec::new();
+        while let Some(Ok((index, result))) = tasks.join_next().await {
+            results.push(json!({"index": index, "delayMs": result.ok()}));
+        }
+        results.sort_by_key(|value| value["index"].as_u64());
+        results
+    });
+    Ok(json!(results))
+}
+
+/// Appends a secret-free import record (format, schemes, outcome) to
+/// `runtime/logs/subscription-import.log`; never the URL, HWID or body.
+fn log_subscription_import(root: &Path, summary: &str, with_hwid: bool, error: Option<String>) {
+    let dir = root.join("runtime").join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("subscription-import.log");
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!(
+        "{seconds} hwid={} {summary} result={}\n",
+        if with_hwid { "sent" } else { "none" },
+        error.as_deref().unwrap_or("ok")
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+        let _ = net_manager_core::config_security::protect_path(&path);
+    }
+}
+/// Hardware UUID of this Mac, or a random ID kept in the app data directory
+/// when IOKit does not report one. Only ever used as an HWID seed.
+fn machine_seed(root: &Path) -> Result<String, String> {
+    if let Ok(output) = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        if let Some(uuid) = text
+            .lines()
+            .find(|line| line.contains("\"IOPlatformUUID\""))
+            .and_then(|line| line.rsplit('"').nth(1))
+            .filter(|uuid| !uuid.is_empty())
+        {
+            return Ok(uuid.to_string());
+        }
+    }
+    let path = root.join("device-id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if !existing.trim().is_empty() {
+            return Ok(existing.trim().to_string());
+        }
+    }
+    let mut bytes = [0u8; 16];
+    std::io::Read::read_exact(
+        &mut std::fs::File::open("/dev/urandom").map_err(|_| "Device ID unavailable")?,
+        &mut bytes,
+    )
+    .map_err(|_| "Device ID unavailable")?;
+    let seed: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::create_dir_all(root).map_err(store_error)?;
+    let temp = root.join("device-id.tmp");
+    std::fs::write(&temp, &seed).map_err(store_error)?;
+    net_manager_core::config_security::protect_path(&temp).map_err(store_error)?;
+    std::fs::rename(&temp, &path).map_err(store_error)?;
+    Ok(seed)
+}
 fn encode(value: impl serde::Serialize) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|_| "Could not encode the result".into())
 }
@@ -60,15 +217,29 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
     if !root.is_absolute() {
         return Err("App data location must be absolute".into());
     }
+    // Delay probes take seconds; they only read the store, so they run
+    // outside the transaction lock and never stall other calls.
+    match method {
+        "measure_delays" => return measure_delays(root, args),
+        "measure_delay" => return measure_delay(root, args),
+        _ => {}
+    }
     let _lock = TRANSACTION
         .lock()
         .map_err(|_| "Profile service is unavailable".to_string())?;
     let store = ProfileStore::new(root.join("profiles.json"));
     let vault = ConfigVault::new(root.join("configs"));
+    if let Some(result) = runtime::handle(root, &store, method, args) {
+        return result;
+    }
     match method {
         "capabilities" => Ok(json!({"os":"macos", "minimumOS":"27.0", "nativeUI":true,
             "profiles":true,"networkInventory":true,"networkMutations":false,
+            "proxyConnections":cfg!(all(target_os = "macos", target_arch = "aarch64")),
             "systemVPN":"providerSetupRequired", "version":env!("CARGO_PKG_VERSION")})),
+        "generate_hwid" => Ok(json!(net_manager_core::subscription::derive_hwid(
+            &machine_seed(root)?
+        ))),
         "profiles" => encode(net_manager_core::subscription::public_profiles(
             store.load().map_err(store_error)?.profiles,
         )),
@@ -77,7 +248,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 store.load().map_err(store_error)?.profiles,
             );
             let interfaces = explorer::list_interfaces();
-            let routes = runtime()?.block_on(explorer::list_routes());
+            let routes = runtime_executor()?.block_on(explorer::list_routes());
             let network_error = (interfaces.is_err() || routes.is_err())
                 .then_some("Some network information could not be read. Try refreshing.");
             let interfaces = interfaces.unwrap_or_default();
@@ -97,7 +268,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 .parse()
                 .map_err(|_| "Enter an IPv4 or IPv6 address".to_string())?;
             encode(
-                runtime()?
+                runtime_executor()?
                     .block_on(explorer::lookup_route(ip))
                     .map_err(|_| "No route could be read for this address".to_string())?,
             )
@@ -164,7 +335,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
             let name = args["name"].as_str().unwrap_or("");
             let client =
                 net_manager_core::subscription::http_client().map_err(subscription_error)?;
-            let fetched = runtime()?
+            let fetched = runtime_executor()?
                 .block_on(net_manager_core::subscription::fetch(&client, url, hwid))
                 .map_err(subscription_error)?;
             let request = net_manager_core::subscription::SubscriptionImport {
@@ -174,6 +345,10 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 name,
                 refresh_interval_minutes: None,
             };
+            let summary = net_manager_core::subscription::summarize_subscription_body(
+                &fetched.body,
+                fetched.content_type.as_deref(),
+            );
             let imported = net_manager_core::subscription::import_body(
                 &vault,
                 &store,
@@ -181,8 +356,21 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 &fetched.body,
                 fetched.user_info,
                 local_port_available,
-            )
-            .map_err(subscription_error)?;
+            );
+            log_subscription_import(
+                root,
+                &summary,
+                !hwid.is_empty(),
+                imported.as_ref().err().map(|e| e.to_string()),
+            );
+            let imported = imported.map_err(|error| {
+                let message = subscription_error(error);
+                if message == "Subscription contained no supported share links" {
+                    format!("{message} ({summary})")
+                } else {
+                    message
+                }
+            })?;
             let skipped_count = imported
                 .errors
                 .iter()
@@ -233,17 +421,58 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
             let index = text_arg(args, "index")?
                 .parse::<usize>()
                 .map_err(|_| "Invalid endpoint index".to_string())?;
-            let document = net_manager_core::subscription::switch_endpoint(
-                &vault,
-                &store,
-                id,
-                index,
-                local_port_available,
-            )
-            .map_err(subscription_error)?;
-            encode(net_manager_core::subscription::public_profiles(
-                document.profiles,
-            ))
+            runtime::restart_around(root, &store, id, || {
+                let document = net_manager_core::subscription::switch_endpoint(
+                    &vault,
+                    &store,
+                    id,
+                    index,
+                    local_port_available,
+                )
+                .map_err(subscription_error)?;
+                encode(net_manager_core::subscription::public_profiles(
+                    document.profiles,
+                ))
+            })
+        }
+        "refresh_subscription" => {
+            let id = text_arg(args, "id")?;
+            let meta = store
+                .load()
+                .map_err(store_error)?
+                .profiles
+                .into_iter()
+                .find(|p| p.id == id)
+                .and_then(|p| p.subscription)
+                .ok_or("Profile is not a subscription")?;
+            let client =
+                net_manager_core::subscription::http_client().map_err(subscription_error)?;
+            let fetched = runtime_executor()?
+                .block_on(net_manager_core::subscription::fetch(
+                    &client, &meta.url, &meta.hwid,
+                ))
+                .map_err(subscription_error)?;
+            let summary = net_manager_core::subscription::summarize_subscription_body(
+                &fetched.body,
+                fetched.content_type.as_deref(),
+            );
+            runtime::restart_around(root, &store, id, || {
+                let outcome = net_manager_core::subscription::refresh_body(
+                    &vault,
+                    &store,
+                    id,
+                    &fetched.body,
+                    fetched.user_info,
+                    local_port_available,
+                );
+                log_subscription_import(
+                    root,
+                    &summary,
+                    !meta.hwid.is_empty(),
+                    outcome.as_ref().err().map(|e| e.to_string()),
+                );
+                encode(outcome.map_err(subscription_error)?)
+            })
         }
         "import_share_link" => {
             let id = text_arg(args, "id")?;
@@ -363,6 +592,158 @@ pub unsafe extern "C" fn netorch_free(value: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_delay_probe_validates_index_and_requires_xray() {
+        let first = "vless://synthetic@nl.test:443?security=tls#NL".to_string();
+        let (url, server) = serve_bodies(vec![first]);
+        let dir = tempfile::tempdir().unwrap();
+        dispatch(
+            dir.path(),
+            "import_subscription",
+            &json!({"id":"sub", "url":url, "hwid":"", "name":""}),
+        )
+        .unwrap();
+        server.join().unwrap();
+        let error = dispatch(
+            dir.path(),
+            "measure_delay",
+            &json!({"id":"sub", "index":"0"}),
+        )
+        .unwrap_err();
+        assert_eq!(error, "Install Xray to start this connection");
+        let error = dispatch(
+            dir.path(),
+            "measure_delay",
+            &json!({"id":"sub", "index":"7"}),
+        )
+        .unwrap_err();
+        assert_eq!(error, "Invalid endpoint index");
+    }
+
+    /// Opt-in: NETORCH_XRAY_ARCHIVE=/path/Xray-macos-arm64-v8a.zip. Measures a
+    /// loopback VLESS server and an unreachable one through real Xray.
+    #[test]
+    fn live_delay_probe_measures_reachable_and_unreachable_servers() {
+        let Ok(archive) = std::env::var("NETORCH_XRAY_ARCHIVE") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        dispatch(root, "install_xray", &json!({"archivePath": archive})).unwrap();
+        let server_binary = root.join("xray-server");
+        std::fs::copy(root.join("backends/xray/v26.7.28/xray"), &server_binary).unwrap();
+        let uuid = "6f1d1b8e-3c2a-4d5e-9f00-112233445566";
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        std::fs::write(
+            root.join("server.json"),
+            format!(
+                r#"{{"inbounds":[{{"listen":"127.0.0.1","port":{port},"protocol":"vless","settings":{{"clients":[{{"id":"{uuid}"}}],"decryption":"none"}},"streamSettings":{{"network":"tcp","security":"none"}}}}],"dns":{{"servers":["https://1.1.1.1/dns-query"]}},"outbounds":[{{"protocol":"freedom","settings":{{"domainStrategy":"UseIPv4"}}}}]}}"#
+            ),
+        )
+        .unwrap();
+        let mut server = std::process::Command::new(&server_binary)
+            .args(["run", "-c"])
+            .arg(root.join("server.json"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let body = format!(
+            "vless://{uuid}@127.0.0.1:{port}?security=none&type=tcp#Loopback\nvless://{uuid}@127.0.0.1:1?security=none&type=tcp#Closed"
+        );
+        let (url, http) = serve_bodies(vec![body]);
+        dispatch(
+            root,
+            "import_subscription",
+            &json!({"id":"sub", "url":url, "hwid":"", "name":""}),
+        )
+        .unwrap();
+        http.join().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let results = dispatch(root, "measure_delays", &json!({"id":"sub"})).unwrap();
+        server.kill().unwrap();
+        server.wait().unwrap();
+        eprintln!("delays: {results}");
+        assert!(results[0]["delayMs"].as_u64().is_some());
+        assert!(results[1]["delayMs"].is_null());
+    }
+
+    /// Serves each body once on a fresh loopback port and records request heads.
+    fn serve_bodies(bodies: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut heads = Vec::new();
+            for body in bodies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                let size = stream.read(&mut request).unwrap();
+                heads.push(String::from_utf8_lossy(&request[..size]).to_ascii_lowercase());
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            heads
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn refresh_subscription_refetches_with_the_stored_hwid() {
+        let first = "vless://synthetic@nl.test:443?security=tls#NL".to_string();
+        let second = "vless://synthetic@nl.test:443?security=tls#NL\nvless://synthetic@de.test:443?security=tls#DE".to_string();
+        let (url, server) = serve_bodies(vec![first, second]);
+        let dir = tempfile::tempdir().unwrap();
+        dispatch(
+            dir.path(),
+            "import_subscription",
+            &json!({"id":"sub", "url":url, "hwid":"stable-hwid", "name":"Mine"}),
+        )
+        .unwrap();
+        let outcome = dispatch(dir.path(), "refresh_subscription", &json!({"id":"sub"})).unwrap();
+        assert_eq!(outcome["endpointCount"], 2);
+        assert_eq!(outcome["activeIndex"], 0);
+        let heads = server.join().unwrap();
+        assert!(heads
+            .iter()
+            .all(|head| head.contains("x-hwid: stable-hwid")));
+        let names = dispatch(dir.path(), "subscription_endpoints", &json!({"id":"sub"})).unwrap();
+        assert_eq!(names[1]["name"], "DE");
+        let profiles = dispatch(dir.path(), "profiles", &json!({})).unwrap();
+        assert_eq!(profiles[0]["name"], "Mine");
+    }
+
+    #[test]
+    fn measuring_delays_requires_a_subscription() {
+        let dir = tempfile::tempdir().unwrap();
+        dispatch(
+            dir.path(),
+            "import_share_link",
+            &json!({"id":"one", "name":"", "link":"vless://00000000-0000-4000-8000-000000000000@nl.test:443?security=tls#NL"}),
+        )
+        .unwrap();
+        let error = dispatch(dir.path(), "measure_delays", &json!({"id":"one"})).unwrap_err();
+        assert_eq!(error, "Delay checks are available for subscriptions");
+    }
+
+    #[test]
+    fn generated_hwid_is_stable_for_the_same_data_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dispatch(dir.path(), "generate_hwid", &json!({})).unwrap();
+        let second = dispatch(dir.path(), "generate_hwid", &json!({})).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.as_str().unwrap().len(), 36);
+    }
+
     use super::*;
     use net_manager_core::profiles::ProfileStore;
 
@@ -395,6 +776,17 @@ mod tests {
         )
         .unwrap();
         server.join().unwrap();
+        let log = std::fs::read_to_string(dir.path().join("runtime/logs/subscription-import.log"))
+            .unwrap();
+        assert!(log.contains("hwid=sent") && log.contains("vless×1") && log.contains("result=ok"));
+        for secret in [
+            "private-subscription-token",
+            "synthetic-private",
+            "one.test",
+            "First",
+        ] {
+            assert!(!log.contains(secret), "log leaked {secret}");
+        }
         assert_eq!(imported["profiles"][0]["subscription"]["endpointCount"], 2);
         assert_eq!(imported["skippedCount"], 1);
         for result in [
@@ -633,5 +1025,57 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    fn import_link(root: &Path, id: &str) {
+        dispatch(
+            root,
+            "import_share_link",
+            &json!({"id":id, "name":"Runtime", "link":"vless://00000000-0000-4000-8000-000000000000@one.test:443?security=tls#One"}),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn runtime_reports_stopped_profiles_and_missing_xray() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "rt");
+        let runtime = dispatch(dir.path(), "runtime", &json!({})).unwrap();
+        assert_eq!(runtime["xrayInstalled"], false);
+        assert_eq!(runtime["systemProxyOwner"], Value::Null);
+        assert_eq!(runtime["statuses"][0]["profileId"], "rt");
+        assert_eq!(runtime["statuses"][0]["state"], "stopped");
+    }
+
+    #[test]
+    fn connect_requires_managed_xray_and_refuses_privileged_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "rt");
+        let error = dispatch(dir.path(), "connect", &json!({"id":"rt"})).unwrap_err();
+        assert_eq!(error, "Install Xray to start this connection");
+        dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"st", "name":"Static", "interfaceName":"en0", "cidrs":"192.0.2.0/24"}),
+        )
+        .unwrap();
+        let error = dispatch(dir.path(), "connect", &json!({"id":"st"})).unwrap_err();
+        assert!(error.contains("privileged helper"), "{error}");
+    }
+
+    #[test]
+    fn system_proxy_and_disconnect_require_a_running_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "rt");
+        let error = dispatch(
+            dir.path(),
+            "set_system_proxy",
+            &json!({"id":"rt", "enabled":"true"}),
+        )
+        .unwrap_err();
+        assert_eq!(error, "Start the connection first");
+        assert!(dispatch(dir.path(), "disconnect", &json!({"id":"rt"})).is_err());
+        // Shutdown with nothing running is a no-op and never touches the system proxy.
+        dispatch(dir.path(), "shutdown", &json!({})).unwrap();
     }
 }
