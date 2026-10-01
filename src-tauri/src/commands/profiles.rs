@@ -7,11 +7,10 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 
-const MAX_SUBSCRIPTION_BODY_BYTES: usize = 1024 * 1024;
+use net_manager_core::subscription::MAX_SUBSCRIPTION_BODY_BYTES;
 static SUBSCRIPTION_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn validate_refresh_interval(minutes: Option<u32>) -> Result<(), String> {
@@ -47,8 +46,7 @@ fn should_auto_refresh(profile: &Profile, now: u64, active: bool) -> bool {
             .as_ref()
             .is_some_and(|subscription| subscription_refresh_due(subscription, now))
 }
-const DELAY_PROBE_URL: &str = "https://connectivitycheck.gstatic.com/generate_204";
-const DELAY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+use net_manager_core::subscription::{DELAY_PROBE_TIMEOUT, DELAY_PROBE_URL};
 
 pub(crate) fn select_available_socks_port(
     used: &HashSet<u16>,
@@ -738,7 +736,8 @@ pub(crate) async fn import_configs_batch(
 
 #[cfg(test)]
 use net_manager_core::subscription::base64_decode;
-pub(crate) use net_manager_core::subscription::parse_subscription_body;
+#[cfg(test)]
+use net_manager_core::subscription::parse_subscription_body;
 use net_manager_core::subscription::parse_subscription_userinfo;
 
 /// Fetch a subscription and import its supported share links.
@@ -916,10 +915,6 @@ async fn refresh_subscription_into_with_ports(
     refresh_subscription_body_into_with_metadata(vault, store, id, &body, available, user_info)
 }
 
-fn share_link_key(uri: &str) -> &str {
-    uri.split_once('#').map(|(link, _)| link).unwrap_or(uri)
-}
-
 #[cfg(test)]
 fn refresh_subscription_body_into(
     vault: &ConfigVault,
@@ -939,118 +934,16 @@ fn refresh_subscription_body_into_with_metadata(
     available: impl Fn(u16) -> bool,
     user_info: Option<SubscriptionUserInfo>,
 ) -> Result<SubscriptionRefreshResult, String> {
-    let mut profile = subscription_profile(store, id)?;
-    let document = store
-        .load()
-        .map_err(|_| "failed to load profiles".to_string())?;
-    let used = profile_listener_ports(&document.profiles, id);
-    let (socks_port, http_port) = select_generated_ports(
-        profile.xray_socks_port,
-        profile.xray_http_port,
-        &used,
-        available,
-    )?;
-    profile.xray_socks_port = Some(socks_port);
-    profile.xray_http_port = Some(http_port);
-    let previous = vault
-        .read_subscription_endpoints(id)
-        .map_err(|_| "failed to read subscription endpoints".to_string())?;
-    let old_index = profile.subscription.as_ref().unwrap().active_index;
-    let selected = previous
-        .get(old_index)
-        .map(|endpoint| share_link_key(&endpoint.url));
-    let selected_ordinal = selected
-        .map(|key| {
-            previous
-                .iter()
-                .take(old_index + 1)
-                .filter(|endpoint| share_link_key(&endpoint.url) == key)
-                .count()
-                - 1
-        })
-        .unwrap_or(0);
-
-    let (urls, unsupported) = parse_subscription_body(body);
-    let mut skipped_count = unsupported;
-    let mut endpoints = Vec::new();
-    let mut configs = Vec::new();
-    for uri in urls {
-        match generate_endpoint_config(&uri, socks_port, http_port) {
-            Ok(config) => {
-                let name = net_manager_core::xray::share_link_name(&uri)
-                    .unwrap_or_else(|| format!("Endpoint {}", endpoints.len() + 1));
-                endpoints
-                    .push(net_manager_core::config_vault::SubscriptionEndpoint { url: uri, name });
-                configs.push(config);
-            }
-            Err(_) => skipped_count += 1,
-        }
-    }
-    if endpoints.is_empty() {
-        return Err(format!(
-            "subscription refresh contained no valid share links ({skipped_count} skipped)"
-        ));
-    }
-    let mut matching = 0;
-    let new_index = selected.and_then(|key| {
-        endpoints.iter().enumerate().find_map(|(index, endpoint)| {
-            if share_link_key(&endpoint.url) == key {
-                let found = matching == selected_ordinal;
-                matching += 1;
-                found.then_some(index)
-            } else {
-                None
-            }
-        })
-    });
-    let fallback_used = new_index.is_none();
-    let active_index = new_index.unwrap_or(0);
-    let config_body = serde_json::to_vec_pretty(&configs[active_index])
-        .map_err(|_| "failed to serialize refreshed config".to_string())?;
-    let import = store_generated_xray(vault, id, &config_body)
-        .map_err(|_| "failed to store refreshed config".to_string())?;
-    let new_path = import.config_path;
-    let rollback = || {
-        let restored = vault
-            .read_subscription_endpoints(id)
-            .is_ok_and(|current| current == previous)
-            || vault.store_subscription_endpoints(id, &previous).is_ok();
-        let removed = vault.remove_revision_for_config(&new_path).is_ok();
-        restored && removed
-    };
-    if vault.store_subscription_endpoints(id, &endpoints).is_err() {
-        return Err(if rollback() {
-            "failed to store refreshed endpoints"
-        } else {
-            "subscription refresh failed; rollback incomplete"
-        }
-        .into());
-    }
-    let old_path = profile.config_path.clone();
-    profile.config_path = new_path.clone();
-    profile.name = endpoints[active_index].name.clone();
-    let subscription = profile.subscription.as_mut().unwrap();
-    subscription.endpoint_count = endpoints.len();
-    subscription.active_index = active_index;
-    subscription.last_refresh_at_unix = Some(unix_now());
-    subscription.last_refresh_error = None;
-    subscription.user_info = user_info;
-    if store.upsert(profile).is_err() {
-        return Err(if rollback() {
-            "failed to store refreshed profile"
-        } else {
-            "subscription refresh failed; rollback incomplete"
-        }
-        .into());
-    }
-    let cleanup_failed = vault.is_managed_profile_path(id, &old_path)
-        && vault.remove_revision_for_config(&old_path).is_err();
+    subscription_profile(store, id)?;
+    let outcome =
+        net_manager_core::subscription::refresh_body(vault, store, id, body, user_info, available)
+            .map_err(|error| error.to_string())?;
     Ok(SubscriptionRefreshResult {
-        endpoint_count: endpoints.len(),
-        active_index,
-        skipped_count,
-        fallback_used,
-        cleanup_failed,
+        endpoint_count: outcome.endpoint_count,
+        active_index: outcome.active_index,
+        skipped_count: outcome.skipped_count,
+        fallback_used: outcome.fallback_used,
+        cleanup_failed: outcome.cleanup_failed,
     })
 }
 
@@ -1111,7 +1004,7 @@ pub(crate) async fn refresh_subscription(
     ensure_profile_stopped(&state, &profile, "refreshing subscription").await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent("v2rayng/1.0")
+        .user_agent(net_manager_core::subscription::SUBSCRIPTION_USER_AGENT)
         .build()
         .map_err(|_| "failed to build subscription HTTP client".to_string())?;
     let result =
@@ -1125,7 +1018,7 @@ pub(crate) async fn refresh_subscription(
 pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .user_agent("v2rayng/1.0")
+        .user_agent(net_manager_core::subscription::SUBSCRIPTION_USER_AGENT)
         .build()
     else {
         return;
@@ -1180,96 +1073,14 @@ pub(crate) struct SubscriptionDelayResult {
     pub error: Option<String>,
 }
 
-struct TemporaryXray(tokio::process::Child);
-
-impl Drop for TemporaryXray {
-    fn drop(&mut self) {
-        let _ = self.0.start_kill();
-    }
-}
-
 async fn measure_delay_with_process(
     uri: &str,
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     probe_url: &str,
     timeout: std::time::Duration,
 ) -> Result<u64, String> {
-    use tokio::io::AsyncWriteExt;
-
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .map_err(|_| "failed to reserve delay probe port".to_string())?;
-    let socks_port = listener
-        .local_addr()
-        .map_err(|_| "failed to reserve delay probe port".to_string())?
-        .port();
-    let config = net_manager_core::xray::generate_share_link_config(uri, socks_port)
-        .map_err(|_| "invalid subscription endpoint".to_string())?;
-    let config = serde_json::to_vec(&config)
-        .map_err(|_| "failed to encode delay probe config".to_string())?;
-    drop(listener);
-
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = TemporaryXray(
-        command
-            .spawn()
-            .map_err(|_| "failed to start delay probe".to_string())?,
-    );
-    let result = tokio::time::timeout(timeout, async {
-        let mut stdin = child
-            .0
-            .stdin
-            .take()
-            .ok_or_else(|| "failed to send delay probe config".to_string())?;
-        stdin
-            .write_all(&config)
-            .await
-            .map_err(|_| "failed to send delay probe config".to_string())?;
-        drop(stdin);
-        loop {
-            if tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, socks_port))
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            if child
-                .0
-                .try_wait()
-                .map_err(|_| "delay probe process failed".to_string())?
-                .is_some()
-            {
-                return Err("delay probe process exited before proxy was ready".into());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))
-            .map_err(|_| "failed to configure delay probe proxy".to_string())?;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .proxy(proxy)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(timeout)
-            .build()
-            .map_err(|_| "failed to build delay probe client".to_string())?;
-        let started = std::time::Instant::now();
-        let response = client
-            .get(probe_url)
-            .send()
-            .await
-            .map_err(|_| "delay probe request failed".to_string())?;
-        if response.status() != reqwest::StatusCode::NO_CONTENT {
-            return Err("delay probe returned an unexpected status".into());
-        }
-        Ok(started.elapsed().as_millis().max(1) as u64)
-    })
-    .await;
-    let _ = child.0.start_kill();
-    let _ = child.0.wait().await;
-    result.map_err(|_| "delay probe timed out".to_string())?
+    net_manager_core::subscription::measure_delay_with_command(uri, command, probe_url, timeout)
+        .await
 }
 
 #[tauri::command]

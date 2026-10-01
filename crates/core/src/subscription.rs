@@ -11,7 +11,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const MAX_SUBSCRIPTION_BODY_BYTES: usize = 1024 * 1024;
+/// Panels that serve full Xray JSON configs send ~20–40 KiB per server.
+pub const MAX_SUBSCRIPTION_BODY_BYTES: usize = 4 * 1024 * 1024;
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -19,11 +20,70 @@ fn failure(message: &str) -> io::Error {
     io::Error::other(message)
 }
 
+/// Subscription panels (Remnawave, Marzban, …) pick the response format by
+/// User-Agent and answer unknown clients with a placeholder server. v2rayN is
+/// universally recognized and receives the Base64 list of share links.
+pub const SUBSCRIPTION_USER_AGENT: &str = "v2rayN/7.13.8";
+
+pub const UNSUPPORTED_CLIENT_MESSAGE: &str =
+    "The subscription server returned a placeholder instead of servers. It may not recognize this app or require an HWID.";
+
+/// Stable, privacy-preserving device HWID for the `X-HWID` header. Panels with
+/// a device limit (e.g. Remnawave) refuse subscriptions without one; deriving
+/// it from a machine identifier keeps it identical across imports on this
+/// device while never revealing the identifier itself.
+pub fn derive_hwid(machine_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("network-orchestrator-hwid-v1:{machine_id}").as_bytes());
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// True when every link is a panel placeholder such as "App not supported".
+pub fn is_unsupported_client_placeholder(urls: &[String]) -> bool {
+    const MARKERS: [&str; 4] = [
+        "not supported",
+        "unsupported",
+        "не поддерживается",
+        "обновите приложение",
+    ];
+    !urls.is_empty()
+        && urls.iter().all(|url| {
+            crate::xray::share_link_name(url).is_some_and(|name| {
+                let name = name.to_lowercase();
+                MARKERS.iter().any(|marker| name.contains(marker))
+            })
+        })
+}
+
 /// Decode a v2ray-style subscription body and count unsupported nonblank lines.
 pub fn parse_subscription_body(body: &str) -> (Vec<String>, usize) {
     let decoded = base64_decode(body.trim()).unwrap_or_else(|| body.to_string());
     let mut urls = Vec::new();
     let mut skipped = 0;
+    let trimmed = decoded.trim();
+    if trimmed.starts_with('[') || trimmed.starts_with('{') {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let configs = match value {
+                serde_json::Value::Array(items) => items,
+                other => vec![other],
+            };
+            for config in &configs {
+                match crate::xray::xray_json_entry(config) {
+                    Ok(entry) => urls.push(entry),
+                    Err(_) => skipped += 1,
+                }
+            }
+            return (urls, skipped);
+        }
+    }
     for line in decoded
         .lines()
         .map(str::trim)
@@ -99,7 +159,7 @@ pub fn http_client() -> io::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("v2rayng/1.0")
+        .user_agent(SUBSCRIPTION_USER_AGENT)
         .build()
         .map_err(|_| failure("Could not create the subscription HTTP client"))
 }
@@ -118,6 +178,66 @@ pub fn validate_url(value: &str) -> io::Result<reqwest::Url> {
 pub struct FetchedSubscription {
     pub body: String,
     pub user_info: Option<SubscriptionUserInfo>,
+    pub content_type: Option<String>,
+}
+
+/// Secret-free description of a subscription response for diagnostics:
+/// format, size, line count and share-link schemes. Never includes hosts,
+/// credentials, names or any other part of the body.
+pub fn summarize_subscription_body(body: &str, content_type: Option<&str>) -> String {
+    let trimmed = body.trim();
+    let decoded = base64_decode(trimmed);
+    let text = decoded.as_deref().unwrap_or(trimmed);
+    let format = if decoded.is_some() {
+        "base64"
+    } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        "json"
+    } else if trimmed.to_ascii_lowercase().starts_with("<!doctype")
+        || trimmed.to_ascii_lowercase().starts_with("<html")
+    {
+        "html"
+    } else if text.lines().any(|line| line.starts_with("proxies:")) {
+        "yaml"
+    } else {
+        "plain"
+    };
+    let mut schemes = std::collections::BTreeMap::<String, usize>::new();
+    let mut lines = 0;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        lines += 1;
+        let scheme = line
+            .split_once("://")
+            .map(|(scheme, _)| scheme)
+            .filter(|scheme| {
+                !scheme.is_empty()
+                    && scheme.len() <= 16
+                    && scheme
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-')
+            })
+            .map(|scheme| scheme.to_ascii_lowercase())
+            .unwrap_or_else(|| "other".into());
+        *schemes.entry(scheme).or_default() += 1;
+    }
+    let schemes = schemes
+        .iter()
+        .map(|(scheme, count)| format!("{scheme}×{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let content_type = content_type
+        .map(|value| value.split(';').next().unwrap_or("").trim().to_string())
+        .filter(|value| {
+            value.len() <= 64
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "/+-.".contains(c))
+        })
+        .unwrap_or_else(|| "-".into());
+    format!(
+        "format={format} bytes={} lines={lines} content-type={content_type} schemes: {}",
+        body.len(),
+        if schemes.is_empty() { "-" } else { &schemes }
+    )
 }
 pub async fn fetch(
     client: &reqwest::Client,
@@ -176,6 +296,11 @@ async fn fetch_inner(
             .get("subscription-userinfo")
             .and_then(|h| h.to_str().ok())
             .and_then(parse_subscription_userinfo);
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -183,13 +308,17 @@ async fn fetch_inner(
             .map_err(|_| failure("Could not read the subscription response"))?
         {
             if chunk.len() > MAX_SUBSCRIPTION_BODY_BYTES - bytes.len() {
-                return Err(invalid("Subscription response exceeds the 1 MiB limit"));
+                return Err(invalid("Subscription response exceeds the 4 MiB limit"));
             }
             bytes.extend_from_slice(&chunk);
         }
         let body =
             String::from_utf8(bytes).map_err(|_| invalid("Subscription response is not UTF-8"))?;
-        return Ok(FetchedSubscription { body, user_info });
+        return Ok(FetchedSubscription {
+            body,
+            user_info,
+            content_type,
+        });
     }
     Err(failure("Subscription redirected too many times"))
 }
@@ -212,7 +341,7 @@ pub fn import_body(
     crate::config_vault::sanitize_profile_id(request.id)?;
     validate_url(request.url)?;
     if body.len() > MAX_SUBSCRIPTION_BODY_BYTES {
-        return Err(invalid("Subscription response exceeds the 1 MiB limit"));
+        return Err(invalid("Subscription response exceeds the 4 MiB limit"));
     }
     if request
         .refresh_interval_minutes
@@ -227,6 +356,9 @@ pub fn import_body(
     let (urls, unsupported) = parse_subscription_body(body);
     if urls.is_empty() {
         return Err(invalid("Subscription contained no supported share links"));
+    }
+    if is_unsupported_client_placeholder(&urls) {
+        return Err(invalid(UNSUPPORTED_CLIENT_MESSAGE));
     }
     let used = profile_listener_ports(&document.profiles, "");
     let (socks, http) = select_generated_ports(None, None, &used, available)?;
@@ -340,7 +472,11 @@ pub fn switch_endpoint(
     profile.config_path = imported.config_path.clone();
     profile.xray_socks_port = Some(socks);
     profile.xray_http_port = Some(http);
-    profile.name = endpoint.name.clone();
+    // A profile named after one of its servers was auto-named and follows the
+    // selection; a user-chosen name is kept.
+    if endpoints.iter().any(|known| known.name == profile.name) {
+        profile.name = endpoint.name.clone();
+    }
     subscription.active_index = index;
     subscription.endpoint_count = endpoints.len();
     match store.upsert(profile) {
@@ -357,6 +493,278 @@ pub fn switch_endpoint(
     }
 }
 
+/// Identity of an endpoint across refreshes: the share link without its
+/// display fragment, or the server name for full Xray JSON entries (their
+/// serialized config may change between fetches).
+pub fn endpoint_key(url: &str) -> String {
+    if url.trim().starts_with(xray::XRAY_JSON_PREFIX) {
+        return format!(
+            "{}{}",
+            xray::XRAY_JSON_PREFIX,
+            xray::share_link_name(url).unwrap_or_default()
+        );
+    }
+    url.split_once('#')
+        .map(|(link, _)| link)
+        .unwrap_or(url)
+        .to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshOutcome {
+    pub endpoint_count: usize,
+    pub active_index: usize,
+    pub skipped_count: usize,
+    pub fallback_used: bool,
+    pub cleanup_failed: bool,
+}
+
+/// Replace a subscription's endpoints with a freshly fetched body, keeping
+/// the selected server when it still exists. Placeholder-only bodies are
+/// rejected and every write is rolled back on failure.
+pub fn refresh_body(
+    vault: &ConfigVault,
+    store: &ProfileStore,
+    id: &str,
+    body: &str,
+    user_info: Option<SubscriptionUserInfo>,
+    available: impl Fn(u16) -> bool,
+) -> io::Result<RefreshOutcome> {
+    if body.len() > MAX_SUBSCRIPTION_BODY_BYTES {
+        return Err(invalid("Subscription response exceeds the 4 MiB limit"));
+    }
+    let document = store.load()?;
+    let mut profile = document
+        .profiles
+        .iter()
+        .find(|p| p.id == id)
+        .cloned()
+        .ok_or_else(|| invalid("Profile not found"))?;
+    let old_index = profile
+        .subscription
+        .as_ref()
+        .ok_or_else(|| invalid("Profile is not a subscription"))?
+        .active_index;
+    let used = profile_listener_ports(&document.profiles, id);
+    let (socks, http) = select_generated_ports(
+        profile.xray_socks_port,
+        profile.xray_http_port,
+        &used,
+        available,
+    )?;
+    let previous = vault.read_subscription_endpoints(id)?;
+    let selected = previous.get(old_index).map(|e| endpoint_key(&e.url));
+    let selected_ordinal = selected
+        .as_ref()
+        .map(|key| {
+            previous
+                .iter()
+                .take(old_index + 1)
+                .filter(|e| &endpoint_key(&e.url) == key)
+                .count()
+                - 1
+        })
+        .unwrap_or(0);
+
+    let (urls, mut skipped_count) = parse_subscription_body(body);
+    if is_unsupported_client_placeholder(&urls) {
+        return Err(invalid(UNSUPPORTED_CLIENT_MESSAGE));
+    }
+    let mut endpoints = Vec::new();
+    let mut configs = Vec::new();
+    for uri in urls {
+        match xray::generate_share_link_config_with_http(&uri, socks, http) {
+            Ok(config) => {
+                let name = xray::share_link_name(&uri)
+                    .unwrap_or_else(|| format!("Endpoint {}", endpoints.len() + 1));
+                endpoints.push(SubscriptionEndpoint { url: uri, name });
+                configs.push(config);
+            }
+            Err(_) => skipped_count += 1,
+        }
+    }
+    if endpoints.is_empty() {
+        return Err(invalid(&format!(
+            "subscription refresh contained no valid share links ({skipped_count} skipped)"
+        )));
+    }
+    let mut matching = 0;
+    let new_index = selected.as_ref().and_then(|key| {
+        endpoints.iter().enumerate().find_map(|(index, endpoint)| {
+            if &endpoint_key(&endpoint.url) == key {
+                let found = matching == selected_ordinal;
+                matching += 1;
+                found.then_some(index)
+            } else {
+                None
+            }
+        })
+    });
+    let fallback_used = new_index.is_none();
+    let active_index = new_index.unwrap_or(0);
+    let imported =
+        vault.store_generated_xray(id, &serde_json::to_vec_pretty(&configs[active_index])?)?;
+    let new_path = imported.config_path;
+    let rollback = || {
+        let restored = vault
+            .read_subscription_endpoints(id)
+            .is_ok_and(|current| current == previous)
+            || vault.store_subscription_endpoints(id, &previous).is_ok();
+        let removed = vault.remove_revision_for_config(&new_path).is_ok();
+        restored && removed
+    };
+    let failure_message = |message: &str| {
+        if rollback() {
+            invalid(message)
+        } else {
+            failure("subscription refresh failed; rollback incomplete")
+        }
+    };
+    if vault.store_subscription_endpoints(id, &endpoints).is_err() {
+        return Err(failure_message("failed to store refreshed endpoints"));
+    }
+    let old_path = profile.config_path.clone();
+    if previous.iter().any(|known| known.name == profile.name) {
+        profile.name = endpoints[active_index].name.clone();
+    }
+    profile.config_path = new_path.clone();
+    profile.xray_socks_port = Some(socks);
+    profile.xray_http_port = Some(http);
+    let subscription = profile.subscription.as_mut().expect("checked above");
+    subscription.endpoint_count = endpoints.len();
+    subscription.active_index = active_index;
+    subscription.last_refresh_at_unix = Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    );
+    subscription.last_refresh_error = None;
+    subscription.user_info = user_info;
+    if store.upsert(profile).is_err() {
+        return Err(failure_message("failed to store refreshed profile"));
+    }
+    let cleanup_failed = vault.is_managed_profile_path(id, &old_path)
+        && vault.remove_revision_for_config(&old_path).is_err();
+    Ok(RefreshOutcome {
+        endpoint_count: endpoints.len(),
+        active_index,
+        skipped_count,
+        fallback_used,
+        cleanup_failed,
+    })
+}
+
+pub const DELAY_PROBE_URL: &str = "https://connectivitycheck.gstatic.com/generate_204";
+pub const DELAY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct TemporaryXray(tokio::process::Child);
+
+impl Drop for TemporaryXray {
+    fn drop(&mut self) {
+        let _ = self.0.start_kill();
+    }
+}
+
+/// Measure HTTP latency through a temporary Xray that runs one endpoint on a
+/// free loopback SOCKS port; the process is always reaped, errors never echo
+/// the share link.
+pub async fn measure_delay_with_command(
+    uri: &str,
+    mut command: tokio::process::Command,
+    probe_url: &str,
+    timeout: std::time::Duration,
+) -> Result<u64, String> {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .map_err(|_| "failed to reserve delay probe port".to_string())?;
+    let socks_port = listener
+        .local_addr()
+        .map_err(|_| "failed to reserve delay probe port".to_string())?
+        .port();
+    let config = xray::generate_share_link_config(uri, socks_port)
+        .map_err(|_| "invalid subscription endpoint".to_string())?;
+    let config = serde_json::to_vec(&config)
+        .map_err(|_| "failed to encode delay probe config".to_string())?;
+    drop(listener);
+
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = TemporaryXray(
+        command
+            .spawn()
+            .map_err(|_| "failed to start delay probe".to_string())?,
+    );
+    let result = tokio::time::timeout(timeout, async {
+        let mut stdin = child
+            .0
+            .stdin
+            .take()
+            .ok_or_else(|| "failed to send delay probe config".to_string())?;
+        stdin
+            .write_all(&config)
+            .await
+            .map_err(|_| "failed to send delay probe config".to_string())?;
+        drop(stdin);
+        loop {
+            if tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, socks_port))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            if child
+                .0
+                .try_wait()
+                .map_err(|_| "delay probe process failed".to_string())?
+                .is_some()
+            {
+                return Err("delay probe process exited before proxy was ready".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))
+            .map_err(|_| "failed to configure delay probe proxy".to_string())?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
+            .build()
+            .map_err(|_| "failed to build delay probe client".to_string())?;
+        let started = std::time::Instant::now();
+        let response = client
+            .get(probe_url)
+            .send()
+            .await
+            .map_err(|_| "delay probe request failed".to_string())?;
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err("delay probe returned an unexpected status".into());
+        }
+        Ok(started.elapsed().as_millis().max(1) as u64)
+    })
+    .await;
+    let _ = child.0.start_kill();
+    let _ = child.0.wait().await;
+    result.map_err(|_| "delay probe timed out".to_string())?
+}
+
+/// Delay to one endpoint using the given Xray executable.
+pub async fn measure_endpoint_delay(
+    executable: &std::path::Path,
+    uri: &str,
+    timeout: Duration,
+) -> Result<u64, String> {
+    let mut command = tokio::process::Command::new(executable);
+    command.args(["run", "-config", "stdin:"]);
+    measure_delay_with_command(uri, command, DELAY_PROBE_URL, timeout).await
+}
+
 pub fn public_profiles(mut profiles: Vec<Profile>) -> Vec<Profile> {
     for profile in &mut profiles {
         if let Some(subscription) = &mut profile.subscription {
@@ -369,6 +777,207 @@ pub fn public_profiles(mut profiles: Vec<Profile>) -> Vec<Profile> {
 
 #[cfg(test)]
 mod tests {
+    fn panel_body(names: &[&str]) -> String {
+        serde_json::Value::Array(
+            names
+                .iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "remarks": name,
+                        "outbounds": [{"tag": "proxy", "protocol": "vless", "settings": {"n": name}}]
+                    })
+                })
+                .collect(),
+        )
+        .to_string()
+    }
+
+    fn import_panel(dir: &std::path::Path, names: &[&str]) -> (ConfigVault, ProfileStore) {
+        let vault = ConfigVault::new(dir.join("configs"));
+        let store = ProfileStore::new(dir.join("profiles.json"));
+        let request = SubscriptionImport {
+            id: "panel",
+            url: "https://sub.example.test/token",
+            hwid: "hwid",
+            name: "My VPN",
+            refresh_interval_minutes: None,
+        };
+        import_body(&vault, &store, &request, &panel_body(names), None, |_| true).unwrap();
+        (vault, store)
+    }
+
+    #[test]
+    fn endpoint_key_uses_the_server_name_for_json_entries() {
+        let a = crate::xray::xray_json_entry(
+            &serde_json::json!({"remarks": "NL", "outbounds": [{"protocol": "vless", "x": 1}]}),
+        )
+        .unwrap();
+        let b = crate::xray::xray_json_entry(
+            &serde_json::json!({"remarks": "NL", "outbounds": [{"protocol": "vless", "x": 2}]}),
+        )
+        .unwrap();
+        assert_eq!(endpoint_key(&a), endpoint_key(&b));
+        assert_eq!(endpoint_key("vless://id@h:1#Name"), "vless://id@h:1");
+    }
+
+    #[test]
+    fn refresh_keeps_selected_server_and_profile_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, store) = import_panel(dir.path(), &["NL", "DE", "FI"]);
+        switch_endpoint(&vault, &store, "panel", 1, |_| true).unwrap();
+        let outcome = refresh_body(
+            &vault,
+            &store,
+            "panel",
+            &panel_body(&["FI", "US", "DE", "NL"]),
+            None,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(outcome.endpoint_count, 4);
+        assert_eq!(outcome.active_index, 2);
+        assert!(!outcome.fallback_used);
+        let profile = store.load().unwrap().profiles.remove(0);
+        assert_eq!(profile.name, "My VPN");
+        assert_eq!(profile.subscription.unwrap().active_index, 2);
+    }
+
+    #[test]
+    fn refresh_rejects_placeholder_and_keeps_existing_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, store) = import_panel(dir.path(), &["NL", "DE"]);
+        let stub = "vless://id@0.0.0.0:1?security=none#App%20not%20supported";
+        let error = refresh_body(&vault, &store, "panel", stub, None, |_| true).unwrap_err();
+        assert_eq!(error.to_string(), UNSUPPORTED_CLIENT_MESSAGE);
+        assert_eq!(vault.read_subscription_endpoints("panel").unwrap().len(), 2);
+    }
+
+    fn panel_json_body() -> String {
+        serde_json::json!([
+            {"remarks": "🇳🇱 Netherlands", "outbounds": [{"tag": "proxy", "protocol": "vless"}]},
+            {"remarks": "🇩🇪 Germany", "outbounds": [{"tag": "proxy", "protocol": "vless"}]},
+            {"remarks": "broken"},
+        ])
+        .to_string()
+    }
+
+    #[test]
+    fn json_subscription_body_yields_one_entry_per_config() {
+        let (urls, skipped) = parse_subscription_body(&panel_json_body());
+        assert_eq!(urls.len(), 2);
+        assert_eq!(skipped, 1);
+        assert_eq!(
+            crate::xray::share_link_name(&urls[1]).as_deref(),
+            Some("🇩🇪 Germany")
+        );
+    }
+
+    #[test]
+    fn json_subscription_imports_per_country_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let store = ProfileStore::new(dir.path().join("profiles.json"));
+        let request = SubscriptionImport {
+            id: "panel",
+            url: "https://sub.example.test/token",
+            hwid: "hwid",
+            name: "",
+            refresh_interval_minutes: None,
+        };
+        let result =
+            import_body(&vault, &store, &request, &panel_json_body(), None, |_| true).unwrap();
+        let profile = &result.profiles[0];
+        assert_eq!(profile.subscription.as_ref().unwrap().endpoint_count, 2);
+        let names: Vec<String> = vault
+            .read_subscription_endpoints("panel")
+            .unwrap()
+            .into_iter()
+            .map(|endpoint| endpoint.name)
+            .collect();
+        assert_eq!(names, vec!["🇳🇱 Netherlands", "🇩🇪 Germany"]);
+    }
+
+    #[test]
+    fn subscription_body_limit_fits_large_panel_json() {
+        assert_eq!(MAX_SUBSCRIPTION_BODY_BYTES, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn body_summary_counts_schemes_without_leaking_secrets() {
+        let links = "trojan://SECRET-PASSWORD@nl.test:443#NL\nss://U0VDUkVU@de.test:8388#DE\nvless://SECRET-UUID@fi.test:443#FI\n";
+        let encoded = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(links)
+        };
+        let summary = summarize_subscription_body(&encoded, Some("text/plain"));
+        assert!(summary.contains("format=base64"), "{summary}");
+        assert!(summary.contains("lines=3"), "{summary}");
+        assert!(summary.contains("trojan×1"), "{summary}");
+        assert!(summary.contains("ss×1"), "{summary}");
+        assert!(summary.contains("vless×1"), "{summary}");
+        assert!(summary.contains("content-type=text/plain"), "{summary}");
+        for secret in ["SECRET", "nl.test", "U0VDUkVU", "NL"] {
+            assert!(!summary.contains(secret), "leaked {secret}: {summary}");
+        }
+        let json = summarize_subscription_body(r#"[{"outbounds":[{"protocol":"vless"}]}]"#, None);
+        assert!(json.contains("format=json"), "{json}");
+        let yaml = summarize_subscription_body("proxies:\n  - name: a\n", None);
+        assert!(yaml.contains("format=yaml"), "{yaml}");
+    }
+
+    #[test]
+    fn derived_hwid_is_stable_uuid_shaped_and_hides_the_seed() {
+        let first = derive_hwid("4C4C4544-0000-1000-8000-B7C04F4B3332");
+        assert_eq!(first, derive_hwid("4C4C4544-0000-1000-8000-B7C04F4B3332"));
+        assert_ne!(first, derive_hwid("another-machine"));
+        assert_eq!(first.len(), 36);
+        let groups: Vec<usize> = first.split('-').map(str::len).collect();
+        assert_eq!(groups, vec![8, 4, 4, 4, 12]);
+        assert!(first.chars().all(|c| c == '-' || c.is_ascii_hexdigit()));
+        assert!(!first.to_uppercase().contains("4C4C4544"));
+        // Valid as an X-HWID header value.
+        assert!(reqwest::header::HeaderValue::from_str(&first).is_ok());
+    }
+
+    #[test]
+    fn client_identifies_as_a_recognized_subscription_app() {
+        // Panels such as Remnawave/Marzban answer unknown User-Agents with a
+        // single placeholder server instead of the real per-country list.
+        assert!(SUBSCRIPTION_USER_AGENT.starts_with("v2rayN/"));
+    }
+
+    #[test]
+    fn placeholder_only_subscription_is_detected() {
+        let stub = vec!["vless://00000000-0000-4000-8000-000000000000@0.0.0.0:1?security=none#App%20not%20supported".to_string()];
+        assert!(is_unsupported_client_placeholder(&stub));
+        let russian = vec!["vless://id@h:1?security=none#%D0%9F%D1%80%D0%B8%D0%BB%D0%BE%D0%B6%D0%B5%D0%BD%D0%B8%D0%B5%20%D0%BD%D0%B5%20%D0%BF%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%B8%D0%B2%D0%B0%D0%B5%D1%82%D1%81%D1%8F".to_string()];
+        assert!(is_unsupported_client_placeholder(&russian));
+        let real = vec![
+            "vless://id@nl.test:443?security=tls#Netherlands".to_string(),
+            "vless://id@de.test:443?security=tls#Germany".to_string(),
+        ];
+        assert!(!is_unsupported_client_placeholder(&real));
+        assert!(!is_unsupported_client_placeholder(&[]));
+    }
+
+    #[test]
+    fn import_rejects_placeholder_subscription_with_a_clear_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let store = ProfileStore::new(dir.path().join("profiles.json"));
+        let request = SubscriptionImport {
+            id: "stub",
+            url: "https://sub.example.test/token",
+            hwid: "",
+            name: "",
+            refresh_interval_minutes: None,
+        };
+        let body = "vless://00000000-0000-4000-8000-000000000000@0.0.0.0:1?security=none#App%20not%20supported";
+        let error = import_body(&vault, &store, &request, body, None, |_| true).unwrap_err();
+        assert_eq!(error.to_string(), UNSUPPORTED_CLIENT_MESSAGE);
+        assert!(store.load().unwrap().profiles.is_empty());
+    }
+
     use super::*;
     use base64::Engine;
     const BODY: &str = "vless://synthetic-id@one.test:443?security=tls#First\nhy2://synthetic-password@two.test:443#Second";
@@ -500,7 +1109,7 @@ mod tests {
                 .unwrap()
                 .to_string();
             assert!(!error.contains("private-token") && !error.contains("private-hwid"));
-            assert!(error.contains("HTTP 403") || error.contains("1 MiB"));
+            assert!(error.contains("HTTP 403") || error.contains("4 MiB"));
             server.await.unwrap();
         }
     }
