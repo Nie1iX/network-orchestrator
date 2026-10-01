@@ -24,6 +24,31 @@ simulated; IPv6 parsing, bulk CIDR parsing, OpenVPN probes, and real config
 generation are covered by Rust tests instead. Do not use sandbox results as
 evidence that real VPN credentials or connectivity work.
 
+## Native proxy connections verification — 2026-10-01
+
+The native client starts Xray in loopback SOCKS/HTTP mode and can drive the
+macOS system proxy. RED: bridge tests rejected `runtime`, `connect` and
+`set_system_proxy` as unknown; core tests lacked the macOS Xray layout and
+`MacProxyAdapter`. GREEN: core managed Xray (synthetic archives plus the
+official `Xray-macos-arm64-v8a.zip` via `XRAY_MACOS_ARCHIVE`, SHA-256
+`9b99a351…63d6`), macOS proxy adapter on a fake `networksetup` runner
+(service filtering, snapshot, loopback-only apply, restore, manager round
+trip), and bridge runtime refusals/state passed.
+
+Live acceptance (`NETORCH_LIVE_XRAY`): verified install from the official zip,
+share-link import, connect, `curl` to https://www.youtube.com/ through the
+client SOCKS port via a loopback VLESS server returned 200, then disconnect
+and shutdown left no Xray process. The loopback server resolves over DoH:
+with incy connected the system resolver returns fake IPs in 240.0.0.0/4,
+which Xray's freedom outbound refuses as reserved.
+
+Manual checks on the host, each restored immediately: `networksetup` can set
+proxies without sudo for an admin user; while incy (packet tunnel on utun9)
+is the primary service, proxies on Wi-Fi/Ethernet appear only under
+`__SCOPED__` and the global proxy stays empty; proxies set on the incy service
+itself are ignored. Hence the in-app override warning. No real user profile
+was used.
+
 ## Native subscription URL verification — 2026-09-30
 
 Import → Subscription now fetches HTTP/HTTPS URLs in the native client, with
