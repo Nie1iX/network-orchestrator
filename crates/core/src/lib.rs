@@ -9,6 +9,7 @@ pub mod explorer;
 pub mod journal;
 #[cfg(target_os = "macos")]
 mod macos_inventory;
+pub mod macos_vpn;
 pub mod managed_xray;
 pub mod models;
 pub mod openvpn_config;

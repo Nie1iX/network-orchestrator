@@ -10,6 +10,11 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ### Added
 
+- Native Connections list VPN services configured by other apps (e.g.
+  Network Extension VPNs) under "Discovered on system" with an External
+  badge, and connect or disconnect them like the macOS VPN menu
+  (`scutil --nc`; only well-formed service UUIDs are accepted).
+
 - Native subscriptions auto-refresh every 15 minutes, hour or 6 hours
   (running connections are left alone), with the last check time, a failure
   marker and the provider's suggested interval. Refresh downloads outside

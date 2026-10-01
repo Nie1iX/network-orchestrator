@@ -149,7 +149,49 @@ struct ConnectionsView: View {
           }
         }
       }
+      if !model.externalVPNs.isEmpty {
+        Text(L10n.text("profiles.external")).font(.system(size: 11.2, weight: .semibold))
+          .foregroundStyle(p.secondary).padding(.horizontal, 8).padding(.top, 14).padding(
+            .bottom, 5)
+        Rectangle().fill(p.border).frame(height: 1)
+        ForEach(model.externalVPNs) { vpn in externalRow(vpn) }
+      }
     }
+  }
+  private func externalRow(_ vpn: ExternalVpn) -> some View {
+    let connected = vpn.state == "connected"
+    let busy =
+      model.switchingExternal.contains(vpn.id) || vpn.state == "connecting"
+      || vpn.state == "disconnecting"
+    return HStack(spacing: 8) {
+      StateDot(state: connected ? "running" : "stopped")
+      NativeIcon(name: "VpnIcon", size: 14).foregroundStyle(p.secondary)
+      VStack(alignment: .leading, spacing: 1) {
+        Text(vpn.name).font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
+        if let provider = vpn.provider {
+          Text(provider).font(.system(size: 10.5)).foregroundStyle(p.muted).lineLimit(1)
+        }
+      }
+      Spacer(minLength: 8)
+      AppBadge(text: "detail.external", color: "warn")
+      if busy {
+        Spinner(size: 12).frame(width: 34)
+      } else {
+        Button {
+          Task { await model.setExternalVPN(vpn, connect: !connected) }
+        } label: {
+          Capsule().fill(connected ? p["up"] : p.border).frame(width: 34, height: 20).overlay(
+            alignment: connected ? .trailing : .leading
+          ) {
+            Circle().fill(.white).frame(width: 16, height: 16).padding(2)
+          }
+        }.buttonStyle(.plain).disabled(!vpn.enabled)
+          .help(L10n.text(connected ? "common.disconnect" : "common.connect"))
+          .accessibilityLabel(L10n.text(connected ? "common.disconnect" : "common.connect"))
+      }
+    }
+    .padding(.horizontal, 8).padding(.vertical, 5)
+    .overlay(alignment: .bottom) { Rectangle().fill(p.border).frame(height: 1) }
   }
   private func row(_ profile: Profile) -> some View {
     let selected = model.selectedProfile?.id == profile.id
