@@ -1,3 +1,4 @@
+import ServiceManagement
 import SwiftUI
 
 private let categoryOrder = ["physical", "vpn", "virtual", "system", "tunnel", "filter"]
@@ -590,6 +591,7 @@ struct SettingsView: View {
   @Environment(\.palette) private var p
   @Bindable var model: AppModel
   @State private var showingImportLog = false
+  @State private var loginItemEnabled = false
   @AppStorage("appearance") private var appearance = "system"
   @Bindable private var localizer = L10n.shared
   var body: some View {
@@ -652,6 +654,28 @@ struct SettingsView: View {
           ).font(.system(size: 10.92)).foregroundStyle(p.muted)
         }.padding(10.5)
       }
+      settingsGroup("settings.groupStartup") {
+        HStack {
+          settingText("settings.startAtLogin", "native.startAtLoginSub")
+          Spacer()
+          Toggle(
+            "",
+            isOn: Binding(
+              get: { loginItemEnabled },
+              set: { enable in
+                do {
+                  if enable {
+                    try SMAppService.mainApp.register()
+                  } else {
+                    try SMAppService.mainApp.unregister()
+                  }
+                } catch { model.error = "native.loginItemFailed" }
+                loginItemEnabled = SMAppService.mainApp.status == .enabled
+              })
+          ).toggleStyle(.switch).controlSize(.small).labelsHidden()
+        }.padding(.horizontal, 14).padding(.vertical, 10.5)
+      }
+      .onAppear { loginItemEnabled = SMAppService.mainApp.status == .enabled }
       settingsGroup("native.diagnostics") {
         HStack {
           settingText("native.importLog", "native.importLogHint")

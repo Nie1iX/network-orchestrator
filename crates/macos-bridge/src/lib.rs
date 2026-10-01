@@ -558,6 +558,20 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                     .map_err(|_| "VPN services could not be listed".to_string())?,
             )
         }
+        "reorder" => {
+            let backend: TunnelBackend = serde_json::from_value(args["backend"].clone())
+                .map_err(|_| "Unknown connection type".to_string())?;
+            let ids: Vec<String> = text_arg(args, "ids")?
+                .split(',')
+                .map(str::to_string)
+                .collect();
+            let document = store
+                .reorder(backend, &ids)
+                .map_err(|_| "The order could not be saved".to_string())?;
+            encode(net_manager_core::subscription::public_profiles(
+                document.profiles,
+            ))
+        }
         "import_log" => {
             let text = std::fs::read_to_string(root.join("runtime/logs/subscription-import.log"))
                 .unwrap_or_default();
@@ -751,6 +765,27 @@ pub unsafe extern "C" fn netorch_free(value: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reorder_changes_the_order_within_a_backend_group() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "a");
+        import_link(dir.path(), "b");
+        let profiles = dispatch(
+            dir.path(),
+            "reorder",
+            &json!({"backend": "xray", "ids": "b,a"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["id"], "b");
+        assert_eq!(profiles[1]["id"], "a");
+        assert!(dispatch(
+            dir.path(),
+            "reorder",
+            &json!({"backend": "xray", "ids": "b"})
+        )
+        .is_err());
+    }
+
     #[test]
     fn external_vpn_toggle_rejects_malformed_service_ids() {
         let dir = tempfile::tempdir().unwrap();
