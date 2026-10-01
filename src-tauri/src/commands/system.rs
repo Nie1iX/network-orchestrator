@@ -259,6 +259,36 @@ fn linux_xray_backend_availability(
     entry
 }
 
+/// System proxy ownership for the status bar: which profile applied it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SystemProxyStatus {
+    pub owner_profile_id: Option<String>,
+    pub owner_name: Option<String>,
+}
+
+#[tauri::command]
+pub(crate) async fn system_proxy_status(
+    state: State<'_, AppState>,
+) -> Result<SystemProxyStatus, String> {
+    let runtime = state.runtime.lock().await;
+    let owner_profile_id = runtime.proxy.ownership().map(|o| o.profile_id.clone());
+    drop(runtime);
+    let owner_name = match &owner_profile_id {
+        Some(id) => state.profiles.load().ok().and_then(|doc| {
+            doc.profiles
+                .iter()
+                .find(|p| p.id == *id)
+                .map(|p| p.name.clone())
+        }),
+        None => None,
+    };
+    Ok(SystemProxyStatus {
+        owner_profile_id,
+        owner_name,
+    })
+}
+
 #[tauri::command]
 pub(crate) async fn get_backend_availability(
     state: State<'_, AppState>,

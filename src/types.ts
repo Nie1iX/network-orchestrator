@@ -259,6 +259,11 @@ export interface Profile {
 
 export type TunnelState = "stopped" | "running" | "failed";
 
+export interface SystemProxyStatus {
+  ownerProfileId: string | null;
+  ownerName: string | null;
+}
+
 export interface TunnelStatus {
   profileId: string;
   state: TunnelState;

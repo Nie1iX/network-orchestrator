@@ -180,6 +180,10 @@ export class SandboxBackend {
       case "get_routes": return this.routes();
       case "get_tunnel_statuses": return this.statuses();
       case "daemon_status": return { state: "ready", message: "Simulated daemon: host network is never modified." };
+      case "system_proxy_status": {
+        const owner = this.profiles.find((p) => this.running.has(p.id) && p.useSystemProxy);
+        return { ownerProfileId: owner?.id ?? null, ownerName: owner?.name ?? null };
+      }
       case "is_elevated": return false;
       case "get_auto_connect_result": return null;
       case "get_always_on_profiles": return this.enrollment;

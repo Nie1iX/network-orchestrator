@@ -139,6 +139,7 @@ pub fn run() {
             remove_conditional_rule,
             is_elevated,
             daemon_status,
+            system_proxy_status,
             restart_elevated,
             discover_wireguard_configs,
             get_route_map,
