@@ -8,6 +8,8 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-01
+
 ### Added
 
 - Native macOS starts Xray connections in loopback SOCKS/HTTP mode without
