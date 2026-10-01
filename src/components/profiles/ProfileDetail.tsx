@@ -543,10 +543,11 @@ export default function ProfileDetail({
               <div className="interface-row">
                 <span className="row-label">{t("detail.traffic")}</span>
                 <span className="row-value">
-                  {formatBytes(trafficUsed ?? 0)} {t("detail.used")}
+                  {formatBytes(trafficUsed ?? 0)}
+                  {" / "}
                   {subscription.userInfo.totalBytes !== null
-                    ? ` / ${formatBytes(subscription.userInfo.totalBytes)}`
-                    : ` / ${t("detail.unlimited")}`}
+                    ? formatBytes(subscription.userInfo.totalBytes)
+                    : "∞"}
                   {limitExhausted && (
                     <span className="warn-text">
                       {" · "}
