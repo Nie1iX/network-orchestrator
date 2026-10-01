@@ -5,6 +5,7 @@ import { ensureElevation, requiresElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
 import { useProfileListMode } from "../prefs";
 import { providerPrefix } from "../subscriptions";
+import { popupNativeMenu, MenuEntry } from "../nativeMenu";
 import { useT } from "../i18n";
 import { BACKEND_LABEL_KEYS } from "../i18n/labels";
 import {
@@ -218,7 +219,7 @@ export default function ProfileManager() {
   const [ctxMenu, setCtxMenu] = useState<{
     x: number;
     y: number;
-    profile: Profile;
+    items: MenuEntry[];
   } | null>(null);
   const [listWidth, setListWidth] = useState(loadListWidth);
   const [splitDragging, setSplitDragging] = useState(false);
@@ -1250,6 +1251,62 @@ export default function ProfileManager() {
         )
       : [];
 
+  /** Row context-menu items — shared by the native Tauri menu and the DOM
+   * fallback used in the browser sandbox. */
+  const profileMenuItems = (p: Profile): MenuEntry[] => {
+    const ctxGroup =
+      listMode === "grouped" && !lowerSearch
+        ? groups.find(
+            (g) =>
+              g.backend === p.backend &&
+              g.items.some((item) => item.id === p.id),
+          )
+        : undefined;
+    const ctxIndex = ctxGroup
+      ? ctxGroup.items.findIndex((item) => item.id === p.id)
+      : -1;
+    const running = statusFor(p.id).state === "running";
+    return [
+      {
+        label: running ? t("common.disconnect") : t("common.connect"),
+        onClick: () =>
+          running ? void onDisconnect(p) : void onConnect(p),
+        disabled: busy.has(p.id),
+      },
+      {
+        label: t("common.edit"),
+        onClick: () => openEdit(p),
+        disabled: busy.has(p.id),
+      },
+      {
+        label: t("detail.diagnostics"),
+        onClick: () => void onDiagnose(p),
+        disabled: diagBusy === p.id,
+      },
+      "separator",
+      {
+        label: t("detail.moveUp"),
+        onClick: () =>
+          ctxGroup && moveProfileInGroup(ctxGroup.items, p.id, -1),
+        disabled: !ctxGroup || ctxIndex <= 0,
+      },
+      {
+        label: t("detail.moveDown"),
+        onClick: () =>
+          ctxGroup && moveProfileInGroup(ctxGroup.items, p.id, 1),
+        disabled:
+          !ctxGroup || ctxIndex < 0 || ctxIndex >= ctxGroup.items.length - 1,
+      },
+      "separator",
+      {
+        label: t("common.delete"),
+        onClick: () => void onDelete(p),
+        disabled: busy.has(p.id),
+        danger: true,
+      },
+    ];
+  };
+
   const renderProfileRow = (
     profile: Profile,
     group: ProfileGroup | null,
@@ -1320,7 +1377,13 @@ export default function ProfileManager() {
           setServiceSelected(false);
           setExternalName(null);
           setSelectedId(profile.id);
-          setCtxMenu({ x: e.clientX, y: e.clientY, profile });
+          const items = profileMenuItems(profile);
+          void popupNativeMenu(items, e.clientX, e.clientY).then(
+            (native) => {
+              if (!native)
+                setCtxMenu({ x: e.clientX, y: e.clientY, items });
+            },
+          );
         }}
         onDragStart={(event) => onCardDragStart(event, profile)}
         onDragEnd={onCardDragEnd}
@@ -1764,67 +1827,14 @@ export default function ProfileManager() {
         onChooseBackend={handleChooseBackend}
       />
 
-      {ctxMenu && (() => {
-        const p = ctxMenu.profile;
-        const ctxGroup =
-          listMode === "grouped" && !lowerSearch
-            ? groups.find(
-                (g) =>
-                  g.backend === p.backend &&
-                  g.items.some((item) => item.id === p.id),
-              )
-            : undefined;
-        const ctxIndex = ctxGroup
-          ? ctxGroup.items.findIndex((item) => item.id === p.id)
-          : -1;
-        const running = statusFor(p.id).state === "running";
-        return (
-          <ContextMenu
-            x={ctxMenu.x}
-            y={ctxMenu.y}
-            onClose={() => setCtxMenu(null)}
-            items={[
-              {
-                label: running ? t("common.disconnect") : t("common.connect"),
-                onClick: () =>
-                  running ? void onDisconnect(p) : void onConnect(p),
-                disabled: busy.has(p.id),
-              },
-              {
-                label: t("common.edit"),
-                onClick: () => openEdit(p),
-                disabled: busy.has(p.id),
-              },
-              {
-                label: t("detail.diagnostics"),
-                onClick: () => void onDiagnose(p),
-                disabled: diagBusy === p.id,
-              },
-              "separator",
-              {
-                label: t("detail.moveUp"),
-                onClick: () =>
-                  ctxGroup && moveProfileInGroup(ctxGroup.items, p.id, -1),
-                disabled: !ctxGroup || ctxIndex <= 0,
-              },
-              {
-                label: t("detail.moveDown"),
-                onClick: () =>
-                  ctxGroup && moveProfileInGroup(ctxGroup.items, p.id, 1),
-                disabled:
-                  !ctxGroup || ctxIndex < 0 || ctxIndex >= ctxGroup.items.length - 1,
-              },
-              "separator",
-              {
-                label: t("common.delete"),
-                onClick: () => void onDelete(p),
-                disabled: busy.has(p.id),
-                danger: true,
-              },
-            ]}
-          />
-        );
-      })()}
+      {ctxMenu && (
+        <ContextMenu
+          x={ctxMenu.x}
+          y={ctxMenu.y}
+          onClose={() => setCtxMenu(null)}
+          items={ctxMenu.items}
+        />
+      )}
 
       <Modal
         open={openVpnCredentialProfile !== null}
