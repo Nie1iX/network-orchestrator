@@ -17,6 +17,7 @@ pub mod openvpn_management;
 pub mod policy;
 pub mod profile_import;
 pub mod profiles;
+pub mod route_check;
 pub mod route_plan;
 pub mod route_state;
 pub mod subscription;

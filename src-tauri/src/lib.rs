@@ -95,6 +95,7 @@ pub fn run() {
             get_routes,
             parse_bulk_cidrs,
             parse_happ_routing,
+            xray_test_route,
             lookup_destination,
             set_interface_state,
             stop_external_tunnel,

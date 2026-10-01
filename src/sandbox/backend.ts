@@ -397,6 +397,71 @@ export class SandboxBackend {
           warnings: [],
         };
       }
+      case "xray_test_route": {
+        // Lite simulator: literal domain/keyword selectors only — geo
+        // lookups and DNS pins are native-side.
+        const req = args.request as {
+          target: string;
+          domainPolicies: DomainPolicy[];
+          privateLanDirect: boolean;
+        };
+        const host = String(req.target).split("://").pop()!.split("/")[0].split("@").pop()!;
+        const bare = host.replace(/^\[|\].*$/g, "").split(":")[0].toLowerCase();
+        const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(bare) || bare.includes(":") || /^[0-9a-f:]+$/i.test(bare) && bare.includes(":");
+        const matchSel = (sel: string): boolean | null => {
+          if (sel.startsWith("geosite:") || sel.startsWith("geoip:") || sel.startsWith("regexp:")) return null;
+          if (sel.startsWith("keyword:")) return !isIp && bare.includes(sel.slice(8));
+          if (sel.startsWith("full:")) return !isIp && bare === sel.slice(5);
+          const pat = sel.startsWith("domain:") ? sel.slice(7) : sel;
+          if (isIp) {
+            if (pat.includes("/")) {
+              const [net, bits] = pat.split("/");
+              const toInt = (s: string) => s.split(".").reduce((a, o) => (a << 8) + Number(o), 0) >>> 0;
+              if (!/^\d+\.\d+\.\d+\.\d+$/.test(net)) return false;
+              const mask = bits === "0" ? 0 : (0xffffffff << (32 - Number(bits))) >>> 0;
+              return (toInt(bare) & mask) === (toInt(net) & mask);
+            }
+            return bare === pat;
+          }
+          return bare === pat || bare.endsWith(`.${pat}`);
+        };
+        let outcome: { outbound: string; source: string; policyIndex?: number; selector?: string } =
+          { outbound: "proxy", source: "default" };
+        let sawUnknown = false;
+        const steps: { label: string; selector?: string; outcome: string }[] = [];
+        outer: for (const [index, policy] of (req.domainPolicies ?? []).entries()) {
+          let unknown = false;
+          for (const raw of policy.domains) {
+            const sel = raw.trim();
+            if (!sel || sel.startsWith("#")) continue;
+            const hit = matchSel(sel);
+            if (hit === true) {
+              steps.push({ label: `${policy.target} rules #${index + 1}`, selector: sel, outcome: "match" });
+              outcome = { outbound: policy.target, source: "policy", policyIndex: index, selector: sel };
+              break outer;
+            }
+            if (hit === null) { unknown = true; sawUnknown = true; }
+          }
+          steps.push({ label: `${policy.target} rules #${index + 1}`, outcome: unknown ? "unknown" : "miss" });
+        }
+        if (outcome.source === "default") {
+          if (req.privateLanDirect && isIp && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|169\.254\.)/.test(bare)) {
+            outcome = { outbound: "direct", source: "privateLan", selector: "privateLanDirect" };
+          }
+          steps.push({ label: "default", outcome: "match" });
+        }
+        return {
+          target: bare,
+          targetKind: isIp ? "ip" : "domain",
+          outbound: outcome.outbound,
+          source: outcome.source,
+          policyIndex: outcome.policyIndex,
+          matchedSelector: outcome.selector,
+          certainty: sawUnknown ? "probable" : "certain",
+          steps,
+          notes: sawUnknown ? ["geoip/geosite selectors could not be evaluated: no geo assets on disk"] : [],
+        };
+      }
       case "plugin:dialog|ask":
       case "plugin:dialog|confirm": return true;
       default: throw new Error(`Command is disabled in sandbox: ${command}`);

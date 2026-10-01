@@ -8,6 +8,7 @@ pub(crate) mod happ_routing;
 pub(crate) mod logs;
 pub(crate) mod profiles;
 pub(crate) mod recovery;
+pub(crate) mod route_check;
 pub(crate) mod route_map;
 pub(crate) mod system;
 pub(crate) mod tunnels;
@@ -33,6 +34,7 @@ pub(crate) use profiles::{
     save_wireguard_profile, set_subscription_refresh_interval, switch_subscription_endpoint,
 };
 pub(crate) use recovery::{cleanup_recovery, get_recovery_report};
+pub(crate) use route_check::xray_test_route;
 pub(crate) use route_map::get_route_map;
 pub(crate) use system::{
     cancel_managed_xray_install, daemon_status, discover_wireguard_configs,
