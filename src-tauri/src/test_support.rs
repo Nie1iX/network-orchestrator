@@ -108,6 +108,7 @@ pub(crate) fn app_state(dir: &Path) -> AppState {
         config_vault: ConfigVault::new(dir.join("configs")),
         backend_settings: BackendSettingsStore::new(dir.join("backend-settings.json")),
         managed_xray_root: dir.join("backends").join("xray"),
+        #[cfg(target_os = "linux")]
         geo_assets_root: dir.join("geoassets"),
         backend_install_lock: tokio::sync::Mutex::new(()),
         backend_install_cancel: AtomicBool::new(false),

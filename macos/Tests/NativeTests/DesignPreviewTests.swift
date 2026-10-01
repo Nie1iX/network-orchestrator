@@ -33,6 +33,12 @@ import Testing
     [
       "id": "design-xray", "name": "Personal proxy", "backend": "xray", "interfaceName": "",
       "routes": [], "xraySocksPort": 10808, "xrayHttpPort": 10809,
+      "subscription": [
+        "endpointCount": 2, "activeIndex": 0,
+        "userInfo": [
+          "uploadBytes": 0, "downloadBytes": 8_151_449_629, "expiresAtUnix": 1_802_708_026,
+        ],
+      ],
     ],
     [
       "id": "design-static", "name": "Local network", "backend": "none", "interfaceName": "en0",
@@ -44,7 +50,8 @@ import Testing
       "name": "en0", "friendlyName": "en0", "ifIndex": 4, "state": "up",
       "addresses": [["address": "192.0.2.10", "prefixLen": 24, "family": "Ipv4"]],
       "category": "physical", "kind": "ethernet", "physical": true,
-      "description": "macOS network interface", "dnsServers": [],
+      "description": "macOS network interface", "dnsServers": [], "mtu": 1500,
+      "linkSpeedMbps": 1000, "rxBytes": 1_048_576, "txBytes": 524_288,
     ],
     [
       "name": "lo0", "friendlyName": "lo0", "ifIndex": 1, "state": "up",
@@ -90,7 +97,37 @@ import Testing
     Capabilities.self,
     from: JSONSerialization.data(withJSONObject: [
       "os": "macos", "minimumOS": "27.0", "nativeUI": true, "networkMutations": false,
-      "version": "Preview",
+      "proxyConnections": true, "version": "Preview",
+    ]))
+  model.subscriptionEndpoints = [
+    "design-xray": [
+      SubscriptionEndpoint(name: "QA Europe", active: true),
+      SubscriptionEndpoint(name: "QA Asia", active: false),
+    ]
+  ]
+  model.runtime = RuntimeState(
+    xrayInstalled: true, xrayVersion: "v26.7.28",
+    statuses: [
+      TunnelStatus(profileId: "design-xray", state: "running", message: nil),
+      TunnelStatus(profileId: "design-wg", state: "stopped", message: nil),
+    ], systemProxyOwner: "design-xray")
+  model.primaryInterface = "en0"
+  model.delays["design-xray"] = [0: UInt64?.some(142)]
+  model.probing["design-xray"] = [1]
+  model.inspections["design-wg"] = try JSONDecoder().decode(
+    Inspection.self,
+    from: JSONSerialization.data(withJSONObject: [
+      "endpoints": [], "osRoutes": [], "internalRoutes": [], "listeners": [], "warnings": [],
+      "routeKnowledgeComplete": true,
+      "interfaceDetails": [
+        ["field": "address", "value": "10.20.0.2/32"], ["field": "dns", "value": "10.20.0.1"],
+      ],
+      "peers": [
+        [
+          "endpoint": ["address": "vpn.example.invalid", "port": 51820, "protocol": "udp"],
+          "routes": [["destination": "10.20.0.0/16", "source": "AllowedIPs"]],
+        ]
+      ],
     ]))
   for language in ["en", "ru"] {
     L10n.shared.preference = language
@@ -101,11 +138,18 @@ import Testing
       try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
       for section in Section.allCases {
         model.section = section
+        model.selectedProfileID = section == .connections ? "design-xray" : nil
         let view = ContentView(model: model, loadsOnAppear: false).environment(\.colorScheme, theme)
           .frame(width: 1200, height: 754)
         try render(
           view, to: directory.appendingPathComponent(section.rawValue.lowercased() + ".png"))
       }
+      model.section = .connections
+      model.selectedProfileID = "design-wg"
+      try render(
+        ContentView(model: model, loadsOnAppear: false).environment(\.colorScheme, theme)
+          .frame(width: 1200, height: 754),
+        to: directory.appendingPathComponent("connections-wireguard.png"))
       let palette = AppPalette(scheme: theme)
       for tab in RouteTab.allCases {
         let view = ScrollView {
@@ -128,6 +172,21 @@ import Testing
           .environment(\.colorScheme, theme).buttonStyle(TauriButtonStyle())
         try render(view, to: directory.appendingPathComponent("dialog-" + filename + ".png"))
       }
+      let linkView = ImportConfigurationView(
+        model: model, preferredBackend: "xray", onClose: {}, initialTab: "Link"
+      )
+      .frame(maxWidth: .infinity, maxHeight: .infinity).background(palette.app)
+      .foregroundStyle(palette.text).environment(\.palette, palette)
+      .environment(\.colorScheme, theme).buttonStyle(TauriButtonStyle())
+      try render(linkView, to: directory.appendingPathComponent("dialog-import-link.png"))
+      let subscriptionView = ImportConfigurationView(
+        model: model, preferredBackend: nil, onClose: {}, initialTab: "Subscription"
+      )
+      .frame(maxWidth: .infinity, maxHeight: .infinity).background(palette.app)
+      .foregroundStyle(palette.text).environment(\.palette, palette)
+      .environment(\.colorScheme, theme).buttonStyle(TauriButtonStyle())
+      try render(
+        subscriptionView, to: directory.appendingPathComponent("dialog-import-subscription.png"))
     }
   }
 }

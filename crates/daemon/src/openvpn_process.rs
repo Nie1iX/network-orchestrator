@@ -16,7 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const RUNTIME_ROOT: &str = "/run/network-orchestrator";
+use crate::openvpn::{stage_dir, RUNTIME_ROOT};
 const MAX_POLL_BYTES: usize = 64 * 1024;
 const MANAGEMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -445,11 +445,6 @@ fn stage_config_at(
         return Err(error);
     }
     Ok(directory)
-}
-
-/// The deterministic runtime staging directory for a (uid, name) pair.
-pub fn stage_dir(uid: u32, name: &str) -> PathBuf {
-    Path::new(RUNTIME_ROOT).join(uid.to_string()).join(name)
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {

@@ -781,9 +781,22 @@ export default function ProfileManager() {
     );
   };
 
+  /** Switching a running profile reconnects it on the new server. */
   const onSwitchEndpoint = async (profile: Profile, index: number) => {
+    const wasRunning = statusFor(profile.id).state === "running";
+    if (wasRunning && requiresElevation(profile)) {
+      try {
+        if (!(await ensureElevation(t("profiles.connecting", { name: profile.name })))) return;
+      } catch (err) {
+        toast("error", String(err));
+        return;
+      }
+    }
     setSwitching(profile.id);
     try {
+      if (wasRunning) {
+        await invoke("disconnect_profile", { id: profile.id });
+      }
       const updated = await invoke<Profile[]>("switch_subscription_endpoint", {
         profileId: profile.id,
         endpointIndex: index,
@@ -801,10 +814,23 @@ export default function ProfileManager() {
         }
       }
       setEndpoints(next);
+      if (wasRunning) {
+        const status = await invoke<TunnelStatus>("connect_profile", {
+          id: profile.id,
+        });
+        if (status.state === "failed") {
+          toast(
+            "error",
+            status.message ??
+              t("profiles.connectFailedDiag", { name: profile.name }),
+          );
+        }
+      }
     } catch (err) {
       setError(String(err));
     } finally {
       setSwitching(null);
+      await refreshAll();
     }
   };
 
@@ -883,19 +909,25 @@ export default function ProfileManager() {
     }
   };
 
+  /** Rolling pool: up to eight probes in flight, the next one starts as soon
+   * as any finishes, so one slow server never holds the rest back. */
   const onMeasureAllEndpoints = async (profile: Profile) => {
     const list = endpoints[profile.id] ?? [];
     if (list.length === 0) return;
     setMeasuringAll((prev) => new Set(prev).add(profile.id));
+    setDelayResults((current) => ({ ...current, [profile.id]: {} }));
     try {
-      const CHUNK = 4;
-      for (let i = 0; i < list.length; i += CHUNK) {
-        await Promise.all(
-          list
-            .slice(i, i + CHUNK)
-            .map((_, k) => onMeasureEndpoint(profile, i + k)),
-        );
-      }
+      const POOL = 8;
+      let next = 0;
+      const worker = async () => {
+        while (next < list.length) {
+          const index = next++;
+          await onMeasureEndpoint(profile, index);
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(POOL, list.length) }, worker),
+      );
     } finally {
       setMeasuringAll((prev) => {
         const next = new Set(prev);
@@ -1230,8 +1262,8 @@ export default function ProfileManager() {
               ? "…"
               : delayRes
                 ? delayRes.delayMs !== null
-                  ? `${delayRes.delayMs} ms`
-                  : "err"
+                  ? t("detail.delayMs", { ms: delayRes.delayMs })
+                  : t("detail.unreachable")
                 : null
         }
         isBusy={isBusy}

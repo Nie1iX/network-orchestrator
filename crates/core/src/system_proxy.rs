@@ -11,6 +11,27 @@ pub struct ProxySnapshot {
     pub proxy_enable: Option<u32>,
     pub proxy_server: Option<String>,
     pub proxy_override: Option<String>,
+    /// macOS: per-service proxy state captured before apply. Empty elsewhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macos_services: Vec<MacServiceProxy>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MacProxyEndpoint {
+    pub enabled: bool,
+    pub server: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MacServiceProxy {
+    pub service: String,
+    pub web: MacProxyEndpoint,
+    pub secure_web: MacProxyEndpoint,
+    pub socks: MacProxyEndpoint,
+    pub bypass: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,7 +83,12 @@ impl SystemProxyManager {
         Self::with_adapter(path, Box::new(WindowsProxyAdapter))
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    pub fn new(path: impl Into<PathBuf>) -> io::Result<Self> {
+        Self::with_adapter(path, Box::new(macos::MacProxyAdapter::system()))
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     pub fn new(path: impl Into<PathBuf>) -> io::Result<Self> {
         Self::with_adapter(path, Box::new(UnsupportedProxyAdapter))
     }
@@ -91,6 +117,33 @@ impl SystemProxyManager {
     }
 
     pub fn apply(&mut self, profile_id: &str, port: u16, bypass: &[String]) -> io::Result<()> {
+        self.apply_server(profile_id, format!("socks=127.0.0.1:{port}"), bypass)
+    }
+
+    /// Like [`apply`](Self::apply), but also routes plain HTTP and HTTPS
+    /// clients to the profile's HTTP CONNECT listener when it has one.
+    pub fn apply_with_http(
+        &mut self,
+        profile_id: &str,
+        socks_port: u16,
+        http_port: Option<u16>,
+        bypass: &[String],
+    ) -> io::Result<()> {
+        let server = match http_port {
+            Some(http) => {
+                format!("http=127.0.0.1:{http};https=127.0.0.1:{http};socks=127.0.0.1:{socks_port}")
+            }
+            None => format!("socks=127.0.0.1:{socks_port}"),
+        };
+        self.apply_server(profile_id, server, bypass)
+    }
+
+    fn apply_server(
+        &mut self,
+        profile_id: &str,
+        server: String,
+        bypass: &[String],
+    ) -> io::Result<()> {
         if self.ownership.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -98,7 +151,6 @@ impl SystemProxyManager {
             ));
         }
         let snapshot = self.adapter.snapshot()?;
-        let server = format!("socks=127.0.0.1:{port}");
         let mut entries = self.adapter.default_bypass();
         for entry in bypass {
             if !entries.iter().any(|existing| existing == entry) {
@@ -226,10 +278,10 @@ pub fn snapshot_matches(expected: &ProxySnapshot, actual: &ProxySnapshot) -> boo
     expected == actual
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 struct UnsupportedProxyAdapter;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 impl ProxyAdapter for UnsupportedProxyAdapter {
     fn snapshot(&mut self) -> io::Result<ProxySnapshot> {
         Err(unsupported())
@@ -242,7 +294,7 @@ impl ProxyAdapter for UnsupportedProxyAdapter {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -425,6 +477,7 @@ mod windows_proxy {
             proxy_enable: get_dword(key, PROXY_ENABLE)?,
             proxy_server: get_string(key, PROXY_SERVER)?,
             proxy_override: get_string(key, PROXY_OVERRIDE)?,
+            ..Default::default()
         })
     }
 
@@ -450,6 +503,7 @@ mod windows_proxy {
             proxy_enable: get_dword(key.0, PROXY_ENABLE)?,
             proxy_server: get_string(key.0, PROXY_SERVER)?,
             proxy_override: get_string(key.0, PROXY_OVERRIDE)?,
+            ..Default::default()
         })
     }
 
@@ -462,6 +516,7 @@ mod windows_proxy {
             proxy_enable: Some(1),
             proxy_server: Some(server.to_string()),
             proxy_override: Some(bypass.to_string()),
+            ..Default::default()
         };
         let actual = read_back(key.0)?;
         drop(key);
@@ -540,6 +595,261 @@ impl ProxyAdapter for WindowsProxyAdapter {
     }
     fn default_bypass(&self) -> Vec<String> {
         windows_proxy::default_bypass()
+    }
+}
+
+/// macOS system proxy through `networksetup`, applied to every enabled
+/// hardware network service (VPN services are owned by their providers and
+/// left untouched). Runs as the logged-in admin user; no root helper.
+#[cfg(target_os = "macos")]
+pub mod macos {
+    use super::{MacProxyEndpoint, MacServiceProxy, ProxyAdapter, ProxySnapshot};
+    use std::io;
+    use std::process::Command;
+
+    const NETWORKSETUP: &str = "/usr/sbin/networksetup";
+    const KINDS: [(&str, &str); 3] = [
+        ("web", "webproxy"),
+        ("secure", "securewebproxy"),
+        ("socks", "socksfirewallproxy"),
+    ];
+
+    pub trait NetworksetupRunner: Send {
+        fn run(&mut self, args: &[String]) -> io::Result<String>;
+    }
+
+    pub struct SystemNetworksetup;
+
+    impl NetworksetupRunner for SystemNetworksetup {
+        fn run(&mut self, args: &[String]) -> io::Result<String> {
+            let output = Command::new(NETWORKSETUP).args(args).output()?;
+            if !output.status.success() {
+                return Err(io::Error::other("networksetup failed"));
+            }
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            // networksetup reports some failures on stdout with exit status 0.
+            if text.starts_with("** Error") {
+                return Err(io::Error::other("networksetup rejected the proxy change"));
+            }
+            Ok(text)
+        }
+    }
+
+    pub struct MacProxyAdapter<R: NetworksetupRunner = SystemNetworksetup> {
+        runner: R,
+    }
+
+    impl MacProxyAdapter<SystemNetworksetup> {
+        pub fn system() -> Self {
+            Self::with_runner(SystemNetworksetup)
+        }
+    }
+
+    impl<R: NetworksetupRunner> MacProxyAdapter<R> {
+        pub fn with_runner(runner: R) -> Self {
+            Self { runner }
+        }
+
+        pub fn runner(&self) -> &R {
+            &self.runner
+        }
+
+        fn call(&mut self, args: &[&str]) -> io::Result<String> {
+            let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            self.runner.run(&owned)
+        }
+
+        fn services(&mut self) -> io::Result<Vec<String>> {
+            let services = hardware_services(&self.call(&["-listnetworkserviceorder"])?);
+            if services.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no enabled network service found",
+                ));
+            }
+            Ok(services)
+        }
+
+        fn read_endpoint(&mut self, kind: &str, service: &str) -> io::Result<MacProxyEndpoint> {
+            Ok(parse_endpoint(
+                &self.call(&[&format!("-get{kind}"), service])?,
+            ))
+        }
+
+        fn write_endpoint(
+            &mut self,
+            kind: &str,
+            service: &str,
+            endpoint: &MacProxyEndpoint,
+        ) -> io::Result<()> {
+            if !endpoint.server.is_empty() {
+                let port = endpoint.port.to_string();
+                self.call(&[&format!("-set{kind}"), service, &endpoint.server, &port])?;
+            }
+            if !endpoint.enabled || endpoint.server.is_empty() {
+                self.call(&[&format!("-set{kind}state"), service, "off"])?;
+            }
+            Ok(())
+        }
+
+        fn write_bypass(&mut self, service: &str, bypass: &[String]) -> io::Result<()> {
+            let mut args = vec!["-setproxybypassdomains".to_string(), service.to_string()];
+            if bypass.is_empty() {
+                args.push("Empty".into());
+            } else {
+                args.extend(bypass.iter().cloned());
+            }
+            self.runner.run(&args).map(|_| ())
+        }
+    }
+
+    impl<R: NetworksetupRunner> ProxyAdapter for MacProxyAdapter<R> {
+        fn snapshot(&mut self) -> io::Result<ProxySnapshot> {
+            let mut services = Vec::new();
+            for service in self.services()? {
+                let bypass = parse_bypass(&self.call(&["-getproxybypassdomains", &service])?);
+                services.push(MacServiceProxy {
+                    web: self.read_endpoint(KINDS[0].1, &service)?,
+                    secure_web: self.read_endpoint(KINDS[1].1, &service)?,
+                    socks: self.read_endpoint(KINDS[2].1, &service)?,
+                    bypass,
+                    service,
+                });
+            }
+            Ok(ProxySnapshot {
+                macos_services: services,
+                ..Default::default()
+            })
+        }
+
+        fn apply(&mut self, server: &str, bypass: &str) -> io::Result<()> {
+            let targets = parse_server(server)?;
+            let bypass: Vec<String> = bypass
+                .split(';')
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect();
+            for service in self.services()? {
+                for (key, kind) in KINDS {
+                    if let Some(port) = targets.get(key) {
+                        let endpoint = MacProxyEndpoint {
+                            enabled: true,
+                            server: "127.0.0.1".into(),
+                            port: *port,
+                        };
+                        self.write_endpoint(kind, &service, &endpoint)?;
+                    }
+                }
+                self.write_bypass(&service, &bypass)?;
+            }
+            Ok(())
+        }
+
+        fn restore(&mut self, snapshot: &ProxySnapshot) -> io::Result<()> {
+            for saved in &snapshot.macos_services {
+                let service = saved.service.as_str();
+                self.write_endpoint(KINDS[0].1, service, &saved.web)?;
+                self.write_endpoint(KINDS[1].1, service, &saved.secure_web)?;
+                self.write_endpoint(KINDS[2].1, service, &saved.socks)?;
+                self.write_bypass(service, &saved.bypass)?;
+            }
+            Ok(())
+        }
+
+        fn default_bypass(&self) -> Vec<String> {
+            [
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "*.local",
+                "169.254/16",
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "fe80::/10",
+                "fc00::/7",
+            ]
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect()
+        }
+    }
+
+    /// Enabled services that sit on a hardware device, in service order.
+    pub fn hardware_services(order: &str) -> Vec<String> {
+        let mut services = Vec::new();
+        let mut pending: Option<String> = None;
+        for line in order.lines().map(str::trim) {
+            if let Some(port) = line.strip_prefix("(Hardware Port:") {
+                let device = port
+                    .rsplit_once("Device:")
+                    .map(|(_, device)| device.trim_end_matches(')').trim())
+                    .unwrap_or("");
+                if let Some(name) = pending.take().filter(|_| !device.is_empty()) {
+                    services.push(name);
+                }
+            } else if let Some((index, name)) = line
+                .strip_prefix('(')
+                .and_then(|rest| rest.split_once(") "))
+            {
+                // "(*)" marks a disabled service.
+                pending = (index != "*").then(|| name.to_string());
+            }
+        }
+        services
+    }
+
+    fn parse_endpoint(text: &str) -> MacProxyEndpoint {
+        let mut endpoint = MacProxyEndpoint::default();
+        for line in text.lines() {
+            match line.split_once(':') {
+                Some(("Enabled", value)) => endpoint.enabled = value.trim() == "Yes",
+                Some(("Server", value)) => endpoint.server = value.trim().to_string(),
+                Some(("Port", value)) => endpoint.port = value.trim().parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+        endpoint
+    }
+
+    fn parse_bypass(text: &str) -> Vec<String> {
+        if text.starts_with("There aren't any") {
+            return Vec::new();
+        }
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Parse `http=127.0.0.1:P;https=…;socks=…`; only loopback targets are
+    /// accepted so a corrupted ownership record can never redirect traffic.
+    fn parse_server(server: &str) -> io::Result<std::collections::HashMap<&'static str, u16>> {
+        let mut targets = std::collections::HashMap::new();
+        for part in server.split(';').filter(|part| !part.is_empty()) {
+            let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid proxy target");
+            let (scheme, address) = part.split_once('=').ok_or_else(invalid)?;
+            let port = address
+                .strip_prefix("127.0.0.1:")
+                .and_then(|port| port.parse::<u16>().ok())
+                .filter(|port| *port != 0)
+                .ok_or_else(invalid)?;
+            let key = match scheme {
+                "http" => "web",
+                "https" => "secure",
+                "socks" => "socks",
+                _ => return Err(invalid()),
+            };
+            targets.insert(key, port);
+        }
+        if targets.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no proxy target",
+            ));
+        }
+        Ok(targets)
     }
 }
 
@@ -706,6 +1016,7 @@ mod tests {
                 proxy_enable: Some(0),
                 proxy_server: None,
                 proxy_override: Some("localhost".into()),
+                ..Default::default()
             },
             store_path: Some(store.clone()),
             ..Default::default()
@@ -750,6 +1061,7 @@ mod tests {
                 proxy_enable: Some(1),
                 proxy_server: Some("old".into()),
                 proxy_override: None,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -782,6 +1094,7 @@ mod tests {
                 proxy_enable: Some(1),
                 proxy_server: Some("old".into()),
                 proxy_override: None,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -814,6 +1127,7 @@ mod tests {
                 proxy_enable: None,
                 proxy_server: None,
                 proxy_override: None,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -867,6 +1181,7 @@ mod tests {
             proxy_enable: Some(1),
             proxy_server: Some("socks=127.0.0.1:10808".into()),
             proxy_override: Some("<local>".into()),
+            ..Default::default()
         };
         assert!(snapshot_matches(&base, &base.clone()));
 
@@ -920,6 +1235,186 @@ mod tests {
         let owner = mgr.ownership().unwrap();
         assert_eq!(owner.profile_id, "p1");
         assert_eq!(owner.applied_server, "socks=127.0.0.1:10808");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::macos::*;
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Records every networksetup invocation and answers reads from a script.
+    #[derive(Default)]
+    struct FakeNetworksetup {
+        answers: HashMap<String, String>,
+        writes: Vec<Vec<String>>,
+    }
+    impl NetworksetupRunner for FakeNetworksetup {
+        fn run(&mut self, args: &[String]) -> io::Result<String> {
+            let key = args.join(" ");
+            if args[0].starts_with("-set") {
+                self.writes.push(args.to_vec());
+                return Ok(String::new());
+            }
+            self.answers
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| io::Error::other(format!("unexpected read {key}")))
+        }
+    }
+
+    const ORDER: &str = "An asterisk (*) denotes that a network service is disabled.\n\
+(1) Wi-Fi\n(Hardware Port: Wi-Fi, Device: en0)\n\n\
+(2) incy\n(Hardware Port: com.wireguard.macos, Device: )\n\n\
+(*) iPhone USB\n(Hardware Port: iPhone USB, Device: en9)\n\n\
+(3) USB LAN\n(Hardware Port: USB 10/100/1000 LAN, Device: en7)\n";
+
+    fn proxy(enabled: bool, server: &str, port: u16) -> String {
+        format!(
+            "Enabled: {}\nServer: {server}\nPort: {port}\nAuthenticated Proxy Enabled: 0\n",
+            if enabled { "Yes" } else { "No" }
+        )
+    }
+
+    fn fake() -> FakeNetworksetup {
+        let mut fake = FakeNetworksetup::default();
+        fake.answers
+            .insert("-listnetworkserviceorder".into(), ORDER.into());
+        for service in ["Wi-Fi", "USB LAN"] {
+            fake.answers
+                .insert(format!("-getwebproxy {service}"), proxy(false, "", 0));
+            fake.answers.insert(
+                format!("-getsecurewebproxy {service}"),
+                proxy(true, "corp.proxy", 3128),
+            );
+            fake.answers.insert(
+                format!("-getsocksfirewallproxy {service}"),
+                proxy(false, "", 0),
+            );
+            fake.answers.insert(
+                format!("-getproxybypassdomains {service}"),
+                "*.local\n169.254/16\n".into(),
+            );
+        }
+        fake
+    }
+
+    #[test]
+    fn hardware_services_skip_disabled_and_vpn_entries() {
+        assert_eq!(hardware_services(ORDER), vec!["Wi-Fi", "USB LAN"]);
+    }
+
+    #[test]
+    fn snapshot_captures_every_proxy_kind_and_bypass_list() {
+        let mut adapter = MacProxyAdapter::with_runner(fake());
+        let snapshot = adapter.snapshot().unwrap();
+        assert_eq!(snapshot.macos_services.len(), 2);
+        let wifi = &snapshot.macos_services[0];
+        assert_eq!(wifi.service, "Wi-Fi");
+        assert!(!wifi.web.enabled);
+        assert_eq!(
+            wifi.secure_web,
+            MacProxyEndpoint {
+                enabled: true,
+                server: "corp.proxy".into(),
+                port: 3128
+            }
+        );
+        assert_eq!(wifi.bypass, vec!["*.local", "169.254/16"]);
+    }
+
+    #[test]
+    fn apply_points_http_https_and_socks_at_loopback_on_each_service() {
+        let mut adapter = MacProxyAdapter::with_runner(fake());
+        adapter
+            .apply(
+                "http=127.0.0.1:20809;https=127.0.0.1:20809;socks=127.0.0.1:20808",
+                "localhost;*.corp",
+            )
+            .unwrap();
+        let writes = &adapter.runner().writes;
+        for service in ["Wi-Fi", "USB LAN"] {
+            for (verb, port) in [
+                ("-setwebproxy", "20809"),
+                ("-setsecurewebproxy", "20809"),
+                ("-setsocksfirewallproxy", "20808"),
+            ] {
+                assert!(writes.contains(&vec![
+                    verb.to_string(),
+                    service.to_string(),
+                    "127.0.0.1".into(),
+                    port.into()
+                ]));
+            }
+            assert!(writes.contains(&vec![
+                "-setproxybypassdomains".to_string(),
+                service.to_string(),
+                "localhost".into(),
+                "*.corp".into()
+            ]));
+        }
+        assert!(!writes.iter().any(|w| w.contains(&"incy".to_string())));
+    }
+
+    #[test]
+    fn apply_rejects_non_loopback_targets() {
+        let mut adapter = MacProxyAdapter::with_runner(fake());
+        assert!(adapter.apply("socks=192.0.2.1:1080", "").is_err());
+        assert!(adapter.runner().writes.is_empty());
+    }
+
+    #[test]
+    fn restore_reinstates_previous_values_and_disables_unused_kinds() {
+        let mut adapter = MacProxyAdapter::with_runner(fake());
+        let snapshot = adapter.snapshot().unwrap();
+        adapter.restore(&snapshot).unwrap();
+        let writes = &adapter.runner().writes;
+        assert!(writes.contains(&vec![
+            "-setsecurewebproxy".to_string(),
+            "Wi-Fi".into(),
+            "corp.proxy".into(),
+            "3128".into()
+        ]));
+        assert!(writes.contains(&vec![
+            "-setwebproxystate".to_string(),
+            "Wi-Fi".into(),
+            "off".into()
+        ]));
+        assert!(writes.contains(&vec![
+            "-setsocksfirewallproxystate".to_string(),
+            "USB LAN".into(),
+            "off".into()
+        ]));
+        assert!(writes.contains(&vec![
+            "-setproxybypassdomains".to_string(),
+            "Wi-Fi".into(),
+            "*.local".into(),
+            "169.254/16".into()
+        ]));
+    }
+
+    #[test]
+    fn manager_round_trip_persists_and_restores_through_mac_adapter() {
+        let dir = std::env::temp_dir().join(format!("netorch-macproxy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut manager = SystemProxyManager::with_adapter(
+            dir.join("proxy.json"),
+            Box::new(MacProxyAdapter::with_runner(fake())),
+        )
+        .unwrap();
+        manager
+            .apply_with_http("profile-a", 20808, Some(20809), &[])
+            .unwrap();
+        let owner = manager.ownership().unwrap();
+        assert_eq!(
+            owner.applied_server,
+            "http=127.0.0.1:20809;https=127.0.0.1:20809;socks=127.0.0.1:20808"
+        );
+        assert_eq!(owner.snapshot.macos_services.len(), 2);
+        manager.restore("profile-a").unwrap();
+        assert!(manager.ownership().is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

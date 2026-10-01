@@ -247,7 +247,102 @@ pub fn generate_vless_config(uri: &str, socks_port: u16) -> io::Result<Value> {
     ))
 }
 
+/// Subscription entries that arrive as complete Xray JSON configs (Remnawave
+/// and similar panels serve this format to v2rayN) are stored next to share
+/// links as `xray-json:<base64url>` so switching, refresh and naming reuse the
+/// share-link paths unchanged.
+pub const XRAY_JSON_PREFIX: &str = "xray-json:";
+/// Only routing-relevant sections survive; `log` (arbitrary file paths), `api`,
+/// `stats`, `inbounds` and anything else from the untrusted panel is dropped.
+const XRAY_JSON_KEEP: [&str; 6] = [
+    "outbounds",
+    "routing",
+    "dns",
+    "policy",
+    "observatory",
+    "burstObservatory",
+];
+
+pub fn xray_json_entry(config: &Value) -> io::Result<String> {
+    use base64::Engine;
+    let object = config
+        .as_object()
+        .ok_or_else(|| invalid_input("xray config must be an object"))?;
+    if object
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .is_none_or(|outbounds| outbounds.is_empty())
+    {
+        return Err(invalid_input("xray config has no outbounds"));
+    }
+    let mut kept = Map::new();
+    for key in XRAY_JSON_KEEP {
+        if let Some(value) = object.get(key) {
+            kept.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(remarks) = object.get("remarks").and_then(Value::as_str) {
+        kept.insert("remarks".into(), json!(remarks));
+    }
+    let bytes = serde_json::to_vec(&Value::Object(kept))
+        .map_err(|_| invalid_input("xray config could not be encoded"))?;
+    Ok(format!(
+        "{XRAY_JSON_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    ))
+}
+
+fn decode_xray_json_entry(uri: &str) -> io::Result<Map<String, Value>> {
+    use base64::Engine;
+    let encoded = uri
+        .trim()
+        .strip_prefix(XRAY_JSON_PREFIX)
+        .ok_or_else(|| invalid_input("not an xray-json entry"))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| invalid_input("invalid xray-json entry"))?;
+    match serde_json::from_slice(&bytes) {
+        Ok(Value::Object(object)) => Ok(object),
+        _ => Err(invalid_input("invalid xray-json entry")),
+    }
+}
+
+fn generate_xray_json_config(uri: &str, socks_port: u16) -> io::Result<Value> {
+    if socks_port == 0 {
+        return Err(invalid_input("socks port must be nonzero"));
+    }
+    let entry = decode_xray_json_entry(uri)?;
+    let mut config = Map::new();
+    for key in XRAY_JSON_KEEP {
+        if let Some(value) = entry.get(key) {
+            config.insert(key.into(), value.clone());
+        }
+    }
+    if config
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .is_none_or(|outbounds| outbounds.is_empty())
+    {
+        return Err(invalid_input("xray config has no outbounds"));
+    }
+    config.insert("log".into(), json!({ "loglevel": "warning" }));
+    config.insert(
+        "inbounds".into(),
+        json!([{
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+            "settings": { "udp": true },
+        }]),
+    );
+    Ok(Value::Object(config))
+}
+
 pub fn generate_share_link_config(uri: &str, socks_port: u16) -> io::Result<Value> {
+    if uri.trim().starts_with(XRAY_JSON_PREFIX) {
+        return generate_xray_json_config(uri, socks_port);
+    }
     match uri.trim().split_once("://").map(|(scheme, _)| scheme) {
         Some("vless") => generate_vless_config(uri, socks_port),
         Some("hysteria2" | "hy2") => generate_hysteria2_config(uri, socks_port),
@@ -276,6 +371,12 @@ pub fn generate_share_link_config_with_http(
 }
 
 pub fn share_link_name(uri: &str) -> Option<String> {
+    if uri.trim().starts_with(XRAY_JSON_PREFIX) {
+        return decode_xray_json_entry(uri)
+            .ok()
+            .and_then(|entry| entry.get("remarks")?.as_str().map(str::to_string))
+            .filter(|name| !name.trim().is_empty());
+    }
     uri.rsplit_once('#')
         .map(|(_, fragment)| percent_decode(fragment))
         .filter(|name| !name.trim().is_empty())
@@ -762,6 +863,94 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    /// Opt-in: XRAY_TEST_BIN=/path/to/xray validates a panel-style JSON entry.
+    #[test]
+    fn xray_accepts_generated_panel_json_config_when_binary_supplied() {
+        let Ok(binary) = std::env::var("XRAY_TEST_BIN") else {
+            return;
+        };
+        let panel = json!({
+            "remarks": "🇳🇱 Netherlands",
+            "dns": {"servers": ["1.1.1.1", "8.8.8.8"]},
+            "inbounds": [{"tag": "socks", "port": 10808, "protocol": "socks"}],
+            "outbounds": [
+                {"tag": "proxy", "protocol": "vless", "settings": {"vnext": [{"address": "nl.example.test", "port": 443, "users": [{"id": "00000000-0000-4000-8000-000000000000", "encryption": "none", "flow": "xtls-rprx-vision"}]}]},
+                 "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"serverName": "www.example.test", "fingerprint": "chrome", "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "shortId": "0123"}}},
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "block", "protocol": "blackhole"}
+            ],
+            "routing": {"domainStrategy": "IPIfNonMatch", "rules": [
+                {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+                {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"}
+            ]}
+        });
+        let entry = xray_json_entry(&panel).unwrap();
+        let config = generate_share_link_config_with_http(&entry, 20808, 20809).unwrap();
+        let mut child = std::process::Command::new(&binary)
+            .args(["run", "-test", "-config", "stdin:"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(config.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    fn panel_config(name: &str) -> Value {
+        json!({
+            "remarks": name,
+            "log": {"loglevel": "debug", "access": "/tmp/stolen.log"},
+            "api": {"tag": "api", "services": ["HandlerService"]},
+            "stats": {},
+            "inbounds": [{"tag": "socks", "port": 10808, "listen": "0.0.0.0", "protocol": "socks"}],
+            "outbounds": [
+                {"tag": "proxy", "protocol": "vless", "settings": {"vnext": []}},
+                {"tag": "direct", "protocol": "freedom"},
+            ],
+            "routing": {"domainStrategy": "IPIfNonMatch", "rules": [{"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"}]},
+            "dns": {"servers": ["1.1.1.1"]},
+        })
+    }
+
+    #[test]
+    fn xray_json_entry_keeps_its_remarks_as_the_endpoint_name() {
+        let entry = xray_json_entry(&panel_config("🇳🇱 Netherlands")).unwrap();
+        assert!(entry.starts_with(XRAY_JSON_PREFIX));
+        assert!(!entry.contains('#') && !entry.contains('\n'));
+        assert_eq!(share_link_name(&entry).as_deref(), Some("🇳🇱 Netherlands"));
+        assert!(xray_json_entry(&json!({"remarks": "x"})).is_err());
+    }
+
+    #[test]
+    fn xray_json_entry_config_uses_our_listeners_and_drops_unsafe_sections() {
+        let entry = xray_json_entry(&panel_config("DE")).unwrap();
+        let config = generate_share_link_config_with_http(&entry, 20808, 20809).unwrap();
+        let inbounds = config["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 2);
+        assert_eq!(inbounds[0]["listen"], "127.0.0.1");
+        assert_eq!(inbounds[0]["port"], 20808);
+        assert_eq!(inbounds[1]["port"], 20809);
+        assert_eq!(config["log"], json!({"loglevel": "warning"}));
+        for dropped in ["api", "stats", "remarks"] {
+            assert!(config.get(dropped).is_none(), "{dropped} kept");
+        }
+        assert_eq!(config["outbounds"][0]["tag"], "proxy");
+        assert_eq!(config["routing"]["domainStrategy"], "IPIfNonMatch");
+        assert_eq!(config["dns"]["servers"][0], "1.1.1.1");
+    }
+
     use super::*;
     use crate::models::DomainRouteTarget;
     use serde_json::json;

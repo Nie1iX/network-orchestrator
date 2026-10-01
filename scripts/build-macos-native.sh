@@ -1,5 +1,18 @@
 #!/bin/bash
 set -euo pipefail
+# Usage: build-macos-native.sh [--dev]
+#   default  release bridge (LTO) + Swift release: the distributable bundle.
+#   --dev    release-fast bridge (no LTO, incremental) + Swift debug: fast local
+#            iteration with symbols; same bundle path, not for distribution.
+CARGO_PROFILE=release
+SWIFT_CONFIG=release
+if [[ "${1:-}" == --dev ]]; then
+    CARGO_PROFILE=release-fast
+    SWIFT_CONFIG=debug
+elif [[ -n "${1:-}" ]]; then
+    echo "Unknown option: $1" >&2
+    exit 2
+fi
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="$REPO_ROOT/target/macos/Network Orchestrator.app"
 if [[ "$(uname -s)" != Darwin ]]; then
@@ -15,10 +28,10 @@ export MACOSX_DEPLOYMENT_TARGET=27.0
 cd "$REPO_ROOT"
 python3 scripts/generate-ui-theme.py --check
 python3 scripts/generate-localizations.py --check
-cargo build --release -p net-manager-macos-bridge
-swift build --package-path macos --configuration release --scratch-path target/macos-swift
+bash "$REPO_ROOT/scripts/stage-macos-bridge.sh" "$CARGO_PROFILE"
+swift build --package-path macos --configuration "$SWIFT_CONFIG" --scratch-path target/macos-swift
 VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "net-manager-macos-bridge"))')"
-BIN_DIR="$(swift build --package-path macos --configuration release --scratch-path target/macos-swift --show-bin-path)"
+BIN_DIR="$(swift build --package-path macos --configuration "$SWIFT_CONFIG" --scratch-path target/macos-swift --show-bin-path)"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 install -m 0755 "$BIN_DIR/NetworkOrchestrator" "$APP_DIR/Contents/MacOS/NetworkOrchestrator"
 cp "$REPO_ROOT/src-tauri/icons/icon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"

@@ -46,6 +46,9 @@ npm run build
 
 - `cargo test -p net-manager-core <filter>` / `-p net-manager-app <filter>` —
   focused tests.
+- `scripts/macos-dev.sh build|run|test|preview|check|du|clean` — native
+  macOS loop: `release-fast` bridge (no LTO, incremental) + Swift debug,
+  isolated QA data for `run`, offscreen renders for `preview`.
 - `npm run tauri dev` — dev run; on Windows,
   `npm run tauri build -- --bundles nsis` builds unsigned NSIS under
   `target/release/bundle/nsis/`; on Linux use `scripts/build-linux-deb.sh`
@@ -76,6 +79,13 @@ npm run build
 - Managed backend downloads must stay fixed-version, hash-pinned, bounded,
   allowlisted, and atomic; tests use synthetic archives and never hit the
   network or install into real app data.
+- `crates/macos-bridge` stays unprivileged: never add `daemon_protocol`
+  methods or network mutations to it. macOS mutations go through a launchd
+  helper speaking `daemon_protocol` over a Unix socket
+  (`docs/plans/2026-09-30-14-macos-privileged-helper.md`). The only
+  exceptions are user-level: the managed Xray child listening on loopback and
+  the per-user system proxy via `networksetup` (snapshot + rollback through
+  `SystemProxyManager`). Routes, interfaces and DNS stay helper-only.
 - Do not commit unless explicitly asked; do not push to `main`/`master`.
 
 ## Conventions

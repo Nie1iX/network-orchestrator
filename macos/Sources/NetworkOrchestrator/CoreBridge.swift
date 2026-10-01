@@ -21,6 +21,23 @@ actor CoreBridge {
   let root: URL
   init(root: URL) { self.root = root }
   func call<T: Decodable & Sendable>(_ method: String, args: [String: String] = [:]) throws -> T {
+    try Self.perform(root: root, method, args: args)
+  }
+  /// Runs off the actor so several slow calls (delay probes) proceed in
+  /// parallel; only for bridge methods that do not take the store lock.
+  nonisolated func callConcurrently<T: Decodable & Sendable>(
+    _ method: String, args: [String: String] = [:]
+  ) async throws -> T {
+    let root = root
+    return try await Task.detached { try Self.perform(root: root, method, args: args) }.value
+  }
+  /// Blocking call for app termination, when the actor can no longer be awaited.
+  nonisolated func callSync(_ method: String) {
+    let _: [String: String]? = try? Self.perform(root: root, method, args: [:])
+  }
+  private static func perform<T: Decodable>(root: URL, _ method: String, args: [String: String])
+    throws -> T
+  {
     let request = try JSONEncoder().encode(CoreRequest(root: root.path, method: method, args: args))
     let pointer = request.withUnsafeBytes { bytes in
       netorch_call(bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count)

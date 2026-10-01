@@ -107,37 +107,31 @@ struct NetworkView: View {
       ForEach(categoryOrder, id: \.self) { category in
         let rows = filtered.filter { $0.category == category }
         if !rows.isEmpty {
-          VStack(alignment: .leading, spacing: 10.5) {
+          VStack(alignment: .leading, spacing: 0) {
             Button {
               if !collapsed.insert(category).inserted { collapsed.remove(category) }
             } label: {
               HStack(spacing: 7) {
-                NativeIcon(name: "ChevronIcon", size: 16).rotationEffect(
+                NativeIcon(name: "ChevronIcon", size: 12).rotationEffect(
                   .degrees(collapsed.contains(category) ? 0 : 180))
-                NativeIcon(name: NativeIcon.category(category), size: 16)
+                NativeIcon(name: NativeIcon.category(category), size: 14)
                 Text(L10n.text(categoryLabel(category))).font(
-                  .system(size: 13.3, weight: .semibold))
-                Text("\(rows.count)").font(.system(size: 10.08)).padding(.horizontal, 7).padding(
-                  .vertical, 1
-                ).background(p.border, in: Capsule())
-                Text(L10n.text(categoryDescription(category))).font(.system(size: 10.92))
-                  .foregroundStyle(
-                    p.muted)
+                  .system(size: 11.2, weight: .semibold))
+                Text("· \(rows.count)").font(.system(size: 10.08)).foregroundStyle(p.muted)
                 Spacer()
-              }.foregroundStyle(p.secondary).padding(.vertical, 7)
-            }.buttonStyle(.plain)
+                Text(L10n.text(categoryDescription(category))).font(.system(size: 10.5))
+                  .foregroundStyle(p.muted)
+              }.foregroundStyle(p.secondary).padding(.horizontal, 8).padding(.vertical, 5)
+                .background(p["bg-elev"], in: RoundedRectangle(cornerRadius: 4))
+                .contentShape(Rectangle())
+            }.buttonStyle(.plain).padding(.bottom, 4)
             if !collapsed.contains(category) {
-              LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 290), spacing: 14, alignment: .top)],
-                alignment: .leading, spacing: 14
-              ) {
-                ForEach(rows) { interface in
-                  Button {
-                    selected = interface
-                  } label: {
-                    InterfaceCard(interface: interface)
-                  }.buttonStyle(.plain)
-                }
+              ForEach(rows) { interface in
+                Button {
+                  selected = interface
+                } label: {
+                  InterfaceRow(interface: interface)
+                }.buttonStyle(.plain)
               }
             }
           }.padding(.bottom, 14)
@@ -628,16 +622,31 @@ struct SettingsView: View {
             HStack(spacing: 10.5) {
               Text(backend).font(.system(size: 11.48, weight: .semibold)).frame(
                 width: 77, alignment: .leading)
-              AppBadge(text: "Not available")
-              Text(L10n.text("Native VPN provider pending")).font(.system(size: 11.48))
-                .foregroundStyle(
-                  p.secondary)
-              Spacer()
+              if backend == "Xray", model.canStartConnections, let runtime = model.runtime {
+                AppBadge(
+                  text: runtime.xrayInstalled ? "native.installed" : "statusbar.state.absent",
+                  color: runtime.xrayInstalled ? "up" : "unknown")
+                Text(L10n.text("native.xraySettings", ["version": runtime.xrayVersion])).font(
+                  .system(size: 11.48)
+                ).foregroundStyle(p.secondary)
+                Spacer()
+                if !runtime.xrayInstalled {
+                  Button(L10n.text(model.installingXray ? "native.installing" : "native.installXray"))
+                  { Task { await model.installXray() } }.disabled(model.installingXray)
+                }
+              } else {
+                AppBadge(text: "Not available")
+                Text(L10n.text("Native VPN provider pending")).font(.system(size: 11.48))
+                  .foregroundStyle(p.secondary)
+                Spacer()
+              }
             }
           }
           Text(
             L10n.text(
-              "Configuration import and analysis work. VPN activation and backend installation are not implemented in this native version."
+              model.canStartConnections
+                ? "native.backendsNote"
+                : "Configuration import and analysis work. VPN activation and backend installation are not implemented in this native version."
             )
           ).font(.system(size: 10.92)).foregroundStyle(p.muted)
         }.padding(10.5)
@@ -677,5 +686,52 @@ struct SettingsView: View {
         p.card, in: RoundedRectangle(cornerRadius: 12)
       ).overlay(RoundedRectangle(cornerRadius: 12).stroke(p.border, lineWidth: 1))
     }
+  }
+}
+
+/// Dense single-line interface row matching the Tauri Network tab.
+struct InterfaceRow: View {
+  @Environment(\.palette) private var p
+  @State private var hovered = false
+  let interface: NetworkInterface
+  private var meta: String {
+    var parts = [interface.kind.label]
+    if let tunnel = interface.tunnelType { parts.insert(tunnel, at: 0) }
+    if let mtu = interface.mtu { parts.append("MTU \(mtu)") }
+    if let speed = interface.linkSpeedMbps { parts.append("\(speed) Mbps") }
+    return parts.joined(separator: " · ")
+  }
+  var body: some View {
+    let up = interface.state == "up"
+    HStack(spacing: 8) {
+      Circle().fill(up ? p["up"] : p["unknown"]).frame(width: 7, height: 7)
+      NativeIcon(name: NativeIcon.category(interface.category), size: 14).foregroundStyle(
+        p.secondary)
+      Text(interface.friendlyName).font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
+      Text(meta).font(.system(size: 10.92)).foregroundStyle(p.muted).lineLimit(1)
+      Spacer(minLength: 12)
+      Text(
+        interface.addresses.first.map { "\($0.address)/\($0.prefixLen)" } ?? "—"
+      ).font(.system(size: 11.2, weight: .medium, design: .monospaced)).lineLimit(1)
+        .frame(width: 210, alignment: .leading)
+      Group {
+        if let rx = interface.rxBytes, let tx = interface.txBytes {
+        HStack(spacing: 2) {
+          NativeIcon(name: "ArrowDownIcon", size: 11)
+          Text(Self.bytes(rx))
+          NativeIcon(name: "ArrowUpIcon", size: 11).padding(.leading, 4)
+          Text(Self.bytes(tx))
+        }.font(.system(size: 10.92)).foregroundStyle(p.secondary)
+        }
+      }.frame(width: 160, alignment: .trailing)
+      AppBadge(text: up ? "Up" : "Down", color: up ? "up" : "down")
+    }
+    .padding(.horizontal, 8).padding(.vertical, 6)
+    .background(hovered ? p.hover : .clear)
+    .overlay(alignment: .bottom) { Rectangle().fill(p.border).frame(height: 1) }
+    .contentShape(Rectangle()).onHover { hovered = $0 }
+  }
+  static func bytes(_ value: UInt64) -> String {
+    ByteCountFormatter.string(fromByteCount: Int64(clamping: value), countStyle: .binary)
   }
 }

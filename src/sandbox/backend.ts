@@ -49,9 +49,9 @@ export class SandboxBackend {
   private authMode: VpnAuthMode = "fullTunnelOnly";
   private recovered = false;
   private endpoints = [
-    "AcmeVPN - ⚡ Нидерланды",
-    "AcmeVPN - 🇩🇪 Германия",
-    "AcmeVPN - 🇫🇮 Финляндия",
+    "AcmeVPN - ⚡ Нидерланды", "AcmeVPN - 🇩🇪 Германия", "AcmeVPN - 🇫🇮 Финляндия",
+    "AcmeVPN - 🇯🇵 Япония", "AcmeVPN - 🇺🇸 США", "AcmeVPN - 🇧🇷 Бразилия",
+    "AcmeVPN - 🇸🇬 Сингапур", "AcmeVPN - 🇬🇧 Великобритания",
   ];
   private backendPaths = new Map<string, string>();
   private xrayManaged = false;
@@ -73,7 +73,7 @@ export class SandboxBackend {
     // demonstrates the "interface occupied" conflict until it is connected.
     this.profiles[0].interfaceName = "wg-home";
     this.profiles[2].subscription = {
-      url: "", hwid: "", endpointCount: 3, activeIndex: 0,
+      url: "", hwid: "", endpointCount: this.endpoints.length, activeIndex: 0,
       refreshIntervalMinutes: null, lastRefreshAtUnix: null, lastRefreshError: null,
       providerTitle: "AcmeVPN",
       announce: "Maintenance window on Saturday 03:00–05:00 UTC.\nNL endpoints may flap briefly.",
@@ -166,7 +166,10 @@ export class SandboxBackend {
 
   invoke(command: string, args: Record<string, unknown> = {}): unknown {
     // Clone responses to prevent UI edits from mutating backend state by reference.
-    return structuredClone(this.dispatch(command, args));
+    const result = this.dispatch(command, args);
+    // Slow synthetic commands (delay probes) resolve later; clone on arrival.
+    if (result instanceof Promise) return result.then((value) => structuredClone(value));
+    return structuredClone(result);
   }
 
   private dispatch(command: string, args: Record<string, unknown>): unknown {
@@ -279,9 +282,36 @@ export class SandboxBackend {
         const p = this.find(args.id); this.stopped(p);
         if (!p.subscription) throw new Error("Not a subscription profile");
         p.subscription.lastRefreshAtUnix = Math.floor(Date.now() / 1000);
-        return { endpointCount: 3, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false };
+        return { endpointCount: this.endpoints.length, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false };
       }
-      case "measure_subscription_endpoint_delay": return { delayMs: 42, error: null };
+      case "measure_subscription_endpoint_delay": {
+        // Deterministic synthetic latency with a real wait, so the browser
+        // preview shows probes landing one by one; every fourth one times out.
+        const index = Number(args.endpointIndex);
+        const delayMs = 60 + ((index * 263) % 900);
+        const unreachable = index % 4 === 3;
+        return new Promise((resolve) =>
+          setTimeout(
+            () => resolve(unreachable ? { delayMs: null, error: "delay probe timed out" } : { delayMs, error: null }),
+            unreachable ? 2500 : delayMs * 2,
+          ));
+      }
+      case "import_share_link": {
+        const link = String(args.link ?? "").trim();
+        const invalid = () => new Error("Invalid or unsupported share link. Use vless://, hysteria2:// or hy2://.");
+        let url: URL;
+        try { url = new URL(link); } catch { throw invalid(); }
+        if (link.length > 65536 || /[\r\n]/.test(link) || !["vless:", "hysteria2:", "hy2:"].includes(url.protocol) || !url.username || !url.hostname || url.port === "0") throw invalid();
+        let name = String(args.name ?? "").trim();
+        if (!name) {
+          try { name = decodeURIComponent(url.hash.slice(1)).trim(); } catch { name = ""; }
+        }
+        const p = profile(`link-${this.profiles.length}`, name || "Imported connection", "xray");
+        this.allocateProxyPorts(p);
+        p.configPath = `/sandbox/${p.id}.json`;
+        this.profiles.push(p);
+        return { profiles: this.profiles, errors: [] };
+      }
       case "import_subscription": {
         const p = profile(`subscription-${this.profiles.length}`, "QA Imported subscription", "xray");
         this.allocateProxyPorts(p);

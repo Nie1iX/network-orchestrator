@@ -97,6 +97,13 @@ struct TranslationCatalog: Decodable, Sendable {
     [("system", "System")] + catalogs.keys.sorted().map { ($0, catalogs[$0]!.name) }
   }
   func text(_ key: String, _ arguments: [String: String] = [:]) -> String {
+    // Core errors may carry a technical detail: "Known message (detail)".
+    if catalogs["en"]?.messages[key] == nil, key.hasSuffix(")"),
+      let range = key.range(of: " ("),
+      catalogs["en"]?.messages[String(key[..<range.lowerBound])] != nil
+    {
+      return text(String(key[..<range.lowerBound]), arguments) + String(key[range.lowerBound...])
+    }
     let translated = catalogs[language]?.messages[key]
     let catalog = translated == nil ? catalogs["en"] : catalogs[language]
     let message = translated ?? catalogs["en"]?.messages[key] ?? .text(key)

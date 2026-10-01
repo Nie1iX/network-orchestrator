@@ -1,18 +1,44 @@
+import AppKit
 import Foundation
 import Observation
+import OSLog
+import SystemConfiguration
 
 @MainActor @Observable final class AppModel {
   let core: CoreBridge
+  /// Separate channel for multi-second delay probes so status polling and
+  /// edits never wait behind them.
+  let probeCore: CoreBridge
+  /// Last measured delay per profile and endpoint index; nil = no response.
+  var delays: [String: [Int: UInt64?]] = [:]
+  /// Endpoint indices still being measured, per profile.
+  var probing: [String: Set<Int>] = [:]
+  var refreshing = Set<String>()
   var snapshot: Snapshot?
   var capabilities: Capabilities?
   var section: Section = .home
   var search = ""
-  var error: String?
+  /// User-facing error. Bridge errors are secret-free by design, so they are
+  /// also mirrored to the unified log (Xcode console, Console.app).
+  var error: String? {
+    didSet { if let error { Self.log.error("\(error, privacy: .public)") } }
+  }
+  private static let log = Logger(subsystem: "com.netmanager.app.macos", category: "app")
   var busy = false
+  var subscriptionEndpoints: [String: [SubscriptionEndpoint]] = [:]
+  var importSkippedCount = 0
   var inspecting: Profile?
   var inspection: Inspection?
   var lookup: Lookup?
   var lookupDestination = ""
+  var runtime: RuntimeState?
+  var selectedProfileID: String?
+  var inspections: [String: Inspection] = [:]
+  var pending = Set<String>()
+  var installingXray = false
+  /// Interface carrying the system default route, e.g. `en0` or a VPN `utun9`.
+  var primaryInterface: String?
+  var notice: String?
 
   init(dataDirectory: URL? = nil) {
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -23,6 +49,7 @@ import Observation
       }
       ?? base.appendingPathComponent("com.netmanager.app.macos", isDirectory: true)
     core = CoreBridge(root: root)
+    probeCore = CoreBridge(root: root)
   }
   var profiles: [Profile] {
     (snapshot?.profiles ?? []).filter {
@@ -30,6 +57,101 @@ import Observation
         || $0.kind.localizedCaseInsensitiveContains(search)
     }
   }
+  var selectedProfile: Profile? {
+    let all = snapshot?.profiles ?? []
+    return all.first { $0.id == selectedProfileID } ?? profiles.first
+  }
+  func status(_ profile: Profile) -> TunnelStatus? {
+    runtime?.statuses.first { $0.profileId == profile.id }
+  }
+  func isRunning(_ profile: Profile) -> Bool { status(profile)?.state == "running" }
+  var activeCount: Int { runtime?.statuses.filter { $0.state == "running" }.count ?? 0 }
+  var canStartConnections: Bool { capabilities?.proxyConnections ?? false }
+  /// A packet-tunnel VPN (e.g. incy) owns the primary service, so macOS takes
+  /// proxy settings from it and ignores ours on Wi-Fi/Ethernet.
+  var systemProxyOverridden: Bool { primaryInterface?.hasPrefix("utun") ?? false }
+
+  func refreshRuntime() async {
+    primaryInterface = Self.currentPrimaryInterface()
+    do { runtime = try await core.call("runtime") } catch { runtime = nil }
+  }
+  func toggle(_ profile: Profile) async {
+    guard !pending.contains(profile.id) else { return }
+    pending.insert(profile.id)
+    defer { pending.remove(profile.id) }
+    do {
+      runtime = try await core.call(
+        isRunning(profile) ? "disconnect" : "connect", args: ["id": profile.id])
+      error = nil
+    } catch {
+      self.error = error.localizedDescription
+      await refreshRuntime()
+    }
+  }
+  func setSystemProxy(_ profile: Profile, enabled: Bool) async {
+    do {
+      runtime = try await core.call(
+        "set_system_proxy", args: ["id": profile.id, "enabled": enabled ? "true" : "false"])
+      if enabled && systemProxyOverridden {
+        notice = "native.proxyOverridden"
+      }
+    } catch { self.error = error.localizedDescription }
+  }
+  func installXray(archive: URL? = nil) async {
+    installingXray = true
+    defer { installingXray = false }
+    do {
+      let _: [String: Bool] = try await core.call(
+        "install_xray", args: archive.map { ["archivePath": $0.path] } ?? [:])
+      await refreshRuntime()
+    } catch { self.error = error.localizedDescription }
+  }
+  func loadInspection(_ profile: Profile) async {
+    guard inspections[profile.id] == nil else { return }
+    if let result: Inspection = try? await core.call("inspect", args: ["id": profile.id]) {
+      inspections[profile.id] = result
+    }
+  }
+  /// Opens a separate Chrome profile that sends everything through this
+  /// connection's SOCKS listener; DNS is resolved remotely by the proxy.
+  func openBrowser(_ profile: Profile) {
+    guard let port = profile.xraySocksPort else { return }
+    let data = core.root.appendingPathComponent("browser", isDirectory: true)
+      .appendingPathComponent(profile.id, isDirectory: true)
+    try? FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    process.arguments = [
+      "-na", "Google Chrome", "--args", "--user-data-dir=\(data.path)",
+      "--proxy-server=socks5://127.0.0.1:\(port)", "--no-first-run",
+      "https://www.youtube.com/",
+    ]
+    do { try process.run() } catch { self.error = "native.browserFailed" }
+  }
+  func terminalProxyCommands(_ profile: Profile) -> String? {
+    guard let socks = profile.xraySocksPort else { return nil }
+    let http = profile.xrayHttpPort.map { "http://127.0.0.1:\($0)" } ?? "socks5h://127.0.0.1:\(socks)"
+    return
+      "export HTTP_PROXY=\(http) HTTPS_PROXY=\(http) ALL_PROXY=socks5h://127.0.0.1:\(socks) NO_PROXY=localhost,127.0.0.1,.local"
+  }
+  func copyTerminalProxy(_ profile: Profile) {
+    guard let text = terminalProxyCommands(profile) else { return }
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+    notice = "native.copied"
+  }
+  /// Stops our Xray processes and rolls back the system proxy. Blocking: runs
+  /// from applicationWillTerminate.
+  nonisolated func shutdown() { core.callSync("shutdown") }
+
+  nonisolated static func currentPrimaryInterface() -> String? {
+    guard let store = SCDynamicStoreCreate(nil, "NetworkOrchestrator" as CFString, nil, nil),
+      let value = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString)
+        as? [String: Any]
+    else { return nil }
+    return value["PrimaryInterface"] as? String
+  }
+
   func refresh() async {
     guard !busy else { return }
     busy = true
@@ -37,6 +159,14 @@ import Observation
     do {
       if capabilities == nil { capabilities = try await core.call("capabilities") }
       snapshot = try await core.call("snapshot")
+      var endpoints: [String: [SubscriptionEndpoint]] = [:]
+      for profile in snapshot?.profiles ?? [] where profile.subscription != nil {
+        endpoints[profile.id] = try await core.call(
+          "subscription_endpoints", args: ["id": profile.id])
+      }
+      subscriptionEndpoints = endpoints
+      inspections = [:]
+      await refreshRuntime()
       error = nil
     } catch { self.error = error.localizedDescription }
   }
@@ -51,8 +181,126 @@ import Observation
     return await change(
       "import", args: ["id": UUID().uuidString, "name": name, "backend": backend, "path": url.path])
   }
+  func importShareLink(_ link: String, name: String) async -> Bool {
+    await change("import_share_link", args: ["id": UUID().uuidString, "name": name, "link": link])
+  }
   func rename(_ profile: Profile, name: String) async -> Bool {
     await change("rename", args: ["id": profile.id, "name": name])
+  }
+  func importSubscription(url: String, hwid: String, name: String) async -> Bool {
+    guard !busy else { return false }
+    busy = true
+    importSkippedCount = 0
+    error = nil
+    do {
+      let result: SubscriptionImportResult = try await core.call(
+        "import_subscription",
+        args: [
+          "id": UUID().uuidString, "url": url.trimmingCharacters(in: .whitespacesAndNewlines),
+          "hwid": hwid.trimmingCharacters(in: .whitespacesAndNewlines), "name": name,
+        ])
+      busy = false
+      await refresh()
+      importSkippedCount = result.skippedCount
+      return true
+    } catch {
+      busy = false
+      self.error = error.localizedDescription
+      return false
+    }
+  }
+  /// Stable per-device HWID, derived in the core from this Mac's hardware ID.
+  func generateHWID() async -> String? {
+    do {
+      let value: String = try await core.call("generate_hwid")
+      return value
+    } catch {
+      self.error = error.localizedDescription
+      return nil
+    }
+  }
+  /// Switching a running connection reconnects it on the new server.
+  func switchEndpoint(_ profile: Profile, index: Int) async {
+    guard !pending.contains(profile.id) else { return }
+    pending.insert(profile.id)
+    defer { pending.remove(profile.id) }
+    _ = await change(
+      "switch_subscription_endpoint", args: ["id": profile.id, "index": String(index)])
+  }
+  /// Name of the selected server of a subscription profile.
+  func activeServer(_ profile: Profile) -> String? {
+    guard let subscription = profile.subscription,
+      let endpoints = subscriptionEndpoints[profile.id],
+      endpoints.indices.contains(subscription.activeIndex)
+    else { return nil }
+    return endpoints[subscription.activeIndex].name
+  }
+  /// Probes every server, up to eight at once, publishing each result the
+  /// moment it arrives so the list fills in live.
+  func measureDelays(_ profile: Profile) async {
+    let id = profile.id
+    guard probing[id] == nil, let count = subscriptionEndpoints[id]?.count, count > 0 else {
+      return
+    }
+    delays[id] = [:]
+    probing[id] = Set(0..<count)
+    defer { probing[id] = nil }
+    let core = probeCore
+    await withTaskGroup(of: (Int, Result<DelayResult, Error>).self) { group in
+      var next = 0
+      while next < min(8, count) {
+        let index = next
+        group.addTask {
+          do {
+            let result: DelayResult = try await core.callConcurrently(
+              "measure_delay", args: ["id": id, "index": String(index)])
+            return (index, .success(result))
+          } catch { return (index, .failure(error)) }
+        }
+        next += 1
+      }
+      for await (index, outcome) in group {
+        switch outcome {
+        case .success(let result): delays[id, default: [:]][index] = .some(result.delayMs)
+        case .failure(let failure):
+          delays[id, default: [:]][index] = .some(nil)
+          if failure.localizedDescription.hasPrefix("Install Xray") {
+            self.error = failure.localizedDescription
+          }
+        }
+        probing[id]?.remove(index)
+        if next < count {
+          let index = next
+          group.addTask {
+            do {
+              let result: DelayResult = try await core.callConcurrently(
+                "measure_delay", args: ["id": id, "index": String(index)])
+              return (index, .success(result))
+            } catch { return (index, .failure(error)) }
+          }
+          next += 1
+        }
+      }
+    }
+  }
+  func refreshSubscription(_ profile: Profile) async {
+    guard !refreshing.contains(profile.id) else { return }
+    refreshing.insert(profile.id)
+    defer { refreshing.remove(profile.id) }
+    do {
+      let outcome: RefreshOutcome = try await core.call(
+        "refresh_subscription", args: ["id": profile.id])
+      delays[profile.id] = nil
+      notice = L10n.text("native.refreshed", ["count": String(outcome.endpointCount)])
+      await refresh()
+    } catch { self.error = error.localizedDescription }
+  }
+  /// Toolbar refresh: re-fetch every subscription, then reload everything.
+  func refreshAll() async {
+    for profile in snapshot?.profiles ?? [] where profile.subscription != nil {
+      await refreshSubscription(profile)
+    }
+    await refresh()
   }
   func remove(_ profile: Profile) async { _ = await change("delete", args: ["id": profile.id]) }
   private func change(_ method: String, args: [String: String]) async -> Bool {

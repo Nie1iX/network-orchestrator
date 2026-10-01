@@ -3706,10 +3706,20 @@ a:focus-visible,
 
 .endpoint-item-delay {
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
   font-size: var(--fs-xs);
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
+
+.endpoint-item-delay .spin {
+  color: var(--accent);
+}
+
+.endpoint-item-delay.delay-good { color: var(--up); }
+.endpoint-item-delay.delay-fair { color: var(--warn); }
+.endpoint-item-delay.delay-bad { color: var(--down); }
 
 .endpoint-proto {
   flex-shrink: 0;

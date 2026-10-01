@@ -35,6 +35,7 @@ pub(crate) struct AppState {
     pub(crate) managed_xray_root: PathBuf,
     /// Per-profile downloaded geoip.dat/geosite.dat overrides
     /// (`geoassets/<profile-id>/`).
+    #[cfg(target_os = "linux")]
     pub(crate) geo_assets_root: PathBuf,
     pub(crate) backend_install_lock: tokio::sync::Mutex<()>,
     pub(crate) backend_install_cancel: AtomicBool,
@@ -147,6 +148,7 @@ pub(crate) fn build_state(data_dir: PathBuf) -> std::io::Result<AppState> {
         config_vault,
         backend_settings,
         managed_xray_root: data_dir.join("backends").join("xray"),
+        #[cfg(target_os = "linux")]
         geo_assets_root: data_dir.join("geoassets"),
         backend_install_lock: tokio::sync::Mutex::new(()),
         backend_install_cancel: AtomicBool::new(false),

@@ -106,6 +106,7 @@ pub fn run() {
             save_vless_profile,
             save_wireguard_profile,
             import_configs_batch,
+            import_share_link,
             import_subscription,
             refresh_subscription,
             set_subscription_refresh_interval,

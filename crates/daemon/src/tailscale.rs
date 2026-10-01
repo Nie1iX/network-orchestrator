@@ -63,11 +63,7 @@ fn localapi(socket: &Path, verb: &str, path: &str, body: &str) -> io::Result<Vec
         .ok_or_else(invalid_data)?;
     let head = std::str::from_utf8(&raw[..head_end]).map_err(|_| invalid_data())?;
     let status_line = head.lines().next().ok_or_else(invalid_data)?;
-    if !status_line
-        .split_whitespace()
-        .nth(1)
-        .is_some_and(|code| code == "200")
-    {
+    if status_line.split_whitespace().nth(1) != Some("200") {
         return Err(io::Error::other("tailscaled refused the request"));
     }
     let chunked = head
