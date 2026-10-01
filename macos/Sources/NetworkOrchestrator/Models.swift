@@ -277,3 +277,12 @@ struct ExitIpEntry: Decodable, Sendable {
   let country: String?
   let error: String?
 }
+
+/// A VPN configured by another app (e.g. incy), toggled with `scutil --nc`.
+struct ExternalVpn: Decodable, Identifiable, Sendable {
+  let id: String
+  let name: String
+  let state: String
+  let provider: String?
+  let enabled: Bool
+}

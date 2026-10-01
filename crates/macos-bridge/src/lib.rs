@@ -538,6 +538,26 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 ))
             })
         }
+        "external_vpns" => encode(
+            net_manager_core::macos_vpn::list(&mut net_manager_core::macos_vpn::SystemScutil)
+                .map_err(|_| "VPN services could not be listed".to_string())?,
+        ),
+        "set_external_vpn" => {
+            let id = args["id"].as_str().unwrap_or_default();
+            let connect = args["connect"].as_str() == Some("true");
+            net_manager_core::macos_vpn::nc_command(id, connect)
+                .map_err(|_| "Unknown VPN service".to_string())?;
+            net_manager_core::macos_vpn::set_connected(
+                &mut net_manager_core::macos_vpn::SystemScutil,
+                id,
+                connect,
+            )
+            .map_err(|_| "The VPN service could not be switched".to_string())?;
+            encode(
+                net_manager_core::macos_vpn::list(&mut net_manager_core::macos_vpn::SystemScutil)
+                    .map_err(|_| "VPN services could not be listed".to_string())?,
+            )
+        }
         "import_log" => {
             let text = std::fs::read_to_string(root.join("runtime/logs/subscription-import.log"))
                 .unwrap_or_default();
@@ -731,6 +751,18 @@ pub unsafe extern "C" fn netorch_free(value: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn external_vpn_toggle_rejects_malformed_service_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = dispatch(
+            dir.path(),
+            "set_external_vpn",
+            &json!({"id": "incy; rm -rf /", "connect": "true"}),
+        )
+        .unwrap_err();
+        assert_eq!(error, "Unknown VPN service");
+    }
+
     #[test]
     fn refresh_interval_is_validated_and_failures_are_recorded() {
         let (url, server) =

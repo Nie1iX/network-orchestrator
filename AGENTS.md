@@ -85,7 +85,9 @@ npm run build
   (`docs/plans/2026-09-30-14-macos-privileged-helper.md`). The only
   exceptions are user-level: the managed Xray child listening on loopback and
   the per-user system proxy via `networksetup` (snapshot + rollback through
-  `SystemProxyManager`). Routes, interfaces and DNS stay helper-only.
+  `SystemProxyManager`), and an explicit user toggle of another app's VPN
+  service via `scutil --nc start|stop <UUID>`. Routes, interfaces and DNS
+  stay helper-only.
 - Do not commit unless explicitly asked; do not push to `main`/`master`.
 
 ## Conventions

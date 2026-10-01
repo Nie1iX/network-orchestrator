@@ -17,6 +17,8 @@ import SystemConfiguration
   /// Exit-IP results per route: "direct" or a running profile id.
   var exitIPs: [String: [ExitIpEntry]] = [:]
   var checkingExitIP = Set<String>()
+  var externalVPNs: [ExternalVpn] = []
+  var switchingExternal = Set<String>()
   var snapshot: Snapshot?
   var capabilities: Capabilities?
   var section: Section = .home
@@ -77,6 +79,19 @@ import SystemConfiguration
   func refreshRuntime() async {
     primaryInterface = Self.currentPrimaryInterface()
     do { runtime = try await core.call("runtime") } catch { runtime = nil }
+    if let list: [ExternalVpn] = try? await core.call("external_vpns") { externalVPNs = list }
+  }
+  /// Connect or disconnect another app's VPN, as the VPN menu would.
+  func setExternalVPN(_ vpn: ExternalVpn, connect: Bool) async {
+    switchingExternal.insert(vpn.id)
+    defer { switchingExternal.remove(vpn.id) }
+    do {
+      externalVPNs = try await core.call(
+        "set_external_vpn", args: ["id": vpn.id, "connect": connect ? "true" : "false"])
+      // Connecting takes a moment; pick up the settled state.
+      try? await Task.sleep(for: .seconds(2))
+      await refreshRuntime()
+    } catch { self.error = error.localizedDescription }
   }
   func toggle(_ profile: Profile) async {
     guard !pending.contains(profile.id) else { return }
