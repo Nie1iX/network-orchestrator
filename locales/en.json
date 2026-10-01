@@ -338,7 +338,6 @@
     "cond.toggleDisable": "Disable rule",
     "cond.toggleEnable": "Enable rule",
     "cond.viaPh": "via (optional)",
-    "device-hwid": "device-hwid",
     "detail.actions": "Profile actions",
     "detail.activeEndpoint": "Active endpoint",
     "detail.alwaysOn": "Always-on",
@@ -410,6 +409,7 @@
     "detail.unlimited": "unlimited",
     "detail.unreachable": "unreachable",
     "detail.unsupported": "Unsupported",
+    "device-hwid": "device-hwid",
     "diag.title": "Diagnostics — {name}",
     "down": "down",
     "elev.actImportWg": "Importing WireGuard configs",
@@ -503,6 +503,8 @@
     "form.shareLink": "Import share link",
     "form.socksAuto": "SOCKS5 port will be assigned automatically when the profile is saved.",
     "form.socksMode": "SOCKS5 (system proxy)",
+    "form.splitDefault": "Split default route (0.0.0.0/1 + 128.0.0.0/1)",
+    "form.splitDefaultHint": "Two /1 halves instead of a single /0 — same full capture, but friendlier to other tunnel managers and route tools.",
     "form.staticHelp": "Static-routes profiles apply policy routes through an existing interface (e.g. Ethernet) without starting a tunnel.",
     "form.staticNoTunnel": "Static routes (no tunnel)",
     "form.sysProxy": "Use Windows system proxy",
@@ -626,8 +628,8 @@
       "one": "Connected: {count}",
       "other": "Connected: {count}"
     },
-    "native.copyFailed": "Could not copy to the clipboard.",
     "native.copied": "Proxy commands copied to the clipboard.",
+    "native.copyFailed": "Could not copy to the clipboard.",
     "native.copyTerminal": "Copy terminal proxy commands",
     "native.helperRequired": "Needs the macOS privileged helper (not available yet)",
     "native.hwidAuto": "Generate automatically",
@@ -807,8 +809,19 @@
     "rules.happHint": "Paste a Happ/Incy routing export — JSON, base64 or a happ:// link",
     "rules.importHapp": "Import Happ routing profile",
     "rules.matcherDefault": "Default",
+    "rules.outboundDns": "DNS resolvers",
     "rules.proxy": "Proxy",
+    "rules.srcDefault": "no rule matched — default outbound",
+    "rules.srcDnsCapture": "port-53 DNS capture",
+    "rules.srcMulticast": "built-in multicast block",
+    "rules.srcPolicy": "rule set #{index}",
+    "rules.srcPrivateLan": "private LAN bypass",
+    "rules.srcResolverPin": "DNS resolver pin",
     "rules.strategyDefault": "Default (AsIs)",
+    "rules.testCheck": "Check route",
+    "rules.testChecking": "Checking…",
+    "rules.testPlaceholder": "example.com, 8.8.8.8 or host:53…",
+    "rules.testProbable": "approximate — some selectors could not be evaluated locally",
     "sets.applyTitle": {
       "one": "Switch to exactly {count} connection",
       "other": "Switch to exactly {count} connections"
@@ -916,8 +929,6 @@
     "{count} total predicted": "{count} total predicted",
     "{value0} Mbps": "{value0} Mbps",
     "{value0} system routes": "{value0} system routes",
-    "{value0} warnings": "{value0} warnings",
-    "form.splitDefault": "Split default route (0.0.0.0/1 + 128.0.0.0/1)",
-    "form.splitDefaultHint": "Two /1 halves instead of a single /0 — same full capture, but friendlier to other tunnel managers and route tools."
+    "{value0} warnings": "{value0} warnings"
   }
 }

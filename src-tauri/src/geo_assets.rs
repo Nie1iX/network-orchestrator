@@ -18,7 +18,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-const MAX_GEO_ASSET_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_GEO_ASSET_BYTES: usize = 64 * 1024 * 1024;
 const REFRESH_AFTER_SECS: u64 = 24 * 60 * 60;
 const META_FILE: &str = "meta.json";
 
@@ -76,7 +76,11 @@ fn asset_dir_key(geoip_url: Option<&str>, geosite_url: Option<&str>) -> String {
     digest[..16].to_string()
 }
 
-fn profile_asset_dir(root: &Path, geoip_url: Option<&str>, geosite_url: Option<&str>) -> PathBuf {
+pub(crate) fn profile_asset_dir(
+    root: &Path,
+    geoip_url: Option<&str>,
+    geosite_url: Option<&str>,
+) -> PathBuf {
     root.join(asset_dir_key(geoip_url, geosite_url))
 }
 

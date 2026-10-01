@@ -11,6 +11,9 @@ import {
   PolicyRoute,
   Profile,
   ProfileInspection,
+  RouteCheckOutbound,
+  RouteCheckResult,
+  RouteCheckSource,
   TunnelBackend,
   WireGuardFields,
   XrayDnsConfig,
@@ -20,7 +23,7 @@ import {
 } from "../types";
 import { usePlatformCapabilities } from "../platform";
 import { ChevronIcon } from "../icons";
-import { t, useT } from "../i18n";
+import { t, useT, type TranslationKey } from "../i18n";
 import { BACKEND_LABEL_KEYS } from "../i18n/labels";
 
 const BACKEND_EXTENSIONS: Record<TunnelBackend, string[]> = {
@@ -54,6 +57,22 @@ const RULE_SETS = [
 ] as const;
 
 type RulesSetId = (typeof RULE_SETS)[number]["id"];
+
+const ROUTE_CHECK_OUTBOUND_KEYS: Record<RouteCheckOutbound, TranslationKey> = {
+  proxy: "rules.proxy",
+  direct: "rules.direct",
+  block: "rules.block",
+  dns: "rules.outboundDns",
+};
+
+const ROUTE_CHECK_SOURCE_KEYS: Record<RouteCheckSource, TranslationKey> = {
+  dnsCapture: "rules.srcDnsCapture",
+  policy: "rules.srcPolicy",
+  resolverPin: "rules.srcResolverPin",
+  multicast: "rules.srcMulticast",
+  privateLan: "rules.srcPrivateLan",
+  default: "rules.srcDefault",
+};
 
 /** Selector lines only — blank lines and # comments don't count. */
 function countRuleLines(text: string): number {
@@ -269,6 +288,10 @@ export default function ProfileFormModal({
   const [happPayload, setHappPayload] = useState("");
   const [happBusy, setHappBusy] = useState(false);
   const [happNotice, setHappNotice] = useState<string | null>(null);
+  const [routeCheckTarget, setRouteCheckTarget] = useState("");
+  const [routeCheckBusy, setRouteCheckBusy] = useState(false);
+  const [routeCheckResult, setRouteCheckResult] = useState<RouteCheckResult | null>(null);
+  const [routeCheckError, setRouteCheckError] = useState<string | null>(null);
   const [tab, setTab] = useState<FormTab>("general");
   const [rulesEditor, setRulesEditor] = useState<RulesSetId | null>(null);
   const tr = useT();
@@ -282,6 +305,9 @@ export default function ProfileFormModal({
       setHappPayload("");
       setHappOpen(false);
       setHappNotice(null);
+      setRouteCheckTarget("");
+      setRouteCheckResult(null);
+      setRouteCheckError(null);
       setTab("general");
       setRulesEditor(null);
       setProbeResults(null);
@@ -457,6 +483,41 @@ export default function ProfileFormModal({
       setHappNotice(String(err));
     } finally {
       setHappBusy(false);
+    }
+  };
+
+  const runRouteCheck = async () => {
+    const target = routeCheckTarget.trim();
+    if (!target) return;
+    setRouteCheckBusy(true);
+    setRouteCheckError(null);
+    try {
+      const result = await invoke<RouteCheckResult>("xray_test_route", {
+        request: {
+          target,
+          domainPolicies: textToPolicies(
+            current.rulesBlock,
+            current.rulesProxy,
+            current.rulesDirect,
+          ),
+          privateLanDirect: current.privateLanDirect,
+          domainStrategy: current.xrayDomainStrategy || null,
+          dns: current.xrayDns ?? {
+            servers: [],
+            hosts: {},
+            fakeDns: false,
+            queryStrategy: null,
+          },
+          geoipUrl: current.xrayGeoipUrl || null,
+          geositeUrl: current.xrayGeositeUrl || null,
+        },
+      });
+      setRouteCheckResult(result);
+    } catch (err) {
+      setRouteCheckResult(null);
+      setRouteCheckError(String(err));
+    } finally {
+      setRouteCheckBusy(false);
     }
   };
 
@@ -1287,6 +1348,68 @@ export default function ProfileFormModal({
             />
             {tr("form.privateLanDirect")}
           </label>
+          <div className="route-check">
+            <div className="route-check-row">
+              <input
+                type="text"
+                value={routeCheckTarget}
+                onChange={(e) => setRouteCheckTarget(e.target.value)}
+                placeholder={tr("rules.testPlaceholder")}
+                spellCheck={false}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void runRouteCheck();
+                  }
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => void runRouteCheck()}
+                disabled={routeCheckBusy || !routeCheckTarget.trim()}
+              >
+                {routeCheckBusy ? tr("rules.testChecking") : tr("rules.testCheck")}
+              </button>
+            </div>
+            {routeCheckError && (
+              <span className="profile-routes-hint">{routeCheckError}</span>
+            )}
+            {routeCheckResult && (
+              <div className="route-check-result">
+                <span
+                  className={`route-check-verdict rules-fg-${routeCheckResult.outbound}`}
+                >
+                  {routeCheckResult.target}
+                  {routeCheckResult.port != null
+                    ? `:${routeCheckResult.port}`
+                    : ""}
+                  {" → "}
+                  {tr(ROUTE_CHECK_OUTBOUND_KEYS[routeCheckResult.outbound])}
+                </span>
+                <span className="profile-routes-hint">
+                  {routeCheckResult.source === "policy" &&
+                  routeCheckResult.policyIndex != null
+                    ? tr("rules.srcPolicy", {
+                        index: routeCheckResult.policyIndex + 1,
+                      })
+                    : tr(ROUTE_CHECK_SOURCE_KEYS[routeCheckResult.source])}
+                  {routeCheckResult.matchedSelector
+                    ? ` · ${routeCheckResult.matchedSelector}`
+                    : ""}
+                </span>
+                {routeCheckResult.certainty === "probable" && (
+                  <span className="profile-routes-hint">
+                    {tr("rules.testProbable")}
+                  </span>
+                )}
+                {routeCheckResult.notes.map((note, index) => (
+                  <span key={index} className="profile-routes-hint">
+                    {note}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
           <button
             type="button"
             className="connection-detail-toggle"

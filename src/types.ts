@@ -173,6 +173,36 @@ export interface HappRoutingImport {
   warnings: string[];
 }
 
+/** Result of `xray_test_route` — which generated rule decides a target. */
+export type RouteCheckOutbound = "proxy" | "direct" | "block" | "dns";
+export type RouteCheckSource =
+  | "dnsCapture"
+  | "policy"
+  | "resolverPin"
+  | "multicast"
+  | "privateLan"
+  | "default";
+export type RouteCheckStepOutcome = "match" | "miss" | "unknown" | "skipped";
+
+export interface RouteCheckStep {
+  label: string;
+  selector?: string;
+  outcome: RouteCheckStepOutcome;
+}
+
+export interface RouteCheckResult {
+  target: string;
+  port?: number;
+  targetKind: "domain" | "ip";
+  outbound: RouteCheckOutbound;
+  source: RouteCheckSource;
+  policyIndex?: number;
+  matchedSelector?: string;
+  certainty: "certain" | "probable";
+  steps: RouteCheckStep[];
+  notes: string[];
+}
+
 export interface SubscriptionMeta {
   url: string;
   hwid: string;

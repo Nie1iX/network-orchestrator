@@ -579,7 +579,9 @@ pub fn validate_routing_policy_selectors(policies: &[DomainPolicy]) -> io::Resul
 
 /// Returns `Ok(None)` for comments (`# …`) and blank selectors so the UI can
 /// keep annotation lines inside routing lists.
-fn classify_routing_selector(selector: &str) -> io::Result<Option<(&'static str, String)>> {
+pub(crate) fn classify_routing_selector(
+    selector: &str,
+) -> io::Result<Option<(&'static str, String)>> {
     let selector = selector.trim();
     if selector.is_empty() || selector.starts_with('#') {
         return Ok(None);
@@ -735,7 +737,7 @@ pub fn dns_bypass_hosts(dns: &XrayDnsConfig) -> Vec<String> {
 
 /// The routable destination of a DNS server entry: `None` for
 /// `localhost`/`fakedns`, which Xray handles internally.
-fn dns_server_route_target(address: &str) -> Option<(&'static str, String)> {
+pub(crate) fn dns_server_route_target(address: &str) -> Option<(&'static str, String)> {
     let host = dns_server_host(address)?;
     if matches!(host, "localhost" | "fakedns") {
         return None;
