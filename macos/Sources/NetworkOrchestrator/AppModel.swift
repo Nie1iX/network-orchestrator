@@ -302,6 +302,17 @@ import SystemConfiguration
     }
     await refresh()
   }
+  /// Saves the three rule sets; a running connection restarts to apply them.
+  func setRoutingRules(
+    _ profile: Profile, block: String, proxy: String, direct: String, privateLanDirect: Bool
+  ) async -> Bool {
+    await change(
+      "set_routing_rules",
+      args: [
+        "id": profile.id, "block": block, "proxy": proxy, "direct": direct,
+        "privateLanDirect": privateLanDirect ? "true" : "false",
+      ])
+  }
   func remove(_ profile: Profile) async { _ = await change("delete", args: ["id": profile.id]) }
   private func change(_ method: String, args: [String: String]) async -> Bool {
     guard !busy else { return false }

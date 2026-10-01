@@ -33,6 +33,12 @@ import Testing
     [
       "id": "design-xray", "name": "Personal proxy", "backend": "xray", "interfaceName": "",
       "routes": [], "xraySocksPort": 10808, "xrayHttpPort": 10809,
+      "domainPolicies": [
+        ["domains": ["geosite:category-ads-all"], "target": "block"],
+        ["domains": ["domain:youtube.com", "geosite:google", "# video"], "target": "proxy"],
+        ["domains": ["geoip:ru", "domain:example.ru"], "target": "direct"],
+      ],
+      "privateLanDirect": true,
       "subscription": [
         "endpointCount": 2, "activeIndex": 0,
         "userInfo": [
@@ -177,6 +183,12 @@ import Testing
           .environment(\.colorScheme, theme).buttonStyle(TauriButtonStyle())
         try render(view, to: directory.appendingPathComponent("dialog-" + filename + ".png"))
       }
+      let xrayProfile = try #require(model.snapshot?.profiles.first { $0.id == "design-xray" })
+      let rulesView = RoutingRulesEditor(model: model, profile: xrayProfile, onClose: {})
+        .frame(maxWidth: .infinity, maxHeight: .infinity).background(palette.app)
+        .foregroundStyle(palette.text).environment(\.palette, palette)
+        .environment(\.colorScheme, theme).buttonStyle(TauriButtonStyle())
+      try render(rulesView, to: directory.appendingPathComponent("dialog-rules.png"))
       let linkView = ImportConfigurationView(
         model: model, preferredBackend: "xray", onClose: {}, initialTab: "Link"
       )

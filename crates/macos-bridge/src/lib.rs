@@ -440,6 +440,54 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 ))
             })
         }
+        "set_routing_rules" => {
+            let id = text_arg(args, "id")?;
+            let mut profile = store
+                .load()
+                .map_err(store_error)?
+                .profiles
+                .into_iter()
+                .find(|p| p.id == id)
+                .ok_or("Profile not found")?;
+            if profile.backend != TunnelBackend::Xray {
+                return Err("Routing rules are available for Xray connections".into());
+            }
+            // Xray matches the first rule, so blocks win over proxy over direct.
+            let mut policies = Vec::new();
+            for (key, target) in [
+                ("block", DomainRouteTarget::Block),
+                ("proxy", DomainRouteTarget::Proxy),
+                ("direct", DomainRouteTarget::Direct),
+            ] {
+                let domains: Vec<String> = args[key]
+                    .as_str()
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                for line in &domains {
+                    let single = [DomainPolicy {
+                        domains: vec![line.clone()],
+                        target,
+                    }];
+                    net_manager_core::xray::validate_routing_policy_selectors(&single)
+                        .map_err(|_| format!("Invalid routing rule ({line})"))?;
+                }
+                if !domains.is_empty() {
+                    policies.push(DomainPolicy { domains, target });
+                }
+            }
+            profile.domain_policies = policies;
+            profile.private_lan_direct = args["privateLanDirect"].as_str() == Some("true");
+            runtime::restart_around(root, &store, id, || {
+                let document = store.upsert(profile).map_err(store_error)?;
+                encode(net_manager_core::subscription::public_profiles(
+                    document.profiles,
+                ))
+            })
+        }
         "refresh_subscription" => {
             let id = text_arg(args, "id")?;
             let meta = store
@@ -602,6 +650,49 @@ pub unsafe extern "C" fn netorch_free(value: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn routing_rules_are_validated_ordered_and_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "rt");
+        let profiles = dispatch(
+            dir.path(),
+            "set_routing_rules",
+            &json!({
+                "id": "rt",
+                "proxy": "domain:youtube.com\ngeosite:google\n# comment",
+                "direct": "geoip:ru\n10.0.0.0/8",
+                "block": "geosite:category-ads-all",
+                "privateLanDirect": "true",
+            }),
+        )
+        .unwrap();
+        let policies = &profiles[0]["domainPolicies"];
+        assert_eq!(policies[0]["target"], "block");
+        assert_eq!(policies[1]["target"], "proxy");
+        assert_eq!(policies[1]["domains"][2], "# comment");
+        assert_eq!(policies[2]["target"], "direct");
+        assert_eq!(profiles[0]["privateLanDirect"], true);
+        let error = dispatch(
+            dir.path(),
+            "set_routing_rules",
+            &json!({"id": "rt", "proxy": "geosite:bad category!", "direct": "", "block": ""}),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("Invalid routing rule"), "{error}");
+        dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"st", "name":"Static", "interfaceName":"en0", "cidrs":"192.0.2.0/24"}),
+        )
+        .unwrap();
+        assert!(dispatch(
+            dir.path(),
+            "set_routing_rules",
+            &json!({"id": "st", "proxy": "domain:a.test", "direct": "", "block": ""}),
+        )
+        .is_err());
+    }
+
     #[test]
     fn subscription_panel_title_and_announce_are_stored_and_logged_by_name_only() {
         use std::io::{Read, Write};
