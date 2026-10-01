@@ -125,6 +125,10 @@ import Testing
       TunnelStatus(profileId: "design-wg", state: "stopped", message: nil),
     ], systemProxyOwner: "design-xray")
   model.primaryInterface = "en0"
+  model.connectionSets = [
+    ConnectionSet(id: "work", name: "Work", profileIds: ["design-xray"]),
+    ConnectionSet(id: "home", name: "Home", profileIds: ["design-wg"]),
+  ]
   model.externalVPNs = [
     ExternalVpn(
       id: "392D9AF2-DA71-4726-B590-5EDE32714C7C", name: "Corporate VPN", state: "connected",

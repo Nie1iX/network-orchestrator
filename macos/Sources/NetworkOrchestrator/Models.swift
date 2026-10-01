@@ -286,3 +286,11 @@ struct ExternalVpn: Decodable, Identifiable, Sendable {
   let provider: String?
   let enabled: Bool
 }
+
+/// A saved combination of connections restored in one click (kept in
+/// UserDefaults, like the web client's localStorage sets).
+struct ConnectionSet: Codable, Identifiable, Sendable, Equatable {
+  var id: String
+  var name: String
+  var profileIds: [String]
+}

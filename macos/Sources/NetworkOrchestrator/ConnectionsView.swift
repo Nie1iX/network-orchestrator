@@ -22,6 +22,10 @@ struct ConnectionsView: View {
   @State private var renaming: Profile?
   @State private var deleting: Profile?
   @State private var name = ""
+  @State private var savingSet = false
+  @State private var setName = ""
+  @AppStorage("connectionsListWidth") private var listWidth = 400.0
+  @State private var dragStartWidth: Double?
   var body: some View {
     VStack(alignment: .leading, spacing: 10.5) {
       HStack(spacing: 7) {
@@ -45,9 +49,10 @@ struct ConnectionsView: View {
               : L10n.text("profiles.noMatch", ["query": model.search]))
         }
       } else {
+        setsBar
         HStack(alignment: .top, spacing: 0) {
-          list.frame(width: 400)
-          Rectangle().fill(p.border).frame(width: 1).padding(.horizontal, 14)
+          list.frame(width: listWidth)
+          splitter
           if let profile = model.selectedProfile {
             ProfileDetailView(
               model: model, profile: profile,
@@ -86,6 +91,51 @@ struct ConnectionsView: View {
       }
     } message: {
       Text(L10n.text("The saved profile and its managed configuration will be removed."))
+    }
+  }
+  /// Draggable divider between the list and the detail pane.
+  private var splitter: some View {
+    Rectangle().fill(p.border).frame(width: 1).padding(.horizontal, 14)
+      .frame(maxHeight: .infinity)
+      .contentShape(Rectangle())
+      .onHover { inside in inside ? NSCursor.resizeLeftRight.push() : NSCursor.pop() }
+      .gesture(
+        DragGesture(minimumDistance: 1)
+          .onChanged { value in
+            let start = dragStartWidth ?? listWidth
+            dragStartWidth = start
+            listWidth = min(max(start + value.translation.width, 300), 640)
+          }
+          .onEnded { _ in dragStartWidth = nil })
+  }
+  /// Saved combinations of connections, applied in one click.
+  private var setsBar: some View {
+    let running = (model.snapshot?.profiles ?? []).filter { model.isRunning($0) }
+    return HStack(spacing: 7) {
+      Text(L10n.text("sets.label").uppercased()).font(.system(size: 10.08, weight: .semibold))
+        .tracking(0.7).foregroundStyle(p.muted)
+      ForEach(model.connectionSets) { set in
+        let active = Set(running.map(\.id)) == Set(set.profileIds)
+        Button(set.name) { Task { await model.applySet(set) } }
+          .buttonStyle(TauriButtonStyle(kind: active ? .accent : .chip, compact: true))
+          .help(L10n.text("sets.applyTitle", ["count": String(set.profileIds.count)]))
+          .contextMenu {
+            Button(L10n.text("sets.deleteTitle"), role: .destructive) { model.deleteSet(set) }
+          }
+      }
+      Button(L10n.text("sets.saveCurrent")) {
+        setName = ""
+        savingSet = true
+      }.buttonStyle(TauriButtonStyle(kind: .chip, compact: true)).disabled(running.isEmpty)
+        .help(L10n.text(running.isEmpty ? "sets.connectFirst" : "sets.saveTitle"))
+      Spacer()
+    }
+    .alert(L10n.text("sets.modalTitle"), isPresented: $savingSet) {
+      TextField(L10n.text("sets.namePh"), text: $setName)
+      Button(L10n.text("Cancel"), role: .cancel) {}
+      Button(L10n.text("Save")) { model.saveCurrentSet(name: setName) }
+    } message: {
+      Text(L10n.text("sets.willInclude", ["count": String(running.count)]))
     }
   }
   @ViewBuilder private var notices: some View {
@@ -136,7 +186,8 @@ struct ConnectionsView: View {
             HStack(spacing: 7) {
               NativeIcon(name: "ChevronIcon", size: 12).rotationEffect(
                 .degrees(collapsed.contains(backend) ? 0 : 180))
-              NativeIcon(name: NativeIcon.backend(backend), size: 15)
+              NativeIcon(name: NativeIcon.backend(backend), size: 15).foregroundStyle(
+                p[backendTint(backend)])
               Text(L10n.text(profiles[0].kind)).font(.system(size: 11.2, weight: .semibold))
               Text("· \(profiles.count)").font(.system(size: 10.08)).foregroundStyle(p.muted)
               Spacer()
@@ -226,6 +277,15 @@ struct ConnectionsView: View {
     .overlay(alignment: .bottom) { Rectangle().fill(p.border).frame(height: 1) }
     .contentShape(Rectangle())
     .onTapGesture { model.selectedProfileID = profile.id }
+    .draggable(profile.id)
+    .dropDestination(for: String.self) { ids, _ in
+      guard let id = ids.first, id != profile.id,
+        let dragged = model.snapshot?.profiles.first(where: { $0.id == id }),
+        dragged.backend == profile.backend
+      else { return false }
+      Task { await model.move(dragged, to: profile) }
+      return true
+    }
     .contextMenu {
       if profile.startsWithoutHelper && model.canStartConnections {
         Button(L10n.text(model.isRunning(profile) ? "common.disconnect" : "common.connect")) {
@@ -238,6 +298,9 @@ struct ConnectionsView: View {
         renaming = profile
       }
       Button(L10n.text("Inspect configuration")) { Task { await model.inspect(profile) } }
+      Divider()
+      Button(L10n.text("detail.moveUp")) { Task { await model.move(profile, by: -1) } }
+      Button(L10n.text("detail.moveDown")) { Task { await model.move(profile, by: 1) } }
       Divider()
       Button(L10n.text("Delete"), role: .destructive) { deleting = profile }
     }

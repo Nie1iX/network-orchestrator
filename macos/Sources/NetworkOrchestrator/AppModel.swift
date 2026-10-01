@@ -55,6 +55,65 @@ import SystemConfiguration
       ?? base.appendingPathComponent("com.netmanager.app.macos", isDirectory: true)
     core = CoreBridge(root: root)
     probeCore = CoreBridge(root: root)
+    isDuplicate = !Self.acquireInstanceLock(root: root)
+    connectionSets = Self.loadSets()
+  }
+  /// Another process already serves this data directory; this one must not
+  /// touch the bridge (startup recovery would stop the other's connections).
+  let isDuplicate: Bool
+  private static var instanceLock: Int32 = -1
+  private static func acquireInstanceLock(root: URL) -> Bool {
+    try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let descriptor = open(root.appendingPathComponent(".instance.lock").path, O_CREAT | O_RDWR, 0o600)
+    guard descriptor >= 0 else { return true }
+    if flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+      close(descriptor)
+      return false
+    }
+    instanceLock = descriptor
+    return true
+  }
+
+  var connectionSets: [ConnectionSet] = []
+  private static let setsKey = "connectionSets"
+  private static func loadSets() -> [ConnectionSet] {
+    guard let data = UserDefaults.standard.data(forKey: setsKey) else { return [] }
+    return (try? JSONDecoder().decode([ConnectionSet].self, from: data)) ?? []
+  }
+  private func saveSets() {
+    if let data = try? JSONEncoder().encode(connectionSets) {
+      UserDefaults.standard.set(data, forKey: Self.setsKey)
+    }
+  }
+  /// Saves the running connections as a set; an identical set is not duplicated.
+  func saveCurrentSet(name: String) {
+    let ids = (snapshot?.profiles ?? []).filter { isRunning($0) }.map(\.id)
+    guard !ids.isEmpty else { return }
+    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    connectionSets.append(
+      ConnectionSet(id: UUID().uuidString, name: trimmed.isEmpty ? L10n.text("sets.label") : trimmed, profileIds: ids))
+    saveSets()
+  }
+  func deleteSet(_ set: ConnectionSet) {
+    connectionSets.removeAll { $0.id == set.id }
+    saveSets()
+  }
+  /// Switch to exactly the set's connections among those this client can start.
+  func applySet(_ set: ConnectionSet) async {
+    for profile in snapshot?.profiles ?? [] where profile.startsWithoutHelper {
+      let wanted = set.profileIds.contains(profile.id)
+      if wanted != isRunning(profile) { await toggle(profile) }
+    }
+  }
+  /// Moves a profile within its backend group (drag and drop or Move up/down).
+  func move(_ profile: Profile, to target: Profile? = nil, by offset: Int = 0) async {
+    var group = (snapshot?.profiles ?? []).filter { $0.backend == profile.backend }.map(\.id)
+    guard let from = group.firstIndex(of: profile.id) else { return }
+    group.remove(at: from)
+    var to = from + offset
+    if let target, let index = group.firstIndex(of: target.id) { to = index }
+    group.insert(profile.id, at: max(0, min(group.count, to)))
+    _ = await change("reorder", args: ["backend": profile.backend, "ids": group.joined(separator: ",")])
   }
   var profiles: [Profile] {
     (snapshot?.profiles ?? []).filter {
@@ -77,6 +136,7 @@ import SystemConfiguration
   var systemProxyOverridden: Bool { primaryInterface?.hasPrefix("utun") ?? false }
 
   func refreshRuntime() async {
+    guard !isDuplicate else { return }
     primaryInterface = Self.currentPrimaryInterface()
     do { runtime = try await core.call("runtime") } catch { runtime = nil }
     if let list: [ExternalVpn] = try? await core.call("external_vpns") { externalVPNs = list }
@@ -160,7 +220,9 @@ import SystemConfiguration
   }
   /// Stops our Xray processes and rolls back the system proxy. Blocking: runs
   /// from applicationWillTerminate.
-  nonisolated func shutdown() { core.callSync("shutdown") }
+  nonisolated func shutdown() {
+    if !isDuplicate { core.callSync("shutdown") }
+  }
 
   nonisolated static func currentPrimaryInterface() -> String? {
     guard let store = SCDynamicStoreCreate(nil, "NetworkOrchestrator" as CFString, nil, nil),
@@ -171,7 +233,7 @@ import SystemConfiguration
   }
 
   func refresh() async {
-    guard !busy else { return }
+    guard !busy, !isDuplicate else { return }
     busy = true
     defer { busy = false }
     do {

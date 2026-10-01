@@ -10,6 +10,12 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ### Added
 
+- Native Connections: saved connection sets applied in one click, drag and
+  drop or Move up/down reordering within a group, a resizable list/detail
+  divider (remembered), backend-colored group icons, Start at login (via
+  SMAppService) and one app instance per data directory — a second launch
+  brings the first forward instead of stopping its connections.
+
 - Native Connections list VPN services configured by other apps (e.g.
   Network Extension VPNs) under "Discovered on system" with an External
   badge, and connect or disconnect them like the macOS VPN menu
