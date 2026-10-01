@@ -702,6 +702,12 @@ pub struct XrayStatusResult {
     pub dns_applied: bool,
     pub ipv4_covered: bool,
     pub ipv6_covered: bool,
+    /// TUN inbound counters from the Xray stats API; `None` when the
+    /// statsquery endpoint is unreachable (e.g. an older staged config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

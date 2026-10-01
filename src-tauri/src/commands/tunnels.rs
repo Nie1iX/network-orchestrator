@@ -350,11 +350,11 @@ async fn linux_xray_reload(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) async fn linux_xray_status(
+pub(crate) async fn linux_xray_status_result(
     client: &crate::daemon_client::DaemonClient,
     profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    let result: XrayStatusResult = client
+) -> Result<XrayStatusResult, String> {
+    client
         .request(
             method::XRAY_STATUS,
             XrayProfileParams {
@@ -362,8 +362,18 @@ pub(crate) async fn linux_xray_status(
             },
         )
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))?;
-    Ok(linux_xray_tunnel_status(result, profile))
+        .map_err(|err| crate::daemon_client::user_message(&err))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn linux_xray_status(
+    client: &crate::daemon_client::DaemonClient,
+    profile: &Profile,
+) -> Result<TunnelStatus, String> {
+    Ok(linux_xray_tunnel_status(
+        linux_xray_status_result(client, profile).await?,
+        profile,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -2460,6 +2470,8 @@ mod tests {
             dns_applied: false,
             ipv4_covered: false,
             ipv6_covered: false,
+            rx_bytes: None,
+            tx_bytes: None,
         };
         assert!(linux_xray_tunnel_status(status, &p).message.is_none());
     }
@@ -2477,6 +2489,8 @@ mod tests {
             dns_applied: false,
             ipv4_covered: true,
             ipv6_covered: false,
+            rx_bytes: None,
+            tx_bytes: None,
         };
         let message = linux_xray_tunnel_status(status, &p).message.unwrap();
         assert!(message.contains("DNS was not applied"));
