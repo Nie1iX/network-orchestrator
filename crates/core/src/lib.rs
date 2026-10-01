@@ -4,6 +4,7 @@ pub mod cidr_bulk;
 pub mod config_security;
 pub mod config_vault;
 pub mod daemon_protocol;
+pub mod exit_ip;
 pub mod explorer;
 pub mod journal;
 #[cfg(target_os = "macos")]
