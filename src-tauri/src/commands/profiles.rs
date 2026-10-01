@@ -85,10 +85,11 @@ pub(crate) fn store_generated_xray(
     vault.store_generated_xray(profile_id, plaintext_json)
 }
 
-pub(crate) fn rewrite_generated_socks_port(
+pub(crate) fn rewrite_generated_proxy_ports(
     vault: &ConfigVault,
     profile: &mut Profile,
-    new_port: u16,
+    new_socks_port: u16,
+    new_http_port: Option<u16>,
 ) -> Result<PathBuf, String> {
     if profile.backend != TunnelBackend::Xray
         || profile.xray_socks_port.is_none()
@@ -96,8 +97,12 @@ pub(crate) fn rewrite_generated_socks_port(
     {
         return Err("profile does not use a managed generated Xray config".into());
     }
-    if profile.xray_http_port == Some(new_port) {
-        return Err("SOCKS5 port would duplicate HTTP proxy port".into());
+    if new_socks_port == 0
+        || new_http_port == Some(0)
+        || new_http_port == Some(new_socks_port)
+        || profile.xray_http_port.is_some() != new_http_port.is_some()
+    {
+        return Err("generated Xray listener ports are invalid".into());
     }
     let bytes = config_security::read_xray_config(&profile.config_path, &profile.id)
         .map_err(|e| e.to_string())?;
@@ -110,11 +115,19 @@ pub(crate) fn rewrite_generated_socks_port(
         .iter_mut()
         .find(|i| i.get("tag").and_then(|t| t.as_str()) == Some("socks-in"))
         .ok_or_else(|| "generated config has no 'socks-in' inbound".to_string())?;
-    inbound["port"] = serde_json::json!(new_port);
+    inbound["port"] = serde_json::json!(new_socks_port);
+    if let Some(http_port) = new_http_port {
+        let inbound = inbounds
+            .iter_mut()
+            .find(|i| i.get("tag").and_then(|t| t.as_str()) == Some("http-in"))
+            .ok_or_else(|| "generated config has no 'http-in' inbound".to_string())?;
+        inbound["port"] = serde_json::json!(http_port);
+    }
     let body = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
     let import = store_generated_xray(vault, &profile.id, &body).map_err(|e| e.to_string())?;
     profile.config_path = import.config_path.clone();
-    profile.xray_socks_port = Some(new_port);
+    profile.xray_socks_port = Some(new_socks_port);
+    profile.xray_http_port = new_http_port;
     Ok(import.config_path)
 }
 
@@ -1563,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_generated_socks_port_creates_revision_and_rejects_ineligible() {
+    fn rewrite_generated_proxy_ports_creates_revision_and_rejects_ineligible() {
         let dir = unique_dir("rewrite-socks");
         let vault = ConfigVault::new(dir.join("configs"));
         let mut p = profile("x-gen");
@@ -1571,21 +1584,23 @@ mod tests {
         p.backend = TunnelBackend::Xray;
         p.xray_socks_port = Some(10808);
         p.xray_http_port = Some(10951);
-        let body = br#"{"inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":10808,"protocol":"socks"}]}"#;
+        let body = br#"{"inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":10808,"protocol":"socks"},{"tag":"http-in","listen":"127.0.0.1","port":10951,"protocol":"http"}]}"#;
         let import = vault.store_xray_config("gen", body).unwrap();
         p.config_path = import.config_path.clone();
 
-        assert!(rewrite_generated_socks_port(&vault, &mut p, 10951).is_err());
+        assert!(rewrite_generated_proxy_ports(&vault, &mut p, 10951, Some(10951)).is_err());
 
-        let new_path = rewrite_generated_socks_port(&vault, &mut p, 10950).unwrap();
+        let new_path = rewrite_generated_proxy_ports(&vault, &mut p, 10808, Some(10950)).unwrap();
         assert_ne!(new_path, import.config_path);
         assert_eq!(p.config_path, new_path);
-        assert_eq!(p.xray_socks_port, Some(10950));
+        assert_eq!(p.xray_socks_port, Some(10808));
+        assert_eq!(p.xray_http_port, Some(10950));
         assert!(import.config_path.exists());
         let raw = config_security::read_xray_config(&new_path, "gen").unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(doc["inbounds"][0]["port"], 10950);
+        assert_eq!(doc["inbounds"][0]["port"], 10808);
         assert_eq!(doc["inbounds"][0]["tag"], "socks-in");
+        assert_eq!(doc["inbounds"][1]["port"], 10950);
 
         let mut bad = p.clone();
         #[cfg(windows)]
@@ -1595,21 +1610,21 @@ mod tests {
         #[cfg(not(windows))]
         let broken = b"{oops".to_vec();
         fs::write(&new_path, &broken).unwrap();
-        assert!(rewrite_generated_socks_port(&vault, &mut bad, 10960).is_err());
+        assert!(rewrite_generated_proxy_ports(&vault, &mut bad, 10960, Some(10950)).is_err());
         assert_eq!(bad.config_path, new_path);
-        assert_eq!(bad.xray_socks_port, Some(10950));
+        assert_eq!(bad.xray_socks_port, Some(10808));
 
         let mut ext = profile("x-ext");
         ext.backend = TunnelBackend::Xray;
         ext.xray_socks_port = Some(10808);
         let before = ext.config_path.clone();
-        assert!(rewrite_generated_socks_port(&vault, &mut ext, 10960).is_err());
+        assert!(rewrite_generated_proxy_ports(&vault, &mut ext, 10960, None).is_err());
         assert_eq!(ext.config_path, before);
         assert_eq!(ext.xray_socks_port, Some(10808));
 
         let mut no_port = ext.clone();
         no_port.xray_socks_port = None;
-        assert!(rewrite_generated_socks_port(&vault, &mut no_port, 10960).is_err());
+        assert!(rewrite_generated_proxy_ports(&vault, &mut no_port, 10960, None).is_err());
         assert!(no_port.xray_socks_port.is_none());
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -188,12 +188,11 @@ line or every platform-specific path is correct.
    the wrong apparent coverage. The `/24` fixture rendered as `/16` in the UI.
    Use `ownerProfileId` for identity and mark aggregates clearly while preserving
    broader prefixes. Duplicate-name and broad-prefix cases were found by inspection.
-4. **Occupied Xray HTTP listeners do not receive the SOCKS conflict handling.**
-   `src-tauri/src/commands/tunnels.rs::connect_profile` checks/reassigns an
-   occupied SOCKS listener but has no equivalent HTTP preflight, while creation
-   reserves both ports. A program occupying the saved HTTP port can cause a
-   later Xray startup failure. Add a dual-listener regression before extending
-   replacement/rollback logic. Found by code inspection, not a real Xray run.
+4. **Occupied Xray HTTP listener preflight (fixed).**
+   `src-tauri/src/commands/tunnels.rs::connect_profile` checks both generated
+   listener ports and rewrites occupied SOCKS/HTTP ports in one managed revision.
+   Unit tests cover HTTP-only and dual-port conflicts. A real Xray run with
+   occupied ports remains unverified.
 
 Sandbox browser logs included Tauri mock callback warnings during development
 reloads/React effect cleanup; no browser error was observed in the completed
