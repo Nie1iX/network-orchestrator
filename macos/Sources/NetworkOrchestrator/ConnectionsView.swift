@@ -158,9 +158,12 @@ struct ConnectionsView: View {
       StateDot(state: state)
       NativeIcon(name: NativeIcon.backend(profile.backend), size: 14).foregroundStyle(
         p[backendTint(profile.backend)])
-      Text(profile.name).font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
-      if let server = model.activeServer(profile), server != profile.name {
-        Text(server).font(.system(size: 11.2)).foregroundStyle(p.secondary).lineLimit(1)
+      // A subscription reads as a group: its name, then the chosen server.
+      VStack(alignment: .leading, spacing: 1) {
+        Text(profile.name).font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
+        if let server = model.activeServer(profile), server != profile.name {
+          Text(server).font(.system(size: 10.5)).foregroundStyle(p.secondary).lineLimit(1)
+        }
       }
       Spacer(minLength: 8)
       Text(rowMeta(profile)).font(.system(size: 11, design: .monospaced)).foregroundStyle(
@@ -266,6 +269,45 @@ struct ConnectionSwitch: View {
   }
 }
 
+/// What the subscription provider says about itself: title, announcement and
+/// support / account links (https only, opened in the default browser).
+struct PanelInfoView: View {
+  @Environment(\.palette) private var p
+  let panel: SubscriptionPanel
+  let profileName: String
+  var body: some View {
+    let links: [(String, URL)] = [
+      ("native.panelSupport", panel.supportUrl), ("native.panelAccount", panel.webPageUrl),
+    ].compactMap { label, value in
+      guard let value, let url = URL(string: value), url.scheme == "https" else { return nil }
+      return (label, url)
+    }
+    if panel.title != nil || panel.announce != nil || !links.isEmpty {
+      VStack(alignment: .leading, spacing: 5) {
+        if let title = panel.title, title != profileName {
+          Text(title).font(.system(size: 11.9, weight: .semibold))
+        }
+        if let announce = panel.announce {
+          Text(announce).font(.system(size: 11.9)).foregroundStyle(p.secondary)
+            .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        }
+        if !links.isEmpty {
+          HStack(spacing: 7) {
+            ForEach(links, id: \.0) { label, url in
+              Button(L10n.text(label)) { NSWorkspace.shared.open(url) }
+                .buttonStyle(TauriButtonStyle(compact: true)).help(url.host() ?? "")
+            }
+          }.padding(.top, 2)
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.horizontal, 12).padding(.vertical, 9)
+      .background(p["info-bg"], in: RoundedRectangle(cornerRadius: 6))
+      .overlay(RoundedRectangle(cornerRadius: 6).stroke(p["info-border"], lineWidth: 1))
+    }
+  }
+}
+
 struct ProfileDetailView: View {
   @Environment(\.palette) private var p
   @Bindable var model: AppModel
@@ -311,6 +353,9 @@ struct ProfileDetailView: View {
         ).frame(width: 28).help(L10n.text("detail.actions"))
       }.padding(.bottom, 10.5)
       Rectangle().fill(p.border).frame(height: 1).padding(.bottom, 7)
+      if let panel = profile.subscription?.panel {
+        PanelInfoView(panel: panel, profileName: profile.name).padding(.bottom, 7)
+      }
       row("detail.backend", L10n.text(profile.kind), mono: false)
       if let server = model.activeServer(profile) {
         row("native.server", server, mono: false)
