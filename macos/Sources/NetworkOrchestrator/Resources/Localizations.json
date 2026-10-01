@@ -782,11 +782,21 @@
       "rules.back": "Back",
       "rules.block": "Block",
       "rules.direct": "Direct",
+      "rules.dnsSummary": "Custom DNS: {servers} resolvers · {hosts} host overrides",
+      "rules.domainMatcher": "Domain matcher",
+      "rules.domainStrategy": "Domain strategy",
       "rules.entryCount": {
         "one": "{count} rule",
         "other": "{count} rules"
       },
+      "rules.happApplied": "Routing profile applied",
+      "rules.happApply": "Apply",
+      "rules.happApplying": "Applying…",
+      "rules.happHint": "Paste a Happ/Incy routing export — JSON, base64 or a happ:// link",
+      "rules.importHapp": "Import Happ routing profile",
+      "rules.matcherDefault": "Default",
       "rules.proxy": "Proxy",
+      "rules.strategyDefault": "Default (AsIs)",
       "sets.applyTitle": {
         "one": "Switch to exactly {count} connection",
         "other": "Switch to exactly {count} connections"
@@ -1718,13 +1728,23 @@
       "rules.back": "Назад",
       "rules.block": "Блок",
       "rules.direct": "Напрямую",
+      "rules.dnsSummary": "Свой DNS: резолверов: {servers} · хостов: {hosts}",
+      "rules.domainMatcher": "Domain matcher",
+      "rules.domainStrategy": "Domain strategy",
       "rules.entryCount": {
         "few": "{count} правила",
         "many": "{count} правил",
         "one": "{count} правило",
         "other": "{count} правила"
       },
+      "rules.happApplied": "Профиль маршрутизации применён",
+      "rules.happApply": "Применить",
+      "rules.happApplying": "Применяю…",
+      "rules.happHint": "Вставьте экспорт Happ/Incy — JSON, base64 или ссылку happ://",
+      "rules.importHapp": "Импорт профиля Happ",
+      "rules.matcherDefault": "По умолчанию",
       "rules.proxy": "Прокси",
+      "rules.strategyDefault": "По умолчанию (AsIs)",
       "sets.applyTitle": {
         "few": "Переключиться ровно на {count} подключения",
         "many": "Переключиться ровно на {count} подключений",
