@@ -77,6 +77,25 @@ pub fn run() {
                 }
             }
             #[cfg(target_os = "linux")]
+            {
+                // `tauri.localhost`/`ipc.localhost` are real http URLs that
+                // pass through WebKit's GIO proxy resolver; a system-wide
+                // proxy left on by another VPN client (e.g. Happ) hijacks or
+                // kills them and the window renders a blank error page. The
+                // UI only ever talks to loopback pseudo-hosts, so bypass the
+                // system proxy entirely.
+                use webkit2gtk::{NetworkProxyMode, WebViewExt, WebsiteDataManagerExt};
+                for (_label, window) in app.webview_windows() {
+                    let _ = window.with_webview(|webview| {
+                        let wv = webview.inner();
+                        if let Some(manager) = wv.website_data_manager() {
+                            manager.set_network_proxy_settings(NetworkProxyMode::NoProxy, None);
+                        }
+                        wv.reload();
+                    });
+                }
+            }
+            #[cfg(target_os = "linux")]
             app.manage(auto_connect::AutoConnectStatus::default());
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
