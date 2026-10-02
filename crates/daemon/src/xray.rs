@@ -1495,6 +1495,11 @@ mod tests {
         let mut input = params();
         input.config = std::fs::read_to_string(&config_path).expect("read panel config");
         let plan = prepare_xray(1000, input, 51820).expect("plan");
+        // XRAY_PLAN_OUT additionally keeps a copy of the plan for manual
+        // `xray run` reproduction outside the test.
+        if let Ok(keep) = std::env::var("XRAY_PLAN_OUT") {
+            std::fs::write(&keep, &plan.config).expect("write plan copy");
+        }
         let staged =
             std::env::temp_dir().join(format!("xray-plan-test-{}.json", std::process::id()));
         std::fs::write(&staged, &plan.config).expect("write staged plan");
