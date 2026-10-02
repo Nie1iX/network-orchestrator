@@ -43,6 +43,7 @@ import {
 } from "./profiles/sets";
 import Skeleton from "./ui/Skeleton";
 import ExternalTunnelPanel from "./ExternalTunnelPanel";
+import LocalProxyPanel from "./LocalProxyPanel";
 import NmConnectionPanel from "./NmConnectionPanel";
 import TailscalePanel from "./TailscalePanel";
 import ToggleSwitch from "./ui/ToggleSwitch";
@@ -232,6 +233,7 @@ export default function ProfileManager() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [externalName, setExternalName] = useState<string | null>(null);
   const [nmSelected, setNmSelected] = useState<string | null>(null);
+  const [proxySelected, setProxySelected] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<TunnelBackend>>(
     loadCollapsedGroups,
   );
@@ -1347,6 +1349,8 @@ export default function ProfileManager() {
     externalTunnels.find((i) => i.name === externalName) ?? null;
   const nmSelectedConn =
     nm?.connections.find((c) => c.uuid === nmSelected) ?? null;
+  const proxySelectedObj =
+    proxies.find((p) => `${p.address}:${p.port}` === proxySelected) ?? null;
 
   const tsRunning =
     tailscale !== null &&
@@ -1497,6 +1501,7 @@ export default function ProfileManager() {
           setServiceSelected(false);
           setExternalName(null);
           setNmSelected(null);
+          setProxySelected(null);
           setSelectedId(profile.id);
         }}
         onToggle={() =>
@@ -1509,6 +1514,7 @@ export default function ProfileManager() {
           setServiceSelected(false);
           setExternalName(null);
           setNmSelected(null);
+          setProxySelected(null);
           setSelectedId(profile.id);
           const items = profileMenuItems(profile);
           void popupNativeMenu(items, e.clientX, e.clientY).then(
@@ -1654,6 +1660,7 @@ export default function ProfileManager() {
               setServiceSelected(false);
               setExternalName(null);
               setNmSelected(null);
+              setProxySelected(null);
               setSelectedId(id);
               document
                 .querySelector(`[data-profile-id="${id}"]`)
@@ -1730,6 +1737,7 @@ export default function ProfileManager() {
               onClick={() => {
                 setExternalName(null);
                 setNmSelected(null);
+                setProxySelected(null);
                 setServiceSelected(true);
               }}
               onKeyDown={(e) => {
@@ -1738,6 +1746,7 @@ export default function ProfileManager() {
                   e.preventDefault();
                   setExternalName(null);
                   setNmSelected(null);
+                  setProxySelected(null);
                   setServiceSelected(true);
                 }
               }}
@@ -1793,6 +1802,7 @@ export default function ProfileManager() {
                   setServiceSelected(false);
                   setSelectedId(null);
                   setNmSelected(null);
+                  setProxySelected(null);
                   setExternalName(iface.name);
                 }}
                 onKeyDown={(e) => {
@@ -1802,6 +1812,7 @@ export default function ProfileManager() {
                     setServiceSelected(false);
                     setSelectedId(null);
                     setNmSelected(null);
+                    setProxySelected(null);
                     setExternalName(iface.name);
                   }
                 }}
@@ -1857,6 +1868,7 @@ export default function ProfileManager() {
                     setSelectedId(null);
                     setExternalName(null);
                     setNmSelected(conn.uuid);
+                    setProxySelected(null);
                   }}
                   onKeyDown={(e) => {
                     if (e.target !== e.currentTarget) return;
@@ -1866,6 +1878,7 @@ export default function ProfileManager() {
                       setSelectedId(null);
                       setExternalName(null);
                       setNmSelected(conn.uuid);
+                      setProxySelected(null);
                     }
                   }}
                 >
@@ -1919,21 +1932,43 @@ export default function ProfileManager() {
             {t("profiles.localProxies")}
           </div>
           <div className="profile-rows">
-            {proxies.map((p) => (
-              <div
-                key={`${p.address}:${p.port}`}
-                className="profile-row profile-row-external"
-              >
-                <span className="status-dot state-running" />
-                <span className="backend-avatar backend-avatar-service">
-                  <LoopbackIcon size={14} />
-                </span>
-                <span className="profile-row-name">
-                  {p.address}:{p.port}
-                </span>
-                <span className="badge badge-external">{p.kind}</span>
-              </div>
-            ))}
+            {proxies.map((p) => {
+              const key = `${p.address}:${p.port}`;
+              const select = () => {
+                setServiceSelected(false);
+                setSelectedId(null);
+                setExternalName(null);
+                setNmSelected(null);
+                setProxySelected(key);
+              };
+              return (
+                <div
+                  key={key}
+                  role="button"
+                  tabIndex={0}
+                  className={`profile-row profile-row-external${
+                    proxySelected === key ? " selected" : ""
+                  }`}
+                  onClick={select}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      select();
+                    }
+                  }}
+                >
+                  <span className="status-dot state-running" />
+                  <span className="backend-avatar backend-avatar-service">
+                    <LoopbackIcon size={14} />
+                  </span>
+                  <span className="profile-row-name">
+                    {p.address}:{p.port}
+                  </span>
+                  <span className="badge badge-external">{p.kind}</span>
+                </div>
+              );
+            })}
           </div>
           <p className="external-note">{t("profiles.localProxiesHint")}</p>
         </div>
@@ -1958,6 +1993,8 @@ export default function ProfileManager() {
               avatarClass={nmAvatarClass(nmSelectedConn.kind)}
               icon={nmIcon(nmSelectedConn.kind)}
             />
+          ) : proxySelectedObj ? (
+            <LocalProxyPanel proxy={proxySelectedObj} />
           ) : serviceSelected && tailscale ? (
             <TailscalePanel
               status={tailscale}
