@@ -4439,6 +4439,12 @@ impl DaemonCore {
             .collect()
     }
 
+    /// Full kernel routing inventory (`ip route`/`ip rule` equivalent):
+    /// routes across every table plus all policy rules.
+    pub fn net_tables(&self) -> io::Result<net_manager_core::daemon_protocol::NetTablesResult> {
+        self.routes.net_tables()
+    }
+
     /// Forget only always-on static owners (`replayable`) whose routes
     /// disappeared from the kernel (for example after a physical link flap).
     /// A later always-on replay resolves the current ifindex before installing
