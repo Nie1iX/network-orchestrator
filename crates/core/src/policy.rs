@@ -36,6 +36,12 @@ pub trait RouteExecutor: Send {
     fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
         Ok(Vec::new())
     }
+    /// Full kernel routing inventory: routes across every table plus all
+    /// policy rules (`ip route`/`ip rule` equivalent). Executors that
+    /// cannot inspect the privileged host view return `Unsupported`.
+    fn net_tables(&self) -> io::Result<crate::daemon_protocol::NetTablesResult> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Add `routes` in order; on the first failure remove the ones already

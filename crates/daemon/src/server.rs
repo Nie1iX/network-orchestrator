@@ -964,6 +964,11 @@ async fn handle<A: Authorizer>(
                 })?;
             Ok(Value::Null)
         }
+        #[cfg(target_os = "linux")]
+        method::NET_TABLES => {
+            let result = with_core(ctx, move |core| core.net_tables()).await?;
+            to_value(&result)
+        }
         method::LINK_SET_STATE => {
             let params: LinkSetStateParams = params(request.params)?;
             validate_iface_name(&params.name).map_err(invalid)?;

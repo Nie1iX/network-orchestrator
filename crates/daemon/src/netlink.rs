@@ -6,7 +6,9 @@ use crate::cond_rules::{IfaceAddr, NetworkObservation};
 use crate::core::{ExternalLinkKind, LinkExecutor, PolicyRuleExecutor, WgSystem};
 use futures::TryStreamExt;
 use ipnet::IpNet;
-use net_manager_core::daemon_protocol::{IpFamily, OwnedRuleResource};
+use net_manager_core::daemon_protocol::{
+    IpFamily, NetTablesResult, OwnedRuleResource, SystemNexthop, SystemRoute, SystemRule,
+};
 use net_manager_core::models::AppliedRoute;
 use net_manager_core::policy::RouteExecutor;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
@@ -15,7 +17,7 @@ use netlink_packet_route::route::{
     RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteProtocol, RouteScope, RouteType,
 };
 use netlink_packet_route::rule::{RuleAction, RuleAttribute, RuleFlag, RuleMessage};
-use netlink_packet_route::AddressFamily;
+use netlink_packet_route::{AddressFamily, IpProtocol};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
@@ -318,6 +320,265 @@ fn route_table(message: &RouteMessage) -> u32 {
         .unwrap_or(message.header.table as u32)
 }
 
+fn route_kind_name(kind: RouteType) -> String {
+    match kind {
+        RouteType::Unspec => "unspec".into(),
+        RouteType::Unicast => "unicast".into(),
+        RouteType::Local => "local".into(),
+        RouteType::Broadcast => "broadcast".into(),
+        RouteType::Anycast => "anycast".into(),
+        RouteType::Multicast => "multicast".into(),
+        RouteType::BlackHole => "blackhole".into(),
+        RouteType::Unreachable => "unreachable".into(),
+        RouteType::Prohibit => "prohibit".into(),
+        RouteType::Throw => "throw".into(),
+        RouteType::Nat => "nat".into(),
+        RouteType::ExternalResolve => "xresolve".into(),
+        RouteType::Other(code) => format!("type {code}"),
+        _ => format!("{:?}", kind).to_lowercase(),
+    }
+}
+
+fn route_scope_name(scope: RouteScope) -> String {
+    match scope {
+        RouteScope::Universe => "universe".into(),
+        RouteScope::Site => "site".into(),
+        RouteScope::Link => "link".into(),
+        RouteScope::Host => "host".into(),
+        RouteScope::NoWhere => "nowhere".into(),
+        RouteScope::Other(code) => format!("scope {code}"),
+        _ => format!("{:?}", scope).to_lowercase(),
+    }
+}
+
+fn rule_action_name(action: RuleAction) -> String {
+    match action {
+        RuleAction::ToTable => "lookup".into(),
+        RuleAction::Goto => "goto".into(),
+        RuleAction::Nop => "nop".into(),
+        RuleAction::Blackhole => "blackhole".into(),
+        RuleAction::Unreachable => "unreachable".into(),
+        RuleAction::Prohibit => "prohibit".into(),
+        RuleAction::Unspec => "unspec".into(),
+        RuleAction::Other(code) => format!("type {code}"),
+        _ => format!("{:?}", action).to_lowercase(),
+    }
+}
+
+fn ip_protocol_name(protocol: IpProtocol) -> String {
+    match i32::from(protocol) {
+        1 => "icmp".into(),
+        6 => "tcp".into(),
+        17 => "udp".into(),
+        58 => "icmpv6".into(),
+        132 => "sctp".into(),
+        other => other.to_string(),
+    }
+}
+
+fn rule_selector(message: &RuleMessage, is_source: bool) -> Option<IpNet> {
+    let (address, length) = if is_source {
+        (
+            message.attributes.iter().find_map(|attr| match attr {
+                RuleAttribute::Source(address) => Some(*address),
+                _ => None,
+            }),
+            message.header.src_len,
+        )
+    } else {
+        (
+            message.attributes.iter().find_map(|attr| match attr {
+                RuleAttribute::Destination(address) => Some(*address),
+                _ => None,
+            }),
+            message.header.dst_len,
+        )
+    };
+    let address = match address {
+        Some(address) => address,
+        // `ip rule` omits the selector entirely when the prefix length is
+        // zero — a "from all" rule reports no FRA_SRC.
+        None if length == 0 => return None,
+        None => match message.header.family {
+            AddressFamily::Inet => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            AddressFamily::Inet6 => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            _ => return None,
+        },
+    };
+    IpNet::new(address, length).ok().map(|net| net.trunc())
+}
+
+/// A `RouteMessage` rendered for the net.tables view. Routes without a
+/// resolvable family are skipped.
+fn system_route(message: &RouteMessage, names: &HashMap<u32, String>) -> Option<SystemRoute> {
+    let family = match message.header.address_family {
+        AddressFamily::Inet => IpFamily::Ipv4,
+        AddressFamily::Inet6 => IpFamily::Ipv6,
+        _ => return None,
+    };
+    let address = |addr: &RouteAddress| -> Option<IpAddr> {
+        match addr {
+            RouteAddress::Inet(address) => Some(IpAddr::V4(*address)),
+            RouteAddress::Inet6(address) => Some(IpAddr::V6(*address)),
+            _ => None,
+        }
+    };
+    let find_address = |wanted: fn(&RouteAttribute) -> Option<&RouteAddress>| {
+        message
+            .attributes
+            .iter()
+            .find_map(|attr| wanted(attr).and_then(address))
+    };
+    let destination = find_address(|attr| match attr {
+        RouteAttribute::Destination(address) => Some(address),
+        _ => None,
+    })
+    .or_else(|| {
+        if message.header.destination_prefix_length != 0 {
+            return None;
+        }
+        match message.header.address_family {
+            AddressFamily::Inet => Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            AddressFamily::Inet6 => Some(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+            _ => None,
+        }
+    })
+    .and_then(|addr| IpNet::new(addr, message.header.destination_prefix_length).ok())
+    .map(|net| net.trunc())?;
+    let interface_index = message.attributes.iter().find_map(|attr| match attr {
+        RouteAttribute::Oif(index) => Some(*index),
+        _ => None,
+    });
+    let protocol = u8::from(message.header.protocol);
+    let nexthops = message
+        .attributes
+        .iter()
+        .find_map(|attr| match attr {
+            RouteAttribute::MultiPath(hops) => Some(hops),
+            _ => None,
+        })
+        .map(|hops| {
+            hops.iter()
+                .map(|hop| {
+                    let gateway = hop.attributes.iter().find_map(|attr| match attr {
+                        RouteAttribute::Gateway(gw) => address(gw),
+                        _ => None,
+                    });
+                    SystemNexthop {
+                        gateway,
+                        interface_index: hop.interface_index,
+                        interface_name: names.get(&hop.interface_index).cloned(),
+                        weight: hop.hops,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(SystemRoute {
+        family,
+        destination,
+        table: route_table(message),
+        kind: route_kind_name(message.header.kind),
+        scope: route_scope_name(message.header.scope),
+        protocol,
+        managed: protocol == RTPROT_NETWORK_ORCHESTRATOR,
+        gateway: find_address(|attr| match attr {
+            RouteAttribute::Gateway(address) => Some(address),
+            _ => None,
+        }),
+        interface_index,
+        interface_name: interface_index.and_then(|index| names.get(&index).cloned()),
+        metric: message.attributes.iter().find_map(|attr| match attr {
+            RouteAttribute::Priority(metric) => Some(*metric),
+            _ => None,
+        }),
+        pref_source: find_address(|attr| match attr {
+            RouteAttribute::PrefSource(address) => Some(address),
+            _ => None,
+        }),
+        nexthops,
+    })
+}
+
+/// A `RuleMessage` rendered for the net.tables view — every selector the
+/// kernel reports, not only the fields the daemon mutates itself.
+fn system_rule(message: &RuleMessage) -> SystemRule {
+    let protocol = message
+        .attributes
+        .iter()
+        .find_map(|attr| match attr {
+            RuleAttribute::Protocol(value) => Some(u8::from(*value)),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let find =
+        |wanted: fn(&RuleAttribute) -> Option<u32>| message.attributes.iter().find_map(wanted);
+    SystemRule {
+        family: if message.header.family == AddressFamily::Inet6 {
+            IpFamily::Ipv6
+        } else {
+            IpFamily::Ipv4
+        },
+        priority: rule_priority(message).unwrap_or(0),
+        action: rule_action_name(message.header.action),
+        table: rule_table(message),
+        goto: find(|attr| match attr {
+            RuleAttribute::Goto(value) => Some(*value),
+            _ => None,
+        }),
+        from: rule_selector(message, true),
+        to: rule_selector(message, false),
+        fwmark: find(|attr| match attr {
+            RuleAttribute::FwMark(value) => Some(*value),
+            _ => None,
+        }),
+        fwmask: find(|attr| match attr {
+            RuleAttribute::FwMask(value) => Some(*value),
+            _ => None,
+        }),
+        iifname: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::Iifname(name) => Some(name.clone()),
+            _ => None,
+        }),
+        oifname: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::Oifname(name) => Some(name.clone()),
+            _ => None,
+        }),
+        uid_range: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::UidRange(range) => Some([range.start, range.end]),
+            _ => None,
+        }),
+        source_port_range: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::SourcePortRange(range) => Some([range.start, range.end]),
+            _ => None,
+        }),
+        destination_port_range: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::DestinationPortRange(range) => Some([range.start, range.end]),
+            _ => None,
+        }),
+        ip_protocol: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::IpProtocol(protocol) => Some(ip_protocol_name(*protocol)),
+            _ => None,
+        }),
+        suppress_prefix_length: find(|attr| match attr {
+            RuleAttribute::SuppressPrefixLen(value) if *value != u32::MAX => Some(*value),
+            _ => None,
+        }),
+        suppress_if_group: find(|attr| match attr {
+            RuleAttribute::SuppressIfGroup(value) if *value != u32::MAX => Some(*value),
+            _ => None,
+        }),
+        tun_id: find(|attr| match attr {
+            RuleAttribute::TunId(value) => Some(*value),
+            _ => None,
+        }),
+        tos: message.header.tos,
+        invert: message.header.flags.contains(&RuleFlag::Invert),
+        protocol,
+        managed: protocol == RTPROT_NETWORK_ORCHESTRATOR,
+    }
+}
+
 fn is_owned_rule(message: &RuleMessage, rule: &OwnedRuleResource) -> bool {
     let expected = rule_request(rule);
     if message.header.family != expected.header.family
@@ -471,6 +732,11 @@ enum Command {
     },
     OwnedRoutesSnapshot {
         reply: mpsc::Sender<io::Result<Vec<AppliedRoute>>>,
+    },
+    /// Routes across every table plus all policy rules, for the
+    /// `ip route`/`ip rule` inventory view.
+    NetTablesDump {
+        reply: mpsc::Sender<io::Result<NetTablesResult>>,
     },
     DefaultGateways {
         reply: mpsc::Sender<io::Result<Vec<(IpAddr, u32)>>>,
@@ -633,11 +899,9 @@ impl NetworkObservation for NetlinkExecutor {
     }
 }
 
-/// Dump links (index→name) and addresses (both families) in one pass.
-/// `IFA_LOCAL` is preferred over `IFA_ADDRESS`: on point-to-point links the
-/// latter is the peer's address, while the former is always ours.
-async fn get_interface_addrs(handle: &rtnetlink::Handle) -> io::Result<Vec<IfaceAddr>> {
-    let mut names: HashMap<u32, String> = HashMap::new();
+/// Interface index → name map, for resolving `Oif`/`Iif` attributes.
+async fn get_link_names(handle: &rtnetlink::Handle) -> io::Result<HashMap<u32, String>> {
+    let mut names = HashMap::new();
     let mut links = handle.link().get().execute();
     while let Some(link) = links.try_next().await.map_err(netlink_error_to_io)? {
         for attribute in &link.attributes {
@@ -646,6 +910,14 @@ async fn get_interface_addrs(handle: &rtnetlink::Handle) -> io::Result<Vec<Iface
             }
         }
     }
+    Ok(names)
+}
+
+/// Dump links (index→name) and addresses (both families) in one pass.
+/// `IFA_LOCAL` is preferred over `IFA_ADDRESS`: on point-to-point links the
+/// latter is the peer's address, while the former is always ours.
+async fn get_interface_addrs(handle: &rtnetlink::Handle) -> io::Result<Vec<IfaceAddr>> {
+    let names = get_link_names(handle).await?;
     let mut addrs = Vec::new();
     let mut stream = handle.address().get().execute();
     while let Some(message) = stream.try_next().await.map_err(netlink_error_to_io)? {
@@ -780,6 +1052,30 @@ async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedRecei
                             }
                         }
                         Ok(routes)
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::NetTablesDump { reply } => {
+                    let result = async {
+                        let names = get_link_names(&handle).await?;
+                        let mut routes = Vec::new();
+                        for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+                            let mut stream = handle.route().get(version).execute();
+                            while let Some(message) =
+                                stream.try_next().await.map_err(netlink_error_to_io)?
+                            {
+                                if let Some(route) = system_route(&message, &names) {
+                                    routes.push(route);
+                                }
+                            }
+                        }
+                        let rules = get_rules(&handle).await?.iter().map(system_rule).collect();
+                        Ok(NetTablesResult {
+                            routes,
+                            rules,
+                            available: true,
+                        })
                     }
                     .await;
                     let _ = reply.send(result);
@@ -1124,6 +1420,10 @@ impl RouteExecutor for NetlinkExecutor {
 
     fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
         self.call_with(|reply| Command::OnLinkNetworks { reply })
+    }
+
+    fn net_tables(&self) -> io::Result<NetTablesResult> {
+        self.call_with(|reply| Command::NetTablesDump { reply })
     }
 }
 
@@ -1746,6 +2046,178 @@ mod tests {
         let mut main_table = route_request(&route, RouteOp::Add);
         main_table.attributes.push(RouteAttribute::Table(254));
         assert_eq!(owned_route_snapshot(&main_table), Some(route));
+    }
+
+    fn names() -> HashMap<u32, String> {
+        HashMap::from([(7, "enp1s0".into()), (42, "wg0".into())])
+    }
+
+    #[test]
+    fn system_route_renders_extended_table_gateway_route() {
+        let mut message = RouteMessage::default();
+        message.header.address_family = AddressFamily::Inet;
+        message.header.kind = RouteType::Unicast;
+        message.header.scope = RouteScope::Universe;
+        message.header.protocol = RouteProtocol::Static;
+        message.header.destination_prefix_length = 24;
+        message
+            .attributes
+            .push(RouteAttribute::Destination(RouteAddress::Inet(
+                "198.51.100.0".parse().unwrap(),
+            )));
+        message
+            .attributes
+            .push(RouteAttribute::Gateway(RouteAddress::Inet(
+                "192.0.2.1".parse().unwrap(),
+            )));
+        message.attributes.push(RouteAttribute::Oif(7));
+        message.attributes.push(RouteAttribute::Priority(600));
+        message.attributes.push(RouteAttribute::Table(51820));
+
+        let route = system_route(&message, &names()).unwrap();
+        assert_eq!(route.family, IpFamily::Ipv4);
+        assert_eq!(route.destination, "198.51.100.0/24".parse().unwrap());
+        assert_eq!(route.table, 51820);
+        assert_eq!(route.kind, "unicast");
+        assert_eq!(route.scope, "universe");
+        assert_eq!(route.gateway, Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(route.interface_name.as_deref(), Some("enp1s0"));
+        assert_eq!(route.metric, Some(600));
+        assert!(!route.managed);
+    }
+
+    #[test]
+    fn system_route_marks_daemon_protocol_and_resolves_default() {
+        let mut message = RouteMessage::default();
+        message.header.address_family = AddressFamily::Inet;
+        message.header.kind = RouteType::Unicast;
+        message.header.protocol = RouteProtocol::from(RTPROT_NETWORK_ORCHESTRATOR);
+        message.header.table = RouteHeader::RT_TABLE_MAIN;
+        message.attributes.push(RouteAttribute::Oif(42));
+
+        let route = system_route(&message, &names()).unwrap();
+        assert_eq!(route.destination, "0.0.0.0/0".parse().unwrap());
+        assert_eq!(route.table, 254);
+        assert_eq!(route.interface_name.as_deref(), Some("wg0"));
+        assert!(route.managed);
+    }
+
+    #[test]
+    fn system_route_renders_multipath_nexthops() {
+        use netlink_packet_route::route::RouteNextHop;
+        let mut message = RouteMessage::default();
+        message.header.address_family = AddressFamily::Inet;
+        message.header.kind = RouteType::Unicast;
+        message.header.table = RouteHeader::RT_TABLE_MAIN;
+        let mut hop = RouteNextHop::default();
+        hop.interface_index = 7;
+        hop.hops = 1;
+        hop.attributes
+            .push(RouteAttribute::Gateway(RouteAddress::Inet(
+                "192.0.2.1".parse().unwrap(),
+            )));
+        message
+            .attributes
+            .push(RouteAttribute::MultiPath(vec![hop]));
+
+        let route = system_route(&message, &names()).unwrap();
+        assert_eq!(route.nexthops.len(), 1);
+        assert_eq!(route.nexthops[0].interface_name.as_deref(), Some("enp1s0"));
+        assert_eq!(
+            route.nexthops[0].gateway,
+            Some("192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(route.nexthops[0].weight, 1);
+    }
+
+    #[test]
+    fn system_route_skips_unknown_family() {
+        let mut message = RouteMessage::default();
+        message.header.address_family = AddressFamily::Unspec;
+        assert!(system_route(&message, &names()).is_none());
+    }
+
+    #[test]
+    fn system_rule_renders_full_selector() {
+        let mut message = RuleMessage::default();
+        message.header.family = AddressFamily::Inet;
+        message.header.action = RuleAction::ToTable;
+        message.header.src_len = 24;
+        message.header.dst_len = 8;
+        message.header.tos = 0x10;
+        message.header.flags.push(RuleFlag::Invert);
+        message.attributes.push(RuleAttribute::Priority(30100));
+        message.attributes.push(RuleAttribute::Table(51820));
+        message
+            .attributes
+            .push(RuleAttribute::Source("10.1.2.0".parse().unwrap()));
+        message
+            .attributes
+            .push(RuleAttribute::Destination("10.9.0.0".parse().unwrap()));
+        message.attributes.push(RuleAttribute::FwMark(0x1234));
+        message.attributes.push(RuleAttribute::FwMask(0xffff));
+        message
+            .attributes
+            .push(RuleAttribute::Iifname("enp1s0".into()));
+        message
+            .attributes
+            .push(RuleAttribute::Oifname("wg0".into()));
+        message.attributes.push(RuleAttribute::SuppressPrefixLen(2));
+        message
+            .attributes
+            .push(RuleAttribute::Protocol(RouteProtocol::from(
+                RTPROT_NETWORK_ORCHESTRATOR,
+            )));
+
+        let rule = system_rule(&message);
+        assert_eq!(rule.family, IpFamily::Ipv4);
+        assert_eq!(rule.priority, 30100);
+        assert_eq!(rule.action, "lookup");
+        assert_eq!(rule.table, 51820);
+        assert_eq!(rule.from, Some("10.1.2.0/24".parse().unwrap()));
+        assert_eq!(rule.to, Some("10.0.0.0/8".parse().unwrap()));
+        assert_eq!(rule.fwmark, Some(0x1234));
+        assert_eq!(rule.fwmask, Some(0xffff));
+        assert_eq!(rule.iifname.as_deref(), Some("enp1s0"));
+        assert_eq!(rule.oifname.as_deref(), Some("wg0"));
+        assert_eq!(rule.suppress_prefix_length, Some(2));
+        assert_eq!(rule.tos, 0x10);
+        assert!(rule.invert);
+        assert!(rule.managed);
+    }
+
+    #[test]
+    fn system_rule_defaults_are_ip_rule_compatible() {
+        // A bare `0: from all lookup main` rule: no selectors, no protocol.
+        let mut message = RuleMessage::default();
+        message.header.family = AddressFamily::Inet;
+        message.header.action = RuleAction::ToTable;
+        message.header.table = RouteHeader::RT_TABLE_MAIN;
+
+        let rule = system_rule(&message);
+        assert_eq!(rule.priority, 0);
+        assert_eq!(rule.table, 254);
+        assert_eq!(rule.from, None);
+        assert_eq!(rule.to, None);
+        assert!(!rule.invert);
+        assert!(!rule.managed);
+    }
+
+    #[test]
+    fn system_rule_ignores_kernel_default_suppress() {
+        let mut message = RuleMessage::default();
+        message.header.family = AddressFamily::Inet;
+        message.header.action = RuleAction::ToTable;
+        message
+            .attributes
+            .push(RuleAttribute::SuppressPrefixLen(u32::MAX));
+        message
+            .attributes
+            .push(RuleAttribute::SuppressIfGroup(u32::MAX));
+
+        let rule = system_rule(&message);
+        assert_eq!(rule.suppress_prefix_length, None);
+        assert_eq!(rule.suppress_if_group, None);
     }
 }
 

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io;
+use std::net::IpAddr;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -68,6 +69,7 @@ pub mod method {
     pub const EXTERNAL_TUNNEL_STOP: &str = "externalTunnel.stop";
     pub const NM_LIST: &str = "nm.list";
     pub const NM_SET_ACTIVE: &str = "nm.setActive";
+    pub const NET_TABLES: &str = "net.tables";
 
     /// Methods implemented by the daemon and reported in `hello.capabilities`.
     pub const CAPABILITIES: &[&str] = &[
@@ -106,6 +108,7 @@ pub mod method {
         EXTERNAL_TUNNEL_STOP,
         NM_LIST,
         NM_SET_ACTIVE,
+        NET_TABLES,
     ];
 }
 
@@ -367,6 +370,109 @@ pub struct NmListResult {
     /// False when the daemon could not reach NetworkManager at all — the
     /// UI should explain the missing backend instead of showing an empty
     /// list.
+    #[serde(default)]
+    pub available: bool,
+}
+
+/// One kernel route as the daemon sees it — every routing table, not only
+/// `main`. Field names mirror what `ip route` prints so the UI can render
+/// a faithful line without guessing kernel conventions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemRoute {
+    pub family: IpFamily,
+    pub destination: IpNet,
+    /// Kernel routing-table id (254 main, 253 default, 255 local; the UI
+    /// renders named tables itself).
+    pub table: u32,
+    /// Route type rendered like `ip route`: `unicast`, `local`,
+    /// `blackhole`, `unreachable`, … (`"type N"` for unknown codes).
+    pub kind: String,
+    /// Scope rendered like `ip route`: `universe`, `site`, `link`, `host`,
+    /// `nowhere` (`"scope N"` for unknown codes).
+    pub scope: String,
+    /// `rt_proto` byte. The daemon stamps its own installs with
+    /// `RTPROT_NETWORK_ORCHESTRATOR`; the UI flags those via `managed`
+    /// rather than hardcoding the number.
+    pub protocol: u8,
+    /// Installed by this daemon (protocol marker matches).
+    pub managed: bool,
+    pub gateway: Option<IpAddr>,
+    pub interface_index: Option<u32>,
+    /// Resolved from the interface dump; `None` for detached ifindices.
+    pub interface_name: Option<String>,
+    pub metric: Option<u32>,
+    /// Preferred source (`src`) if the route carries one.
+    pub pref_source: Option<IpAddr>,
+    /// ECMP nexthops; non-empty only for multipath routes.
+    pub nexthops: Vec<SystemNexthop>,
+}
+
+/// One nexthop of a multipath (`RTA_MULTIPATH`) route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemNexthop {
+    pub gateway: Option<IpAddr>,
+    pub interface_index: u32,
+    pub interface_name: Option<String>,
+    /// Kernel weight (`hops`); `ip route` prints `weight N` when > 0.
+    pub weight: u8,
+}
+
+/// One policy-routing rule as the daemon sees it (`ip rule` equivalent):
+/// every selector the kernel reports plus its action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemRule {
+    pub family: IpFamily,
+    /// `ip rule` prints `0:` for a rule with no FRA_PRIORITY.
+    pub priority: u32,
+    /// Action rendered like `ip rule`: `lookup`, `goto`, `unreachable`,
+    /// `blackhole`, `prohibit`, `nop` (`"type N"` for unknown codes).
+    pub action: String,
+    pub table: u32,
+    /// Target priority when `action` is `goto`.
+    pub goto: Option<u32>,
+    /// `from` selector: the FRA_SRC address under `src_len`.
+    pub from: Option<IpNet>,
+    /// `to` selector: the FRA_DST address under `dst_len`.
+    pub to: Option<IpNet>,
+    pub fwmark: Option<u32>,
+    /// `None` means the kernel's implicit all-ones mask.
+    pub fwmask: Option<u32>,
+    pub iifname: Option<String>,
+    pub oifname: Option<String>,
+    /// `[start, end]` uid range.
+    pub uid_range: Option<[u32; 2]>,
+    /// `[start, end]` port ranges.
+    pub source_port_range: Option<[u16; 2]>,
+    pub destination_port_range: Option<[u16; 2]>,
+    /// IP-protocol selector rendered as a name when common (`tcp`, `udp`,
+    /// `icmp`, `icmpv6`), otherwise the protocol number.
+    pub ip_protocol: Option<String>,
+    pub suppress_prefix_length: Option<u32>,
+    pub suppress_if_group: Option<u32>,
+    pub tun_id: Option<u32>,
+    /// `dsfield`/`tos` selector; `ip rule` prints `tos 0xNN` when nonzero.
+    pub tos: u8,
+    /// `ip rule ... not` — the FIB_RULE_INVERT flag.
+    pub invert: bool,
+    /// FRA_PROTOCOL rt_proto byte; rules the kernel reports without one
+    /// carry 0.
+    pub protocol: u8,
+    /// Installed by this daemon (protocol marker matches).
+    pub managed: bool,
+}
+
+/// Full privileged view of the host routing plane (`ip route` + `ip rule`
+/// across every table), read via the daemon's rtnetlink socket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetTablesResult {
+    pub routes: Vec<SystemRoute>,
+    pub rules: Vec<SystemRule>,
+    /// False when the daemon could not dump the kernel state — the UI
+    /// should explain instead of showing empty tables.
     #[serde(default)]
     pub available: bool,
 }
@@ -1305,7 +1411,7 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop","nm.list","nm.setActive"],"tools":{}}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop","nm.list","nm.setActive","net.tables"],"tools":{}}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);
