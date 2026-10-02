@@ -730,6 +730,14 @@ fn stage_geo_assets(
         ("geoip.dat", assets.geoip_dat_b64.as_deref()),
         ("geosite.dat", assets.geosite_dat_b64.as_deref()),
     ] {
+        let managed = fs::File::open(managed_dir.join(name))
+            .ok()
+            .map(|input| {
+                let mut bytes = Vec::new();
+                let _ = input.take(MAX_GEO_ASSET_BYTES + 1).read_to_end(&mut bytes);
+                bytes
+            })
+            .filter(|bytes| !bytes.is_empty() && bytes.len() as u64 <= MAX_GEO_ASSET_BYTES);
         let bytes = match encoded {
             Some(data) => {
                 let decoded = base64::engine::general_purpose::STANDARD
@@ -738,21 +746,17 @@ fn stage_geo_assets(
                 if decoded.is_empty() || decoded.len() as u64 > MAX_GEO_ASSET_BYTES {
                     return Err(invalid_input());
                 }
-                decoded
-            }
-            None => {
-                let input = fs::File::open(managed_dir.join(name))
-                    .map_err(|_| io::Error::other("geo asset file is unreadable"))?;
-                let mut bytes = Vec::new();
-                input
-                    .take(MAX_GEO_ASSET_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|_| io::Error::other("geo asset file is unreadable"))?;
-                if bytes.is_empty() || bytes.len() as u64 > MAX_GEO_ASSET_BYTES {
-                    return Err(io::Error::other("geo asset file is invalid"));
+                // Provider dats are minimal overlays (they carry only their
+                // own categories), so they are merged over the managed stock
+                // file; a missing or malformed stock file falls back to the
+                // overlay alone.
+                match managed.as_deref() {
+                    Some(stock) => net_manager_core::geo_list::merge_geo_list(stock, &decoded)
+                        .unwrap_or(decoded),
+                    None => decoded,
                 }
-                bytes
             }
+            None => managed.ok_or_else(|| io::Error::other("geo asset file is unreadable"))?,
         };
         write_private_file(&staging.join(name), &bytes)?;
     }
@@ -1305,6 +1309,32 @@ mod tests {
         assert!(stage_geo_assets(&geo_assets(Some(&empty), None), &staging, &managed).is_err());
         let oversized = encode.encode(vec![0u8; MAX_GEO_ASSET_BYTES as usize + 1]);
         assert!(stage_geo_assets(&geo_assets(Some(&oversized), None), &staging, &managed).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Provider dats carry only their own categories, so a provided file is
+    /// merged over the managed stock file instead of replacing it.
+    #[test]
+    fn stage_geo_assets_merges_overlay_over_stock() {
+        use base64::Engine;
+        let (root, staging, managed) = staged_fixture();
+        let entry = |code: &str| -> Vec<u8> {
+            let mut record = vec![0x0a, 2 + code.len() as u8, 0x0a, code.len() as u8];
+            record.extend_from_slice(code.as_bytes());
+            record
+        };
+        let mut stock = entry("GOOGLE");
+        stock.extend(entry("PRIVATE"));
+        fs::write(managed.join("geosite.dat"), &stock).unwrap();
+        let overlay = entry("TORRENT");
+        let assets = geo_assets(
+            None,
+            Some(&base64::engine::general_purpose::STANDARD.encode(overlay)),
+        );
+        stage_geo_assets(&assets, &staging, &managed).unwrap();
+        let staged = fs::read(staging.join("geosite.dat")).unwrap();
+        let codes = net_manager_core::geo_list::geo_codes(&staged).unwrap();
+        assert_eq!(codes, ["GOOGLE", "PRIVATE", "TORRENT"]);
         fs::remove_dir_all(root).unwrap();
     }
 

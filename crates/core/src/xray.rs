@@ -1234,6 +1234,52 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    /// Opt-in pipeline probe: XRAY_PANEL_CONFIG=<managed config>,
+    /// XRAY_PROFILES=<profiles.json>, XRAY_PROFILE_ID=<id>, XRAY_PROC_OUT=<out>
+    /// applies `apply_profile_routing` exactly like the TUN connect path and
+    /// writes the wire-format config to XRAY_PROC_OUT for daemon-side tests.
+    /// Skips silently unless all four vars are set.
+    #[test]
+    fn env_gated_apply_profile_routing_dumps_wire_config() {
+        let (Ok(config_path), Ok(profiles_path), Ok(profile_id), Ok(out_path)) = (
+            std::env::var("XRAY_PANEL_CONFIG"),
+            std::env::var("XRAY_PROFILES"),
+            std::env::var("XRAY_PROFILE_ID"),
+            std::env::var("XRAY_PROC_OUT"),
+        ) else {
+            return;
+        };
+        let base: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&config_path).expect("read panel config"),
+        )
+        .expect("parse panel config");
+        let document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&profiles_path).expect("read profiles"))
+                .expect("parse profiles");
+        let profiles: Vec<crate::models::Profile> =
+            serde_json::from_value(document["profiles"].clone()).expect("parse profile list");
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile id");
+        let processed = apply_profile_routing(
+            &base,
+            &profile.domain_policies,
+            &ProfileRoutingOptions {
+                private_lan_direct: profile.private_lan_direct,
+                domain_strategy: profile.xray_domain_strategy,
+                domain_matcher: profile.xray_domain_matcher,
+                dns: profile.xray_dns.clone(),
+            },
+        )
+        .expect("apply_profile_routing");
+        std::fs::write(
+            &out_path,
+            serde_json::to_string(&processed).expect("encode processed config"),
+        )
+        .expect("write processed config");
+    }
+
     /// Opt-in: XRAY_TEST_BIN=/path/to/xray validates a panel-style JSON entry.
     #[test]
     fn xray_accepts_generated_panel_json_config_when_binary_supplied() {
