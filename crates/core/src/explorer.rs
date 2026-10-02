@@ -64,8 +64,7 @@ fn route_metric(r: &net_route::Route) -> u32 {
 
 /// Longest prefix wins; ties go to the lowest metric. Routes of the other
 /// address family never match.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
-fn longest_prefix_match(dest: IpAddr, routes: &[RouteEntry]) -> Option<&RouteEntry> {
+pub fn longest_prefix_match(dest: IpAddr, routes: &[RouteEntry]) -> Option<&RouteEntry> {
     routes
         .iter()
         .filter(|r| {

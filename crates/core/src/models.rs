@@ -368,6 +368,18 @@ pub struct Profile {
     /// Ignored in SOCKS mode and when explicit profile routes are set.
     #[serde(default)]
     pub xray_split_default: bool,
+    /// Hosts (literal IPs or DNS names) that must stay reachable via the
+    /// physical uplink, bypassing any foreign capture tunnel — e.g. a VPN
+    /// server's own endpoint while another client's TUN holds the default
+    /// route. Resolved to /32 or /128 host routes through the current uplink
+    /// gateway at apply time.
+    #[serde(default)]
+    pub endpoint_bypasses: Vec<String>,
+    /// When true, an absent `interface_name` does not fail planning: declared
+    /// routes stay deferred and are installed when the interface appears
+    /// (external tunnels come and go). Ignored while the interface exists.
+    #[serde(default)]
+    pub wait_for_interface: bool,
 }
 
 impl Default for Profile {
@@ -396,6 +408,8 @@ impl Default for Profile {
             xray_domain_matcher: None,
             xray_dns: XrayDnsConfig::default(),
             xray_split_default: false,
+            endpoint_bypasses: Vec::new(),
+            wait_for_interface: false,
         }
     }
 }

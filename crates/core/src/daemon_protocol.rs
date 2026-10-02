@@ -66,6 +66,8 @@ pub mod method {
     pub const COND_RULES_PUT: &str = "condRules.put";
     pub const COND_RULES_REMOVE: &str = "condRules.remove";
     pub const EXTERNAL_TUNNEL_STOP: &str = "externalTunnel.stop";
+    pub const NM_LIST: &str = "nm.list";
+    pub const NM_SET_ACTIVE: &str = "nm.setActive";
 
     /// Methods implemented by the daemon and reported in `hello.capabilities`.
     pub const CAPABILITIES: &[&str] = &[
@@ -102,6 +104,8 @@ pub mod method {
         COND_RULES_PUT,
         COND_RULES_REMOVE,
         EXTERNAL_TUNNEL_STOP,
+        NM_LIST,
+        NM_SET_ACTIVE,
     ];
 }
 
@@ -289,17 +293,89 @@ pub struct HelloResult {
     pub tools: std::collections::BTreeMap<String, bool>,
 }
 
+/// Attach intent for a routes owner: `routes` bind to `interface_name`
+/// whenever that link exists, and `endpoint_bypasses` stay pinned to the
+/// physical uplink. External tunnels re-create their links, so the daemon
+/// re-plans the spec on every reconcile instead of trusting one ifindex.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachSpecParams {
+    pub interface_name: String,
+    pub routes: Vec<PolicyRoute>,
+    pub endpoint_bypasses: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutesApplyParams {
     pub owner: String,
     pub routes: Vec<AppliedRoute>,
+    /// Present when the owner arms an external-interface attach: the daemon
+    /// re-derives routes from the spec on every reconcile. `routes` still
+    /// carries what is installable right now (empty when the target link is
+    /// absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach: Option<AttachSpecParams>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutesApplyResult {
     pub applied: usize,
+}
+
+/// Backend family of a NetworkManager connection profile.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NmConnectionKind {
+    WireGuard,
+    OpenVpn,
+    /// Another NM VPN plugin (openconnect, l2tp, …).
+    Vpn,
+    /// Not a tunnel profile; filtered out of `nm.list` results.
+    Other,
+}
+
+/// Live activation state of an NM connection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NmConnectionState {
+    Inactive,
+    Activating,
+    Active,
+}
+
+/// One NetworkManager connection profile (VPN/WireGuard) with live state.
+/// NM owns the secrets; the app only sees metadata and may ask the daemon
+/// to activate/deactivate by UUID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NmConnection {
+    pub uuid: String,
+    pub id: String,
+    pub kind: NmConnectionKind,
+    /// Bound interface from the profile settings, or the live device while
+    /// the connection is active. `None` = NM picks the name on connect.
+    pub interface_name: Option<String>,
+    pub state: NmConnectionState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NmListResult {
+    pub connections: Vec<NmConnection>,
+    /// False when the daemon could not reach NetworkManager at all — the
+    /// UI should explain the missing backend instead of showing an empty
+    /// list.
+    #[serde(default)]
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NmSetActiveParams {
+    pub uuid: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1006,6 +1082,10 @@ pub enum OwnedResource {
     Address(WireGuardAddressResource),
     Rule(OwnedRuleResource),
     Dns(WireGuardDnsResource),
+    /// Deferred intent: routes bound to an external interface by *name*
+    /// plus uplink bypasses. Carries no kernel artifact by itself; realized
+    /// `Route` resources on the same entry are its current derivation.
+    AttachSpec(AttachSpecParams),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1225,7 +1305,7 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop"],"tools":{}}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop","nm.list","nm.setActive"],"tools":{}}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);

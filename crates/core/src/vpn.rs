@@ -1243,10 +1243,10 @@ impl TunnelManager {
             ));
         }
         if profile.backend == TunnelBackend::None {
-            if profile.routes.is_empty() {
+            if profile.routes.is_empty() && profile.endpoint_bypasses.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "static-routes profile has no routes to apply",
+                    "static-routes profile has no routes or endpoint bypasses to apply",
                 ));
             }
             self.static_route_profiles.insert(profile.id.clone());
