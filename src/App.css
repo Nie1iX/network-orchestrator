@@ -2419,6 +2419,78 @@ a:focus-visible,
   font-size: var(--fs-xs);
 }
 
+/* Intent status badges (explainability) — semantic state colors. */
+.state-deferred {
+  color: var(--warn);
+  background-color: var(--warn-bg);
+}
+
+.state-missing {
+  color: var(--down);
+  background-color: var(--down-bg);
+}
+
+.system-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.system-head-row .system-tables-heading {
+  flex: 1;
+}
+
+.system-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.system-badge-gap {
+  margin-left: var(--sp-2);
+}
+
+.system-intent-empty {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+.system-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0 var(--sp-3);
+}
+
+.system-check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.dns-probe {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+  margin: var(--sp-3) 0;
+  flex-wrap: wrap;
+}
+
+.dns-probe input[type="text"] {
+  flex: 0 1 14rem;
+}
+
+.dns-probe .dns-probe-host {
+  flex: 1 1 16rem;
+}
+
+.dns-resolv {
+  margin: var(--sp-2) 0;
+}
+
+.dns-result {
+  margin-bottom: var(--sp-4);
+}
+
 /* ── Flow diagram ───────────────────────────────────────────────────── */
 
 .route-flow {

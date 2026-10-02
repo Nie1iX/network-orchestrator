@@ -585,7 +585,7 @@ export interface SystemRoute {
   /** Kernel table id (254 main, 253 default, 255 local). */
   table: number;
   /** `unicast` | `local` | `blackhole` | … as `ip route` prints it. */
-  kind: string;
+  routeType: string;
   /** `universe` | `site` | `link` | `host` | `nowhere` | `scope N`. */
   scope: string;
   /** rt_proto byte. */
@@ -689,4 +689,111 @@ export interface CondRulesPutResult {
 
 export interface CondRulesRemoveResult {
   removed: boolean;
+}
+
+// ── Manual route/rule editing + reconcile explainability (Linux daemon) ──
+
+/** Payload of `net_route_add` — a daemon-owned unicast route. */
+export interface NetRouteAddParams {
+  /** CIDR destination. */
+  destination: string;
+  /** Kernel table id; absent = main (254). */
+  table?: number;
+  gateway?: string;
+  /** Exactly one of interfaceName/interfaceIndex is required. */
+  interfaceName?: string;
+  interfaceIndex?: number;
+  metric?: number;
+  /** Preferred source (`src`). */
+  prefSource?: string;
+}
+
+/** Payload of `net_rule_add` — a `lookup` policy rule. */
+export interface NetRuleAddParams {
+  family: "ipv4" | "ipv6";
+  /** Explicit priority; 0 is reserved by the kernel local rule. */
+  priority: number;
+  /** Lookup target table. */
+  table: number;
+  from?: string;
+  to?: string;
+  fwmark?: number;
+  fwmask?: number;
+  iifname?: string;
+  oifname?: string;
+  invert?: boolean;
+}
+
+/** What a `net.*.del` call did with the kernel object. */
+export type NetEditOutcome = "deleted" | "suppressed";
+
+export interface NetEditResult {
+  outcome: NetEditOutcome;
+}
+
+/** Reconciliation status of one journaled intent piece. */
+export type ExplainStatus =
+  | "effective"
+  | "deferred"
+  | "conflicted"
+  | "missing"
+  | "active";
+
+export interface ExplainEntry {
+  /** Journal owner: `wg:…`, `manual`, `cond:…`, a client owner. */
+  owner: string;
+  state: "applying" | "applied" | "stale";
+  /** `route` | `rule` | `attach` | `suppressed-route` | `suppressed-rule` | `link` | `dns` | `process`. */
+  kind: string;
+  subject: string;
+  status: ExplainStatus;
+  /** Why it is in this status (English, daemon-composed). */
+  detail: string;
+}
+
+export interface NetExplainResult {
+  entries: ExplainEntry[];
+  /** False when the kernel dump was unavailable. */
+  available: boolean;
+}
+
+// ── DNS inventory + probe (Linux daemon) ─────────────────────────────
+
+export interface DnsDomain {
+  domain: string;
+  routeOnly: boolean;
+}
+
+/** Per-link resolver state as systemd-resolved reports it. */
+export interface DnsLinkStatus {
+  interfaceIndex: number;
+  interfaceName: string;
+  servers: string[];
+  currentServer: string | null;
+  domains: DnsDomain[];
+  defaultRoute: boolean;
+}
+
+export interface NetDnsStatusResult {
+  links: DnsLinkStatus[];
+  /** False when systemd-resolved is unreachable. */
+  available: boolean;
+  /** `nameserver` lines of /etc/resolv.conf — the stub view apps use. */
+  resolvConf: string[];
+}
+
+/** Result of `net_dns_probe`: one real query plus its egress path. */
+export interface NetDnsProbeResult {
+  /** Resolver that was queried. */
+  server: string;
+  /** Source address the kernel picked for the packet. */
+  source: string | null;
+  interfaceIndex: number | null;
+  interfaceName: string | null;
+  gateway: string | null;
+  /** dig-style `name TTL TYPE data` answer lines. */
+  answers: string[];
+  /** `NOERROR` | `NXDOMAIN` | `SERVFAIL` | … */
+  status: string;
+  rttMs: number;
 }
