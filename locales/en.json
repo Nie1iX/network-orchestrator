@@ -719,6 +719,7 @@
     "profiles.infoElev": "WireGuard, OpenVPN, interface changes, and policy routes require administrator privileges. Several connections can run at once.",
     "profiles.modeManagedOnly": "Managed tunnels are disabled in Orchestrator mode — change App mode in Settings.",
     "profiles.nmGroup": "NetworkManager",
+    "profiles.nmNote": "Managed by NetworkManager — the profile and its credentials live there.",
     "profiles.nmUnavailable": "NetworkManager is not reachable — VPN profiles managed by it cannot be listed.",
     "profiles.noMatch": "No connections match \"{query}\".",
     "profiles.refreshIntervalFailed": "Cannot update subscription refresh interval.",

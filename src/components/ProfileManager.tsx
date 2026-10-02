@@ -38,6 +38,7 @@ import {
 } from "./profiles/sets";
 import Skeleton from "./ui/Skeleton";
 import ExternalTunnelPanel from "./ExternalTunnelPanel";
+import NmConnectionPanel from "./NmConnectionPanel";
 import TailscalePanel from "./TailscalePanel";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import { useToast } from "./ui/Toast";
@@ -224,6 +225,7 @@ export default function ProfileManager() {
   >({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [externalName, setExternalName] = useState<string | null>(null);
+  const [nmSelected, setNmSelected] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<TunnelBackend>>(
     loadCollapsedGroups,
   );
@@ -1276,12 +1278,22 @@ export default function ProfileManager() {
       .flatMap((p) => [p.interfaceName, statusFor(p.id).interfaceName ?? ""])
       .filter((name) => name !== ""),
   );
+  // Interfaces already owned by a NetworkManager connection live in the NM
+  // group — showing them under "detected" too would list the same tunnel
+  // twice.
+  const nmIfaces = new Set(
+    (nm?.connections ?? [])
+      .map((c) => c.interfaceName)
+      .filter((n): n is string => n !== null),
+  );
   const externalTunnels = interfaces.filter(
     (i) =>
       isTunnelIface(i) &&
       !isTailscaleIface(i) &&
       !managedIfaces.has(i.name) &&
-      !managedIfaces.has(i.friendlyName),
+      !managedIfaces.has(i.friendlyName) &&
+      !nmIfaces.has(i.name) &&
+      !nmIfaces.has(i.friendlyName),
   );
   const externalNames = new Set(
     externalTunnels.flatMap((i) => [i.name, i.friendlyName]),
@@ -1300,6 +1312,8 @@ export default function ProfileManager() {
   );
   const externalSelected =
     externalTunnels.find((i) => i.name === externalName) ?? null;
+  const nmSelectedConn =
+    nm?.connections.find((c) => c.uuid === nmSelected) ?? null;
 
   const tsRunning =
     tailscale !== null &&
@@ -1449,6 +1463,7 @@ export default function ProfileManager() {
         onSelect={() => {
           setServiceSelected(false);
           setExternalName(null);
+          setNmSelected(null);
           setSelectedId(profile.id);
         }}
         onToggle={() =>
@@ -1460,6 +1475,7 @@ export default function ProfileManager() {
           e.preventDefault();
           setServiceSelected(false);
           setExternalName(null);
+          setNmSelected(null);
           setSelectedId(profile.id);
           const items = profileMenuItems(profile);
           void popupNativeMenu(items, e.clientX, e.clientY).then(
@@ -1604,6 +1620,7 @@ export default function ProfileManager() {
               if (!id) return;
               setServiceSelected(false);
               setExternalName(null);
+              setNmSelected(null);
               setSelectedId(id);
               document
                 .querySelector(`[data-profile-id="${id}"]`)
@@ -1679,6 +1696,7 @@ export default function ProfileManager() {
               className={`profile-row${serviceSelected ? " selected" : ""}`}
               onClick={() => {
                 setExternalName(null);
+                setNmSelected(null);
                 setServiceSelected(true);
               }}
               onKeyDown={(e) => {
@@ -1686,6 +1704,7 @@ export default function ProfileManager() {
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
                   setExternalName(null);
+                  setNmSelected(null);
                   setServiceSelected(true);
                 }
               }}
@@ -1740,6 +1759,7 @@ export default function ProfileManager() {
                 onClick={() => {
                   setServiceSelected(false);
                   setSelectedId(null);
+                  setNmSelected(null);
                   setExternalName(iface.name);
                 }}
                 onKeyDown={(e) => {
@@ -1748,6 +1768,7 @@ export default function ProfileManager() {
                     e.preventDefault();
                     setServiceSelected(false);
                     setSelectedId(null);
+                    setNmSelected(null);
                     setExternalName(iface.name);
                   }
                 }}
@@ -1793,7 +1814,27 @@ export default function ProfileManager() {
               {nm.connections.map((conn) => (
                 <div
                   key={conn.uuid}
-                  className="profile-row profile-row-external"
+                  role="button"
+                  tabIndex={0}
+                  className={`profile-row profile-row-external${
+                    nmSelected === conn.uuid ? " selected" : ""
+                  }`}
+                  onClick={() => {
+                    setServiceSelected(false);
+                    setSelectedId(null);
+                    setExternalName(null);
+                    setNmSelected(conn.uuid);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setServiceSelected(false);
+                      setSelectedId(null);
+                      setExternalName(null);
+                      setNmSelected(conn.uuid);
+                    }
+                  }}
                 >
                   <span
                     className={`status-dot state-${
@@ -1811,6 +1852,9 @@ export default function ProfileManager() {
                       · {conn.interfaceName}
                     </span>
                   )}
+                  <span className="badge badge-external">
+                    {t("detail.external")}
+                  </span>
                   {(conn.kind === "vpn" || conn.kind === "other") && (
                     <span className="badge badge-managed">{conn.kind}</span>
                   )}
@@ -1846,6 +1890,14 @@ export default function ProfileManager() {
               rate={throughput[externalSelected.ifIndex] ?? null}
               busy={externalBusy === externalSelected.name}
               onToggle={() => void onToggleExternal(externalSelected)}
+            />
+          ) : nmSelectedConn ? (
+            <NmConnectionPanel
+              conn={nmSelectedConn}
+              busy={nmBusy === nmSelectedConn.uuid}
+              onToggle={() => void onToggleNm(nmSelectedConn)}
+              avatarClass={nmAvatarClass(nmSelectedConn.kind)}
+              icon={nmIcon(nmSelectedConn.kind)}
             />
           ) : serviceSelected && tailscale ? (
             <TailscalePanel
