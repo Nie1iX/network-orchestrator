@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
@@ -51,6 +52,15 @@ pub trait NetworkObservation: Send + Sync {
     fn interface_addrs(&self) -> io::Result<Vec<IfaceAddr>>;
     /// Daemon-owned routes (`RTPROT_NETWORK_ORCHESTRATOR`) in the kernel.
     fn owned_routes(&self) -> io::Result<Vec<AppliedRoute>>;
+    /// `ip route get <to>` through the policy rules — the egress a packet
+    /// would take right now. Used by the DNS probe; unavailable observers
+    /// (tests, degraded setups) return `Unsupported`.
+    fn route_lookup(
+        &self,
+        _to: IpAddr,
+    ) -> io::Result<net_manager_core::daemon_protocol::RouteLookup> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Used when no observer is wired (tests, degraded setups): no address can
