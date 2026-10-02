@@ -1071,10 +1071,25 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
         thread::sleep(Duration::from_millis(25));
     }
     signal_pidfd(&pidfd, libc::SIGKILL)?;
-    child
-        .wait()
-        .map_err(|_| io::Error::other("Xray child wait failed"))?;
-    Ok(())
+    // A child wedged in an uninterruptible syscall survives SIGKILL; keep
+    // the reaper bounded too so `stop` never blocks a core task forever.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .map_err(|_| io::Error::other("Xray child wait failed"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Xray child did not exit",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[cfg(target_os = "linux")]

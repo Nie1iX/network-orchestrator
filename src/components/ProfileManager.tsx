@@ -1191,7 +1191,8 @@ export default function ProfileManager() {
   const managedIfaces = new Set(
     profiles
       .filter((p) => statusFor(p.id).state === "running")
-      .flatMap((p) => [p.interfaceName]),
+      .flatMap((p) => [p.interfaceName, statusFor(p.id).interfaceName ?? ""])
+      .filter((name) => name !== ""),
   );
   const externalTunnels = interfaces.filter(
     (i) =>
