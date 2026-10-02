@@ -10,7 +10,7 @@ use crate::cond_rules::{validate_rule, CondRuleStore, NetworkObservation, NoObse
 use crate::core::DaemonCore;
 use crate::openvpn::{prepare_openvpn, OpenVpnPlan};
 use crate::settings::{DaemonSettings, SettingsStore};
-use crate::validate::{validate_apply, validate_iface_name, validate_owner};
+use crate::validate::{validate_apply, validate_attach, validate_iface_name, validate_owner};
 use crate::wireguard::parse_wireguard_config;
 use crate::xray::prepare_xray;
 use net_manager_core::daemon_protocol::{
@@ -19,10 +19,11 @@ use net_manager_core::daemon_protocol::{
     AlwaysOnSetParams, AlwaysOnSetResult, CondRulesListResult, CondRulesPutParams,
     CondRulesPutResult, CondRulesRemoveParams, CondRulesRemoveResult, ConditionalRuleEntry,
     ErrorCode, EventFrame, ExternalTunnelStopParams, HelloParams, HelloResult, LinkSetStateParams,
-    OpenVpnConnectRequest, OpenVpnConnectResult, OpenVpnDisconnectResult, OpenVpnProbeResult,
-    OpenVpnProfileParams, OwnedChanged, OwnedListResult, OwnerParams, RequestFrame, ResponseFrame,
-    RoutesApplyParams, RoutesApplyResult, RoutesRemoveResult, SettingsResult, SettingsSetParams,
-    VpnAuthMode, WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
+    NmListResult, NmSetActiveParams, OpenVpnConnectRequest, OpenVpnConnectResult,
+    OpenVpnDisconnectResult, OpenVpnProbeResult, OpenVpnProfileParams, OwnedChanged,
+    OwnedListResult, OwnerParams, RequestFrame, ResponseFrame, RoutesApplyParams,
+    RoutesApplyResult, RoutesRemoveResult, SettingsResult, SettingsSetParams, VpnAuthMode,
+    WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
     WireGuardProfileParams, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
     XrayInstallParams, XrayInstallResult, XrayProfileParams, XrayRemoveResult, HELLO_TIMEOUT_SECS,
     MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
@@ -866,10 +867,14 @@ async fn handle<A: Authorizer>(
             validate_owner(&params.owner).map_err(invalid)?;
             reject_wireguard_owner(&params.owner)?;
             validate_apply(&params.routes).map_err(invalid)?;
+            if let Some(spec) = &params.attach {
+                validate_attach(spec).map_err(invalid)?;
+            }
             authorize(ctx, peer, Action::SystemNetwork).await?;
             let owner = params.owner.clone();
-            let applied = with_core(ctx, move |core| {
-                core.apply_routes(uid, &params.owner, params.routes)
+            let applied = with_core(ctx, move |core| match params.attach {
+                Some(spec) => core.apply_attach(uid, &params.owner, spec, params.routes),
+                None => core.apply_routes(uid, &params.owner, params.routes),
             })
             .await?;
             notify(ctx, uid, owner);
@@ -930,6 +935,34 @@ async fn handle<A: Authorizer>(
             // Orphan cleanup inside evaluation withdraws the rule's routes.
             eval_conditional(ctx).await;
             to_value(&CondRulesRemoveResult { removed })
+        }
+        #[cfg(target_os = "linux")]
+        method::NM_LIST => match crate::nm::list_connections().await {
+            Ok(connections) => to_value(&NmListResult {
+                connections,
+                available: true,
+            }),
+            Err(err) if err.kind() == io::ErrorKind::NotConnected => to_value(&NmListResult {
+                connections: Vec::new(),
+                available: false,
+            }),
+            Err(err) => Err((ErrorCode::Internal, err.to_string())),
+        },
+        #[cfg(target_os = "linux")]
+        method::NM_SET_ACTIVE => {
+            let params: NmSetActiveParams = params(request.params)?;
+            authorize(ctx, peer, Action::ConnectProfile).await?;
+            crate::nm::set_active(&params.uuid, params.active)
+                .await
+                .map_err(|err| match err.kind() {
+                    io::ErrorKind::NotFound => (ErrorCode::NotFound, err.to_string()),
+                    io::ErrorKind::NotConnected => (
+                        ErrorCode::NotFound,
+                        "NetworkManager is not available".into(),
+                    ),
+                    _ => (ErrorCode::Internal, err.to_string()),
+                })?;
+            Ok(Value::Null)
         }
         method::LINK_SET_STATE => {
             let params: LinkSetStateParams = params(request.params)?;

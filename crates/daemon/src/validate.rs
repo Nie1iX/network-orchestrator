@@ -2,10 +2,16 @@
 //! reaches netlink is checked here first, before polkit is even asked.
 
 use ipnet::IpNet;
-use net_manager_core::daemon_protocol::{MAX_OWNER_BYTES, MAX_ROUTES_PER_REQUEST};
+use net_manager_core::daemon_protocol::{
+    AttachSpecParams, MAX_OWNER_BYTES, MAX_ROUTES_PER_REQUEST,
+};
 use net_manager_core::models::AppliedRoute;
 use std::collections::HashSet;
 use std::net::IpAddr;
+
+/// Cap on `endpoint_bypasses` per attach spec: endpoints are a handful of
+/// VPN servers, not a bulk list.
+pub const MAX_ENDPOINT_BYPASSES: usize = 256;
 
 /// Detect a full address-family union even when no single route is `/0`.
 pub fn full_coverage(routes: impl IntoIterator<Item = IpNet>) -> (bool, bool) {
@@ -48,6 +54,58 @@ pub fn validate_owner(owner: &str) -> Result<(), String> {
     }
     if owner.chars().any(char::is_control) {
         return Err("owner must not contain control characters".into());
+    }
+    Ok(())
+}
+
+/// An attach spec reaches the journal verbatim and is re-planned on every
+/// reconcile, so every field is checked once here. `via` on a policy route
+/// names an on-link peer (e.g. a tun gateway); it must be unicast and match
+/// the destination family, same as `AppliedRoute.gateway`.
+pub fn validate_attach(spec: &AttachSpecParams) -> Result<(), String> {
+    // An empty interface name is legal for bypass-only specs — there is no
+    // link to bind — but declared routes always need a binding target.
+    if !spec.interface_name.is_empty() {
+        validate_iface_name(&spec.interface_name)?;
+    } else if !spec.routes.is_empty() {
+        return Err("attach routes need an interface name".into());
+    }
+    if spec.routes.len() > MAX_ROUTES_PER_REQUEST {
+        return Err(format!(
+            "at most {MAX_ROUTES_PER_REQUEST} spec routes, got {}",
+            spec.routes.len()
+        ));
+    }
+    if spec.endpoint_bypasses.len() > MAX_ENDPOINT_BYPASSES {
+        return Err(format!(
+            "at most {MAX_ENDPOINT_BYPASSES} endpoint bypasses, got {}",
+            spec.endpoint_bypasses.len()
+        ));
+    }
+    for route in &spec.routes {
+        if let Some(via) = route.via {
+            let same_family = via.is_ipv4() == route.destination.addr().is_ipv4();
+            if !same_family || via.is_unspecified() || via.is_multicast() {
+                return Err(format!(
+                    "via {via} must be a unicast address in the family of {}",
+                    route.destination
+                ));
+            }
+        }
+    }
+    for host in &spec.endpoint_bypasses {
+        if host.is_empty() || host.len() > 253 {
+            return Err("endpoint bypass host must be 1-253 bytes".into());
+        }
+        if host.parse::<IpAddr>().is_err()
+            && !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        {
+            return Err(format!(
+                "endpoint bypass host {host:?} is not a DNS name or IP"
+            ));
+        }
     }
     Ok(())
 }

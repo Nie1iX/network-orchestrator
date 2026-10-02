@@ -57,6 +57,10 @@ impl LinkExecutor for NoLinks {
             "test never mutates",
         ))
     }
+
+    fn link_index(&self, _name: &str) -> io::Result<Option<u32>> {
+        Ok(None)
+    }
 }
 
 struct DenyAll;

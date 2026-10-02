@@ -163,6 +163,40 @@ fn owned_route_snapshot(message: &RouteMessage) -> Option<AppliedRoute> {
     })
 }
 
+/// A connected main-table subnet: unicast, carries an output interface, no
+/// gateway — i.e. an on-link network. Returns `(interface, destination)`.
+fn on_link_network(message: &RouteMessage) -> Option<(u32, IpNet)> {
+    if message.header.kind != RouteType::Unicast
+        || message.header.destination_prefix_length == 0
+        || route_table(message) != RouteHeader::RT_TABLE_MAIN as u32
+        || message
+            .attributes
+            .iter()
+            .any(|attribute| matches!(attribute, RouteAttribute::Gateway(_)))
+    {
+        return None;
+    }
+    let destination = message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Destination(RouteAddress::Inet(address)) => Some(IpAddr::V4(*address)),
+            RouteAttribute::Destination(RouteAddress::Inet6(address)) => Some(IpAddr::V6(*address)),
+            _ => None,
+        })?;
+    let interface = message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Oif(index) => Some(*index),
+            _ => None,
+        })?;
+    let destination = IpNet::new(destination, message.header.destination_prefix_length)
+        .ok()?
+        .trunc();
+    Some((interface, destination))
+}
+
 /// A main-table default route carrying a gateway and an output interface —
 /// i.e. the physical uplink. Tunnel-carrying routes live in policy tables or
 /// lack a gateway, so they are naturally excluded.
@@ -441,6 +475,9 @@ enum Command {
     DefaultGateways {
         reply: mpsc::Sender<io::Result<Vec<(IpAddr, u32)>>>,
     },
+    OnLinkNetworks {
+        reply: mpsc::Sender<io::Result<Vec<(u32, IpNet)>>>,
+    },
     RulesSnapshot {
         reply: mpsc::Sender<io::Result<Vec<OwnedRuleResource>>>,
     },
@@ -707,6 +744,24 @@ async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedRecei
                             }
                         }
                         Ok(gateways)
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::OnLinkNetworks { reply } => {
+                    let result = async {
+                        let mut networks = Vec::new();
+                        for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+                            let mut stream = handle.route().get(version).execute();
+                            while let Some(message) =
+                                stream.try_next().await.map_err(netlink_error_to_io)?
+                            {
+                                if let Some(network) = on_link_network(&message) {
+                                    networks.push(network);
+                                }
+                            }
+                        }
+                        Ok(networks)
                     }
                     .await;
                     let _ = reply.send(result);
@@ -1066,6 +1121,10 @@ impl RouteExecutor for NetlinkExecutor {
     fn default_gateways(&self) -> io::Result<Vec<(IpAddr, u32)>> {
         self.call_with(|reply| Command::DefaultGateways { reply })
     }
+
+    fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
+        self.call_with(|reply| Command::OnLinkNetworks { reply })
+    }
 }
 
 impl PolicyRuleExecutor for NetlinkExecutor {
@@ -1154,6 +1213,16 @@ impl LinkExecutor for NetlinkExecutor {
         } else {
             Ok(ExternalLinkKind::Other)
         }
+    }
+
+    /// Read-only name → ifindex probe; 0 means "no such interface".
+    fn link_index(&self, name: &str) -> io::Result<Option<u32>> {
+        let c_name = CString::new(name).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "interface name contains NUL")
+        })?;
+        // SAFETY: `c_name` is a valid NUL-terminated string for the call.
+        let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+        Ok((index != 0).then_some(index))
     }
 }
 
