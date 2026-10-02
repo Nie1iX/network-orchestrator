@@ -462,6 +462,36 @@ export class SandboxBackend {
           notes: sawUnknown ? ["geoip/geosite selectors could not be evaluated: no geo assets on disk"] : [],
         };
       }
+      case "get_net_tables": return {
+        available: true,
+        routes: [
+          { family: "ipv4", destination: "0.0.0.0/0", table: 254, routeType: "unicast", scope: "universe", protocol: 16, managed: false, gateway: "192.168.1.1", interfaceIndex: 23, interfaceName: "enp59s0u2", metric: 100, prefSource: null, nexthops: [] },
+          { family: "ipv4", destination: "198.51.100.88/32", table: 254, routeType: "unicast", scope: "universe", protocol: 79, managed: true, gateway: "192.168.1.1", interfaceIndex: 23, interfaceName: "enp59s0u2", metric: 51, prefSource: null, nexthops: [] },
+        ],
+        rules: [
+          { family: "ipv4", priority: 0, action: "lookup", table: 255, goto: null, from: null, to: null, fwmark: null, fwmask: null, iifname: null, oifname: null, uidRange: null, sourcePortRange: null, destinationPortRange: null, ipProtocol: null, suppressPrefixLength: null, suppressIfGroup: null, tunId: null, tos: 0, invert: false, protocol: 0, managed: false },
+          { family: "ipv4", priority: 32766, action: "lookup", table: 254, goto: null, from: null, to: null, fwmark: null, fwmask: null, iifname: null, oifname: null, uidRange: null, sourcePortRange: null, destinationPortRange: null, ipProtocol: null, suppressPrefixLength: null, suppressIfGroup: null, tunId: null, tos: 0, invert: false, protocol: 0, managed: false },
+        ],
+      };
+      case "net_explain": return {
+        available: true,
+        entries: [
+          { owner: "manual", state: "applied", kind: "route", subject: "198.51.100.88/32 dev enp59s0u2 table main", status: "effective", detail: "installed" },
+        ],
+      };
+      case "net_dns_status": return {
+        available: true,
+        resolvConf: ["127.0.0.53"],
+        links: [
+          { interfaceIndex: 132, interfaceName: "Mihomo", servers: ["198.18.0.2", "fdfe:dcba:9876::2"], currentServer: "198.18.0.2", defaultRoute: true, domains: [{ domain: ".", routeOnly: true }] },
+          { interfaceIndex: 5, interfaceName: "tailscale0", servers: ["100.100.100.100"], currentServer: "100.100.100.100", defaultRoute: false, domains: [{ domain: "tailfa4e85.ts.net", routeOnly: false }, { domain: "ts.net", routeOnly: true }] },
+          { interfaceIndex: 23, interfaceName: "enp59s0u2", servers: ["192.168.1.1"], currentServer: "192.168.1.1", defaultRoute: true, domains: [] },
+        ],
+      };
+      case "net_dns_probe": return {
+        server: "198.18.0.2", source: "198.18.0.1", interfaceIndex: 132, interfaceName: "Mihomo",
+        gateway: "198.18.0.2", answers: ["example.com 1 A 198.18.0.226"], status: "NOERROR", rttMs: 12,
+      };
       case "plugin:dialog|ask":
       case "plugin:dialog|confirm": return true;
       default: throw new Error(`Command is disabled in sandbox: ${command}`);
