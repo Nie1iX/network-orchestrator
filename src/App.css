@@ -1688,6 +1688,36 @@ a:focus-visible,
 .rules-fg-proxy { color: var(--accent); }
 .rules-fg-direct { color: var(--up); }
 .rules-fg-block { color: var(--down); }
+.rules-fg-dns { color: var(--info); }
+
+.route-check {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+
+.route-check-row {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+.route-check-row input {
+  flex: 1;
+  font-family: var(--font-mono);
+}
+
+.route-check-result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.route-check-verdict {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-strong);
+}
 
 .rules-editor {
   min-height: 0;
@@ -3441,6 +3471,17 @@ a:focus-visible,
   min-width: 0;
 }
 
+.profile-row-server {
+  flex: 0 2 auto;
+  min-width: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
 .profile-row-meta {
   display: inline-flex;
   align-items: center;
@@ -3923,6 +3964,12 @@ a:focus-visible,
   display: flex;
   align-items: center;
   gap: var(--sp-4);
+}
+
+.status-bar-active-name {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ── Monitor table ────────────────────────────────────────────────────── */

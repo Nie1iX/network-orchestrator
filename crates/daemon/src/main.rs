@@ -23,7 +23,7 @@ mod linux {
     use network_orchestrator_daemon::netlink::{watch_network_changes, NetlinkExecutor};
     use network_orchestrator_daemon::openvpn_process::TrustedOpenVpnProcess;
     use network_orchestrator_daemon::server::{
-        bind_socket, eval_conditional, serve, OwnerEvent, ServerContext,
+        bind_socket, eval_conditional, serve, watch_client_sessions, OwnerEvent, ServerContext,
     };
     use network_orchestrator_daemon::settings::{SettingsStore, SETTINGS_FILE};
     use network_orchestrator_daemon::xray_process::TrustedXrayProcess;
@@ -192,6 +192,13 @@ mod linux {
                 eprintln!("network-orchestrator-daemon: network change watch unavailable: {err}")
             })
             .ok();
+        // Suspend/resume can leave no netlink trace at all (the links and
+        // addresses survive); logind's PrepareForSleep gives an explicit wake
+        // so the reconcile refreshes bypass gateways right after resume.
+        let suspend_wake = network_wake.clone();
+        let suspend_watch = tokio::spawn(watch_suspend_resume(suspend_wake));
+        let session_ctx = ctx.clone();
+        let session_watch = tokio::spawn(watch_client_sessions(session_ctx));
         let network_core = ctx.core.clone();
         let network_events = ctx.events.clone();
         let network_ctx = ctx.clone();
@@ -240,6 +247,10 @@ mod linux {
         let _ = always_on_reconcile.await;
         network_reconcile.abort();
         let _ = network_reconcile.await;
+        suspend_watch.abort();
+        let _ = suspend_watch.await;
+        session_watch.abort();
+        let _ = session_watch.await;
         if let Some(watch) = network_watch {
             watch.abort();
             let _ = watch.await;
@@ -259,6 +270,39 @@ mod linux {
             result.failed.len()
         );
         shutdown_result(&result)
+    }
+
+    /// Follow logind's `PrepareForSleep`: on wake, give the network a moment
+    /// to settle, then wake the reconcile loop. D-Bus absence (containers,
+    /// minimal systems) just disables the fast path — the 10 s interval and
+    /// netlink watch still cover the resume.
+    async fn watch_suspend_resume(wake: Arc<tokio::sync::Notify>) {
+        use futures::StreamExt;
+        let Ok(connection) = zbus::Connection::system().await else {
+            return;
+        };
+        let Ok(proxy) = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )
+        .await
+        else {
+            return;
+        };
+        let Ok(mut stream) = proxy.receive_signal("PrepareForSleep").await else {
+            return;
+        };
+        while let Some(signal) = stream.next().await {
+            let Ok(sleeping) = signal.body().deserialize::<bool>() else {
+                continue;
+            };
+            if !sleeping {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                wake.notify_one();
+            }
+        }
     }
 
     fn shutdown_result(result: &CleanupResult) -> io::Result<()> {

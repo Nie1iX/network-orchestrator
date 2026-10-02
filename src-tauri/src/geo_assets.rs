@@ -1,21 +1,24 @@
-//! Per-profile `geoip.dat`/`geosite.dat` overrides.
+//! `geoip.dat`/`geosite.dat` overrides.
 //!
-//! The app downloads the files over HTTPS into a bounded per-profile cache
-//! (`<data>/geoassets/<profile>/`); on connect their bytes are sent inline in
-//! the daemon request (the sandboxed unit cannot read `/home`), decoded into
+//! The app downloads the files over HTTPS into a bounded cache keyed by the
+//! URL pair (`<data>/geoassets/<sha256(urls)[:16]>/`) — profiles sharing the
+//! same URLs reuse one copy. On connect the bytes are sent inline in the
+//! daemon request (the sandboxed unit cannot read `/home`), decoded into
 //! the root-owned xray runtime directory, and `XRAY_LOCATION_ASSET` points
 //! there — the privileged process never consumes user-writable paths. A
 //! stale cache is preferred over a failed refresh — a dat file is data, not
-//! an executable.
+//! an executable. Refresh probes the `<url>.sha256` sidecar when published
+//! and verifies the downloaded payload against it.
 
 use crate::state::AppState;
 use net_manager_core::models::Profile;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-const MAX_GEO_ASSET_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_GEO_ASSET_BYTES: usize = 64 * 1024 * 1024;
 const REFRESH_AFTER_SECS: u64 = 24 * 60 * 60;
 const META_FILE: &str = "meta.json";
 
@@ -28,6 +31,12 @@ struct GeoAssetMeta {
     geoip_url: Option<String>,
     geosite_url: Option<String>,
     fetched_at_unix: Option<u64>,
+    /// SHA-256 of the cached `geoip.dat`, recorded after each download or
+    /// taken from a `<url>.sha256` sidecar.
+    #[serde(default)]
+    geoip_sha256: Option<String>,
+    #[serde(default)]
+    geosite_sha256: Option<String>,
 }
 
 pub(crate) fn validate_geo_asset_url(url: &str) -> Result<(), String> {
@@ -55,13 +64,40 @@ fn normalized_url(value: Option<&str>) -> Option<&str> {
     }
 }
 
-fn profile_asset_dir(root: &Path, profile_id: &str) -> PathBuf {
-    let safe: String = profile_id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(64)
-        .collect();
-    root.join(if safe.is_empty() { "profile" } else { &safe })
+/// Cache directory keyed by the geoip+geosite URL pair: profiles pointing
+/// at the same asset set share one copy instead of duplicating ~20 MiB per
+/// profile.
+fn asset_dir_key(geoip_url: Option<&str>, geosite_url: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(geoip_url.unwrap_or("").as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(geosite_url.unwrap_or("").as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..16].to_string()
+}
+
+pub(crate) fn profile_asset_dir(
+    root: &Path,
+    geoip_url: Option<&str>,
+    geosite_url: Option<&str>,
+) -> PathBuf {
+    root.join(asset_dir_key(geoip_url, geosite_url))
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(data))
+}
+
+/// Parses a `<url>.sha256` sidecar body: either a bare 64-hex digest or
+/// the `<digest>  <filename>` form produced by GitHub releases.
+fn parse_sha256_sidecar(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?.trim();
+    let token = text.split_whitespace().next()?;
+    if token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(token.to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 fn load_meta(dir: &Path) -> GeoAssetMeta {
@@ -98,6 +134,16 @@ fn cache_is_fresh(dir: &Path, file: &str, url: &str, meta: &GeoAssetMeta) -> boo
             .is_some_and(|ts| now_unix().saturating_sub(ts) < REFRESH_AFTER_SECS)
 }
 
+fn warn_stale(state: Option<&AppState>, profile_name: &str, err: &str) {
+    if let Some(state) = state {
+        crate::commands::logs::record_log(
+            state,
+            crate::commands::logs::LogLevel::Warn,
+            format!("geo asset refresh failed for '{profile_name}', using cached copy: {err}"),
+        );
+    }
+}
+
 async fn ensure_with_fetch(
     state: Option<&AppState>,
     root: &Path,
@@ -107,14 +153,14 @@ async fn ensure_with_fetch(
     let geoip_url = normalized_url(profile.xray_geoip_url.as_deref());
     let geosite_url = normalized_url(profile.xray_geosite_url.as_deref());
     if geoip_url.is_none() && geosite_url.is_none() {
-        // Cleared URLs must not leave stale overrides in the cache.
-        let _ = std::fs::remove_dir_all(profile_asset_dir(root, &profile.id));
+        // Managed bundled assets are used; the shared cache is left in
+        // place — other profiles may point at the same URL pair.
         return Ok(None);
     }
     for url in [geoip_url, geosite_url].into_iter().flatten() {
         validate_geo_asset_url(url)?;
     }
-    let dir = profile_asset_dir(root, &profile.id);
+    let dir = profile_asset_dir(root, geoip_url, geosite_url);
     std::fs::create_dir_all(&dir).map_err(|_| "geo asset directory is unavailable".to_string())?;
     let mut meta = load_meta(&dir);
 
@@ -123,43 +169,55 @@ async fn ensure_with_fetch(
         ("geosite.dat", geosite_url, "geosite"),
     ] {
         let target = dir.join(file);
-        match url {
-            None => {
-                // Cleared URL must not keep staging a stale override.
-                let _ = std::fs::remove_file(&target);
+        let Some(url) = url else { continue };
+        if cache_is_fresh(&dir, file, url, &meta) {
+            continue;
+        }
+        // Cheap freshness probe: a `<url>.sha256` sidecar answers "did the
+        // asset change" without re-downloading ~20 MiB. A failed probe is
+        // not fatal — fall through to the plain refresh path.
+        let known_digest = match key {
+            "geoip" => meta.geoip_sha256.as_deref(),
+            _ => meta.geosite_sha256.as_deref(),
+        };
+        let sidecar = fetch(&format!("{url}.sha256"))
+            .await
+            .ok()
+            .and_then(|bytes| parse_sha256_sidecar(&bytes));
+        if let (Some(expected), Some(known)) = (sidecar.as_deref(), known_digest) {
+            if expected == known && target.is_file() {
+                meta.fetched_at_unix = Some(now_unix());
+                continue;
+            }
+        }
+        match fetch(url).await {
+            Ok(bytes) => {
+                if let Some(expected) = sidecar.as_deref() {
+                    if sha256_hex(&bytes) != expected {
+                        let err = "geo asset digest mismatch".to_string();
+                        if target.is_file() {
+                            warn_stale(state, &profile.name, &err);
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                }
+                write_atomic(&target, &bytes)?;
+                let digest = sidecar.unwrap_or_else(|| sha256_hex(&bytes));
                 match key {
-                    "geoip" => meta.geoip_url = None,
-                    _ => meta.geosite_url = None,
-                }
-            }
-            Some(url) => {
-                if cache_is_fresh(&dir, file, url, &meta) {
-                    continue;
-                }
-                match fetch(url).await {
-                    Ok(bytes) => {
-                        write_atomic(&target, &bytes)?;
-                        match key {
-                            "geoip" => meta.geoip_url = Some(url.to_string()),
-                            _ => meta.geosite_url = Some(url.to_string()),
-                        }
-                        meta.fetched_at_unix = Some(now_unix());
+                    "geoip" => {
+                        meta.geoip_url = Some(url.to_string());
+                        meta.geoip_sha256 = Some(digest);
                     }
-                    Err(err) if target.is_file() => {
-                        if let Some(state) = state {
-                            crate::commands::logs::record_log(
-                                state,
-                                crate::commands::logs::LogLevel::Warn,
-                                format!(
-                                    "geo asset refresh failed for '{}', using cached copy: {err}",
-                                    profile.name
-                                ),
-                            );
-                        }
+                    _ => {
+                        meta.geosite_url = Some(url.to_string());
+                        meta.geosite_sha256 = Some(digest);
                     }
-                    Err(err) => return Err(err),
                 }
+                meta.fetched_at_unix = Some(now_unix());
             }
+            Err(err) if target.is_file() => warn_stale(state, &profile.name, &err),
+            Err(err) => return Err(err),
         }
     }
     write_meta(&dir, &meta)?;
@@ -329,7 +387,8 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(result.join("geoip.dat")).unwrap(), b"ip");
         assert_eq!(std::fs::read(result.join("geosite.dat")).unwrap(), b"site");
-        assert_eq!(calls.lock().unwrap().len(), 2);
+        // Two sidecar probes (miss → plain refresh) + two downloads.
+        assert_eq!(calls.lock().unwrap().len(), 4);
 
         // Second call with fresh cache must not refetch.
         let result2 = ensure_with_fetch(None, &dir, &profile, &fetch)
@@ -337,45 +396,147 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result2, result);
+        assert_eq!(calls.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn url_pair_cache_is_shared_between_profiles() {
+        let dir = unique_dir("geo-shared");
+        let mut map = HashMap::new();
+        map.insert("https://a/geoip.dat".to_string(), Ok(b"ip".to_vec()));
+        let (fetch, calls) = fetcher(map);
+        let first = profile_with_urls(Some("https://a/geoip.dat"), None);
+        let mut second = first.clone();
+        second.id = "another-profile".into();
+        let dir1 = ensure_with_fetch(None, &dir, &first, &fetch)
+            .await
+            .unwrap()
+            .unwrap();
+        let dir2 = ensure_with_fetch(None, &dir, &second, &fetch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dir1, dir2);
+        // One download + one sidecar probe total; the second profile reused
+        // the fresh cache.
         assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn url_change_triggers_redownload_and_failed_download_keeps_cache() {
+    async fn failed_refresh_keeps_stale_cache() {
         let dir = unique_dir("geo-stale");
+        let url = "https://a/geoip.dat";
         let mut map = HashMap::new();
-        map.insert("https://a/geoip.dat".to_string(), Ok(b"v1".to_vec()));
-        map.insert(
-            "https://b/geoip.dat".to_string(),
-            Err("fetch failed".to_string()),
-        );
+        map.insert(url.to_string(), Ok(b"v1".to_vec()));
         let (fetch, _) = fetcher(map);
-        let profile = profile_with_urls(Some("https://a/geoip.dat"), None);
-        ensure_with_fetch(None, &dir, &profile, &fetch)
+        let profile = profile_with_urls(Some(url), None);
+        let asset_dir = ensure_with_fetch(None, &dir, &profile, &fetch)
             .await
+            .unwrap()
             .unwrap();
-        let asset_dir = profile_asset_dir(&dir, "prof-1");
         assert_eq!(std::fs::read(asset_dir.join("geoip.dat")).unwrap(), b"v1");
 
-        // Force staleness by clearing meta freshness.
-        let meta_path = asset_dir.join(META_FILE);
+        // Force staleness, then make every fetch fail.
         std::fs::write(
-            &meta_path,
+            asset_dir.join(META_FILE),
             serde_json::to_vec(&GeoAssetMeta {
-                geoip_url: Some("https://b/geoip.dat".into()),
-                geosite_url: None,
                 fetched_at_unix: Some(0),
+                geoip_url: Some(url.into()),
+                geoip_sha256: Some(sha256_hex(b"v1")),
+                ..GeoAssetMeta::default()
             })
             .unwrap(),
         )
         .unwrap();
-        let profile = profile_with_urls(Some("https://b/geoip.dat"), None);
+        let (fetch, _) = fetcher(HashMap::new());
         let result = ensure_with_fetch(None, &dir, &profile, &fetch)
             .await
             .unwrap();
         assert!(result.is_some());
-        // Failed refresh keeps the previous bytes.
         assert_eq!(std::fs::read(asset_dir.join("geoip.dat")).unwrap(), b"v1");
+    }
+
+    #[tokio::test]
+    async fn matching_sha256_sidecar_skips_redownload() {
+        let dir = unique_dir("geo-sidecar");
+        let url = "https://a/geoip.dat";
+        let asset_dir = profile_asset_dir(&dir, Some(url), None);
+        std::fs::create_dir_all(&asset_dir).unwrap();
+        std::fs::write(asset_dir.join("geoip.dat"), b"v1").unwrap();
+        std::fs::write(
+            asset_dir.join(META_FILE),
+            serde_json::to_vec(&GeoAssetMeta {
+                fetched_at_unix: Some(0), // stale on purpose
+                geoip_url: Some(url.into()),
+                geoip_sha256: Some(sha256_hex(b"v1")),
+                ..GeoAssetMeta::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut map = HashMap::new();
+        // Sidecar answers the cached digest → the dat file itself is never
+        // requested (it is absent from the map and would error).
+        map.insert(
+            format!("{url}.sha256"),
+            Ok(format!("{}  geoip.dat", sha256_hex(b"v1")).into_bytes()),
+        );
+        let (fetch, calls) = fetcher(map);
+        let profile = profile_with_urls(Some(url), None);
+        let result = ensure_with_fetch(None, &dir, &profile, &fetch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, asset_dir);
+        assert_eq!(calls.lock().unwrap().as_slice(), &[format!("{url}.sha256")]);
+    }
+
+    #[tokio::test]
+    async fn digest_mismatch_keeps_stale_cache_and_errors_without_one() {
+        let dir = unique_dir("geo-mismatch");
+        let url = "https://a/geoip.dat";
+        let expected = sha256_hex(b"upstream-v2");
+        let mut map = HashMap::new();
+        map.insert(format!("{url}.sha256"), Ok(expected.into_bytes()));
+        map.insert(url.to_string(), Ok(b"forged".to_vec()));
+
+        // No cached copy → mismatch is a hard error.
+        let (fetch, _) = fetcher(map.clone());
+        let profile = profile_with_urls(Some(url), None);
+        assert!(ensure_with_fetch(None, &dir, &profile, &fetch)
+            .await
+            .is_err());
+
+        // With a cached copy the stale bytes win over a bad refresh.
+        let asset_dir = profile_asset_dir(&dir, Some(url), None);
+        std::fs::create_dir_all(&asset_dir).unwrap();
+        std::fs::write(asset_dir.join("geoip.dat"), b"v1").unwrap();
+        let (fetch, _) = fetcher(map);
+        let result = ensure_with_fetch(None, &dir, &profile, &fetch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(result.join("geoip.dat")).unwrap(), b"v1");
+    }
+
+    #[tokio::test]
+    async fn verified_download_records_digest() {
+        let dir = unique_dir("geo-verify");
+        let url = "https://a/geoip.dat";
+        let mut map = HashMap::new();
+        map.insert(format!("{url}.sha256"), Ok(sha256_hex(b"v1").into_bytes()));
+        map.insert(url.to_string(), Ok(b"v1".to_vec()));
+        let (fetch, _) = fetcher(map);
+        let profile = profile_with_urls(Some(url), None);
+        let asset_dir = ensure_with_fetch(None, &dir, &profile, &fetch)
+            .await
+            .unwrap()
+            .unwrap();
+        let meta = load_meta(&asset_dir);
+        assert_eq!(
+            meta.geoip_sha256.as_deref(),
+            Some(sha256_hex(b"v1").as_str())
+        );
     }
 
     #[tokio::test]
@@ -389,30 +550,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleared_url_removes_stale_file() {
+    async fn cleared_urls_use_managed_assets_and_keep_shared_cache() {
         let dir = unique_dir("geo-clear");
         let mut map = HashMap::new();
         map.insert("https://a/geoip.dat".to_string(), Ok(b"v1".to_vec()));
         let (fetch, _) = fetcher(map);
         let profile = profile_with_urls(Some("https://a/geoip.dat"), None);
-        ensure_with_fetch(None, &dir, &profile, &fetch)
+        let asset_dir = ensure_with_fetch(None, &dir, &profile, &fetch)
             .await
+            .unwrap()
             .unwrap();
-        let asset_dir = profile_asset_dir(&dir, "prof-1");
         assert!(asset_dir.join("geoip.dat").is_file());
 
+        // Cleared URLs fall back to the managed assets; the shared cache
+        // dir stays for other profiles pointing at the same pair.
         let cleared = profile_with_urls(None, None);
         assert!(ensure_with_fetch(None, &dir, &cleared, &fetch)
             .await
             .unwrap()
             .is_none());
-        assert!(!asset_dir.join("geoip.dat").exists());
+        assert!(asset_dir.join("geoip.dat").exists());
     }
 
     #[test]
-    fn profile_dir_sanitizes_id() {
-        let dir = profile_asset_dir(Path::new("/tmp/x"), "../evil/../id");
-        assert!(dir.starts_with("/tmp/x"));
-        assert!(!dir.to_string_lossy().contains(".."));
+    fn asset_dir_key_is_path_safe_and_pair_scoped() {
+        let a = asset_dir_key(Some("https://a/geoip.dat"), Some("https://a/geosite.dat"));
+        assert_eq!(
+            a,
+            asset_dir_key(Some("https://a/geoip.dat"), Some("https://a/geosite.dat"))
+        );
+        assert_ne!(
+            a,
+            asset_dir_key(Some("https://b/geoip.dat"), Some("https://a/geosite.dat"))
+        );
+        assert_ne!(a, asset_dir_key(Some("https://a/geoip.dat"), None));
+        assert_eq!(a.len(), 16);
+        assert!(a
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && b.is_ascii_lowercase() || b.is_ascii_digit()));
+    }
+
+    #[test]
+    fn parse_sha256_sidecar_accepts_bare_and_sums_formats() {
+        let digest = "0ff7bd198654a0e922030e9cde7513b8b2ae1503335592e1db7811fcaa2d9a9a";
+        assert_eq!(
+            parse_sha256_sidecar(digest.as_bytes()).as_deref(),
+            Some(digest)
+        );
+        assert_eq!(
+            parse_sha256_sidecar(format!("{digest}  geoip.dat\n").as_bytes()).as_deref(),
+            Some(digest)
+        );
+        assert!(parse_sha256_sidecar(b"short").is_none());
+        assert!(parse_sha256_sidecar(b"").is_none());
+        assert!(parse_sha256_sidecar(&[0xff, 0xfe]).is_none());
     }
 }

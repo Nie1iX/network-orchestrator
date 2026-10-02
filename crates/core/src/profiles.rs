@@ -176,9 +176,12 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
             TunnelBackend::WireGuard | TunnelBackend::OpenVpn
         ) || (profile.backend == TunnelBackend::Xray
             && profile.xray_mode == crate::models::XrayMode::Tun));
+    // Нативный клиент macOS импортирует и анализирует OpenVPN без запуска туннеля.
+    let read_only_openvpn = cfg!(target_os = "macos") && profile.backend == TunnelBackend::OpenVpn;
     if !profile.routes.is_empty()
         && profile.interface_name.trim().is_empty()
         && !daemon_assigned_interface
+        && !read_only_openvpn
     {
         return Err(invalid_data(
             "profile interface name must not be blank when policy routes are set",
@@ -535,6 +538,23 @@ mod tests {
             let err = validate_profile(&profile).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
+    }
+
+    #[test]
+    fn openvpn_imported_routes_allow_blank_interface_on_linux_and_macos() {
+        let mut profile = wg_profile();
+        profile.backend = TunnelBackend::OpenVpn;
+        profile.config_path = PathBuf::from("client.ovpn");
+        profile.interface_name.clear();
+        profile.routes = vec![PolicyRoute {
+            destination: "10.20.0.0/16".parse().unwrap(),
+            metric: 0,
+            via: None,
+        }];
+        assert_eq!(
+            validate_profile(&profile).is_ok(),
+            cfg!(target_os = "linux") || cfg!(target_os = "macos")
+        );
     }
 
     #[test]

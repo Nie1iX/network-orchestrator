@@ -79,10 +79,11 @@ pub(crate) fn store_generated_xray(
     vault.store_generated_xray(profile_id, plaintext_json)
 }
 
-pub(crate) fn rewrite_generated_socks_port(
+pub(crate) fn rewrite_generated_proxy_ports(
     vault: &ConfigVault,
     profile: &mut Profile,
-    new_port: u16,
+    new_socks_port: u16,
+    new_http_port: Option<u16>,
 ) -> Result<PathBuf, String> {
     if profile.backend != TunnelBackend::Xray
         || profile.xray_socks_port.is_none()
@@ -90,8 +91,12 @@ pub(crate) fn rewrite_generated_socks_port(
     {
         return Err("profile does not use a managed generated Xray config".into());
     }
-    if profile.xray_http_port == Some(new_port) {
-        return Err("SOCKS5 port would duplicate HTTP proxy port".into());
+    if new_socks_port == 0
+        || new_http_port == Some(0)
+        || new_http_port == Some(new_socks_port)
+        || profile.xray_http_port.is_some() != new_http_port.is_some()
+    {
+        return Err("generated Xray listener ports are invalid".into());
     }
     let bytes = config_security::read_xray_config(&profile.config_path, &profile.id)
         .map_err(|e| e.to_string())?;
@@ -104,11 +109,19 @@ pub(crate) fn rewrite_generated_socks_port(
         .iter_mut()
         .find(|i| i.get("tag").and_then(|t| t.as_str()) == Some("socks-in"))
         .ok_or_else(|| "generated config has no 'socks-in' inbound".to_string())?;
-    inbound["port"] = serde_json::json!(new_port);
+    inbound["port"] = serde_json::json!(new_socks_port);
+    if let Some(http_port) = new_http_port {
+        let inbound = inbounds
+            .iter_mut()
+            .find(|i| i.get("tag").and_then(|t| t.as_str()) == Some("http-in"))
+            .ok_or_else(|| "generated config has no 'http-in' inbound".to_string())?;
+        inbound["port"] = serde_json::json!(http_port);
+    }
     let body = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
     let import = store_generated_xray(vault, &profile.id, &body).map_err(|e| e.to_string())?;
     profile.config_path = import.config_path.clone();
-    profile.xray_socks_port = Some(new_port);
+    profile.xray_socks_port = Some(new_socks_port);
+    profile.xray_http_port = new_http_port;
     Ok(import.config_path)
 }
 
@@ -665,6 +678,7 @@ pub(crate) fn import_configs_into(
             name,
             backend,
             config_path,
+            routes: import.routes,
             xray_mode: XrayMode::platform_default(),
             ..Default::default()
         };
@@ -732,27 +746,10 @@ pub(crate) async fn import_configs_batch(
 use net_manager_core::subscription::base64_decode;
 #[cfg(test)]
 use net_manager_core::subscription::parse_subscription_body;
-#[cfg(test)]
-use net_manager_core::subscription::parse_subscription_userinfo;
 
 // Subscription metadata parsing lives in the core so the native client
 // shares it; these names keep the Tauri call sites and tests stable.
 use net_manager_core::subscription::ResponseMeta as SubscriptionResponseMeta;
-
-#[cfg(test)]
-fn parse_subscription_provider_title(value: &str) -> Option<String> {
-    net_manager_core::subscription::parse_provider_title(value)
-}
-
-#[cfg(test)]
-fn parse_subscription_url_header(value: &str) -> Option<String> {
-    net_manager_core::subscription::parse_url_header(value)
-}
-
-#[cfg(test)]
-fn subscription_profile_name(provider_title: Option<&str>, endpoint_name: &str) -> String {
-    net_manager_core::subscription::subscription_profile_name(provider_title, endpoint_name)
-}
 
 /// Fetch a subscription and import its supported share links.
 pub(crate) async fn import_subscription_into(
@@ -1162,15 +1159,9 @@ pub(crate) async fn get_subscription_endpoints(
         .map(|(i, e)| SubscriptionEndpointInfo {
             name: e.name,
             active: i == active_index,
-            protocol: subscription_endpoint_protocol(&e.url),
+            protocol: net_manager_core::xray::endpoint_protocol(&e.url),
         })
         .collect())
-}
-
-/// Human-readable protocol/transport badge for a share link, e.g.
-/// `VLESS · Reality` or `Hysteria2`.
-fn subscription_endpoint_protocol(uri: &str) -> Option<String> {
-    net_manager_core::xray::endpoint_protocol(uri)
 }
 
 #[tauri::command]
@@ -1573,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_generated_socks_port_creates_revision_and_rejects_ineligible() {
+    fn rewrite_generated_proxy_ports_creates_revision_and_rejects_ineligible() {
         let dir = unique_dir("rewrite-socks");
         let vault = ConfigVault::new(dir.join("configs"));
         let mut p = profile("x-gen");
@@ -1581,21 +1572,23 @@ mod tests {
         p.backend = TunnelBackend::Xray;
         p.xray_socks_port = Some(10808);
         p.xray_http_port = Some(10951);
-        let body = br#"{"inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":10808,"protocol":"socks"}]}"#;
+        let body = br#"{"inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":10808,"protocol":"socks"},{"tag":"http-in","listen":"127.0.0.1","port":10951,"protocol":"http"}]}"#;
         let import = vault.store_xray_config("gen", body).unwrap();
         p.config_path = import.config_path.clone();
 
-        assert!(rewrite_generated_socks_port(&vault, &mut p, 10951).is_err());
+        assert!(rewrite_generated_proxy_ports(&vault, &mut p, 10951, Some(10951)).is_err());
 
-        let new_path = rewrite_generated_socks_port(&vault, &mut p, 10950).unwrap();
+        let new_path = rewrite_generated_proxy_ports(&vault, &mut p, 10808, Some(10950)).unwrap();
         assert_ne!(new_path, import.config_path);
         assert_eq!(p.config_path, new_path);
-        assert_eq!(p.xray_socks_port, Some(10950));
+        assert_eq!(p.xray_socks_port, Some(10808));
+        assert_eq!(p.xray_http_port, Some(10950));
         assert!(import.config_path.exists());
         let raw = config_security::read_xray_config(&new_path, "gen").unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(doc["inbounds"][0]["port"], 10950);
+        assert_eq!(doc["inbounds"][0]["port"], 10808);
         assert_eq!(doc["inbounds"][0]["tag"], "socks-in");
+        assert_eq!(doc["inbounds"][1]["port"], 10950);
 
         let mut bad = p.clone();
         #[cfg(windows)]
@@ -1605,21 +1598,21 @@ mod tests {
         #[cfg(not(windows))]
         let broken = b"{oops".to_vec();
         fs::write(&new_path, &broken).unwrap();
-        assert!(rewrite_generated_socks_port(&vault, &mut bad, 10960).is_err());
+        assert!(rewrite_generated_proxy_ports(&vault, &mut bad, 10960, Some(10950)).is_err());
         assert_eq!(bad.config_path, new_path);
-        assert_eq!(bad.xray_socks_port, Some(10950));
+        assert_eq!(bad.xray_socks_port, Some(10808));
 
         let mut ext = profile("x-ext");
         ext.backend = TunnelBackend::Xray;
         ext.xray_socks_port = Some(10808);
         let before = ext.config_path.clone();
-        assert!(rewrite_generated_socks_port(&vault, &mut ext, 10960).is_err());
+        assert!(rewrite_generated_proxy_ports(&vault, &mut ext, 10960, None).is_err());
         assert_eq!(ext.config_path, before);
         assert_eq!(ext.xray_socks_port, Some(10808));
 
         let mut no_port = ext.clone();
         no_port.xray_socks_port = None;
-        assert!(rewrite_generated_socks_port(&vault, &mut no_port, 10960).is_err());
+        assert!(rewrite_generated_proxy_ports(&vault, &mut no_port, 10960, None).is_err());
         assert!(no_port.xray_socks_port.is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1749,6 +1742,35 @@ mod tests {
     }
 
     #[test]
+    fn import_configs_into_preserves_openvpn_static_routes() {
+        let dir = unique_dir("batch-ovpn-routes");
+        fs::remove_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let vault = ConfigVault::new(dir.join("configs"));
+        let store = net_manager_core::profiles::ProfileStore::new(dir.join("profiles.json"));
+        let source = dir.join("client.ovpn");
+        fs::write(
+            &source,
+            "client\nremote vpn.example\nroute 10.20.0.0 255.255.0.0\nroute-ipv6 fd00:1::/64\n",
+        )
+        .unwrap();
+        let result = import_configs_into(
+            &vault,
+            &store,
+            &[source.to_string_lossy().to_string()],
+            None,
+        )
+        .unwrap();
+        assert!(result.errors.is_empty());
+        assert_eq!(result.profiles[0].routes.len(), 2);
+        assert_eq!(
+            result.profiles[0].routes[0].destination.to_string(),
+            "10.20.0.0/16"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn import_configs_into_reports_unknown_extension_without_default() {
         let dir = unique_dir("batch-unknown");
         let vault = ConfigVault::new(dir.join("configs"));
@@ -1801,7 +1823,7 @@ mod tests {
         let with_whitespace = format!("  \n{}\n  ", encoded);
         let (urls, skipped) = parse_subscription_body(&with_whitespace);
         assert_eq!(urls.len(), 1);
-        assert_eq!(skipped.len(), 0);
+        assert!(skipped.is_empty());
         assert!(urls[0].starts_with("vless://uuid@host"));
     }
 
@@ -1817,7 +1839,7 @@ mod tests {
 
     #[test]
     fn subscription_userinfo_parses_bounded_usage_and_optional_expiry() {
-        let parsed = parse_subscription_userinfo(
+        let parsed = net_manager_core::subscription::parse_subscription_userinfo(
             "upload=1024; download=2048; total=4096; expire=1798761600",
         )
         .unwrap();
@@ -1825,12 +1847,19 @@ mod tests {
         assert_eq!(parsed.download_bytes, 2048);
         assert_eq!(parsed.total_bytes, Some(4096));
         assert_eq!(parsed.expires_at_unix, Some(1798761600));
-        let unlimited =
-            parse_subscription_userinfo("upload=0; download=42; total=0; expire=0").unwrap();
+        let unlimited = net_manager_core::subscription::parse_subscription_userinfo(
+            "upload=0; download=42; total=0; expire=0",
+        )
+        .unwrap();
         assert_eq!(unlimited.total_bytes, None);
         assert_eq!(unlimited.expires_at_unix, None);
-        assert!(parse_subscription_userinfo("upload=private-secret; download=3").is_none());
-        assert!(parse_subscription_userinfo(&"x".repeat(513)).is_none());
+        assert!(net_manager_core::subscription::parse_subscription_userinfo(
+            "upload=private-secret; download=3"
+        )
+        .is_none());
+        assert!(
+            net_manager_core::subscription::parse_subscription_userinfo(&"x".repeat(513)).is_none()
+        );
     }
 
     #[test]
@@ -2374,41 +2403,66 @@ mod tests {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode("AcmeVPN 🇳🇱");
         assert_eq!(
-            parse_subscription_provider_title(&format!("base64:{encoded}")).as_deref(),
+            net_manager_core::subscription::parse_provider_title(&format!("base64:{encoded}"))
+                .as_deref(),
             Some("AcmeVPN 🇳🇱")
         );
         assert_eq!(
-            parse_subscription_provider_title("Acme%20VPN").as_deref(),
+            net_manager_core::subscription::parse_provider_title("Acme%20VPN").as_deref(),
             Some("Acme VPN")
         );
         assert_eq!(
-            parse_subscription_provider_title("  AcmeVPN  ").as_deref(),
+            net_manager_core::subscription::parse_provider_title("  AcmeVPN  ").as_deref(),
             Some("AcmeVPN")
         );
-        assert_eq!(parse_subscription_provider_title("   "), None);
-        assert_eq!(parse_subscription_provider_title("base64:%%%"), None);
-        assert_eq!(parse_subscription_provider_title("bad\nheader"), None);
-        assert_eq!(parse_subscription_provider_title(&"x".repeat(300)), None);
+        assert_eq!(
+            net_manager_core::subscription::parse_provider_title("   "),
+            None
+        );
+        assert_eq!(
+            net_manager_core::subscription::parse_provider_title("base64:%%%"),
+            None
+        );
+        assert_eq!(
+            net_manager_core::subscription::parse_provider_title("bad\nheader"),
+            None
+        );
+        assert_eq!(
+            net_manager_core::subscription::parse_provider_title(&"x".repeat(300)),
+            None
+        );
     }
 
     #[test]
     fn subscription_profile_name_combines_provider_and_endpoint() {
         assert_eq!(
-            subscription_profile_name(Some("AcmeVPN"), "⚡ Нидерланды"),
-            "AcmeVPN - ⚡ Нидерланды"
+            net_manager_core::subscription::subscription_profile_name(
+                Some("AcmeVPN"),
+                "⚡ Нидерланды"
+            ),
+            "AcmeVPN · ⚡ Нидерланды"
         );
         assert_eq!(
-            subscription_profile_name(Some("AcmeVPN"), "AcmeVPN - ⚡ NL"),
-            "AcmeVPN - ⚡ NL"
+            net_manager_core::subscription::subscription_profile_name(
+                Some("AcmeVPN"),
+                "AcmeVPN - ⚡ NL"
+            ),
+            "AcmeVPN · ⚡ NL"
         );
         assert_eq!(
-            subscription_profile_name(Some("Acme"), "AcmeVPN - NL"),
-            "Acme - AcmeVPN - NL"
+            net_manager_core::subscription::subscription_profile_name(Some("Acme"), "AcmeVPN - NL"),
+            "Acme · AcmeVPN - NL"
         );
-        assert_eq!(subscription_profile_name(None, "Node"), "Node");
-        assert_eq!(subscription_profile_name(Some("  "), "Node"), "Node");
         assert_eq!(
-            subscription_profile_name(Some("AcmeVPN"), "AcmeVPN"),
+            net_manager_core::subscription::subscription_profile_name(None, "Node"),
+            "Node"
+        );
+        assert_eq!(
+            net_manager_core::subscription::subscription_profile_name(Some("  "), "Node"),
+            "Node"
+        );
+        assert_eq!(
+            net_manager_core::subscription::subscription_profile_name(Some("AcmeVPN"), "AcmeVPN"),
             "AcmeVPN"
         );
     }
@@ -2452,7 +2506,7 @@ mod tests {
             refreshed.subscription.as_ref().unwrap().skipped_protocols,
             ["ss", "trojan"]
         );
-        assert_eq!(refreshed.name, "AcmeVPN - First");
+        assert_eq!(refreshed.name, "AcmeVPN · First");
         refresh_subscription_body_into_with_metadata(
             &vault,
             &store,
@@ -2530,33 +2584,35 @@ mod tests {
     #[test]
     fn subscription_url_header_accepts_only_http_links() {
         assert_eq!(
-            parse_subscription_url_header("https://support.example.test").as_deref(),
+            net_manager_core::subscription::parse_url_header("https://support.example.test")
+                .as_deref(),
             Some("https://support.example.test")
         );
-        assert!(parse_subscription_url_header("javascript:alert(1)").is_none());
-        assert!(parse_subscription_url_header("ftp://host/path").is_none());
-        assert!(parse_subscription_url_header("not a url").is_none());
-        assert!(parse_subscription_url_header("   ").is_none());
+        assert!(net_manager_core::subscription::parse_url_header("javascript:alert(1)").is_none());
+        assert!(net_manager_core::subscription::parse_url_header("ftp://host/path").is_none());
+        assert!(net_manager_core::subscription::parse_url_header("not a url").is_none());
+        assert!(net_manager_core::subscription::parse_url_header("   ").is_none());
     }
 
     #[test]
     fn endpoint_protocol_label_summarizes_scheme_security_and_transport() {
         assert_eq!(
-            subscription_endpoint_protocol(
+            net_manager_core::xray::endpoint_protocol(
                 "vless://id@host.test:443?security=reality&type=grpc#Node"
             )
             .as_deref(),
             Some("VLESS · Reality · GRPC")
         );
         assert_eq!(
-            subscription_endpoint_protocol("vless://id@host.test:443?security=tls#Node").as_deref(),
+            net_manager_core::xray::endpoint_protocol("vless://id@host.test:443?security=tls#Node")
+                .as_deref(),
             Some("VLESS · TLS")
         );
         assert_eq!(
-            subscription_endpoint_protocol("hy2://pass@host.test:443#Node").as_deref(),
+            net_manager_core::xray::endpoint_protocol("hy2://pass@host.test:443#Node").as_deref(),
             Some("Hysteria2")
         );
-        assert!(subscription_endpoint_protocol("not a url").is_none());
+        assert!(net_manager_core::xray::endpoint_protocol("not a url").is_none());
     }
 
     #[tokio::test]

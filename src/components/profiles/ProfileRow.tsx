@@ -10,6 +10,9 @@ interface ProfileRowProps {
   rate: { rxRate: number; txRate: number } | null;
   /** Delay chip text; null hides the chip (non-subscription profiles). */
   delayText: string | null;
+  /** Active endpoint shown muted next to the name when it isn't already
+   * part of it (e.g. the user renamed the profile). */
+  serverName?: string | null;
   isBusy: boolean;
   /** The profile's interface is occupied by a tunnel managed elsewhere. */
   conflict: boolean;
@@ -34,6 +37,7 @@ export default function ProfileRow({
   status,
   rate,
   delayText,
+  serverName,
   isBusy,
   conflict,
   selected,
@@ -55,6 +59,7 @@ export default function ProfileRow({
     <div
       role="button"
       tabIndex={0}
+      aria-current={selected || undefined}
       data-profile-id={profile.id}
       className={`profile-row${selected ? " selected" : ""}${
         status.state === "running" ? " state-running" : ""
@@ -83,13 +88,28 @@ export default function ProfileRow({
       >
         <GripVerticalIcon size={13} />
       </span>
-      <span className={`status-dot state-${status.state}`} />
+      <span
+        className={`status-dot state-${status.state}`}
+        title={
+          status.state === "running"
+            ? t("detail.runningOn", {
+                iface:
+                  status.interfaceName || profile.interfaceName || "tunnel",
+              })
+            : status.state === "failed"
+              ? t("detail.failed")
+              : t("detail.stopped")
+        }
+      />
       {showBackendBadge && (
         <span className={`backend-avatar backend-avatar-${profile.backend}`}>
           {backendIcon(profile.backend, 14)}
         </span>
       )}
       <span className="profile-row-name">{profile.name}</span>
+      {serverName && !profile.name.includes(serverName) && (
+        <span className="profile-row-server">· {serverName}</span>
+      )}
       {(status.state === "failed" && status.message) || conflict ? (
         <span
           className={`profile-row-meta${conflict && status.state !== "failed" ? " warn" : ""}`}

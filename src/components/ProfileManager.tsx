@@ -4,6 +4,8 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation, requiresElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
 import { useProfileListMode } from "../prefs";
+import { providerPrefix } from "../subscriptions";
+import { popupNativeMenu, MenuEntry } from "../nativeMenu";
 import { useT } from "../i18n";
 import { BACKEND_LABEL_KEYS } from "../i18n/labels";
 import {
@@ -217,7 +219,7 @@ export default function ProfileManager() {
   const [ctxMenu, setCtxMenu] = useState<{
     x: number;
     y: number;
-    profile: Profile;
+    items: MenuEntry[];
   } | null>(null);
   const [listWidth, setListWidth] = useState(loadListWidth);
   const [splitDragging, setSplitDragging] = useState(false);
@@ -937,6 +939,24 @@ export default function ProfileManager() {
     }
   };
 
+  /** Copy shell proxy exports for a running Xray SOCKS/HTTP profile —
+   * same format as the macOS client's "Copy terminal proxy". */
+  const onCopyTerminalProxy = async (profile: Profile) => {
+    const socks = profile.xraySocksPort;
+    if (profile.backend !== "xray" || socks === null) return;
+    const http =
+      profile.xrayHttpPort !== null
+        ? `http://127.0.0.1:${profile.xrayHttpPort}`
+        : `socks5h://127.0.0.1:${socks}`;
+    const text = `export HTTP_PROXY=${http} HTTPS_PROXY=${http} ALL_PROXY=socks5h://127.0.0.1:${socks} NO_PROXY=localhost,127.0.0.1,.local`;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast("success", t("native.copied"));
+    } catch {
+      toast("error", t("native.copyFailed"));
+    }
+  };
+
   const applySnippet = (snippet: ConnectionSnippet) => {
     const targetIds = new Set(snippet.profileIds);
     for (const profile of profiles) {
@@ -1231,6 +1251,62 @@ export default function ProfileManager() {
         )
       : [];
 
+  /** Row context-menu items — shared by the native Tauri menu and the DOM
+   * fallback used in the browser sandbox. */
+  const profileMenuItems = (p: Profile): MenuEntry[] => {
+    const ctxGroup =
+      listMode === "grouped" && !lowerSearch
+        ? groups.find(
+            (g) =>
+              g.backend === p.backend &&
+              g.items.some((item) => item.id === p.id),
+          )
+        : undefined;
+    const ctxIndex = ctxGroup
+      ? ctxGroup.items.findIndex((item) => item.id === p.id)
+      : -1;
+    const running = statusFor(p.id).state === "running";
+    return [
+      {
+        label: running ? t("common.disconnect") : t("common.connect"),
+        onClick: () =>
+          running ? void onDisconnect(p) : void onConnect(p),
+        disabled: busy.has(p.id),
+      },
+      {
+        label: t("common.edit"),
+        onClick: () => openEdit(p),
+        disabled: busy.has(p.id),
+      },
+      {
+        label: t("detail.diagnostics"),
+        onClick: () => void onDiagnose(p),
+        disabled: diagBusy === p.id,
+      },
+      "separator",
+      {
+        label: t("detail.moveUp"),
+        onClick: () =>
+          ctxGroup && moveProfileInGroup(ctxGroup.items, p.id, -1),
+        disabled: !ctxGroup || ctxIndex <= 0,
+      },
+      {
+        label: t("detail.moveDown"),
+        onClick: () =>
+          ctxGroup && moveProfileInGroup(ctxGroup.items, p.id, 1),
+        disabled:
+          !ctxGroup || ctxIndex < 0 || ctxIndex >= ctxGroup.items.length - 1,
+      },
+      "separator",
+      {
+        label: t("common.delete"),
+        onClick: () => void onDelete(p),
+        disabled: busy.has(p.id),
+        danger: true,
+      },
+    ];
+  };
+
   const renderProfileRow = (
     profile: Profile,
     group: ProfileGroup | null,
@@ -1242,6 +1318,13 @@ export default function ProfileManager() {
     const endpointList = endpoints[profile.id];
     const activeEndpointIdx =
       endpointList?.findIndex((e) => e.active) ?? -1;
+    const endpointDisplay = endpointList
+      ? providerPrefix(endpointList.map((e) => e.name))
+      : null;
+    const serverName =
+      activeEndpointIdx >= 0 && endpointDisplay
+        ? endpointDisplay.names[activeEndpointIdx]
+        : null;
     const delayRes =
       activeEndpointIdx >= 0
         ? delayResults[profile.id]?.[activeEndpointIdx]
@@ -1267,6 +1350,7 @@ export default function ProfileManager() {
                 : null
         }
         isBusy={isBusy}
+        serverName={serverName}
         conflict={ifaceConflictIds.has(profile.id)}
         selected={externalName === null && selected?.id === profile.id}
         dragging={dragState?.profileId === profile.id}
@@ -1293,7 +1377,13 @@ export default function ProfileManager() {
           setServiceSelected(false);
           setExternalName(null);
           setSelectedId(profile.id);
-          setCtxMenu({ x: e.clientX, y: e.clientY, profile });
+          const items = profileMenuItems(profile);
+          void popupNativeMenu(items, e.clientX, e.clientY).then(
+            (native) => {
+              if (!native)
+                setCtxMenu({ x: e.clientX, y: e.clientY, items });
+            },
+          );
         }}
         onDragStart={(event) => onCardDragStart(event, profile)}
         onDragEnd={onCardDragEnd}
@@ -1687,6 +1777,9 @@ export default function ProfileManager() {
               onSetRefreshInterval={(minutes) =>
                 void onSetRefreshInterval(selected, minutes)
               }
+              onCopyTerminalProxy={() =>
+                void onCopyTerminalProxy(selected)
+              }
             />
           ) : (
             <div className="profile-detail-empty">
@@ -1734,67 +1827,14 @@ export default function ProfileManager() {
         onChooseBackend={handleChooseBackend}
       />
 
-      {ctxMenu && (() => {
-        const p = ctxMenu.profile;
-        const ctxGroup =
-          listMode === "grouped" && !lowerSearch
-            ? groups.find(
-                (g) =>
-                  g.backend === p.backend &&
-                  g.items.some((item) => item.id === p.id),
-              )
-            : undefined;
-        const ctxIndex = ctxGroup
-          ? ctxGroup.items.findIndex((item) => item.id === p.id)
-          : -1;
-        const running = statusFor(p.id).state === "running";
-        return (
-          <ContextMenu
-            x={ctxMenu.x}
-            y={ctxMenu.y}
-            onClose={() => setCtxMenu(null)}
-            items={[
-              {
-                label: running ? t("common.disconnect") : t("common.connect"),
-                onClick: () =>
-                  running ? void onDisconnect(p) : void onConnect(p),
-                disabled: busy.has(p.id),
-              },
-              {
-                label: t("common.edit"),
-                onClick: () => openEdit(p),
-                disabled: busy.has(p.id),
-              },
-              {
-                label: t("detail.diagnostics"),
-                onClick: () => void onDiagnose(p),
-                disabled: diagBusy === p.id,
-              },
-              "separator",
-              {
-                label: t("detail.moveUp"),
-                onClick: () =>
-                  ctxGroup && moveProfileInGroup(ctxGroup.items, p.id, -1),
-                disabled: !ctxGroup || ctxIndex <= 0,
-              },
-              {
-                label: t("detail.moveDown"),
-                onClick: () =>
-                  ctxGroup && moveProfileInGroup(ctxGroup.items, p.id, 1),
-                disabled:
-                  !ctxGroup || ctxIndex < 0 || ctxIndex >= ctxGroup.items.length - 1,
-              },
-              "separator",
-              {
-                label: t("common.delete"),
-                onClick: () => void onDelete(p),
-                disabled: busy.has(p.id),
-                danger: true,
-              },
-            ]}
-          />
-        );
-      })()}
+      {ctxMenu && (
+        <ContextMenu
+          x={ctxMenu.x}
+          y={ctxMenu.y}
+          onClose={() => setCtxMenu(null)}
+          items={ctxMenu.items}
+        />
+      )}
 
       <Modal
         open={openVpnCredentialProfile !== null}

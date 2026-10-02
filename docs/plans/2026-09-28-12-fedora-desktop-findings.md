@@ -44,8 +44,8 @@
 | F1 | `remote … tcp` / `proto tcp` (`tcp4`, `tcp6`) отклонялись sanitizer'ом — легальные client-алиасы OpenVPN. Ломал реальные pfSense-экспорты | **исправлено** (`is_client_proto`, 2026-09-28) |
 | F2 | Allowlist отклонял обычные client-директивы: `verb`, `explicit-exit-notify`, `keepalive`, `mute`, `connect-timeout`, `ping-exit`, `ncp-ciphers`, `peer-fingerprint`, `topology`, `auth-retry`, `pull`, `float`, `route-nopull`, MTU-кнобы (`mssfix`, `fragment`, `link-mtu`) и др. | **исправлено** (там же) |
 | F3 | Неудачный connect молчит в UI: daemon возвращает `InvalidParams`/failed — toggle откатывается без сообщения. Корень: `route-changed` (netlink watcher) → `refreshAll` → `setError(null)` затирал баннер; async-переход `→failed` вообще нигде не показывался. | **исправлено** (`actionError` + watcher переходов, 2026-09-28) |
-| F4 | `route`/`route-ipv6` в `.ovpn` отклоняются (по дизайну — маршрутами владеет daemon), но **import не конвертирует их в policy routes профиля** — split-конфиги (`bi-zone-sep.ovpn`) теряют маршруты молча. | открыто, feature gap |
-| F5 | `pkcs12`/файловые ссылки в `.ovpn` — import не подтягивает sibling-файлы и не предупреждает, что asset отсутствует. pfSense-профили упадут на connect уже на staging. | открыто |
+| F4 | `route`/`route-ipv6` в `.ovpn` отклоняются (по дизайну — маршрутами владеет daemon), но **import не конвертирует их в policy routes профиля** — split-конфиги (`bi-zone-sep.ovpn`) теряют маршруты молча. | **исправлено**: поддерживаемые маршруты переносятся в policy routes; неподдерживаемые формы отклоняются при import |
+| F5 | `pkcs12`/файловые ссылки в `.ovpn` — import не подтягивает sibling-файлы и не предупреждает, что asset отсутствует. pfSense-профили упадут на connect уже на staging. | **исправлено**: assets копируются в vault; отсутствующий asset даёт явную ошибку import |
 | F6 | TLS handshake к `178.170.197.253:1194` виснет >15 c: TCP connect мгновенный, ClientHello без ответа. Ручной `openvpn` с теми же флагами — то же самое → не баг приложения. Гипотезы: MTU через `happ-xray`, сервер молчит на tcp. Перепроверить на прямом линке. | env, не app |
 | F7 | TUN-inbound генерируется без `sniffing` → `domain:`/`geosite:` правила под TUN инертны (видны только IP). Это главный gap до Happ-style split. | **исправлено** (`sniffing.enabled`+`destOverride:[http,tls,quic]` на обоих генераторах; `xray run -test` на пиннённом v26.3.27 — OK) |
 | F8 | UI-текст «require administrator privileges» — виндовая формулировка на Linux. | косметика |
@@ -97,7 +97,7 @@
 - UX: профиль из подписки дефолтит `xrayMode=socks` → на Linux «connect» без TUN выглядит как «не работает». Варианты: дефолт `tun` для generated-профилей на Linux или явная подсказка в карточке.
 - Детект чужого владельца default-route (Happ `lookup 52` pri 5210-5270 выше наших 10000/10001) → понятное «another tunnel owns default route» вместо молчаливого нетрафика.
 - fakeDNS/DNS-intercept — паритет с Happ для non-TLS/UDP трафика (их пул `198.18.0.0/15`, у нас адрес тоже оттуда — инфраструктура совместима).
-- F4/F5/F9 (OpenVPN) — отложено по приоритету.
+- F9 (OpenVPN) — отложено по приоритету; F4/F5 исправлены позже.
 
 ## Итерация 3: дефолт TUN на Linux + Logs-таб (2026-09-28)
 
@@ -128,7 +128,7 @@
    не-owned `ip rule`/default-route владельца и отвечать читаемой ошибкой.
 3. **fakeDNS / DNS-intercept нет.** Non-TLS/UDP DNS идёт по IP-правилам/аплинку;
    sniffing покрывает HTTPS/QUIC. Для паритета с Happ — backlog-фича.
-4. **OpenVPN незрелый** — F4/F5/F9 отложены; конфигурационная совместимость
+4. **OpenVPN незрелый** — F9 остаётся открытым; конфигурационная совместимость
    и рукопожатие не проверены.
 5. **UX невнятный** (замечание пользователя): вкладки/карточки/формы требуют
    переработки — отдельная итерация. Частный случай уже ловился: SOCKS-дефолт

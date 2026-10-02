@@ -1,10 +1,12 @@
 use crate::config_security::{protect_path, read_with_backup_semantics};
-use crate::models::TunnelBackend;
+use crate::models::{PolicyRoute, TunnelBackend};
+use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct ConfigImport {
     pub config_path: PathBuf,
     pub warnings: Vec<String>,
+    pub routes: Vec<PolicyRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,16 +165,16 @@ impl ConfigVault {
         fs::create_dir_all(&profile_dir)?;
         protect_path(&profile_dir)?;
 
-        let result = (|| -> io::Result<Vec<String>> {
+        let result = (|| -> io::Result<(Vec<String>, Vec<PolicyRoute>)> {
             fs::create_dir(&staging)?;
             protect_path(&staging)?;
-            let warnings = match backend {
+            let (warnings, routes) = match backend {
                 TunnelBackend::OpenVpn => stage_openvpn(source, &staging, &config_name)?,
                 _ => {
                     let staged_config = staging.join(&config_name);
                     copy_source_with_backup_fallback(source, &staged_config)?;
                     protect_path(&staged_config)?;
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 }
             };
             fs::rename(&staging, &revision)?;
@@ -181,13 +184,14 @@ impl ConfigVault {
                 let _ = fs::remove_dir_all(&revision);
                 return Err(err);
             }
-            Ok(warnings)
+            Ok((warnings, routes))
         })();
 
         match result {
-            Ok(warnings) => Ok(ConfigImport {
+            Ok((warnings, routes)) => Ok(ConfigImport {
                 config_path: revision.join(config_name),
                 warnings,
+                routes,
             }),
             Err(err) => {
                 let _ = fs::remove_dir_all(&staging);
@@ -266,6 +270,7 @@ impl ConfigVault {
             Ok(()) => Ok(ConfigImport {
                 config_path: revision.join(config_name),
                 warnings: Vec::new(),
+                routes: Vec::new(),
             }),
             Err(err) => {
                 let _ = fs::remove_dir_all(&staging);
@@ -309,6 +314,7 @@ impl ConfigVault {
             Ok(()) => Ok(ConfigImport {
                 config_path: revision.join(config_name),
                 warnings: Vec::new(),
+                routes: Vec::new(),
             }),
             Err(err) => {
                 let _ = fs::remove_dir_all(&staging);
@@ -411,6 +417,7 @@ const PATH_DIRECTIVES: &[&str] = &[
     "tls-crypt-v2",
     "secret",
     "auth-user-pass",
+    "askpass",
     "crl-verify",
 ];
 
@@ -427,7 +434,74 @@ pub(crate) const SCRIPT_DIRECTIVES: &[&str] = &[
     "plugin",
 ];
 
-fn stage_openvpn(source: &Path, staging: &Path, config_name: &str) -> io::Result<Vec<String>> {
+fn parse_openvpn_static_route(directive: &str, args: &[String]) -> io::Result<PolicyRoute> {
+    let invalid = || invalid_data("unsupported OpenVPN route directive");
+    let (destination, via, metric) = match directive {
+        "route" if (1..=4).contains(&args.len()) => {
+            let destination = if args[0].contains('/') {
+                if args.len() != 1 {
+                    return Err(invalid());
+                }
+                match args[0].parse::<IpNet>().map_err(|_| invalid())? {
+                    route @ IpNet::V4(_) => route.trunc(),
+                    _ => return Err(invalid()),
+                }
+            } else {
+                let address = args[0].parse::<Ipv4Addr>().map_err(|_| invalid())?;
+                let mask = args
+                    .get(1)
+                    .map(|value| value.parse::<Ipv4Addr>().map_err(|_| invalid()))
+                    .transpose()?;
+                IpNet::V4(
+                    match mask {
+                        Some(mask) => Ipv4Net::with_netmask(address, mask),
+                        None => Ipv4Net::new(address, 32),
+                    }
+                    .map_err(|_| invalid())?
+                    .trunc(),
+                )
+            };
+            let via = match args.get(2).map(String::as_str) {
+                None | Some("default" | "vpn_gateway") => None,
+                Some(value) => Some(IpAddr::V4(value.parse().map_err(|_| invalid())?)),
+            };
+            let metric = args
+                .get(3)
+                .map(|value| value.parse::<u32>().map_err(|_| invalid()))
+                .transpose()?
+                .unwrap_or(0);
+            (destination, via, metric)
+        }
+        "route-ipv6" if (1..=3).contains(&args.len()) => {
+            let destination = match args[0].parse::<IpNet>().map_err(|_| invalid())? {
+                route @ IpNet::V6(_) => route.trunc(),
+                _ => return Err(invalid()),
+            };
+            let via = match args.get(1).map(String::as_str) {
+                None | Some("default") => None,
+                Some(value) => Some(IpAddr::V6(value.parse().map_err(|_| invalid())?)),
+            };
+            let metric = args
+                .get(2)
+                .map(|value| value.parse::<u32>().map_err(|_| invalid()))
+                .transpose()?
+                .unwrap_or(0);
+            (destination, via, metric)
+        }
+        _ => return Err(invalid()),
+    };
+    Ok(PolicyRoute {
+        destination,
+        metric,
+        via,
+    })
+}
+
+fn stage_openvpn(
+    source: &Path,
+    staging: &Path,
+    config_name: &str,
+) -> io::Result<(Vec<String>, Vec<PolicyRoute>)> {
     let text = fs::read_to_string(source)?;
     let source_dir = source.parent().unwrap_or_else(|| Path::new("."));
     let assets_dir = staging.join("assets");
@@ -435,6 +509,7 @@ fn stage_openvpn(source: &Path, staging: &Path, config_name: &str) -> io::Result
     let mut copied: HashMap<PathBuf, String> = HashMap::new();
     let mut warned: HashSet<String> = HashSet::new();
     let mut warnings = Vec::new();
+    let mut routes = Vec::new();
     let mut output = Vec::new();
     let mut in_block: Option<String> = None;
 
@@ -462,6 +537,10 @@ fn stage_openvpn(source: &Path, staging: &Path, config_name: &str) -> io::Result
         if directive == "config" {
             return Err(invalid_data("nested 'config' directives are not supported"));
         }
+        if matches!(directive.as_str(), "route" | "route-ipv6") {
+            routes.push(parse_openvpn_static_route(&directive, &tokens[1..])?);
+            continue;
+        }
         if SCRIPT_DIRECTIVES.contains(&directive.as_str()) && warned.insert(directive.clone()) {
             warnings.push(format!(
                 "directive '{directive}' references an external or executable item that requires review"
@@ -472,12 +551,19 @@ fn stage_openvpn(source: &Path, staging: &Path, config_name: &str) -> io::Result
                 || SCRIPT_DIRECTIVES.contains(&directive.as_str()))
         {
             let resolved = resolve_reference(source_dir, &tokens[1]);
-            let meta = fs::symlink_metadata(&resolved)?;
+            let meta = fs::symlink_metadata(&resolved).map_err(|err| {
+                if err.kind() == io::ErrorKind::NotFound
+                    && PATH_DIRECTIVES.contains(&directive.as_str())
+                {
+                    invalid_data("OpenVPN referenced asset is missing")
+                } else {
+                    err
+                }
+            })?;
             if !meta.is_file() {
-                return Err(invalid_input(format!(
-                    "referenced path '{}' is not a regular file",
-                    tokens[1]
-                )));
+                return Err(invalid_data(
+                    "OpenVPN referenced asset is not a regular file",
+                ));
             }
             let relative = match copied.get(&resolved) {
                 Some(existing) => existing.clone(),
@@ -520,7 +606,7 @@ fn stage_openvpn(source: &Path, staging: &Path, config_name: &str) -> io::Result
     let staged_config = staging.join(config_name);
     fs::write(&staged_config, text_out)?;
     protect_path(&staged_config)?;
-    Ok(warnings)
+    Ok((warnings, routes))
 }
 
 pub(crate) fn inline_tag(token: &str) -> Option<(bool, &str)> {
@@ -854,6 +940,35 @@ mod tests {
     }
 
     #[test]
+    fn import_openvpn_stages_credential_files_and_inline_auth() {
+        let (vault, dir) = vault("ovpn-creds");
+        let cfg_dir = dir.join("cfg");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        fs::write(cfg_dir.join("up.txt"), b"alice\ns3cret\n").unwrap();
+        fs::write(cfg_dir.join("key-pass.txt"), b"key-pass\n").unwrap();
+        let source = cfg_dir.join("client.ovpn");
+        fs::write(
+            &source,
+            "client\nremote vpn.example\nauth-user-pass up.txt\naskpass key-pass.txt\n",
+        )
+        .unwrap();
+
+        let import = vault.import("p", TunnelBackend::OpenVpn, &source).unwrap();
+        let text = fs::read_to_string(&import.config_path).unwrap();
+        assert!(
+            text.contains("auth-user-pass \"assets/0-up.txt\""),
+            "{text}"
+        );
+        assert!(text.contains("askpass \"assets/1-key-pass.txt\""), "{text}");
+        let rev = import.config_path.parent().unwrap();
+        assert_eq!(
+            fs::read(rev.join("assets").join("0-up.txt")).unwrap(),
+            b"alice\ns3cret\n"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn openvpn_auth_user_pass_without_arg_is_preserved() {
         let (vault, dir) = vault("ovpn-aup");
         let cfg_dir = dir.join("cfg");
@@ -896,18 +1011,79 @@ mod tests {
         let cfg_dir = dir.join("cfg");
         fs::create_dir_all(&cfg_dir).unwrap();
         let source = cfg_dir.join("client.ovpn");
-        fs::write(&source, "client\nca missing-ca.crt\n").unwrap();
+        fs::write(&source, "client\npkcs12 missing-private-client.p12\n").unwrap();
 
         let err = vault
             .import("miss", TunnelBackend::OpenVpn, &source)
             .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("referenced asset is missing"));
+        assert!(!err.to_string().contains("private-client"));
 
         let profile_dir = vault.root().join("miss");
         let leftovers: Vec<_> = fs::read_dir(&profile_dir)
             .map(|d| d.filter_map(|e| e.ok()).collect())
             .unwrap_or_default();
         assert!(leftovers.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn import_openvpn_moves_static_routes_into_profile_metadata() {
+        let (vault, dir) = vault("ovpn-routes");
+        let source = dir.join("client.ovpn");
+        fs::write(dir.join("client.p12"), b"PKCS12").unwrap();
+        fs::write(
+            &source,
+            "client\nremote vpn.example 1194\npkcs12 client.p12\nroute 10.20.0.0 255.255.0.0\nroute-ipv6 fd00:1::/64\n",
+        )
+        .unwrap();
+
+        let import = vault.import("p", TunnelBackend::OpenVpn, &source).unwrap();
+        assert_eq!(import.routes.len(), 2);
+        assert_eq!(import.routes[0].destination.to_string(), "10.20.0.0/16");
+        assert_eq!(import.routes[1].destination.to_string(), "fd00:1::/64");
+        let config = fs::read_to_string(&import.config_path).unwrap();
+        assert!(!config.lines().any(|line| line.starts_with("route")));
+        assert!(config.contains("pkcs12 \"assets/0-client.p12\""));
+        assert_eq!(
+            fs::read(
+                import
+                    .config_path
+                    .parent()
+                    .unwrap()
+                    .join("assets/0-client.p12")
+            )
+            .unwrap(),
+            b"PKCS12"
+        );
+        let assets = std::collections::BTreeMap::from([(
+            "assets/0-client.p12".to_string(),
+            b"PKCS12".to_vec(),
+        )]);
+        assert!(crate::openvpn_config::sanitize_openvpn_config(
+            &config,
+            &assets,
+            Path::new("/run/network-orchestrator/test"),
+        )
+        .is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn import_openvpn_rejects_routes_it_cannot_preserve() {
+        let (vault, dir) = vault("ovpn-unsupported-route");
+        let source = dir.join("client.ovpn");
+        fs::write(
+            &source,
+            "client\nremote vpn.example\nroute 10.0.0.0 255.0.0.0 net_gateway\n",
+        )
+        .unwrap();
+        let err = vault
+            .import("p", TunnelBackend::OpenVpn, &source)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("route"));
         fs::remove_dir_all(&dir).unwrap();
     }
 

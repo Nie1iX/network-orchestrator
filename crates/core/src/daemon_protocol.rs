@@ -505,6 +505,34 @@ pub enum OpenVpnWarning {
     AuthenticationFailed,
 }
 
+/// Sanitized reason for a failed OpenVPN session. Values map to fixed
+/// keywords from the management `STATE` detail field and daemon-side
+/// credential checks — no raw log text crosses the wire.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum OpenVpnFailure {
+    /// `auth-failure` detail or a `PASSWORD:Verification Failed` event.
+    AuthenticationFailure,
+    /// The server asked for credentials (or a key passphrase) that the
+    /// profile does not supply.
+    CredentialsRequired,
+    /// `resolve-error` — the remote host could not be resolved.
+    ResolveError,
+    /// `connect-error`/`proxy-reconnect` — the server was unreachable.
+    ConnectError,
+    /// `tls-error`/`tls-failed` — TLS handshake failure.
+    TlsError,
+    /// `connection-reset`, `ping-restart`, `ping-exit`, `inactive-exit`,
+    /// `reconnect`, `suspend`, `network-change`, `primary-changing`.
+    ConnectionLost,
+    /// `exit-with-error` — exited without a more specific reason.
+    ExitWithError,
+    /// `exit-with-notification` — server asked the client to exit.
+    ExitNotification,
+    /// `sigint`/`sigterm`/`sighup`/`sigusr1` — terminated by a signal.
+    Terminated,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenVpnStatusResult {
@@ -515,6 +543,9 @@ pub struct OpenVpnStatusResult {
     pub tx_bytes: u64,
     pub applied_routes: Vec<IpNet>,
     pub warnings: Vec<OpenVpnWarning>,
+    /// Present while `state == "failed"` when a sanitized reason is known.
+    #[serde(default)]
+    pub failure_reason: Option<OpenVpnFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -581,6 +612,12 @@ pub struct XrayConnectParams {
     pub dns_servers: Vec<std::net::IpAddr>,
     #[serde(default)]
     pub dns_domains: Vec<String>,
+    /// Hosts (literal IPs or resolvable names) that must stay reachable
+    /// through the physical gateway while the tunnel captures the family:
+    /// upstream DNS resolvers and well-known resolvers clients may point
+    /// at. The daemon installs `/32`/`/128` host routes for them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_bypass: Vec<String>,
     /// Optional kernel interface-name hint; sanitized by the daemon, which
     /// falls back to the deterministic hash name when absent or unusable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -613,6 +650,7 @@ impl std::fmt::Debug for XrayConnectParams {
             .field("routes", &self.routes)
             .field("dns_servers", &self.dns_servers)
             .field("dns_domains", &self.dns_domains)
+            .field("dns_bypass", &self.dns_bypass)
             .field("interface_name", &self.interface_name)
             .field(
                 "geo_assets",
@@ -664,6 +702,12 @@ pub struct XrayStatusResult {
     pub dns_applied: bool,
     pub ipv4_covered: bool,
     pub ipv6_covered: bool,
+    /// TUN inbound counters from the Xray stats API; `None` when the
+    /// statsquery endpoint is unreachable (e.g. an older staged config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1465,7 +1509,7 @@ mod tests {
         assert_eq!(params.routes[0].destination, "10.9.0.0/16".parse().unwrap());
 
         let (_, result): (_, OpenVpnConnectResult) = ok_response(
-            r#"{"id":11,"ok":true,"result":{"status":{"profileId":"office","state":"connecting","interfaceName":"ovpn-ab12","rxBytes":0,"txBytes":0,"appliedRoutes":[],"warnings":[]}}}"#,
+            r#"{"id":11,"ok":true,"result":{"status":{"profileId":"office","state":"connecting","interfaceName":"ovpn-ab12","rxBytes":0,"txBytes":0,"appliedRoutes":[],"warnings":[],"failureReason":null}}}"#,
         );
         assert_eq!(result.status.state, OpenVpnConnectionState::Connecting);
 
@@ -1474,9 +1518,10 @@ mod tests {
         assert_eq!(frame.method, method::OPENVPN_STATUS);
         assert_eq!(params.profile_id, "office");
         let (_, status): (_, OpenVpnStatusResult) = ok_response(
-            r#"{"id":12,"ok":true,"result":{"profileId":"office","state":"connected","interfaceName":"ovpn-ab12","rxBytes":7,"txBytes":8,"appliedRoutes":["10.9.0.0/16"],"warnings":["dnsNotApplied","ipv6NotCovered"]}}"#,
+            r#"{"id":12,"ok":true,"result":{"profileId":"office","state":"connected","interfaceName":"ovpn-ab12","rxBytes":7,"txBytes":8,"appliedRoutes":["10.9.0.0/16"],"warnings":["dnsNotApplied","ipv6NotCovered"],"failureReason":null}}"#,
         );
         assert_eq!(status.state, OpenVpnConnectionState::Connected);
+        assert_eq!(status.failure_reason, None);
         assert_eq!(status.applied_routes, vec!["10.9.0.0/16".parse().unwrap()]);
         assert_eq!(
             status.warnings,

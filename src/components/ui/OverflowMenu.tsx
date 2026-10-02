@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { DotsVerticalIcon } from "../../icons";
 import { t } from "../../i18n";
+import { popupNativeMenu } from "../../nativeMenu";
 
 export interface OverflowMenuItem {
   label: string;
@@ -40,8 +41,10 @@ export default function OverflowMenu({ items, title }: OverflowMenuProps) {
       <button
         type="button"
         className="overflow-menu-trigger"
-        onClick={(e) => {
+        onClick={async (e) => {
           e.stopPropagation();
+          const rect = e.currentTarget.getBoundingClientRect();
+          if (await popupNativeMenu(items, rect.left, rect.bottom)) return;
           setOpen((v) => !v);
         }}
         title={resolvedTitle}

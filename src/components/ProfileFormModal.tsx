@@ -6,17 +6,24 @@ import {
   AnalyzedRoute,
   DomainPolicy,
   DomainRouteTarget,
+  HappRoutingImport,
   NetworkInterface,
   PolicyRoute,
   Profile,
   ProfileInspection,
+  RouteCheckOutbound,
+  RouteCheckResult,
+  RouteCheckSource,
   TunnelBackend,
   WireGuardFields,
+  XrayDnsConfig,
+  XrayDomainMatcher,
+  XrayDomainStrategy,
   XrayMode,
 } from "../types";
 import { usePlatformCapabilities } from "../platform";
 import { ChevronIcon } from "../icons";
-import { t, useT } from "../i18n";
+import { t, useT, type TranslationKey } from "../i18n";
 import { BACKEND_LABEL_KEYS } from "../i18n/labels";
 
 const BACKEND_EXTENSIONS: Record<TunnelBackend, string[]> = {
@@ -50,6 +57,22 @@ const RULE_SETS = [
 ] as const;
 
 type RulesSetId = (typeof RULE_SETS)[number]["id"];
+
+const ROUTE_CHECK_OUTBOUND_KEYS: Record<RouteCheckOutbound, TranslationKey> = {
+  proxy: "rules.proxy",
+  direct: "rules.direct",
+  block: "rules.block",
+  dns: "rules.outboundDns",
+};
+
+const ROUTE_CHECK_SOURCE_KEYS: Record<RouteCheckSource, TranslationKey> = {
+  dnsCapture: "rules.srcDnsCapture",
+  policy: "rules.srcPolicy",
+  resolverPin: "rules.srcResolverPin",
+  multicast: "rules.srcMulticast",
+  privateLan: "rules.srcPrivateLan",
+  default: "rules.srcDefault",
+};
 
 /** Selector lines only — blank lines and # comments don't count. */
 function countRuleLines(text: string): number {
@@ -116,6 +139,13 @@ export interface ProfileFormState {
   xrayTunIp: string;
   xrayGeoipUrl: string;
   xrayGeositeUrl: string;
+  /** "" keeps the generated default. */
+  xrayDomainStrategy: XrayDomainStrategy | "";
+  xrayDomainMatcher: XrayDomainMatcher | "";
+  /** Opaque pass-through: no editor yet, but a save must not wipe it. */
+  xrayDns: XrayDnsConfig | null;
+  /** Linux TUN: def1 halves (0.0.0.0/1 + 128.0.0.0/1) instead of 0.0.0.0/0. */
+  xraySplitDefault: boolean;
 }
 
 /** Group a profile's policies into per-target text (comments preserved). */
@@ -183,6 +213,10 @@ export function newFormState(
     xrayTunIp: "172.19.0.1/30",
     xrayGeoipUrl: "",
     xrayGeositeUrl: "",
+    xrayDomainStrategy: "",
+    xrayDomainMatcher: "",
+    xrayDns: null,
+    xraySplitDefault: false,
   };
 }
 
@@ -214,6 +248,10 @@ export function editFormState(profile: Profile): ProfileFormState {
     xrayTunIp: profile.xrayTunIp ?? "172.19.0.1/30",
     xrayGeoipUrl: profile.xrayGeoipUrl ?? "",
     xrayGeositeUrl: profile.xrayGeositeUrl ?? "",
+    xrayDomainStrategy: profile.xrayDomainStrategy ?? "",
+    xrayDomainMatcher: profile.xrayDomainMatcher ?? "",
+    xrayDns: profile.xrayDns ?? null,
+    xraySplitDefault: profile.xraySplitDefault ?? false,
   };
 }
 
@@ -246,6 +284,14 @@ export default function ProfileFormModal({
   const [bulkCidrs, setBulkCidrs] = useState("");
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [happOpen, setHappOpen] = useState(false);
+  const [happPayload, setHappPayload] = useState("");
+  const [happBusy, setHappBusy] = useState(false);
+  const [happNotice, setHappNotice] = useState<string | null>(null);
+  const [routeCheckTarget, setRouteCheckTarget] = useState("");
+  const [routeCheckBusy, setRouteCheckBusy] = useState(false);
+  const [routeCheckResult, setRouteCheckResult] = useState<RouteCheckResult | null>(null);
+  const [routeCheckError, setRouteCheckError] = useState<string | null>(null);
   const [tab, setTab] = useState<FormTab>("general");
   const [rulesEditor, setRulesEditor] = useState<RulesSetId | null>(null);
   const tr = useT();
@@ -256,6 +302,12 @@ export default function ProfileFormModal({
       setFormError(null);
       setBulkCidrs("");
       setBulkOpen(false);
+      setHappPayload("");
+      setHappOpen(false);
+      setHappNotice(null);
+      setRouteCheckTarget("");
+      setRouteCheckResult(null);
+      setRouteCheckError(null);
       setTab("general");
       setRulesEditor(null);
       setProbeResults(null);
@@ -387,6 +439,88 @@ export default function ProfileFormModal({
     }
   };
 
+  const applyHappImport = async () => {
+    if (!happPayload.trim()) return;
+    setHappBusy(true);
+    setHappNotice(null);
+    setFormError(null);
+    try {
+      const imported = await invoke<HappRoutingImport>("parse_happ_routing", {
+        payload: happPayload,
+      });
+      const dns = imported.dns;
+      const hasDns =
+        dns.servers.length > 0 ||
+        Object.keys(dns.hosts).length > 0 ||
+        dns.fakeDns ||
+        dns.queryStrategy !== null;
+      update({
+        // A profile with any lists replaces all three buckets — absent
+        // buckets are empty in Happ semantics. A DNS-only import leaves
+        // the rule text alone.
+        ...(imported.domainPolicies.length > 0
+          ? {
+              rulesBlock: policiesToText(imported.domainPolicies, "block"),
+              rulesProxy: policiesToText(imported.domainPolicies, "proxy"),
+              rulesDirect: policiesToText(imported.domainPolicies, "direct"),
+            }
+          : {}),
+        privateLanDirect: imported.privateLanDirect ?? current.privateLanDirect,
+        xrayDomainStrategy:
+          imported.domainStrategy ?? current.xrayDomainStrategy,
+        xrayDomainMatcher: imported.domainMatcher ?? current.xrayDomainMatcher,
+        xrayDns: hasDns ? dns : current.xrayDns,
+        xrayGeoipUrl: imported.geoipUrl ?? current.xrayGeoipUrl,
+        xrayGeositeUrl: imported.geositeUrl ?? current.xrayGeositeUrl,
+      });
+      setHappPayload("");
+      setHappNotice(
+        imported.warnings.length > 0
+          ? imported.warnings.join("\n")
+          : tr("rules.happApplied"),
+      );
+    } catch (err) {
+      setHappNotice(String(err));
+    } finally {
+      setHappBusy(false);
+    }
+  };
+
+  const runRouteCheck = async () => {
+    const target = routeCheckTarget.trim();
+    if (!target) return;
+    setRouteCheckBusy(true);
+    setRouteCheckError(null);
+    try {
+      const result = await invoke<RouteCheckResult>("xray_test_route", {
+        request: {
+          target,
+          domainPolicies: textToPolicies(
+            current.rulesBlock,
+            current.rulesProxy,
+            current.rulesDirect,
+          ),
+          privateLanDirect: current.privateLanDirect,
+          domainStrategy: current.xrayDomainStrategy || null,
+          dns: current.xrayDns ?? {
+            servers: [],
+            hosts: {},
+            fakeDns: false,
+            queryStrategy: null,
+          },
+          geoipUrl: current.xrayGeoipUrl || null,
+          geositeUrl: current.xrayGeositeUrl || null,
+        },
+      });
+      setRouteCheckResult(result);
+    } catch (err) {
+      setRouteCheckResult(null);
+      setRouteCheckError(String(err));
+    } finally {
+      setRouteCheckBusy(false);
+    }
+  };
+
   const save = async () => {
     for (const route of current.routes) {
       if (!route.destination.trim()) {
@@ -492,6 +626,10 @@ export default function ProfileFormModal({
       xrayTunIp: isXray && current.xrayMode === "tun" && caps?.os === "windows" ? current.xrayTunIp.trim() : null,
       xrayGeoipUrl: isXray && current.xrayMode === "tun" ? current.xrayGeoipUrl.trim() || null : null,
       xrayGeositeUrl: isXray && current.xrayMode === "tun" ? current.xrayGeositeUrl.trim() || null : null,
+      xrayDomainStrategy: isXray && current.xrayDomainStrategy ? current.xrayDomainStrategy : null,
+      xrayDomainMatcher: isXray && current.xrayDomainMatcher ? current.xrayDomainMatcher : null,
+      xrayDns: isXray ? (current.xrayDns ?? undefined) : undefined,
+      xraySplitDefault: isXray && current.xrayMode === "tun" && current.xraySplitDefault,
     };
     setSaving(true);
     try {
@@ -901,9 +1039,24 @@ export default function ProfileFormModal({
         current.xrayMode === "tun" && (
           <div className="profile-tun-fields">
             {caps?.os === "linux" ? (
+              <>
               <span className="profile-help">
                 {tr("form.tunHelpLinux")}
               </span>
+              <label className="profile-proxy-toggle">
+                <input
+                  type="checkbox"
+                  checked={current.xraySplitDefault}
+                  onChange={(e) =>
+                    update({ xraySplitDefault: e.target.checked })
+                  }
+                />
+                <span>{tr("form.splitDefault")}</span>
+              </label>
+              <span className="profile-help">
+                {tr("form.splitDefaultHint")}
+              </span>
+              </>
             ) : (
             <>
             <label>
@@ -1195,6 +1348,147 @@ export default function ProfileFormModal({
             />
             {tr("form.privateLanDirect")}
           </label>
+          <div className="route-check">
+            <div className="route-check-row">
+              <input
+                type="text"
+                value={routeCheckTarget}
+                onChange={(e) => setRouteCheckTarget(e.target.value)}
+                placeholder={tr("rules.testPlaceholder")}
+                spellCheck={false}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void runRouteCheck();
+                  }
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => void runRouteCheck()}
+                disabled={routeCheckBusy || !routeCheckTarget.trim()}
+              >
+                {routeCheckBusy ? tr("rules.testChecking") : tr("rules.testCheck")}
+              </button>
+            </div>
+            {routeCheckError && (
+              <span className="profile-routes-hint">{routeCheckError}</span>
+            )}
+            {routeCheckResult && (
+              <div className="route-check-result">
+                <span
+                  className={`route-check-verdict rules-fg-${routeCheckResult.outbound}`}
+                >
+                  {routeCheckResult.target}
+                  {routeCheckResult.port != null
+                    ? `:${routeCheckResult.port}`
+                    : ""}
+                  {" → "}
+                  {tr(ROUTE_CHECK_OUTBOUND_KEYS[routeCheckResult.outbound])}
+                </span>
+                <span className="profile-routes-hint">
+                  {routeCheckResult.source === "policy" &&
+                  routeCheckResult.policyIndex != null
+                    ? tr("rules.srcPolicy", {
+                        index: routeCheckResult.policyIndex + 1,
+                      })
+                    : tr(ROUTE_CHECK_SOURCE_KEYS[routeCheckResult.source])}
+                  {routeCheckResult.matchedSelector
+                    ? ` · ${routeCheckResult.matchedSelector}`
+                    : ""}
+                </span>
+                {routeCheckResult.certainty === "probable" && (
+                  <span className="profile-routes-hint">
+                    {tr("rules.testProbable")}
+                  </span>
+                )}
+                {routeCheckResult.notes.map((note, index) => (
+                  <span key={index} className="profile-routes-hint">
+                    {note}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            className="connection-detail-toggle"
+            onClick={() => setHappOpen((v) => !v)}
+            aria-expanded={happOpen}
+          >
+            <ChevronIcon size={13} collapsed={!happOpen} />
+            {tr("rules.importHapp")}
+          </button>
+          {happOpen && (
+            <div className="profile-bulk-cidrs">
+              <label>
+                {tr("rules.happHint")}
+                <textarea
+                  value={happPayload}
+                  onChange={(event) => setHappPayload(event.target.value)}
+                  rows={4}
+                  placeholder='{"Name":"…","DirectSites":[…]}'
+                  spellCheck={false}
+                />
+              </label>
+              <div className="profile-bulk-actions">
+                <button
+                  type="button"
+                  onClick={applyHappImport}
+                  disabled={happBusy || !happPayload.trim()}
+                >
+                  {happBusy ? tr("rules.happApplying") : tr("rules.happApply")}
+                </button>
+              </div>
+              {happNotice && (
+                <span className="profile-routes-hint">{happNotice}</span>
+              )}
+            </div>
+          )}
+          <label>
+            {tr("rules.domainStrategy")}
+            <select
+              value={current.xrayDomainStrategy}
+              onChange={(e) =>
+                update({
+                  xrayDomainStrategy: e.target.value as XrayDomainStrategy | "",
+                })
+              }
+            >
+              <option value="">{tr("rules.strategyDefault")}</option>
+              <option value="asIs">AsIs</option>
+              <option value="ipIfNonMatch">IPIfNonMatch</option>
+              <option value="ipOnDemand">IPOnDemand</option>
+            </select>
+          </label>
+          <label>
+            {tr("rules.domainMatcher")}
+            <select
+              value={current.xrayDomainMatcher}
+              onChange={(e) =>
+                update({
+                  xrayDomainMatcher: e.target.value as XrayDomainMatcher | "",
+                })
+              }
+            >
+              <option value="">{tr("rules.matcherDefault")}</option>
+              <option value="mph">mph</option>
+              <option value="hybrid">hybrid</option>
+              <option value="linear">linear</option>
+            </select>
+          </label>
+          {current.xrayDns &&
+            (current.xrayDns.servers.length > 0 ||
+              Object.keys(current.xrayDns.hosts).length > 0 ||
+              current.xrayDns.fakeDns) && (
+              <span className="profile-routes-hint">
+                {tr("rules.dnsSummary", {
+                  servers: current.xrayDns.servers.length,
+                  hosts: Object.keys(current.xrayDns.hosts).length,
+                })}
+                {current.xrayDns.fakeDns ? " · fakeDNS" : ""}
+              </span>
+            )}
           {current.xrayMode === "tun" && (
             <div className="geo-override">
               <span className="profile-routes-hint">

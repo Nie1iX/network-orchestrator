@@ -14,11 +14,11 @@ use crate::xray_process::XrayProcessRunner;
 use ipnet::IpNet;
 use net_manager_core::daemon_protocol::{
     CleanupResult, ConditionalRouteRule, ConditionalRuleState, ConditionalRuleStatus, IpFamily,
-    OpenVpnConnectionState, OpenVpnPlanConflict, OpenVpnPlanResult, OpenVpnProbeResult,
-    OpenVpnProcessResource, OpenVpnStatusResult, OpenVpnWarning, OwnedEntry, OwnedResource,
-    OwnedRuleResource, OwnedState, RouteCondition, WireGuardAddressResource, WireGuardFullResource,
-    WireGuardLinkResource, WireGuardStatusResult, WireGuardWarning, XrayConnectParams,
-    XrayProcessResource, XrayStatusResult,
+    OpenVpnConnectionState, OpenVpnFailure, OpenVpnPlanConflict, OpenVpnPlanResult,
+    OpenVpnProbeResult, OpenVpnProcessResource, OpenVpnStatusResult, OpenVpnWarning, OwnedEntry,
+    OwnedResource, OwnedRuleResource, OwnedState, RouteCondition, WireGuardAddressResource,
+    WireGuardFullResource, WireGuardLinkResource, WireGuardStatusResult, WireGuardWarning,
+    XrayConnectParams, XrayProcessResource, XrayStatusResult,
 };
 use net_manager_core::journal::{JournalDocument, JournalEntry, JournalStore};
 use net_manager_core::models::TunnelState;
@@ -525,6 +525,54 @@ mod openvpn_tests {
             .contains(&OpenVpnWarning::AuthenticationFailed));
         core.connect_openvpn(1000, plan()).unwrap();
         assert!(core.openvpn_status(1000, "home").warnings.is_empty());
+        core.disconnect_openvpn(1000, "home").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn state_detail_survives_teardown_as_failure_reason() {
+        let dir = unique_dir("failure-detail");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        process.pending.lock().unwrap().push_back(vec![
+            ManagementEvent::FailureDetail(OpenVpnFailure::TlsError),
+            ManagementEvent::State(OpenVpnState::Exiting),
+        ]);
+        core.reconcile_openvpn().unwrap();
+        let status = core.openvpn_status(1000, "home");
+        assert_eq!(status.state, OpenVpnConnectionState::Failed);
+        assert_eq!(status.failure_reason, Some(OpenVpnFailure::TlsError));
+        // Disconnect and a fresh connect clear the stored reason.
+        core.disconnect_openvpn(1000, "home").unwrap();
+        core.connect_openvpn(1000, plan()).unwrap();
+        assert_eq!(core.openvpn_status(1000, "home").failure_reason, None);
+        core.disconnect_openvpn(1000, "home").unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unanswered_password_prompt_fails_as_credentials_required() {
+        let dir = unique_dir("creds-required");
+        let process = FakeProcess::default();
+        let routes = Recorder::default();
+        let mut core = core(&dir, &process, &routes);
+        core.connect_openvpn(1000, plan()).unwrap();
+        process
+            .pending
+            .lock()
+            .unwrap()
+            .push_back(vec![ManagementEvent::FailureDetail(
+                OpenVpnFailure::CredentialsRequired,
+            )]);
+        assert!(core.reconcile_openvpn().is_err());
+        let status = core.openvpn_status(1000, "home");
+        assert_eq!(status.state, OpenVpnConnectionState::Failed);
+        assert_eq!(
+            status.failure_reason,
+            Some(OpenVpnFailure::CredentialsRequired)
+        );
         core.disconnect_openvpn(1000, "home").unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1207,6 +1255,7 @@ mod openvpn_tests {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1451,6 +1500,9 @@ pub struct DaemonCore {
     openvpn_runtime: HashMap<(u32, String), OpenVpnRuntime>,
     openvpn_failed: HashSet<(u32, String)>,
     openvpn_auth_failed: HashSet<(u32, String)>,
+    /// Sanitized failure reason per failed owner; survives teardown because
+    /// the runtime snapshot is dropped with the journal entry.
+    openvpn_failures: HashMap<(u32, String), OpenVpnFailure>,
     /// Unix seconds; injectable so handshake ageing is testable.
     clock: Box<dyn Fn() -> u64 + Send>,
     wireguard_handshake: HashMap<(u32, String), HandshakeWatch>,
@@ -1594,6 +1646,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1635,6 +1688,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1674,6 +1728,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1707,6 +1762,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1744,6 +1800,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -1786,6 +1843,7 @@ impl DaemonCore {
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
+            openvpn_failures: HashMap::new(),
             clock: Box::new(unix_now),
             wireguard_handshake: HashMap::new(),
             tunnel_failed: HashSet::new(),
@@ -2015,6 +2073,10 @@ impl DaemonCore {
             })
             .collect();
         journaled.sort();
+        let full = process
+            .full
+            .as_ref()
+            .map(|full| (full.table, full.ipv4, full.ipv6));
         let mut desired: Vec<_> = plan
             .routes
             .iter()
@@ -2022,8 +2084,10 @@ impl DaemonCore {
                 (
                     route.destination,
                     route.metric,
-                    if route.destination.prefix_len() == 0 {
-                        process.full.as_ref().map(|full| full.table)
+                    if full
+                        .is_some_and(|(_, ipv4, ipv6)| is_full_route(ipv4, ipv6, route.destination))
+                    {
+                        full.map(|(table, _, _)| table)
                     } else {
                         None
                     },
@@ -2048,6 +2112,17 @@ impl DaemonCore {
         for ip in crate::xray::dns_bypass_addrs(&plan.dns_servers, plan.full_ipv4, plan.full_ipv6) {
             if !targets.contains(&ip) {
                 targets.push(ip);
+            }
+        }
+        for host in &plan.dns_bypass {
+            for ip in crate::xray::dns_bypass_addrs(
+                &resolve_host_addrs(Some(host.as_str())),
+                plan.full_ipv4,
+                plan.full_ipv6,
+            ) {
+                if !targets.contains(&ip) {
+                    targets.push(ip);
+                }
             }
         }
         let mut wanted: Vec<_> = targets
@@ -2135,7 +2210,7 @@ impl DaemonCore {
         self.add_xray_bypass_routes(index, plan)?;
         for route in &plan.routes {
             let mut applied = AppliedRoute::on_link(route.destination, link_index, route.metric);
-            if route.destination.prefix_len() == 0 {
+            if is_full_route(plan.full_ipv4, plan.full_ipv6, route.destination) {
                 applied.table = full.map(|full| full.table);
             }
             self.journal.entries[index]
@@ -2222,6 +2297,17 @@ impl DaemonCore {
         for ip in crate::xray::dns_bypass_addrs(&plan.dns_servers, plan.full_ipv4, plan.full_ipv6) {
             if !targets.contains(&ip) {
                 targets.push(ip);
+            }
+        }
+        for host in &plan.dns_bypass {
+            for ip in crate::xray::dns_bypass_addrs(
+                &resolve_host_addrs(Some(host.as_str())),
+                plan.full_ipv4,
+                plan.full_ipv6,
+            ) {
+                if !targets.contains(&ip) {
+                    targets.push(ip);
+                }
             }
         }
         if targets.is_empty() {
@@ -2311,10 +2397,29 @@ impl DaemonCore {
             }
             _ => TunnelState::Failed,
         };
+        // Live counters come from the stats api only while running; a failure
+        // (old staged config, missing listener) degrades to absent counters.
+        let stats_target = process.map(|process| (process.name.clone(), process.transport_mark));
+        let (rx_bytes, tx_bytes) = if state == TunnelState::Running {
+            stats_target
+                .and_then(|(name, mark)| {
+                    self.xray.as_mut().and_then(|runner| {
+                        runner
+                            .query_stats(&name, crate::xray::xray_api_port(mark))
+                            .ok()
+                    })
+                })
+                .map(|(rx, tx)| (Some(rx), Some(tx)))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
         XrayStatusResult {
             profile_id: profile_id.to_owned(),
             state,
             interface_name: process.map(|process| process.name.clone()),
+            rx_bytes,
+            tx_bytes,
             dns_applied: entry.is_some_and(|entry| {
                 entry
                     .resources
@@ -2458,6 +2563,8 @@ impl DaemonCore {
         self.openvpn_failed.remove(&(uid, owner));
         self.openvpn_auth_failed
             .remove(&(uid, format!("ovpn:{}", plan.profile_id)));
+        self.openvpn_failures
+            .remove(&(uid, format!("ovpn:{}", plan.profile_id)));
         Ok(self.openvpn_status(uid, &plan.profile_id))
     }
 
@@ -2591,6 +2698,7 @@ impl DaemonCore {
         let Some(index) = self.position(uid, &owner) else {
             if self.openvpn_failed.remove(&key) {
                 self.openvpn_auth_failed.remove(&key);
+                self.openvpn_failures.remove(&key);
                 return Ok(());
             }
             return Err(io::Error::new(
@@ -2603,6 +2711,7 @@ impl DaemonCore {
         if result.is_ok() {
             self.openvpn_failed.remove(&key);
             self.openvpn_auth_failed.remove(&key);
+            self.openvpn_failures.remove(&key);
         }
         result
     }
@@ -2803,6 +2912,9 @@ impl DaemonCore {
         if state == OpenVpnConnectionState::Failed && self.openvpn_auth_failed.contains(&key) {
             warnings.push(OpenVpnWarning::AuthenticationFailed);
         }
+        let failure_reason = (state == OpenVpnConnectionState::Failed)
+            .then(|| self.openvpn_failures.get(&key).copied())
+            .flatten();
         OpenVpnStatusResult {
             profile_id: profile_id.to_owned(),
             state,
@@ -2811,6 +2923,7 @@ impl DaemonCore {
             tx_bytes: runtime.map_or(0, |runtime| runtime.snapshot.sent),
             applied_routes,
             warnings,
+            failure_reason,
         }
     }
 
@@ -2860,9 +2973,20 @@ impl DaemonCore {
             match &event {
                 ManagementEvent::AuthenticationFailed => {
                     self.openvpn_auth_failed.insert((uid, owner.to_owned()));
+                    self.openvpn_failures.insert(
+                        (uid, owner.to_owned()),
+                        OpenVpnFailure::AuthenticationFailure,
+                    );
                     return self.fail_openvpn(uid, owner);
                 }
                 ManagementEvent::PasswordPrompt(_) => return self.fail_openvpn(uid, owner),
+                ManagementEvent::FailureDetail(reason) => {
+                    self.openvpn_failures
+                        .insert((uid, owner.to_owned()), *reason);
+                    if matches!(reason, OpenVpnFailure::CredentialsRequired) {
+                        return self.fail_openvpn(uid, owner);
+                    }
+                }
                 _ => {}
             }
             if let Some(runtime) = self.openvpn_runtime.get_mut(&(uid, owner.to_owned())) {
@@ -3127,6 +3251,15 @@ impl DaemonCore {
     }
 
     fn fail_openvpn(&mut self, uid: u32, owner: &str) -> io::Result<()> {
+        if let Some(reason) = self
+            .openvpn_runtime
+            .get(&(uid, owner.to_owned()))
+            .and_then(|runtime| runtime.snapshot.last_failure)
+        {
+            self.openvpn_failures
+                .entry((uid, owner.to_owned()))
+                .or_insert(reason);
+        }
         if let Some(index) = self.position(uid, owner) {
             let _ = self.teardown_openvpn_entry(index);
             self.persist();
@@ -4292,6 +4425,22 @@ impl DaemonCore {
         self.teardown(|entry| entry.uid == uid)
     }
 
+    /// Session cleanup after the uid's last client died: tear down its owners
+    /// except those registered as always-on (`keep` holds `(uid, owner)`
+    /// pairs from `always_on::replayable_owners`) and daemon-managed
+    /// `cond:` owners, which the reconcile loops re-apply on their own.
+    pub fn cleanup_session_uid(
+        &mut self,
+        uid: u32,
+        keep: &std::collections::HashSet<(u32, String)>,
+    ) -> io::Result<CleanupResult> {
+        self.teardown(|entry| {
+            entry.uid == uid
+                && !keep.contains(&(uid, entry.owner.clone()))
+                && !entry.owner.starts_with("cond:")
+        })
+    }
+
     /// Tear down every owner of every uid, newest first (SIGTERM path).
     pub fn shutdown(&mut self) -> io::Result<CleanupResult> {
         self.teardown(|_| true)
@@ -4930,6 +5079,7 @@ mod xray_core_tests {
             }).to_string(),
             routes: vec![PolicyRoute { destination: "10.20.0.0/16".parse().unwrap(), metric: 5, via: None }],
             dns_servers: vec![], dns_domains: vec![],
+            dns_bypass: vec![],
             interface_name: None,
             geo_assets: None,
         }
@@ -7871,6 +8021,40 @@ mod tests {
         assert_eq!(result.removed_owners, vec!["a".to_string()]);
         assert!(result.failed.is_empty());
         assert!(core.owned(1000).is_empty());
+        assert_eq!(core.owned(1001).len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn session_cleanup_keeps_always_on_and_conditional_owners() {
+        let dir = unique_dir("session-cleanup");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        core.apply_routes(1000, "a", vec![route("10.1.0.0/16")])
+            .unwrap();
+        core.apply_routes(1000, "pinned", vec![route("10.2.0.0/16")])
+            .unwrap();
+        // Conditional owners are daemon-managed, not client-owned; only the
+        // reconciler may create them, so seed the journal directly.
+        core.journal.entries.push(JournalEntry {
+            uid: 1000,
+            owner: "cond:office".into(),
+            state: OwnedState::Applied,
+            resources: vec![OwnedResource::Route(AppliedRoute::on_link(
+                "10.3.0.0/16".parse().unwrap(),
+                42,
+                5,
+            ))],
+        });
+        core.apply_routes(1001, "other", vec![route("10.4.0.0/16")])
+            .unwrap();
+        let keep = std::collections::HashSet::from([(1000_u32, "pinned".to_string())]);
+        let result = core.cleanup_session_uid(1000, &keep).unwrap();
+        assert_eq!(result.removed_owners, vec!["a".to_string()]);
+        assert!(result.failed.is_empty());
+        let mut remaining: Vec<_> = core.owned(1000).into_iter().map(|o| o.owner).collect();
+        remaining.sort();
+        assert_eq!(remaining, ["cond:office", "pinned"]);
         assert_eq!(core.owned(1001).len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }

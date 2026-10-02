@@ -6,7 +6,9 @@ pub mod config_vault;
 pub mod daemon_protocol;
 pub mod exit_ip;
 pub mod explorer;
+pub mod happ_routing;
 pub mod journal;
+pub mod log_sanitize;
 #[cfg(target_os = "macos")]
 mod macos_inventory;
 pub mod macos_vpn;
@@ -17,6 +19,7 @@ pub mod openvpn_management;
 pub mod policy;
 pub mod profile_import;
 pub mod profiles;
+pub mod route_check;
 pub mod route_plan;
 pub mod route_state;
 pub mod subscription;
