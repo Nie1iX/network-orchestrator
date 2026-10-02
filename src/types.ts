@@ -567,6 +567,74 @@ export interface NmListResult {
   available: boolean;
 }
 
+// ── Kernel routing tables (Linux daemon, `ip route`/`ip rule`) ────────
+
+/** One nexthop of a multipath route. */
+export interface SystemNexthop {
+  gateway: string | null;
+  interfaceIndex: number;
+  interfaceName: string | null;
+  weight: number;
+}
+
+/** A kernel route from any routing table. */
+export interface SystemRoute {
+  family: "ipv4" | "ipv6";
+  /** CIDR; `0.0.0.0/0`/`::/0` render as `default`. */
+  destination: string;
+  /** Kernel table id (254 main, 253 default, 255 local). */
+  table: number;
+  /** `unicast` | `local` | `blackhole` | … as `ip route` prints it. */
+  kind: string;
+  /** `universe` | `site` | `link` | `host` | `nowhere` | `scope N`. */
+  scope: string;
+  /** rt_proto byte. */
+  protocol: number;
+  /** Installed by this daemon (RTPROT marker). */
+  managed: boolean;
+  gateway: string | null;
+  interfaceIndex: number | null;
+  interfaceName: string | null;
+  metric: number | null;
+  prefSource: string | null;
+  nexthops: SystemNexthop[];
+}
+
+/** A policy-routing rule (`ip rule` equivalent) with every selector. */
+export interface SystemRule {
+  family: "ipv4" | "ipv6";
+  priority: number;
+  /** `lookup` | `goto` | `unreachable` | `blackhole` | `prohibit` | `nop`. */
+  action: string;
+  table: number;
+  goto: number | null;
+  from: string | null;
+  to: string | null;
+  fwmark: number | null;
+  fwmask: number | null;
+  iifname: string | null;
+  oifname: string | null;
+  uidRange: [number, number] | null;
+  sourcePortRange: [number, number] | null;
+  destinationPortRange: [number, number] | null;
+  ipProtocol: string | null;
+  suppressPrefixLength: number | null;
+  suppressIfGroup: number | null;
+  tunId: number | null;
+  tos: number;
+  /** `ip rule ... not`. */
+  invert: boolean;
+  protocol: number;
+  managed: boolean;
+}
+
+export interface NetTablesResult {
+  routes: SystemRoute[];
+  rules: SystemRule[];
+  /** False when the daemon cannot dump kernel state. */
+  available: boolean;
+}
+
 // ── Localhost proxy discovery (opt-in scan) ───────────────────────────
 
 export type LocalProxyKind = "socks5" | "socks4" | "http";
