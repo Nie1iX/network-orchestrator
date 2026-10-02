@@ -5347,7 +5347,7 @@ mod xray_core_tests {
             config: json!({
                 "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
                 "outbounds":[
-                    {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"proxy.test","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                    {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"198.51.100.7","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
                     {"tag":"direct","protocol":"freedom"}
                 ],
                 "routing":{"domainStrategy":"AsIs","rules":[]}
@@ -5676,7 +5676,7 @@ mod xray_core_tests {
         updated.config = json!({
             "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
             "outbounds":[
-                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"proxy.test","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"198.51.100.7","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
                 {"tag":"direct","protocol":"freedom"}
             ],
             "routing":{"domainStrategy":"AsIs","rules":[{"type":"field","domain":["example.test"],"outboundTag":"direct"}]}
@@ -5693,7 +5693,7 @@ mod xray_core_tests {
         let runner = Flaky::new(events.clone());
         let mut core = DaemonCore::open_with_xray(
             JournalStore::new(dir.join("state.json")),
-            Box::new(Routes(events.clone())),
+            Box::new(GatewayRoutes::new(events.clone())),
             Box::new(Links),
             Box::new(Tun(events.clone())),
             Box::new(runner),
@@ -5721,7 +5721,11 @@ mod xray_core_tests {
             .unwrap();
         assert_eq!(process_index, 43);
         assert!(owned[0].resources.iter().all(|resource| match resource {
-            OwnedResource::Route(route) => route.interface_index == 43,
+            // TUN-scoped routes followed the respawn; the endpoint bypass
+            // stays pinned to the physical uplink it was installed on.
+            OwnedResource::Route(route) => {
+                route.interface_index == 43 || route.gateway.is_some()
+            }
             OwnedResource::Address(address) => address.interface_index == 43,
             OwnedResource::Dns(dns) => dns.interface_index == 43,
             _ => true,

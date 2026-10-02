@@ -195,9 +195,9 @@ async fn probe(addr: IpAddr, port: u16) -> Option<ProxyKind> {
     None
 }
 
-pub(crate) async fn run_scan() -> Vec<LocalProxy> {
+async fn probe_targets(candidates: Vec<(IpAddr, u16)>) -> Vec<LocalProxy> {
     let mut set = tokio::task::JoinSet::new();
-    for (addr, port) in loopback_listen_ports() {
+    for (addr, port) in candidates {
         set.spawn(async move { probe(addr, port).await.map(|k| (addr, port, k)) });
     }
     let mut found = Vec::new();
@@ -212,6 +212,10 @@ pub(crate) async fn run_scan() -> Vec<LocalProxy> {
     }
     found.sort_by_key(|p| p.port);
     found
+}
+
+pub(crate) async fn run_scan() -> Vec<LocalProxy> {
+    probe_targets(loopback_listen_ports()).await
 }
 
 #[tauri::command]
@@ -359,9 +363,19 @@ mod tests {
             let _ = s.write_all(&[0x05, 0x00]).await;
         })
         .await;
-        let found = run_scan().await;
-        assert!(found
-            .iter()
-            .any(|p| p.port == port && p.address == addr && p.kind == ProxyKind::Socks5));
+        // End to end: the listener surfaces in /proc enumeration, and the
+        // probe classifies it. Probing is scoped to this test's own port —
+        // a full host scan would consume accepts of concurrent tests'
+        // listeners and flake them.
+        assert!(loopback_listen_ports().contains(&(addr, port)));
+        let found = probe_targets(vec![(addr, port)]).await;
+        assert_eq!(
+            found,
+            vec![LocalProxy {
+                address: addr,
+                port,
+                kind: ProxyKind::Socks5
+            }]
+        );
     }
 }
