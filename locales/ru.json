@@ -784,6 +784,7 @@
     "profiles.infoElev": "WireGuard, OpenVPN, изменения интерфейсов и policy-маршруты требуют прав администратора. Несколько подключений могут работать одновременно.",
     "profiles.modeManagedOnly": "Управляемые туннели отключены в режиме «Оркестратор» — измените режим приложения в настройках.",
     "profiles.nmGroup": "NetworkManager",
+    "profiles.nmNote": "Управляется NetworkManager — профиль и его секреты хранятся там.",
     "profiles.nmUnavailable": "NetworkManager недоступен — список управляемых им VPN-профилей получить нельзя.",
     "profiles.noMatch": "Нет подключений, подходящих под «{query}».",
     "profiles.refreshIntervalFailed": "Не удалось изменить интервал обновления подписки.",
