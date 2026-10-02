@@ -6,6 +6,7 @@ pub(crate) mod exit_ips;
 pub(crate) mod explorer;
 pub(crate) mod happ_routing;
 pub(crate) mod logs;
+pub(crate) mod net_tables;
 pub(crate) mod nm;
 pub(crate) mod profiles;
 pub(crate) mod proxies;
@@ -29,6 +30,7 @@ pub(crate) use explorer::{
 };
 pub(crate) use happ_routing::parse_happ_routing;
 pub(crate) use logs::{clear_logs, daemon_log_tail, get_logs};
+pub(crate) use net_tables::get_net_tables;
 pub(crate) use nm::{nm_list_connections, nm_set_active};
 pub(crate) use profiles::{
     delete_profile, get_profiles, get_subscription_endpoints, import_configs_batch,

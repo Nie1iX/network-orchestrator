@@ -4,16 +4,18 @@ import Page from "./Page";
 import RouteFlow from "./RouteFlow";
 import RouteMap from "./RouteMap";
 import RouteTable from "./RouteTable";
+import SystemTables from "./SystemTables";
 import { RouteLookupResult, RouteMap as RouteMapData } from "../types";
 import { TranslationKey, useT } from "../i18n";
 import { setRoutesPrefs, useRoutesPrefs } from "../prefs";
 
-type RouteTab = "flow" | "tree" | "table";
+type RouteTab = "flow" | "tree" | "table" | "system";
 
 const TABS: { id: RouteTab; labelKey: TranslationKey }[] = [
   { id: "flow", labelKey: "routes.flow" },
   { id: "tree", labelKey: "routes.tree" },
   { id: "table", labelKey: "routes.table" },
+  { id: "system", labelKey: "routes.system" },
 ];
 
 export default function RouteView() {
@@ -200,6 +202,7 @@ export default function RouteView() {
           />
         )}
         {tab === "table" && <RouteTable hideIpv6={prefs.hideIpv6} />}
+        {tab === "system" && <SystemTables hideIpv6={prefs.hideIpv6} />}
       </div>
     </Page>
   );

@@ -2400,6 +2400,25 @@ a:focus-visible,
   min-height: 300px;
 }
 
+.system-tables-heading {
+  margin: var(--sp-5) 0 var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-strong);
+  color: var(--text-secondary);
+}
+
+.system-table-group:first-of-type .system-tables-heading,
+.system-tables-heading:first-of-type {
+  margin-top: var(--sp-2);
+}
+
+.system-route-details {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
 /* ── Flow diagram ───────────────────────────────────────────────────── */
 
 .route-flow {
