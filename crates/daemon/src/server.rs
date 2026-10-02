@@ -269,6 +269,10 @@ impl<A: Authorizer> ServerContext<A> {
 
 type Failure = (ErrorCode, String);
 
+/// Longest a single request may take before the client gets a `timed out`
+/// answer; covers polkit dialogs that wait on user input.
+const DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Entry point for an accepted connection: enforces the connection limit,
 /// then serves it until either side closes.
 pub async fn serve_accepted<S, A>(mut stream: S, peer: PeerIdentity, ctx: Arc<ServerContext<A>>)
@@ -347,10 +351,22 @@ where
         };
         let response = match serde_json::from_slice::<RequestFrame>(&frame) {
             Ok(request) => {
+                let id = request.id;
                 if request.method == method::SUBSCRIBE && subscription.is_none() {
                     subscription = Some(ctx.events.subscribe());
                 }
-                dispatch(request, &peer, &ctx).await
+                // A wedged handler must not hold the connection (and its
+                // semaphore permit) forever; the blocking work itself may
+                // linger, but the client is answered and released.
+                match tokio::time::timeout(DISPATCH_TIMEOUT, dispatch(request, &peer, &ctx)).await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        eprintln!(
+                            "network-orchestrator-daemon: request {id} timed out after {DISPATCH_TIMEOUT:?}"
+                        );
+                        ResponseFrame::error(id, ErrorCode::Internal, "request timed out")
+                    }
+                }
             }
             Err(_) => ResponseFrame::error(0, ErrorCode::InvalidParams, "malformed request frame"),
         };

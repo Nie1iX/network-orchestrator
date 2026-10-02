@@ -21,6 +21,7 @@ use std::ffi::CString;
 use std::io;
 use std::net::IpAddr;
 use std::sync::mpsc;
+use std::time::Duration;
 use tokio::sync::mpsc as async_mpsc;
 
 /// `RTPROT` stamped on every route the daemon installs; deletes filter on
@@ -505,10 +506,11 @@ enum Command {
 }
 
 /// Handle to the netlink actor thread. Cloneable; every call blocks the
-/// calling (non-async) thread until the kernel answers.
+/// calling (non-async) thread until the kernel answers or times out.
 #[derive(Clone)]
 pub struct NetlinkExecutor {
     tx: async_mpsc::UnboundedSender<Command>,
+    reply_timeout: Duration,
 }
 
 impl NetlinkExecutor {
@@ -521,7 +523,7 @@ impl NetlinkExecutor {
             .name("netlink-actor".into())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_io()
+                    .enable_all()
                     .build()
                 {
                     Ok(runtime) => runtime,
@@ -544,7 +546,10 @@ impl NetlinkExecutor {
                 });
             })?;
         ready_rx.recv().map_err(|_| actor_gone())??;
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            reply_timeout: ACTOR_REPLY_TIMEOUT,
+        })
     }
 
     fn call(
@@ -553,7 +558,11 @@ impl NetlinkExecutor {
     ) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx.send(command(reply_tx)).map_err(|_| actor_gone())?;
-        reply_rx.recv().map_err(|_| actor_gone())?
+        // An unbounded recv here wedges every caller forever once the actor
+        // stalls (e.g. a dead rtnetlink connection task); fail instead.
+        reply_rx
+            .recv_timeout(self.reply_timeout)
+            .map_err(|_| actor_gone())?
     }
 
     fn call_with<T>(
@@ -562,7 +571,9 @@ impl NetlinkExecutor {
     ) -> io::Result<T> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx.send(command(reply_tx)).map_err(|_| actor_gone())?;
-        reply_rx.recv().map_err(|_| actor_gone())?
+        reply_rx
+            .recv_timeout(self.reply_timeout)
+            .map_err(|_| actor_gone())?
     }
 
     pub fn owned_routes_snapshot(&self) -> io::Result<Vec<AppliedRoute>> {
@@ -664,298 +675,308 @@ async fn get_rules(handle: &rtnetlink::Handle) -> io::Result<Vec<RuleMessage>> {
 
 async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedReceiver<Command>) {
     while let Some(command) = rx.recv().await {
-        match command {
-            Command::Route { op, route, reply } => {
-                let message = route_request(&route, op);
-                let result = match op {
-                    RouteOp::Add => {
-                        let mut request = handle.route().add();
-                        *request.message_mut() = message;
-                        request.execute().await
+        // A netlink request whose reply never arrives (e.g. the connection
+        // task died) would otherwise pin the actor and every queued caller
+        // forever; abort the stuck command — dropping the arm's `reply`
+        // makes the waiting caller fail fast instead of hanging.
+        let executed = tokio::time::timeout(ACTOR_COMMAND_TIMEOUT, async {
+            match command {
+                Command::Route { op, route, reply } => {
+                    let message = route_request(&route, op);
+                    let result = match op {
+                        RouteOp::Add => {
+                            let mut request = handle.route().add();
+                            *request.message_mut() = message;
+                            request.execute().await
+                        }
+                        RouteOp::Delete => handle.route().del(message).execute().await,
+                    };
+                    let _ = reply.send(result.map_err(netlink_error_to_io));
+                }
+                Command::DefaultGateways { reply } => {
+                    let result = async {
+                        let mut gateways = Vec::new();
+                        for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+                            let mut stream = handle.route().get(version).execute();
+                            while let Some(message) =
+                                stream.try_next().await.map_err(netlink_error_to_io)?
+                            {
+                                if let Some(gateway) = default_gateway(&message) {
+                                    gateways.push(gateway);
+                                }
+                            }
+                        }
+                        Ok(gateways)
                     }
-                    RouteOp::Delete => handle.route().del(message).execute().await,
-                };
-                let _ = reply.send(result.map_err(netlink_error_to_io));
-            }
-            Command::DefaultGateways { reply } => {
-                let result = async {
-                    let mut gateways = Vec::new();
-                    for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
-                        let mut stream = handle.route().get(version).execute();
-                        while let Some(message) =
-                            stream.try_next().await.map_err(netlink_error_to_io)?
-                        {
-                            if let Some(gateway) = default_gateway(&message) {
-                                gateways.push(gateway);
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::OwnedRoutesSnapshot { reply } => {
+                    let result = async {
+                        let mut routes = Vec::new();
+                        for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+                            let mut stream = handle.route().get(version).execute();
+                            while let Some(message) =
+                                stream.try_next().await.map_err(netlink_error_to_io)?
+                            {
+                                if let Some(route) = owned_route_snapshot(&message) {
+                                    routes.push(route);
+                                }
+                            }
+                        }
+                        Ok(routes)
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::RulesSnapshot { reply } => {
+                    let result = async {
+                        let messages = get_rules(&handle).await?;
+                        Ok(messages.iter().map(rule_snapshot).collect())
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::Rule { rule, add, reply } => {
+                    let result = async {
+                        let existing = get_rules(&handle).await?;
+                        if add {
+                            if existing.iter().any(|message| {
+                                message.header.family == rule_family(rule.family)
+                                    && rule_priority(message) == Some(rule.priority)
+                            }) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::AlreadyExists,
+                                    "policy rule priority is occupied",
+                                ));
+                            }
+                            let mut request = handle.rule().add();
+                            *request.message_mut() = rule_request(&rule);
+                            request.execute().await.map_err(netlink_error_to_io)
+                        } else {
+                            let suspicious = existing.iter().any(|message| {
+                                message.header.family == rule_family(rule.family)
+                                    && rule_priority(message) == Some(rule.priority)
+                            });
+                            let Some(_message) = existing
+                                .iter()
+                                .find(|message| is_owned_rule(message, &rule))
+                            else {
+                                return Err(io::Error::new(
+                                    if suspicious {
+                                        io::ErrorKind::Other
+                                    } else {
+                                        io::ErrorKind::NotFound
+                                    },
+                                    if suspicious {
+                                        "policy rule identity is unverified"
+                                    } else {
+                                        "owned policy rule not found"
+                                    },
+                                ));
+                            };
+                            match handle
+                                .rule()
+                                .del(rule_request(&rule))
+                                .execute()
+                                .await
+                                .map_err(netlink_error_to_io)
+                            {
+                                Ok(()) => {
+                                    if get_rules(&handle)
+                                        .await?
+                                        .iter()
+                                        .any(|message| is_owned_rule(message, &rule))
+                                    {
+                                        Err(io::Error::other("owned policy rule survived deletion"))
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
+                                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                                    Err(io::Error::other("owned policy rule could not be deleted"))
+                                }
+                                Err(err) => Err(err),
                             }
                         }
                     }
-                    Ok(gateways)
+                    .await;
+                    let _ = reply.send(result);
                 }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::OwnedRoutesSnapshot { reply } => {
-                let result = async {
-                    let mut routes = Vec::new();
-                    for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
-                        let mut stream = handle.route().get(version).execute();
-                        while let Some(message) =
-                            stream.try_next().await.map_err(netlink_error_to_io)?
-                        {
-                            if let Some(route) = owned_route_snapshot(&message) {
-                                routes.push(route);
-                            }
-                        }
-                    }
-                    Ok(routes)
+                Command::RulePresent { rule, reply } => {
+                    let result = get_rules(&handle)
+                        .await
+                        .map(|rules| rules.iter().any(|message| is_owned_rule(message, &rule)));
+                    let _ = reply.send(result);
                 }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::RulesSnapshot { reply } => {
-                let result = async {
-                    let messages = get_rules(&handle).await?;
-                    Ok(messages.iter().map(rule_snapshot).collect())
-                }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::Rule { rule, add, reply } => {
-                let result = async {
-                    let existing = get_rules(&handle).await?;
-                    if add {
-                        if existing.iter().any(|message| {
-                            message.header.family == rule_family(rule.family)
-                                && rule_priority(message) == Some(rule.priority)
-                        }) {
-                            return Err(io::Error::new(
-                                io::ErrorKind::AlreadyExists,
-                                "policy rule priority is occupied",
-                            ));
-                        }
-                        let mut request = handle.rule().add();
-                        *request.message_mut() = rule_request(&rule);
-                        request.execute().await.map_err(netlink_error_to_io)
-                    } else {
-                        let suspicious = existing.iter().any(|message| {
-                            message.header.family == rule_family(rule.family)
-                                && rule_priority(message) == Some(rule.priority)
-                        });
-                        let Some(_message) = existing
+                Command::TableInUse { table, reply } => {
+                    let result = async {
+                        if get_rules(&handle)
+                            .await?
                             .iter()
-                            .find(|message| is_owned_rule(message, &rule))
-                        else {
+                            .any(|rule| rule_table(rule) == table)
+                        {
+                            return Ok(true);
+                        }
+                        for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+                            let mut routes = handle.route().get(version).execute();
+                            while let Some(route) =
+                                routes.try_next().await.map_err(netlink_error_to_io)?
+                            {
+                                if route_table(&route) == table {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                        Ok(false)
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::Link { index, up, reply } => {
+                    let mut request = handle.link().set(index);
+                    *request.message_mut() = link_request(index, up);
+                    let _ = reply.send(request.execute().await.map_err(netlink_error_to_io));
+                }
+                Command::LinkDel { index, reply } => {
+                    let _ = reply.send(
+                        handle
+                            .link()
+                            .del(index)
+                            .execute()
+                            .await
+                            .map_err(netlink_error_to_io),
+                    );
+                }
+                Command::InterfaceAddrs { reply } => {
+                    let _ = reply.send(get_interface_addrs(&handle).await);
+                }
+                Command::WgCreate {
+                    name,
+                    owner_marker,
+                    reply,
+                } => {
+                    let mut request = handle.link().add();
+                    *request.message_mut() = wireguard_create_request(&name, &owner_marker);
+                    let result = async {
+                        request.execute().await.map_err(netlink_error_to_io)?;
+                        let link = get_link(&handle, &name, 0).await?.ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "created interface not found")
+                        })?;
+                        if !is_wireguard_link(&link, &name, 0) {
                             return Err(io::Error::new(
-                                if suspicious {
-                                    io::ErrorKind::Other
-                                } else {
-                                    io::ErrorKind::NotFound
-                                },
-                                if suspicious {
-                                    "policy rule identity is unverified"
-                                } else {
-                                    "owned policy rule not found"
-                                },
+                                io::ErrorKind::PermissionDenied,
+                                "created interface identity changed",
                             ));
+                        }
+                        let index = link.header.index;
+                        let mut set = handle.link().set(index);
+                        set.message_mut()
+                            .attributes
+                            .push(LinkAttribute::IfAlias(owner_marker.clone()));
+                        let result = set.execute().await.map_err(netlink_error_to_io);
+                        if result.is_err() {
+                            let _ = delete_fresh_link(&handle, &name, index).await;
+                            return result.map(|()| index);
+                        }
+                        let verified = get_link(&handle, &name, index).await?;
+                        if !verified.is_some_and(|link| {
+                            is_owned_wireguard_link(&link, &name, index, &owner_marker)
+                        }) {
+                            let _ = delete_fresh_link(&handle, &name, index).await;
+                            return Err(io::Error::other(
+                                "created interface owner marker is missing",
+                            ));
+                        }
+                        Ok(index)
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::WgDelete {
+                    name,
+                    index,
+                    owner_marker,
+                    reply,
+                } => {
+                    let result = async {
+                        let Some(link) = get_link(&handle, &name, index).await? else {
+                            return Ok(());
                         };
-                        match handle
-                            .rule()
-                            .del(rule_request(&rule))
+                        if !is_owned_wireguard_link(&link, &name, index, &owner_marker) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "interface identity does not match owner",
+                            ));
+                        }
+                        handle
+                            .link()
+                            .del(link.header.index)
                             .execute()
                             .await
                             .map_err(netlink_error_to_io)
-                        {
-                            Ok(()) => {
-                                if get_rules(&handle)
-                                    .await?
-                                    .iter()
-                                    .any(|message| is_owned_rule(message, &rule))
-                                {
-                                    Err(io::Error::other("owned policy rule survived deletion"))
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                                Err(io::Error::other("owned policy rule could not be deleted"))
-                            }
-                            Err(err) => Err(err),
-                        }
                     }
+                    .await;
+                    let _ = reply.send(result);
                 }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::RulePresent { rule, reply } => {
-                let result = get_rules(&handle)
-                    .await
-                    .map(|rules| rules.iter().any(|message| is_owned_rule(message, &rule)));
-                let _ = reply.send(result);
-            }
-            Command::TableInUse { table, reply } => {
-                let result = async {
-                    if get_rules(&handle)
-                        .await?
-                        .iter()
-                        .any(|rule| rule_table(rule) == table)
-                    {
-                        return Ok(true);
-                    }
-                    for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
-                        let mut routes = handle.route().get(version).execute();
-                        while let Some(route) =
-                            routes.try_next().await.map_err(netlink_error_to_io)?
-                        {
-                            if route_table(&route) == table {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    Ok(false)
+                Command::WgOwned {
+                    name,
+                    index,
+                    owner_marker,
+                    reply,
+                } => {
+                    let result = get_link(&handle, &name, index).await.map(|link| {
+                        link.is_some_and(|link| {
+                            is_owned_wireguard_link(&link, &name, index, &owner_marker)
+                        })
+                    });
+                    let _ = reply.send(result);
                 }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::Link { index, up, reply } => {
-                let mut request = handle.link().set(index);
-                *request.message_mut() = link_request(index, up);
-                let _ = reply.send(request.execute().await.map_err(netlink_error_to_io));
-            }
-            Command::LinkDel { index, reply } => {
-                let _ = reply.send(
-                    handle
-                        .link()
-                        .del(index)
-                        .execute()
-                        .await
-                        .map_err(netlink_error_to_io),
-                );
-            }
-            Command::InterfaceAddrs { reply } => {
-                let _ = reply.send(get_interface_addrs(&handle).await);
-            }
-            Command::WgCreate {
-                name,
-                owner_marker,
-                reply,
-            } => {
-                let mut request = handle.link().add();
-                *request.message_mut() = wireguard_create_request(&name, &owner_marker);
-                let result = async {
-                    request.execute().await.map_err(netlink_error_to_io)?;
-                    let link = get_link(&handle, &name, 0).await?.ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "created interface not found")
-                    })?;
-                    if !is_wireguard_link(&link, &name, 0) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "created interface identity changed",
-                        ));
-                    }
-                    let index = link.header.index;
-                    let mut set = handle.link().set(index);
-                    set.message_mut()
-                        .attributes
-                        .push(LinkAttribute::IfAlias(owner_marker.clone()));
-                    let result = set.execute().await.map_err(netlink_error_to_io);
-                    if result.is_err() {
-                        let _ = delete_fresh_link(&handle, &name, index).await;
-                        return result.map(|()| index);
-                    }
-                    let verified = get_link(&handle, &name, index).await?;
-                    if !verified.is_some_and(|link| {
-                        is_owned_wireguard_link(&link, &name, index, &owner_marker)
-                    }) {
-                        let _ = delete_fresh_link(&handle, &name, index).await;
-                        return Err(io::Error::other(
-                            "created interface owner marker is missing",
-                        ));
-                    }
-                    Ok(index)
+                Command::WgPresent { name, index, reply } => {
+                    let result = get_link(&handle, &name, index).await.map(|link| {
+                        link.is_some_and(|link| is_wireguard_link(&link, &name, index))
+                    });
+                    let _ = reply.send(result);
                 }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::WgDelete {
-                name,
-                index,
-                owner_marker,
-                reply,
-            } => {
-                let result = async {
-                    let Some(link) = get_link(&handle, &name, index).await? else {
-                        return Ok(());
+                Command::WgAddress {
+                    index,
+                    address,
+                    add,
+                    reply,
+                } => {
+                    let result = if add {
+                        handle
+                            .address()
+                            .add(index, address.addr(), address.prefix_len())
+                            .execute()
+                            .await
+                            .map_err(netlink_error_to_io)
+                    } else {
+                        handle
+                            .address()
+                            .del(address_delete_request(index, address))
+                            .execute()
+                            .await
+                            .map_err(|err| netlink_error_with(err, classify_address_delete_errno))
                     };
-                    if !is_owned_wireguard_link(&link, &name, index, &owner_marker) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "interface identity does not match owner",
-                        ));
-                    }
-                    handle
-                        .link()
-                        .del(link.header.index)
-                        .execute()
-                        .await
-                        .map_err(netlink_error_to_io)
+                    let _ = reply.send(result);
                 }
-                .await;
-                let _ = reply.send(result);
+                Command::WgMtu { index, mtu, reply } => {
+                    let _ = reply.send(
+                        handle
+                            .link()
+                            .set(index)
+                            .mtu(mtu)
+                            .execute()
+                            .await
+                            .map_err(netlink_error_to_io),
+                    );
+                }
             }
-            Command::WgOwned {
-                name,
-                index,
-                owner_marker,
-                reply,
-            } => {
-                let result = get_link(&handle, &name, index).await.map(|link| {
-                    link.is_some_and(|link| {
-                        is_owned_wireguard_link(&link, &name, index, &owner_marker)
-                    })
-                });
-                let _ = reply.send(result);
-            }
-            Command::WgPresent { name, index, reply } => {
-                let result = get_link(&handle, &name, index)
-                    .await
-                    .map(|link| link.is_some_and(|link| is_wireguard_link(&link, &name, index)));
-                let _ = reply.send(result);
-            }
-            Command::WgAddress {
-                index,
-                address,
-                add,
-                reply,
-            } => {
-                let result = if add {
-                    handle
-                        .address()
-                        .add(index, address.addr(), address.prefix_len())
-                        .execute()
-                        .await
-                        .map_err(netlink_error_to_io)
-                } else {
-                    handle
-                        .address()
-                        .del(address_delete_request(index, address))
-                        .execute()
-                        .await
-                        .map_err(|err| netlink_error_with(err, classify_address_delete_errno))
-                };
-                let _ = reply.send(result);
-            }
-            Command::WgMtu { index, mtu, reply } => {
-                let _ = reply.send(
-                    handle
-                        .link()
-                        .set(index)
-                        .mtu(mtu)
-                        .execute()
-                        .await
-                        .map_err(netlink_error_to_io),
-                );
-            }
+        })
+        .await;
+        if executed.is_err() {
+            eprintln!("network-orchestrator-daemon: netlink command timed out, skipping");
         }
     }
 }
@@ -1009,6 +1030,15 @@ pub fn watch_network_changes(
         connection.abort();
     }))
 }
+
+/// Upper bound for a single netlink round-trip; generous for kernel dumps,
+/// short enough that a stalled actor fails callers instead of wedging them.
+const ACTOR_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Upper bound per actor command; below `ACTOR_REPLY_TIMEOUT` so the actor
+/// drops a stuck request before callers report it, keeping later commands
+/// serviced.
+const ACTOR_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn actor_gone() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "netlink actor is not running")
@@ -1647,5 +1677,44 @@ mod tests {
         let mut main_table = route_request(&route, RouteOp::Add);
         main_table.attributes.push(RouteAttribute::Table(254));
         assert_eq!(owned_route_snapshot(&main_table), Some(route));
+    }
+}
+
+#[cfg(test)]
+mod executor_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc as async_mpsc;
+
+    fn executor(tx: async_mpsc::UnboundedSender<Command>) -> NetlinkExecutor {
+        NetlinkExecutor {
+            tx,
+            reply_timeout: Duration::from_millis(50),
+        }
+    }
+
+    #[test]
+    fn call_errors_fast_when_actor_channel_dropped() {
+        let (tx, rx) = async_mpsc::unbounded_channel();
+        drop(rx);
+        assert!(executor(tx).owned_routes_snapshot().is_err());
+    }
+
+    #[test]
+    fn call_times_out_when_actor_never_replies() {
+        let (tx, rx) = async_mpsc::unbounded_channel();
+        let _keep = rx; // channel alive, but no command is ever serviced
+        let start = Instant::now();
+        assert!(executor(tx).owned_routes_snapshot().is_err());
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn call_with_times_out_when_actor_never_replies() {
+        let (tx, rx) = async_mpsc::unbounded_channel();
+        let _keep = rx;
+        let start = Instant::now();
+        assert!(executor(tx).interface_addrs().is_err());
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 }

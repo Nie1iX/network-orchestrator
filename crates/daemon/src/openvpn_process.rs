@@ -621,10 +621,25 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
         thread::sleep(Duration::from_millis(25));
     }
     send_child_signal(&pidfd, child, libc::SIGKILL)?;
-    child
-        .wait()
-        .map_err(|_| io::Error::other("OpenVPN child wait failed"))?;
-    Ok(())
+    // A child wedged in an uninterruptible syscall survives SIGKILL; bound
+    // the final reap so `stop` cannot block a core task forever.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .map_err(|_| io::Error::other("OpenVPN child wait failed"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "OpenVPN child did not exit",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn send_child_signal(pidfd: &OwnedFd, child: &mut Child, signal: i32) -> io::Result<()> {

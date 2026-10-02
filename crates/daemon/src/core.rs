@@ -29,6 +29,10 @@ use net_manager_core::policy::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 /// What a netdev the daemon does not own is, decided via sysfs by the
 /// executor. Drives `stop_external_link`: WireGuard can be unlinked, foreign
@@ -5993,6 +5997,60 @@ fn trusted_ip_binary() -> io::Result<&'static str> {
     Ok(PATH)
 }
 
+/// Hard bound for short-lived helper binaries (`wg`, `ip`, `systemctl`):
+/// unbounded `.output()`/`.wait()` calls on a wedged helper pin a
+/// blocking-pool thread — and the core mutex behind it — forever.
+#[cfg(target_os = "linux")]
+const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Spawn `cmd` and wait for exit with a deadline; on timeout the child is
+/// killed and reaped. Stdout is drained by a reader thread so a verbose
+/// child cannot deadlock on a full pipe.
+#[cfg(target_os = "linux")]
+fn helper_output(mut cmd: std::process::Command) -> io::Result<std::process::Output> {
+    use std::process::{Output, Stdio};
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .map_err(|_| io::Error::other("helper launch failed"))?;
+    let reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let deadline = Instant::now() + HELPER_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "helper command timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = reader.and_then(|r| r.join().ok()).unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
+/// `helper_output` for callers that only need the exit status.
+#[cfg(target_os = "linux")]
+fn helper_status(cmd: std::process::Command) -> io::Result<std::process::ExitStatus> {
+    helper_output(cmd).map(|output| output.status)
+}
+
 /// Stop `wg-quick@<name>` when an active unit owns the device — it removes
 /// the link along with its routes and DNS. `name` comes from
 /// `validate_iface_name`, so the unit name cannot escape the template.
@@ -6001,13 +6059,9 @@ fn stop_wg_quick_unit(name: &str) -> bool {
     use std::process::{Command, Stdio};
     let unit = format!("wg-quick@{name}");
     let quiet = |args: &[&str]| {
-        Command::new("/usr/bin/systemctl")
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+        let mut cmd = Command::new("/usr/bin/systemctl");
+        cmd.args(args).stderr(Stdio::null());
+        helper_status(cmd).is_ok_and(|status| status.success())
     };
     if !quiet(&["is-active", "--quiet", &unit]) {
         return false;
@@ -6026,13 +6080,11 @@ fn stop_wg_quick_unit(name: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn wg_dump(name: &str) -> io::Result<String> {
-    use std::process::{Command, Stdio};
-    let output = Command::new(trusted_wg_binary()?)
-        .args(["show", name, "dump"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|_| io::Error::other("WireGuard status is unavailable"))?;
+    use std::process::Command;
+    let mut cmd = Command::new(trusted_wg_binary()?);
+    cmd.args(["show", name, "dump"]);
+    let output =
+        helper_output(cmd).map_err(|_| io::Error::other("WireGuard status is unavailable"))?;
     if !output.status.success() || output.stdout.len() > 64 * 1024 {
         return Err(io::Error::other("WireGuard status is unavailable"));
     }
@@ -6042,7 +6094,7 @@ fn wg_dump(name: &str) -> io::Result<String> {
 
 #[cfg(target_os = "linux")]
 fn ip_route_device(destination: std::net::IpAddr, mark: Option<u32>) -> io::Result<String> {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     let mut args = vec![
         "-j".to_string(),
         "route".into(),
@@ -6053,12 +6105,9 @@ fn ip_route_device(destination: std::net::IpAddr, mark: Option<u32>) -> io::Resu
         args.push("mark".into());
         args.push(mark.to_string());
     }
-    let output = Command::new(trusted_ip_binary()?)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|_| io::Error::other("route lookup failed"))?;
+    let mut cmd = Command::new(trusted_ip_binary()?);
+    cmd.args(&args);
+    let output = helper_output(cmd).map_err(|_| io::Error::other("route lookup failed"))?;
     if !output.status.success() || output.stdout.len() > 64 * 1024 {
         return Err(io::Error::other("route lookup failed"));
     }
@@ -6085,9 +6134,21 @@ impl WgConfigExecutor for TrustedWgCommand {
                 )
             })?;
         let write_result = child.stdin.take().unwrap().write_all(config.as_bytes());
-        let status = child
-            .wait()
-            .map_err(|_| io::Error::other("WireGuard configuration failed"))?;
+        let deadline = Instant::now() + HELPER_TIMEOUT;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "WireGuard configuration timed out",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         if write_result.is_err() {
             return Err(io::Error::other("WireGuard config transfer failed"));
         }
@@ -6103,13 +6164,10 @@ impl WgConfigExecutor for TrustedWgCommand {
     }
 
     fn set_fwmark(&mut self, name: &str, mark: u32) -> io::Result<()> {
-        use std::process::{Command, Stdio};
-        let status = Command::new(trusted_wg_binary()?)
-            .args(["set", name, "fwmark", &mark.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+        use std::process::Command;
+        let mut cmd = Command::new(trusted_wg_binary()?);
+        cmd.args(["set", name, "fwmark", &mark.to_string()]);
+        let status = helper_status(cmd)
             .map_err(|_| io::Error::other("WireGuard fwmark configuration failed"))?;
         if status.success() {
             Ok(())
@@ -6119,13 +6177,11 @@ impl WgConfigExecutor for TrustedWgCommand {
     }
 
     fn marks_in_use(&self) -> io::Result<Vec<u32>> {
-        use std::process::{Command, Stdio};
-        let output = Command::new(trusted_wg_binary()?)
-            .args(["show", "all", "fwmark"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|_| io::Error::other("WireGuard mark inspection failed"))?;
+        use std::process::Command;
+        let mut cmd = Command::new(trusted_wg_binary()?);
+        cmd.args(["show", "all", "fwmark"]);
+        let output =
+            helper_output(cmd).map_err(|_| io::Error::other("WireGuard mark inspection failed"))?;
         if !output.status.success() || output.stdout.len() > 64 * 1024 {
             return Err(io::Error::other("WireGuard mark inspection failed"));
         }
