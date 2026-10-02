@@ -1,6 +1,6 @@
 use crate::commands::profiles::{
     loopback_port_available, profile_listener_ports, remove_managed_revision,
-    rewrite_generated_socks_port, select_available_socks_port,
+    rewrite_generated_proxy_ports, select_available_socks_port,
 };
 use crate::state::{find_profile, AppState, RuntimeState};
 use net_manager_core::analysis;
@@ -12,16 +12,77 @@ use std::net::{Ipv4Addr, TcpStream};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, State};
 
-fn select_replacement_socks_port(
+fn select_connect_ports(
     profiles: &[Profile],
     profile: &Profile,
     available: impl Fn(u16) -> bool,
-) -> Result<u16, String> {
+) -> Result<Option<(u16, Option<u16>)>, String> {
+    let Some(socks_port) = profile.xray_socks_port else {
+        return Ok(None);
+    };
+    let http_port = profile.xray_http_port;
+    let socks_occupied = !available(socks_port);
+    let http_occupied = http_port.is_some_and(|port| !available(port));
+    if !socks_occupied && !http_occupied {
+        return Ok(None);
+    }
     let mut used = profile_listener_ports(profiles, &profile.id);
-    if let Some(http_port) = profile.xray_http_port {
+    if let Some(http_port) = http_port {
         used.insert(http_port);
     }
-    select_available_socks_port(&used, available)
+    let socks_port = if socks_occupied {
+        select_available_socks_port(&used, &available)?
+    } else {
+        socks_port
+    };
+    used.insert(socks_port);
+    let http_port = if http_occupied {
+        Some(select_available_socks_port(&used, available)?)
+    } else {
+        http_port
+    };
+    Ok(Some((socks_port, http_port)))
+}
+
+fn prepare_xray_listener_ports(
+    state: &AppState,
+    profile: &mut Profile,
+    profiles: &mut [Profile],
+) -> Result<Option<String>, String> {
+    let old_socks = profile.xray_socks_port;
+    let old_http = profile.xray_http_port;
+    let Some((new_socks, new_http)) =
+        select_connect_ports(profiles, profile, loopback_port_available)?
+    else {
+        return Ok(None);
+    };
+    let old_path = profile.config_path.clone();
+    rewrite_generated_proxy_ports(&state.config_vault, profile, new_socks, new_http)?;
+    if let Err(err) = state.profiles.upsert(profile.clone()) {
+        let _ = state
+            .config_vault
+            .remove_revision_for_config(&profile.config_path);
+        return Err(err.to_string());
+    }
+    if let Some(stored) = profiles.iter_mut().find(|stored| stored.id == profile.id) {
+        *stored = profile.clone();
+    }
+    remove_managed_revision(
+        &state.config_vault,
+        &profile.id,
+        &old_path,
+        "connection started",
+    )?;
+    let mut notices = Vec::new();
+    if let Some(port) = old_socks.filter(|port| *port != new_socks) {
+        notices.push(format!("SOCKS5 port changed from {port} to {new_socks}."));
+    }
+    if let (Some(port), Some(new_port)) = (old_http, new_http) {
+        if port != new_port {
+            notices.push(format!("HTTP port changed from {port} to {new_port}."));
+        }
+    }
+    Ok(Some(notices.join(" ")))
 }
 
 #[cfg(target_os = "linux")]
@@ -60,18 +121,48 @@ fn openvpn_credential_requirements(
     config: &str,
     assets: &std::collections::BTreeMap<String, Vec<u8>>,
 ) -> OpenVpnCredentialRequirements {
-    let directive = |name: &str| {
-        config.lines().any(|line| {
-            line.split_whitespace()
-                .next()
-                .is_some_and(|word| word.trim_start_matches('-').eq_ignore_ascii_case(name))
-        })
-    };
+    let mut user_pass = false;
+    let mut askpass_prompt = false;
+    let mut askpass_file = false;
+    // Inline block contents are not directives; a credential line inside an
+    // inline block must not be mistaken for a prompt request.
+    let mut in_block = false;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if in_block {
+            if trimmed.starts_with("</") {
+                in_block = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with('<') && !trimmed.starts_with("</") {
+            in_block = true;
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let Some(word) = tokens.next() else { continue };
+        let word = word.trim_start_matches('-');
+        if word.eq_ignore_ascii_case("auth-user-pass") {
+            // `username-only` still prompts; a file argument does not.
+            match tokens.next().map(|arg| arg.trim_matches('"')) {
+                None | Some("username-only") => user_pass = true,
+                Some(_) => {}
+            }
+        } else if word.eq_ignore_ascii_case("askpass") {
+            if tokens.next().is_none() {
+                askpass_prompt = true;
+            } else {
+                askpass_file = true;
+            }
+        }
+    }
+    let encrypted_key = openvpn_encrypted_key(config.as_bytes())
+        || assets.values().any(|asset| openvpn_encrypted_key(asset));
     OpenVpnCredentialRequirements {
-        user_pass: directive("auth-user-pass"),
-        key_passphrase: directive("askpass")
-            || openvpn_encrypted_key(config.as_bytes())
-            || assets.values().any(|asset| openvpn_encrypted_key(asset)),
+        user_pass,
+        // A passphrase file supplies the answer; only a bare `askpass` or
+        // an encrypted key without a file still prompts via management.
+        key_passphrase: (askpass_prompt || encrypted_key) && !askpass_file,
     }
 }
 
@@ -160,19 +251,40 @@ fn prepare_linux_xray_tun_params(
     let config = net_manager_core::xray::apply_profile_routing(
         &base,
         &profile.domain_policies,
-        profile.private_lan_direct,
+        &net_manager_core::xray::ProfileRoutingOptions {
+            private_lan_direct: profile.private_lan_direct,
+            domain_strategy: profile.xray_domain_strategy,
+            domain_matcher: profile.xray_domain_matcher,
+            dns: profile.xray_dns.clone(),
+        },
     )
     .map_err(|_| "invalid Xray routing rules".to_string())?;
     let default_route = profile.routes.is_empty();
+    let route = |destination: &str| PolicyRoute {
+        destination: destination.parse().unwrap(),
+        metric: 5,
+        via: None,
+    };
     let routes = if default_route {
-        vec![PolicyRoute {
-            destination: "0.0.0.0/0".parse().unwrap(),
-            metric: 5,
-            via: None,
-        }]
+        // Split-default installs the two def1 halves instead of one /0 —
+        // same full coverage, but coexisting tunnel managers that use the
+        // halves see a consistent picture.
+        if profile.xray_split_default {
+            vec![route("0.0.0.0/1"), route("128.0.0.0/1")]
+        } else {
+            vec![route("0.0.0.0/0")]
+        }
     } else {
         profile.routes.clone()
     };
+    let mut dns_bypass = net_manager_core::xray::dns_bypass_hosts(&profile.xray_dns);
+    if default_route {
+        for ip in ["1.1.1.1", "8.8.8.8", "9.9.9.9"] {
+            dns_bypass.push(ip.to_string());
+        }
+    }
+    dns_bypass.sort();
+    dns_bypass.dedup();
     let params = XrayConnectParams {
         profile_id: profile.id.clone(),
         config: serde_json::to_string(&config)
@@ -184,6 +296,7 @@ fn prepare_linux_xray_tun_params(
             Vec::new()
         },
         dns_domains: Vec::new(),
+        dns_bypass,
         interface_name: link_name_hint(profile),
         geo_assets: None,
     };
@@ -298,11 +411,11 @@ async fn linux_xray_reload(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) async fn linux_xray_status(
+pub(crate) async fn linux_xray_status_result(
     client: &crate::daemon_client::DaemonClient,
     profile: &Profile,
-) -> Result<TunnelStatus, String> {
-    let result: XrayStatusResult = client
+) -> Result<XrayStatusResult, String> {
+    client
         .request(
             method::XRAY_STATUS,
             XrayProfileParams {
@@ -310,8 +423,18 @@ pub(crate) async fn linux_xray_status(
             },
         )
         .await
-        .map_err(|err| crate::daemon_client::user_message(&err))?;
-    Ok(linux_xray_tunnel_status(result, profile))
+        .map_err(|err| crate::daemon_client::user_message(&err))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn linux_xray_status(
+    client: &crate::daemon_client::DaemonClient,
+    profile: &Profile,
+) -> Result<TunnelStatus, String> {
+    Ok(linux_xray_tunnel_status(
+        linux_xray_status_result(client, profile).await?,
+        profile,
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -353,16 +476,39 @@ pub(crate) fn linux_openvpn_tunnel_status(status: OpenVpnStatusResult) -> Tunnel
         OpenVpnConnectionState::Connecting => notices.push("OpenVPN is connecting"),
         OpenVpnConnectionState::Reconnecting => notices.push("OpenVPN is reconnecting"),
         OpenVpnConnectionState::Failed => {
-            if status
-                .warnings
-                .contains(&OpenVpnWarning::AuthenticationFailed)
-            {
-                notices.push(
-                    "OpenVPN authentication failed; check username, password, or private key passphrase",
-                );
-            } else {
-                notices.push("OpenVPN connection failed; check credentials or server settings");
-            }
+            use net_manager_core::daemon_protocol::OpenVpnFailure as F;
+            notices.push(match status.failure_reason {
+                Some(F::AuthenticationFailure) => {
+                    "OpenVPN authentication failed; check username, password, or private key passphrase"
+                }
+                Some(F::CredentialsRequired) => {
+                    "OpenVPN server requested credentials that are not stored for this profile"
+                }
+                Some(F::ResolveError) => "OpenVPN could not resolve the server address",
+                Some(F::ConnectError) => {
+                    "OpenVPN could not reach the server (connection refused or timed out)"
+                }
+                Some(F::TlsError) => {
+                    "OpenVPN TLS handshake failed; check CA, certificate, or tls-auth settings"
+                }
+                Some(F::ConnectionLost) => {
+                    "OpenVPN connection was lost (timeout or connection reset)"
+                }
+                Some(F::ExitNotification) => {
+                    "OpenVPN server asked the client to disconnect"
+                }
+                Some(F::Terminated) => "OpenVPN process was terminated",
+                Some(F::ExitWithError) | None => {
+                    if status
+                        .warnings
+                        .contains(&OpenVpnWarning::AuthenticationFailed)
+                    {
+                        "OpenVPN authentication failed; check username, password, or private key passphrase"
+                    } else {
+                        "OpenVPN connection failed; check credentials or server settings"
+                    }
+                }
+            });
         }
         _ => {}
     }
@@ -967,13 +1113,21 @@ async fn connect_profile_inner(
     }
     #[cfg(target_os = "linux")]
     if profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun {
-        let status = linux_xray_connect(
+        let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+        let port_notice = prepare_xray_listener_ports(state, &mut profile, &mut profiles)?;
+        let mut status = linux_xray_connect(
             &crate::daemon_client::DaemonClient::system(),
             &state.config_vault,
             state,
             &profile,
         )
         .await?;
+        if let Some(notice) = port_notice {
+            status.message = Some(match status.message.take() {
+                Some(existing) => format!("{existing}; {notice}"),
+                None => notice,
+            });
+        }
         let _ = app.emit("route-changed", ());
         return Ok(status);
     }
@@ -1004,39 +1158,11 @@ async fn connect_profile_inner(
     let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
     let mut runtime = state.runtime.lock().await;
     cleanup_stale_routes_before_connect(&mut runtime, &profile).await?;
-    let mut port_notice: Option<String> = None;
-    if profile.backend == TunnelBackend::Xray {
-        if let Some(port) = profile.xray_socks_port {
-            if !loopback_port_available(port) {
-                let new_port =
-                    select_replacement_socks_port(&profiles, &profile, loopback_port_available)?;
-                let old_path = profile.config_path.clone();
-                rewrite_generated_socks_port(&state.config_vault, &mut profile, new_port)?;
-                match state.profiles.upsert(profile.clone()) {
-                    Ok(_) => {
-                        if let Some(stored) = profiles.iter_mut().find(|p| p.id == id) {
-                            *stored = profile.clone();
-                        }
-                        remove_managed_revision(
-                            &state.config_vault,
-                            &profile.id,
-                            &old_path,
-                            "connection started",
-                        )?;
-                        port_notice = Some(format!(
-                            "SOCKS5 port changed from {port} to {new_port} because the previous port is occupied."
-                        ));
-                    }
-                    Err(err) => {
-                        let _ = state
-                            .config_vault
-                            .remove_revision_for_config(&profile.config_path);
-                        return Err(err.to_string());
-                    }
-                }
-            }
-        }
-    }
+    let port_notice = if profile.backend == TunnelBackend::Xray {
+        prepare_xray_listener_ports(state, &mut profile, &mut profiles)?
+    } else {
+        None
+    };
     let candidate_analysis = analysis::analyze_profile(&profile)
         .map_err(|e| format!("cannot analyze profile config: {e}"))?;
     let conflicts =
@@ -1064,7 +1190,10 @@ async fn connect_profile_inner(
         .connect(&profile)
         .map_err(|e| e.to_string())?;
     if let Some(notice) = port_notice {
-        status.message = Some(notice);
+        status.message = Some(match status.message.take() {
+            Some(existing) => format!("{existing}; {notice}"),
+            None => notice,
+        });
     }
 
     let mut proxy_applied = false;
@@ -1764,6 +1893,37 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn credential_files_and_inline_blocks_satisfy_requirements_without_prompts() {
+        let assets: std::collections::BTreeMap<String, Vec<u8>> = [
+            ("assets/up.txt".into(), b"alice\nsecret\n".to_vec()),
+            (
+                "assets/key.pem".into(),
+                b"-----BEGIN ENCRYPTED PRIVATE KEY-----".to_vec(),
+            ),
+            ("assets/pass.txt".into(), b"key-pass\n".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        // File-referenced and inline credentials never reach the
+        // management password prompt.
+        let file = "client\nremote vpn.example\nauth-user-pass \"assets/up.txt\"\nkey assets/key.pem\naskpass assets/pass.txt\n";
+        let requirements = openvpn_credential_requirements(file, &assets);
+        assert!(!requirements.user_pass);
+        assert!(!requirements.key_passphrase);
+        // Inline <auth-user-pass> embeds credentials; the `username-only`
+        // flag still triggers a prompt.
+        let inline =
+            "client\nremote vpn.example\n<auth-user-pass>\nalice\nsecret\n</auth-user-pass>\n";
+        assert!(!openvpn_credential_requirements(inline, &Default::default()).user_pass);
+        let username_only = "client\nremote vpn.example\nauth-user-pass username-only\n";
+        assert!(openvpn_credential_requirements(username_only, &Default::default()).user_pass);
+        // An encrypted key without an askpass file still needs a passphrase.
+        let key_only = "client\nremote vpn.example\nkey assets/key.pem\n";
+        assert!(openvpn_credential_requirements(key_only, &assets).key_passphrase);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn implicit_connect_migrates_plaintext_credentials_into_keyring() {
         use std::os::unix::fs::OpenOptionsExt;
         let dir = unique_dir("ovpn-remember-migrate");
@@ -2270,6 +2430,74 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn split_default_profile_emits_def1_halves_and_dns_bypasses() {
+        let dir = unique_dir("xray-split-default");
+        let vault = net_manager_core::config_vault::ConfigVault::new(dir.join("configs"));
+        let mut p = profile("xray-split-def");
+        p.id = "xray-split-def".into();
+        p.backend = TunnelBackend::Xray;
+        p.xray_mode = XrayMode::Tun;
+        p.xray_socks_port = Some(10808);
+        p.xray_http_port = Some(10809);
+        p.xray_split_default = true;
+        p.xray_dns.servers = vec![
+            net_manager_core::models::XrayDnsServer {
+                address: "udp://9.9.9.9:53".into(),
+                route: net_manager_core::models::XrayDnsRoute::Direct,
+                domains: Vec::new(),
+                port: None,
+                skip_fallback: false,
+            },
+            net_manager_core::models::XrayDnsServer {
+                address: "https://dns.resolver.test/dns-query".into(),
+                route: net_manager_core::models::XrayDnsRoute::Direct,
+                domains: Vec::new(),
+                port: None,
+                skip_fallback: false,
+            },
+            net_manager_core::models::XrayDnsServer {
+                address: "udp://8.8.4.4".into(),
+                route: net_manager_core::models::XrayDnsRoute::Proxy,
+                domains: Vec::new(),
+                port: None,
+                skip_fallback: false,
+            },
+        ];
+        let config = net_manager_core::xray::generate_share_link_config_with_http(
+            "vless://11111111-2222-3333-4444-555555555555@node.test:443?security=tls",
+            10808,
+            10809,
+        )
+        .unwrap();
+        p.config_path = vault
+            .store_xray_config(&p.id, &serde_json::to_vec(&config).unwrap())
+            .unwrap()
+            .config_path;
+        let params = prepare_linux_xray_tun_params(&vault, &p).unwrap();
+        assert_eq!(
+            params
+                .routes
+                .iter()
+                .map(|r| r.destination.to_string())
+                .collect::<Vec<_>>(),
+            ["0.0.0.0/1", "128.0.0.0/1"]
+        );
+        // Direct resolvers and the well-known public DNS stay on the
+        // physical uplink; the proxy-routed resolver does not (it must be
+        // reachable *through* the tunnel).
+        for expected in ["1.1.1.1", "8.8.8.8", "9.9.9.9", "dns.resolver.test"] {
+            assert!(
+                params.dns_bypass.iter().any(|h| h == expected),
+                "missing {expected} in {:?}",
+                params.dns_bypass
+            );
+        }
+        assert!(!params.dns_bypass.iter().any(|h| h == "8.8.4.4"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn xray_tun_split_routes_do_not_warn_about_intentionally_omitted_dns_or_full_coverage() {
         let mut p = profile("split");
         p.backend = TunnelBackend::Xray;
@@ -2286,6 +2514,8 @@ mod tests {
             dns_applied: false,
             ipv4_covered: false,
             ipv6_covered: false,
+            rx_bytes: None,
+            tx_bytes: None,
         };
         assert!(linux_xray_tunnel_status(status, &p).message.is_none());
     }
@@ -2303,6 +2533,8 @@ mod tests {
             dns_applied: false,
             ipv4_covered: true,
             ipv6_covered: false,
+            rx_bytes: None,
+            tx_bytes: None,
         };
         let message = linux_xray_tunnel_status(status, &p).message.unwrap();
         assert!(message.contains("DNS was not applied"));
@@ -2320,6 +2552,7 @@ mod tests {
             tx_bytes: 0,
             applied_routes: Vec::new(),
             warnings: Vec::new(),
+            failure_reason: None,
         };
         let message = linux_openvpn_tunnel_status(status).message.unwrap();
         assert!(message.contains("check credentials or server"));
@@ -2337,12 +2570,43 @@ mod tests {
             tx_bytes: 0,
             applied_routes: Vec::new(),
             warnings: vec![OpenVpnWarning::AuthenticationFailed],
+            failure_reason: None,
         };
         let message = linux_openvpn_tunnel_status(status).message.unwrap();
         assert_eq!(
             message,
             "OpenVPN authentication failed; check username, password, or private key passphrase"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openvpn_failure_reason_maps_to_specific_safe_messages() {
+        use net_manager_core::daemon_protocol::OpenVpnFailure as F;
+        for (reason, needle) in [
+            (F::CredentialsRequired, "credentials that are not stored"),
+            (F::ResolveError, "resolve the server address"),
+            (F::ConnectError, "could not reach the server"),
+            (F::TlsError, "TLS handshake failed"),
+            (F::ConnectionLost, "connection was lost"),
+            (F::ExitNotification, "asked the client to disconnect"),
+            (F::Terminated, "terminated"),
+            (F::ExitWithError, "check credentials or server settings"),
+            (F::AuthenticationFailure, "authentication failed"),
+        ] {
+            let status = OpenVpnStatusResult {
+                profile_id: "p1".into(),
+                state: OpenVpnConnectionState::Failed,
+                interface_name: None,
+                rx_bytes: 0,
+                tx_bytes: 0,
+                applied_routes: Vec::new(),
+                warnings: Vec::new(),
+                failure_reason: Some(reason),
+            };
+            let message = linux_openvpn_tunnel_status(status).message.unwrap();
+            assert!(message.contains(needle), "{reason:?}: {message}");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -2356,6 +2620,7 @@ mod tests {
             tx_bytes: 0,
             applied_routes: Vec::new(),
             warnings: Vec::new(),
+            failure_reason: None,
         };
         let result = finish_openvpn_connect(
             status,
@@ -2778,7 +3043,7 @@ mod proxy_tests {
     }
 
     #[test]
-    fn socks_reallocation_skips_own_http_port_and_other_listeners() {
+    fn connect_port_reallocation_skips_own_http_port_and_other_listeners() {
         let mut current = profile("current");
         current.id = "current".into();
         current.backend = TunnelBackend::Xray;
@@ -2788,10 +3053,32 @@ mod proxy_tests {
         other.id = "other".into();
         other.backend = TunnelBackend::Xray;
         other.xray_socks_port = Some(10810);
-        let selected = select_replacement_socks_port(&[current.clone(), other], &current, |port| {
-            port != 10808
-        })
-        .unwrap();
-        assert_eq!(selected, 10811);
+        let selected =
+            select_connect_ports(&[current.clone(), other], &current, |port| port != 10808)
+                .unwrap();
+        assert_eq!(selected, Some((10811, Some(10809))));
+    }
+
+    #[test]
+    fn connect_port_reallocation_replaces_occupied_http_and_both_ports() {
+        let mut current = profile("current");
+        current.id = "current".into();
+        current.backend = TunnelBackend::Xray;
+        current.xray_socks_port = Some(10808);
+        current.xray_http_port = Some(10809);
+        let mut other = profile("other");
+        other.id = "other".into();
+        other.backend = TunnelBackend::Xray;
+        other.xray_socks_port = Some(10810);
+        let profiles = [current.clone(), other];
+        assert_eq!(
+            select_connect_ports(&profiles, &current, |port| port != 10809).unwrap(),
+            Some((10808, Some(10811)))
+        );
+        assert_eq!(
+            select_connect_ports(&profiles, &current, |port| !matches!(port, 10808 | 10809))
+                .unwrap(),
+            Some((10811, Some(10812)))
+        );
     }
 }

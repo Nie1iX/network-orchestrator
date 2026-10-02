@@ -309,8 +309,9 @@ pub fn response_meta_from_headers(
     response_meta(&pairs, body)
 }
 
-/// Compose the profile display name as `{provider} - {endpoint}`. When the
-/// endpoint name already carries the provider prefix it is used as-is.
+/// Compose the profile display name as `{provider} · {endpoint}`. When the
+/// endpoint name already carries the provider prefix (with any separator)
+/// it is re-joined with ` · `.
 pub fn subscription_profile_name(provider_title: Option<&str>, endpoint_name: &str) -> String {
     let Some(title) = provider_title
         .map(str::trim)
@@ -320,19 +321,52 @@ pub fn subscription_profile_name(provider_title: Option<&str>, endpoint_name: &s
     };
     if let Some(rest) = endpoint_name.strip_prefix(title) {
         let rest = rest.trim_start();
-        if rest.starts_with(['-', '–', '—', '|']) {
-            let stripped = rest.trim_start_matches(['-', '–', '—', '|', ' ']).trim();
+        if rest.starts_with(['-', '–', '—', '|', '·', '•']) {
+            let stripped = rest
+                .trim_start_matches(['-', '–', '—', '|', '·', '•', ' '])
+                .trim();
             return if stripped.is_empty() {
                 title.to_string()
             } else {
-                format!("{title} - {stripped}")
+                format!("{title} · {stripped}")
             };
         }
     }
     if endpoint_name == title {
         return title.to_string();
     }
-    format!("{title} - {endpoint_name}")
+    format!("{title} · {endpoint_name}")
+}
+
+/// The last ` · ` / ` - ` / ` – ` / ` — ` / ` | `-delimited segment of an
+/// endpoint name — "AcmeVPN · ⚡ NL" → "⚡ NL". Returns the whole name when
+/// no separator is present.
+fn endpoint_tail(endpoint_name: &str) -> &str {
+    for sep in [" · ", " • ", " - ", " – ", " — ", " | "] {
+        if let Some((_, tail)) = endpoint_name.rsplit_once(sep) {
+            let tail = tail.trim();
+            if !tail.is_empty() {
+                return tail;
+            }
+        }
+    }
+    endpoint_name
+}
+
+/// True when `profile_name` is the auto-generated name of `endpoint_name` —
+/// bare, provider-prefixed, or the provider-less tail of a prefixed name.
+/// Separator-insensitive, so names from older releases still follow the
+/// selected server.
+fn auto_profile_name_matches(
+    provider_title: Option<&str>,
+    endpoint_name: &str,
+    profile_name: &str,
+) -> bool {
+    endpoint_name == profile_name
+        || subscription_profile_name(provider_title, endpoint_name) == profile_name
+        || endpoint_tail(endpoint_name) == profile_name
+        || subscription_profile_name(provider_title, profile_name)
+            == subscription_profile_name(provider_title, endpoint_name)
 }
 
 /// A profile name the app generated from one of its servers (optionally with
@@ -343,9 +377,9 @@ fn is_generated_name(
     provider_title: Option<&str>,
     endpoints: &[SubscriptionEndpoint],
 ) -> bool {
-    endpoints.iter().any(|endpoint| {
-        name == endpoint.name || name == subscription_profile_name(provider_title, &endpoint.name)
-    })
+    endpoints
+        .iter()
+        .any(|endpoint| auto_profile_name_matches(provider_title, &endpoint.name, name))
 }
 
 /// Secret-free description of a subscription response for diagnostics:
@@ -1106,12 +1140,12 @@ mod tests {
         )
         .unwrap();
         let profile = store.load().unwrap().profiles.remove(0);
-        assert_eq!(profile.name, "Panel - NL");
+        assert_eq!(profile.name, "Panel · NL");
         let subscription = profile.subscription.unwrap();
         assert_eq!(subscription.provider_title.as_deref(), Some("Panel"));
         assert_eq!(subscription.announce.as_deref(), Some("News"));
         switch_endpoint(&vault, &store, "panel", 1, |_| true).unwrap();
-        assert_eq!(store.load().unwrap().profiles[0].name, "Panel - DE");
+        assert_eq!(store.load().unwrap().profiles[0].name, "Panel · DE");
         refresh_body(
             &vault,
             &store,
@@ -1122,7 +1156,7 @@ mod tests {
         )
         .unwrap();
         let profile = store.load().unwrap().profiles.remove(0);
-        assert_eq!(profile.name, "Panel - DE");
+        assert_eq!(profile.name, "Panel · DE");
         assert_eq!(
             profile.subscription.unwrap().announce.as_deref(),
             Some("News")

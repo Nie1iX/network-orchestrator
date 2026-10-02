@@ -98,6 +98,7 @@ interface ProfileDetailProps {
   onSwitchEndpoint: (index: number) => void;
   onMeasureAllEndpoints: () => void;
   onSetRefreshInterval: (minutes: number | null) => void;
+  onCopyTerminalProxy: () => void;
 }
 
 export default function ProfileDetail({
@@ -133,6 +134,7 @@ export default function ProfileDetail({
   onSwitchEndpoint,
   onMeasureAllEndpoints,
   onSetRefreshInterval,
+  onCopyTerminalProxy,
 }: ProfileDetailProps) {
   const t = useT();
   const alwaysOnKind: AlwaysOnKind | null =
@@ -413,90 +415,20 @@ export default function ProfileDetail({
               </span>
             </div>
           )}
-        {profile.subscription && endpoints && (
-          <div className="endpoint-section">
-            <div className="endpoint-section-head">
-              <span className="section-label">
-                {t("detail.endpoints")} · {endpoints.length}
-                {switching && <span className="endpoint-note">{t("detail.switching")}</span>}
-              </span>
+        {profile.backend === "xray" &&
+          profile.xrayMode === "socks" &&
+          profile.xraySocksPort !== null &&
+          status.state === "running" && (
+            <div className="sub-links">
               <button
                 type="button"
-                className="btn-sm btn-with-icon"
-                onClick={onMeasureAllEndpoints}
-                disabled={
-                  measuringAll ||
-                  switching ||
-                  refreshingSubscription ||
-                  isBusy
-                }
-                title={t("detail.testAllTitle")}
+                className="btn-sm"
+                onClick={onCopyTerminalProxy}
               >
-                {measuringAll && <SpinnerIcon size={12} />}
-                {measuringAll
-                  ? t("detail.testingProgress", {
-                      done: Object.keys(delayResults ?? {}).length,
-                      total: endpoints.length,
-                    })
-                  : t("detail.testAll")}
+                {t("native.copyTerminal")}
               </button>
             </div>
-            <ul className="endpoint-list">
-              {endpoints.map((ep, i) => {
-                const res = delayResults?.[i];
-                const measuring = measuringEndpoints.has(`${profile.id}:${i}`);
-                return (
-                  <li key={i}>
-                    <button
-                      type="button"
-                      className={`endpoint-item ${ep.active ? "active" : ""}`}
-                      onClick={() => onSwitchEndpoint(i)}
-                      disabled={
-                        switching ||
-                        refreshingSubscription ||
-                        isBusy ||
-                        ep.active
-                      }
-                      title={
-                        ep.active
-                          ? t("detail.activeEndpoint")
-                          : status.state === "running"
-                            ? t("detail.switchEndpointReconnect")
-                            : t("detail.switchEndpoint")
-                      }
-                    >
-                      <span
-                        className={`endpoint-item-dot ${ep.active ? "on" : ""}`}
-                      />
-                      <span className="endpoint-item-name">
-                        {endpointDisplay?.names[i] ?? ep.name}
-                      </span>
-                      {ep.protocol && (
-                        <span className="endpoint-proto">{ep.protocol}</span>
-                      )}
-                      <span
-                        className={`endpoint-item-delay ${delayClass(res, measuring)}`}
-                        aria-busy={measuring || undefined}
-                      >
-                        {measuring ? (
-                          <SpinnerIcon size={12} />
-                        ) : res ? (
-                          res.delayMs !== null ? (
-                            t("detail.delayMs", { ms: res.delayMs })
-                          ) : (
-                            t("detail.unreachable")
-                          )
-                        ) : (
-                          "—"
-                        )}
-                      </span>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
-        )}
+          )}
         {profile.subscription && (
           <div className="interface-row">
             <span className="row-label">{t("detail.autoRefresh")}</span>
@@ -569,10 +501,11 @@ export default function ProfileDetail({
               <div className="interface-row">
                 <span className="row-label">{t("detail.traffic")}</span>
                 <span className="row-value">
-                  {formatBytes(trafficUsed ?? 0)} {t("detail.used")}
+                  {formatBytes(trafficUsed ?? 0)}
+                  {" / "}
                   {subscription.userInfo.totalBytes !== null
-                    ? ` / ${formatBytes(subscription.userInfo.totalBytes)}`
-                    : ` / ${t("detail.unlimited")}`}
+                    ? formatBytes(subscription.userInfo.totalBytes)
+                    : "∞"}
                   {limitExhausted && (
                     <span className="warn-text">
                       {" · "}
@@ -675,6 +608,91 @@ export default function ProfileDetail({
                 </ul>
               </div>
             )}
+          </div>
+        )}
+
+        {profile.subscription && endpoints && (
+          <div className="endpoint-section">
+            <div className="endpoint-section-head">
+              <span className="section-label">
+                {t("detail.endpoints")} · {endpoints.length}
+                {switching && <span className="endpoint-note">{t("detail.switching")}</span>}
+              </span>
+              <button
+                type="button"
+                className="btn-sm btn-with-icon"
+                onClick={onMeasureAllEndpoints}
+                disabled={
+                  measuringAll ||
+                  switching ||
+                  refreshingSubscription ||
+                  isBusy
+                }
+                title={t("detail.testAllTitle")}
+              >
+                {measuringAll && <SpinnerIcon size={12} />}
+                {measuringAll
+                  ? t("detail.testingProgress", {
+                      done: Object.keys(delayResults ?? {}).length,
+                      total: endpoints.length,
+                    })
+                  : t("detail.testAll")}
+              </button>
+            </div>
+            <ul className="endpoint-list">
+              {endpoints.map((ep, i) => {
+                const res = delayResults?.[i];
+                const measuring = measuringEndpoints.has(`${profile.id}:${i}`);
+                return (
+                  <li key={i}>
+                    <button
+                      type="button"
+                      className={`endpoint-item ${ep.active ? "active" : ""}`}
+                      onClick={() => onSwitchEndpoint(i)}
+                      disabled={
+                        switching ||
+                        refreshingSubscription ||
+                        isBusy ||
+                        ep.active
+                      }
+                      title={
+                        ep.active
+                          ? t("detail.activeEndpoint")
+                          : status.state === "running"
+                            ? t("detail.switchEndpointReconnect")
+                            : t("detail.switchEndpoint")
+                      }
+                    >
+                      <span
+                        className={`endpoint-item-dot ${ep.active ? "on" : ""}`}
+                      />
+                      <span className="endpoint-item-name">
+                        {endpointDisplay?.names[i] ?? ep.name}
+                      </span>
+                      {ep.protocol && (
+                        <span className="endpoint-proto">{ep.protocol}</span>
+                      )}
+                      <span
+                        className={`endpoint-item-delay ${delayClass(res, measuring)}`}
+                        aria-busy={measuring || undefined}
+                      >
+                        {measuring ? (
+                          <SpinnerIcon size={12} />
+                        ) : res ? (
+                          res.delayMs !== null ? (
+                            t("detail.delayMs", { ms: res.delayMs })
+                          ) : (
+                            t("detail.unreachable")
+                          )
+                        ) : (
+                          "—"
+                        )}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
           </div>
         )}
       </div>

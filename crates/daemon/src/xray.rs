@@ -17,9 +17,15 @@ pub struct XrayPlan {
     pub mtu: u32,
     pub dns_servers: Vec<IpAddr>,
     pub dns_domains: Vec<String>,
+    /// Additional hosts that get a physical-gateway host route when their
+    /// family is fully captured (see [`dns_bypass_addrs`]): upstream DNS
+    /// resolvers chosen in the profile, which may be literal IPs or names.
+    pub dns_bypass: Vec<String>,
     pub full_ipv4: bool,
     pub full_ipv6: bool,
     pub mark: u32,
+    /// Loopback port of the injected `api-in` StatsService listener.
+    pub api_port: u16,
     /// Upstream host of the first outbound (literal IP or hostname). Kernel
     /// must keep a direct route to it outside the tunnel, otherwise the
     /// tunnel would try to carry its own server traffic.
@@ -41,6 +47,7 @@ impl std::fmt::Debug for XrayPlan {
             .field("mtu", &self.mtu)
             .field("dns_servers", &self.dns_servers)
             .field("dns_domains", &self.dns_domains)
+            .field("dns_bypass", &self.dns_bypass)
             .field("full_ipv4", &self.full_ipv4)
             .field("full_ipv6", &self.full_ipv6)
             .field("mark", &self.mark)
@@ -92,12 +99,21 @@ fn one(value: &Value) -> io::Result<&Value> {
 }
 
 fn validate_generated(config: &Value) -> io::Result<()> {
-    let root = object(config, &["log", "inbounds", "outbounds", "routing"])?;
+    let root = object(
+        config,
+        &["log", "inbounds", "outbounds", "routing", "dns", "fakedns"],
+    )?;
     if let Some(log) = root.get("log") {
         object(log, &["loglevel"])?;
         if !matches!(log["loglevel"].as_str(), Some("warning" | "error" | "none")) {
             return Err(rejected());
         }
+    }
+    if let Some(dns) = root.get("dns") {
+        validate_dns(dns)?;
+    }
+    if let Some(fakedns) = root.get("fakedns") {
+        validate_fakedns(fakedns)?;
     }
     let inbounds = root
         .get("inbounds")
@@ -130,7 +146,7 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         .get("outbounds")
         .and_then(Value::as_array)
         .ok_or_else(rejected)?;
-    if outbounds.len() < 2 || outbounds.len() > 3 {
+    if outbounds.len() < 2 || outbounds.len() > 4 {
         return Err(rejected());
     }
     let mut tags = HashSet::new();
@@ -167,7 +183,7 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                 port(&outbound["settings"]["port"])?;
                 validate_hysteria_stream(&outbound["streamSettings"])?;
             }
-            "freedom" | "blackhole"
+            "freedom" | "blackhole" | "dns"
                 if index > 0
                     && !map.contains_key("settings")
                     && !map.contains_key("streamSettings") => {}
@@ -177,9 +193,20 @@ fn validate_generated(config: &Value) -> io::Result<()> {
     if outbounds[1]["protocol"] != "freedom" {
         return Err(rejected());
     }
-    let routing = object(&config["routing"], &["domainStrategy", "rules"])?;
+    let routing = object(
+        &config["routing"],
+        &["domainStrategy", "domainMatcher", "rules"],
+    )?;
     if let Some(strategy) = routing.get("domainStrategy") {
-        if strategy != "AsIs" {
+        if !matches!(
+            strategy.as_str(),
+            Some("AsIs" | "IPIfNonMatch" | "IPOnDemand")
+        ) {
+            return Err(rejected());
+        }
+    }
+    if let Some(matcher) = routing.get("domainMatcher") {
+        if !matches!(matcher.as_str(), Some("mph" | "hybrid" | "linear")) {
             return Err(rejected());
         }
     }
@@ -188,9 +215,33 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         return Err(rejected());
     }
     for rule in rules {
-        object(rule, &["type", "domain", "ip", "outboundTag"])?;
+        object(
+            rule,
+            &["type", "domain", "ip", "port", "network", "outboundTag"],
+        )?;
         if rule["type"] != "field" || !tags.contains(string(&rule["outboundTag"])?) {
             return Err(rejected());
+        }
+        if let Some(rule_port) = rule.get("port") {
+            match rule_port {
+                Value::String(list) => {
+                    if list.len() > 128
+                        || !list.split(',').all(|item| {
+                            let mut bounds = item.splitn(2, '-');
+                            bounds.all(|bound| bound.parse::<u16>().is_ok() && bound.len() <= 5)
+                        })
+                    {
+                        return Err(rejected());
+                    }
+                }
+                Value::Number(_) => port(rule_port)?,
+                _ => return Err(rejected()),
+            }
+        }
+        if let Some(network) = rule.get("network") {
+            if !matches!(network.as_str(), Some("tcp" | "udp" | "tcp,udp")) {
+                return Err(rejected());
+            }
         }
         for key in ["domain", "ip"] {
             if let Some(items) = rule.get(key) {
@@ -202,6 +253,110 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                     routing_selector(key, string(item)?)?;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// The generated `dns` section: resolver entries may be bare address strings
+/// or `{address, port, domains, skipFallback}` objects; hosts map names to
+/// one or more literal addresses.
+fn validate_dns(dns: &Value) -> io::Result<()> {
+    let dns = object(dns, &["hosts", "servers", "queryStrategy"])?;
+    if let Some(query) = dns.get("queryStrategy") {
+        string(query)?;
+    }
+    if let Some(hosts) = dns.get("hosts") {
+        let hosts = hosts.as_object().ok_or_else(rejected)?;
+        if hosts.len() > 128 {
+            return Err(rejected());
+        }
+        for (name, value) in hosts {
+            if name.is_empty() || name.len() > 253 {
+                return Err(rejected());
+            }
+            match value {
+                Value::String(entry) if !entry.is_empty() && entry.len() <= 256 => {}
+                Value::Array(entries) => {
+                    if entries.is_empty() || entries.len() > 8 {
+                        return Err(rejected());
+                    }
+                    for entry in entries {
+                        string(entry)?;
+                    }
+                }
+                _ => return Err(rejected()),
+            }
+        }
+    }
+    if let Some(servers) = dns.get("servers") {
+        let servers = servers.as_array().ok_or_else(rejected)?;
+        if servers.is_empty() || servers.len() > 16 {
+            return Err(rejected());
+        }
+        for server in servers {
+            match server {
+                Value::String(address) => {
+                    if address.is_empty() || address.len() > 256 {
+                        return Err(rejected());
+                    }
+                }
+                Value::Object(_) => {
+                    let entry = object(
+                        server,
+                        &[
+                            "address",
+                            "port",
+                            "domains",
+                            "skipFallback",
+                            "queryStrategy",
+                        ],
+                    )?;
+                    string(&entry["address"])?;
+                    if let Some(server_port) = entry.get("port") {
+                        port(server_port)?;
+                    }
+                    if let Some(domains) = entry.get("domains") {
+                        let domains = domains.as_array().ok_or_else(rejected)?;
+                        if domains.is_empty() || domains.len() > 64 {
+                            return Err(rejected());
+                        }
+                        for domain in domains {
+                            string(domain)?;
+                        }
+                    }
+                    if let Some(skip) = entry.get("skipFallback") {
+                        if !skip.is_boolean() {
+                            return Err(rejected());
+                        }
+                    }
+                    if let Some(query) = entry.get("queryStrategy") {
+                        string(query)?;
+                    }
+                }
+                _ => return Err(rejected()),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_fakedns(fakedns: &Value) -> io::Result<()> {
+    let pools = fakedns.as_array().ok_or_else(rejected)?;
+    if pools.is_empty() || pools.len() > 4 {
+        return Err(rejected());
+    }
+    for pool in pools {
+        let pool = object(pool, &["ipPool", "poolSize"])?;
+        let cidr = string(&pool["ipPool"])?;
+        if cidr.parse::<ipnet::IpNet>().is_err() {
+            return Err(rejected());
+        }
+        if pool["poolSize"]
+            .as_u64()
+            .is_none_or(|size| size == 0 || size > 65535)
+        {
+            return Err(rejected());
         }
     }
     Ok(())
@@ -227,11 +382,25 @@ fn routing_selector(key: &str, item: &str) -> io::Result<()> {
     } else {
         match item.split_once(':') {
             Some(("geosite", category)) => {
-                !category.is_empty()
-                    && category.len() <= 64
-                    && category
+                // `geosite:category@attr` filters on asset attributes (the
+                // `*` wildcard is allowed inside the attribute only).
+                let mut parts = category.splitn(2, '@');
+                let (name, attr) = (parts.next().unwrap_or_default(), parts.next());
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                    && attr.is_none_or(|attr| {
+                        !attr.is_empty()
+                            && attr.len() <= 64
+                            && attr.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric()
+                                    || byte == b'-'
+                                    || byte == b'_'
+                                    || byte == b'*'
+                            })
+                    })
             }
             Some(("domain" | "full" | "keyword" | "regexp", value)) => !value.is_empty(),
             Some(_) => false,
@@ -373,12 +542,6 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
             return Err(rejected());
         }
     }
-    if (seen.contains(&"0.0.0.0/1".parse().unwrap())
-        && seen.contains(&"128.0.0.0/1".parse().unwrap()))
-        || (seen.contains(&"::/1".parse().unwrap()) && seen.contains(&"8000::/1".parse().unwrap()))
-    {
-        return Err(rejected());
-    }
     if params
         .dns_servers
         .iter()
@@ -387,17 +550,24 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         || params.dns_domains.iter().any(|domain| {
             domain.is_empty() || domain.len() > 253 || domain.chars().any(char::is_control)
         })
+        || params.dns_bypass.len() > 16
+        || params.dns_bypass.iter().any(|host| {
+            host.is_empty()
+                || host.len() > 253
+                || host
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '@' | '%'))
+        })
     {
         return Err(rejected());
     }
-    let full_ipv4 = params
-        .routes
-        .iter()
-        .any(|r| r.destination.to_string() == "0.0.0.0/0");
-    let full_ipv6 = params
-        .routes
-        .iter()
-        .any(|r| r.destination.to_string() == "::/0");
+    // Both the single default route and its def1 halves mean the family is
+    // fully captured; the halves live in the same tunnel table.
+    let net = |network: &str| network.parse::<ipnet::IpNet>().unwrap();
+    let full_ipv4 = seen.contains(&net("0.0.0.0/0"))
+        || (seen.contains(&net("0.0.0.0/1")) && seen.contains(&net("128.0.0.0/1")));
+    let full_ipv6 = seen.contains(&net("::/0"))
+        || (seen.contains(&net("::/1")) && seen.contains(&net("8000::/1")));
     let (covers_ipv4, covers_ipv6) = full_coverage(params.routes.iter().map(|r| r.destination));
     if (covers_ipv4 && !full_ipv4) || (covers_ipv6 && !full_ipv6) {
         return Err(rejected());
@@ -444,15 +614,51 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
     .parse()
     .map_err(|_| rejected())?;
     let mtu = 1500;
-    config["inbounds"] = json!([{
-        "tag": "tun-in",
-        "protocol": "tun",
-        "settings": { "name": name, "mtu": mtu },
-        // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
-        // SNI / HTTP Host so domain and geosite routing rules can match.
-        "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
-    }]);
+    let mut dest_override = vec!["http", "tls", "quic"];
+    // Fake-IP answers need the sniffing stage to keep the fake destination so
+    // routing can match it against domain policies.
+    if config["fakedns"]
+        .as_array()
+        .is_some_and(|pools| !pools.is_empty())
+    {
+        dest_override.push("fakedns");
+    }
+    // Caller inbounds are loopback socks/http listeners that a TUN tunnel
+    // replaces wholesale. The extra `api-in` dokodemo door feeds the local
+    // StatsService; it never leaves loopback.
+    let api_port = xray_api_port(mark);
+    config["inbounds"] = json!([
+        {
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": { "name": name, "mtu": mtu },
+            // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
+            // SNI / HTTP Host so domain and geosite routing rules can match.
+            "sniffing": { "enabled": true, "destOverride": dest_override },
+        },
+        {
+            "tag": "api-in",
+            "protocol": "dokodemo-door",
+            "listen": "127.0.0.1",
+            "port": api_port,
+            "settings": { "address": "127.0.0.1" },
+        },
+    ]);
     config["log"] = json!({"loglevel":"warning"});
+    config["stats"] = json!({});
+    config["policy"] = json!({
+        "system": {
+            "statsInboundUplink": true,
+            "statsInboundDownlink": true,
+            "statsOutboundUplink": true,
+            "statsOutboundDownlink": true,
+        }
+    });
+    config["api"] = json!({"tag": "api", "services": ["StatsService"]});
+    config["routing"]["rules"]
+        .as_array_mut()
+        .ok_or_else(rejected)?
+        .push(json!({"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"}));
     for outbound in config["outbounds"].as_array_mut().ok_or_else(rejected)? {
         if outbound["protocol"] != "blackhole" {
             if outbound["streamSettings"].is_null() {
@@ -470,13 +676,28 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         mtu,
         dns_servers: params.dns_servers,
         dns_domains: params.dns_domains,
+        dns_bypass: params.dns_bypass,
         full_ipv4,
         full_ipv6,
         mark,
+        api_port,
         server_host,
         geo_assets: params.geo_assets,
     })
 }
+
+/// Loopback port of the per-tunnel `api-in` listener, derived from the
+/// policy-routing slot so concurrently running tunnels never collide and a
+/// reload keeps the same endpoint.
+pub fn xray_api_port(mark: u32) -> u16 {
+    u16::try_from(API_PORT_BASE + mark.saturating_sub(POLICY_MARK_BASE).min(127))
+        .unwrap_or(API_PORT_BASE as u16)
+}
+
+/// Policy marks are allocated as `POLICY_MARK_BASE + slot` (0..128 slots); the
+/// API listeners take the same slot numbering on loopback.
+pub const POLICY_MARK_BASE: u32 = 51820;
+const API_PORT_BASE: u32 = 10185;
 
 /// DNS resolvers whose family is fully captured by the tunnel need a direct
 /// host route through the physical gateway: without it, resolver queries
@@ -520,6 +741,7 @@ mod tests {
             }],
             dns_servers: vec![],
             dns_domains: vec![],
+            dns_bypass: vec![],
             interface_name: None,
             geo_assets: None,
         }
@@ -534,10 +756,14 @@ mod tests {
         assert!(plan.name[5..].chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(plan.name, prepare_xray(1000, params(), 51820).unwrap().name);
         let config: Value = serde_json::from_str(&plan.config).unwrap();
-        assert_eq!(config["inbounds"].as_array().unwrap().len(), 1);
-        assert_eq!(config["inbounds"][0]["protocol"], "tun");
-        assert_eq!(config["inbounds"][0]["settings"]["name"], plan.name);
-        assert_eq!(config["inbounds"][0]["settings"]["mtu"], 1500);
+        let inbounds = config["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 2);
+        assert_eq!(inbounds[0]["protocol"], "tun");
+        assert_eq!(inbounds[0]["settings"]["name"], plan.name);
+        assert_eq!(inbounds[0]["settings"]["mtu"], 1500);
+        assert_eq!(inbounds[1]["protocol"], "dokodemo-door");
+        assert_eq!(inbounds[1]["listen"], "127.0.0.1");
+        assert_eq!(inbounds[1]["port"], plan.api_port);
         for index in [0, 1] {
             assert_eq!(
                 config["outbounds"][index]["streamSettings"]["sockopt"]["mark"],
@@ -662,7 +888,10 @@ mod tests {
     }
 
     #[test]
-    fn def1_style_routes_cannot_bypass_full_tunnel_marking() {
+    fn def1_style_route_pair_counts_as_full_coverage() {
+        // The split-default halves are full capture, applied through the
+        // tunnel table and mark rules like a single default route — never
+        // through the main table, where they would capture marked traffic.
         let mut input = params();
         input.routes = ["0.0.0.0/1", "128.0.0.0/1"]
             .into_iter()
@@ -672,7 +901,9 @@ mod tests {
                 via: None,
             })
             .collect();
-        assert!(prepare_xray(1000, input, 51820).is_err());
+        let plan = prepare_xray(1000, input, 51820).unwrap();
+        assert!(plan.full_ipv4);
+        assert!(!plan.full_ipv6);
     }
 
     #[test]
@@ -686,6 +917,126 @@ mod tests {
                 via: None,
             })
             .collect();
+        assert!(prepare_xray(1000, input, 51820).is_err());
+    }
+
+    #[test]
+    fn a_lone_def1_half_is_a_normal_route_not_full_coverage() {
+        let mut input = params();
+        input.routes = vec![PolicyRoute {
+            destination: "0.0.0.0/1".parse().unwrap(),
+            metric: 5,
+            via: None,
+        }];
+        let plan = prepare_xray(1000, input, 51820).unwrap();
+        assert!(!plan.full_ipv4);
+    }
+
+    #[test]
+    fn plan_injects_a_loopback_stats_listener_and_api_route() {
+        let plan = prepare_xray(1000, params(), 51820).unwrap();
+        let config: Value = serde_json::from_str(&plan.config).unwrap();
+        assert_eq!(plan.api_port, xray_api_port(51820));
+        assert_eq!(xray_api_port(51821), plan.api_port + 1);
+        assert_eq!(
+            config["api"],
+            json!({"tag": "api", "services": ["StatsService"]})
+        );
+        assert!(config["stats"].is_object());
+        assert_eq!(
+            config["policy"]["system"]["statsInboundUplink"],
+            json!(true)
+        );
+        let api_in = &config["inbounds"][1];
+        assert_eq!(api_in["tag"], "api-in");
+        assert_eq!(api_in["listen"], "127.0.0.1");
+        assert_eq!(api_in["port"], json!(xray_api_port(51820)));
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        let rule = rules
+            .iter()
+            .find(|rule| rule["outboundTag"] == "api")
+            .expect("api route");
+        assert_eq!(rule["inboundTag"], json!(["api-in"]));
+    }
+
+    #[test]
+    fn plan_accepts_generated_split_dns_and_strategy_sections() {
+        // Mirror of what `apply_profile_routing` emits for a profile with
+        // xrayDns + strategy overrides — the daemon must not reject it.
+        let mut input = params();
+        input.config = json!({
+            "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[
+                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"proxy.test","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                {"tag":"direct","protocol":"freedom"},
+                {"tag":"blocked","protocol":"blackhole"},
+                {"tag":"dns-out","protocol":"dns"}
+            ],
+            "dns":{
+                "hosts":{"domain:ads.test":["127.0.0.1"]},
+                "servers":[
+                    "fakedns",
+                    {"address":"https://1.1.1.1/dns-query","domains":["geosite:category-ru@attr"],"skipFallback":true},
+                    "udp://9.9.9.9:53"
+                ],
+                "queryStrategy":"UseIPv4"
+            },
+            "fakedns":[{"ipPool":"198.18.0.0/16","poolSize":65535}],
+            "routing":{
+                "domainStrategy":"IPIfNonMatch",
+                "domainMatcher":"mph",
+                "rules":[
+                    {"type":"field","port":"53","outboundTag":"dns-out"},
+                    {"type":"field","ip":["1.1.1.1"],"outboundTag":"direct"},
+                    {"type":"field","domain":["geosite:category-ru@attr"],"outboundTag":"proxy"},
+                    {"type":"field","network":"udp","domain":["ntp.test"],"outboundTag":"blocked"}
+                ]
+            }
+        })
+        .to_string();
+        let plan = prepare_xray(1000, input, 51820).unwrap();
+        let config: Value = serde_json::from_str(&plan.config).unwrap();
+        assert_eq!(
+            config["inbounds"][0]["sniffing"]["destOverride"],
+            json!(["http", "tls", "quic", "fakedns"])
+        );
+        assert_eq!(config["outbounds"][3]["protocol"], "dns");
+        assert_eq!(
+            config["outbounds"][3]["streamSettings"]["sockopt"]["mark"],
+            51820
+        );
+    }
+
+    #[test]
+    fn plan_rejects_malformed_dns_sections() {
+        let with_dns = |dns: Value| {
+            let mut config: Value = serde_json::from_str(&params().config).unwrap();
+            config["dns"] = dns;
+            let mut input = params();
+            input.config = config.to_string();
+            prepare_xray(1000, input, 51820)
+        };
+        assert!(with_dns(json!({"servers": [{"address": "ok.test", "exec": "sh"}]})).is_err());
+        assert!(with_dns(json!({"servers": [{"address": "ok.test", "port": 99999}]})).is_err());
+        assert!(with_dns(json!({"hosts": {"x.test": 42}})).is_err());
+        let mut config: Value = serde_json::from_str(&params().config).unwrap();
+        config["fakedns"] = json!([{"ipPool": "not-a-cidr", "poolSize": 16}]);
+        let mut input = params();
+        input.config = config.to_string();
+        assert!(prepare_xray(1000, input, 51820).is_err());
+    }
+    #[test]
+    fn dns_bypass_hosts_are_carried_into_the_plan() {
+        let mut input = params();
+        input.dns_bypass = vec!["8.8.8.8".into(), "dns.example.test".into()];
+        let plan = prepare_xray(1000, input, 51820).unwrap();
+        assert_eq!(plan.dns_bypass, ["8.8.8.8", "dns.example.test"]);
+
+        let mut input = params();
+        input.dns_bypass = vec!["1.1.1.1".into(); 17];
+        assert!(prepare_xray(1000, input, 51820).is_err());
+        let mut input = params();
+        input.dns_bypass = vec!["bad host/name".into()];
         assert!(prepare_xray(1000, input, 51820).is_err());
     }
 }

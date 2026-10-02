@@ -9,7 +9,39 @@ use std::ffi::{c_char, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
+// The proxy runtime needs the managed Xray package, pinned for Apple
+// Silicon; on other targets the bridge still builds so subscription,
+// profile and inventory commands can be exercised off-macOS.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+mod runtime {
+    use net_manager_core::profiles::ProfileStore;
+    use serde_json::Value;
+    use std::path::{Path, PathBuf};
+
+    pub(crate) fn managed_executable(_root: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    pub(crate) fn restart_around(
+        _root: &Path,
+        _store: &ProfileStore,
+        _id: &str,
+        change: impl FnOnce() -> Result<Value, String>,
+    ) -> Result<Value, String> {
+        change()
+    }
+
+    pub(crate) fn handle(
+        _root: &Path,
+        _store: &ProfileStore,
+        _method: &str,
+        _args: &Value,
+    ) -> Option<Result<Value, String>> {
+        None
+    }
+}
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 static TRANSACTION: Mutex<()> = Mutex::new(());
@@ -688,14 +720,23 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
             }
             let backend: TunnelBackend = serde_json::from_value(args["backend"].clone())
                 .map_err(|_| "Choose a valid VPN type".to_string())?;
-            let imported = vault
-                .import(id, backend, Path::new(path))
-                .map_err(store_error)?;
+            let imported = vault.import(id, backend, Path::new(path)).map_err(|err| {
+                let message = err.to_string();
+                if matches!(
+                    message.as_str(),
+                    "unsupported OpenVPN route directive" | "OpenVPN referenced asset is missing"
+                ) {
+                    message
+                } else {
+                    store_error(err)
+                }
+            })?;
             let p = Profile {
                 id: id.into(),
                 name: name.into(),
                 backend,
                 config_path: imported.config_path.clone(),
+                routes: imported.routes,
                 ..Profile::default()
             };
             let result = analysis::analyze_profile(&p)
@@ -1294,6 +1335,49 @@ mod tests {
     }
 
     #[test]
+    fn openvpn_import_preserves_static_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("client.ovpn");
+        std::fs::write(
+            &source,
+            "client\nremote vpn.example\nroute 10.20.0.0 255.255.0.0\n",
+        )
+        .unwrap();
+        let result = dispatch(
+            dir.path(),
+            "import",
+            &json!({"id":"ovpn", "name":"Lab", "backend":"openVpn", "path":source}),
+        )
+        .unwrap();
+        assert_eq!(result[0]["routes"][0]["destination"], "10.20.0.0/16");
+    }
+
+    #[test]
+    fn openvpn_import_reports_unsupported_routes_and_missing_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("client.ovpn");
+        let request = json!({"id":"ovpn", "name":"Lab", "backend":"openVpn", "path":source});
+        std::fs::write(
+            &source,
+            "client\nremote vpn.example\nroute 10.0.0.0 255.0.0.0 net_gateway\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(dir.path(), "import", &request).unwrap_err(),
+            "unsupported OpenVPN route directive"
+        );
+        std::fs::write(
+            &source,
+            "client\nremote vpn.example\npkcs12 missing-secret.p12\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(dir.path(), "import", &request).unwrap_err(),
+            "OpenVPN referenced asset is missing"
+        );
+    }
+
+    #[test]
     fn rejected_import_does_not_leave_a_vault_revision() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.json");
@@ -1365,6 +1449,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn import_link(root: &Path, id: &str) {
         dispatch(
             root,
@@ -1375,6 +1460,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn runtime_reports_stopped_profiles_and_missing_xray() {
         let dir = tempfile::tempdir().unwrap();
         import_link(dir.path(), "rt");
@@ -1386,6 +1472,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn connect_requires_managed_xray_and_refuses_privileged_backends() {
         let dir = tempfile::tempdir().unwrap();
         import_link(dir.path(), "rt");
@@ -1402,6 +1489,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn system_proxy_and_disconnect_require_a_running_connection() {
         let dir = tempfile::tempdir().unwrap();
         import_link(dir.path(), "rt");

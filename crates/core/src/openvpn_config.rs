@@ -101,7 +101,13 @@ pub fn sanitize_openvpn_config(
                 .ok_or(OpenVpnConfigError::InvalidConfig)?;
             if !matches!(
                 tag,
-                "ca" | "cert" | "key" | "tls-auth" | "tls-crypt" | "tls-crypt-v2" | "pkcs12"
+                "ca" | "cert"
+                    | "key"
+                    | "tls-auth"
+                    | "tls-crypt"
+                    | "tls-crypt-v2"
+                    | "pkcs12"
+                    | "auth-user-pass"
             ) {
                 return Err(OpenVpnConfigError::UnsupportedDirective);
             }
@@ -118,7 +124,24 @@ pub fn sanitize_openvpn_config(
             "dev" if args == ["tun"] => {}
             "proto" if args.len() == 1 && is_client_proto(&args[0]) => {}
             "remote-cert-tls" if args == ["server"] => {}
-            "auth-user-pass" | "askpass" => require_args(args, 0, 0)?,
+            "auth-user-pass" | "askpass" => match args {
+                // Bare: credentials are requested via the management interface.
+                [] => {}
+                // `username-only` prompts for a username without a password.
+                [arg] if directive == "auth-user-pass" && arg == "username-only" => {}
+                [_] => {
+                    output.push_str(&staged_asset_line(
+                        &directive,
+                        args,
+                        managed_assets,
+                        staging_dir,
+                        &mut assets,
+                        &mut total_asset_bytes,
+                    )?);
+                    continue;
+                }
+                _ => return Err(OpenVpnConfigError::InvalidConfig),
+            },
             "remote" => validate_remote(args)?,
             "resolv-retry"
                 if args.len() == 1 && (args[0] == "infinite" || positive_number(&args[0])) => {}
@@ -582,13 +605,18 @@ mod tests {
 
     #[test]
     fn management_credentials_require_valueless_directives() {
-        let safe = sanitize("client\nremote vpn.example\nauth-user-pass\naskpass\n").unwrap();
+        let safe = sanitize(
+            "client\nremote vpn.example\nauth-user-pass\naskpass\nauth-user-pass username-only\n",
+        )
+        .unwrap();
         assert!(safe.config.contains("auth-user-pass\n"));
         assert!(safe.config.contains("askpass\n"));
+        assert!(safe.config.contains("auth-user-pass username-only\n"));
         for directive in [
             "auth-user-pass /tmp/secret.txt",
             "askpass /tmp/key-password.txt",
-            "<auth-user-pass>",
+            "auth-user-pass a.txt b.txt",
+            "askpass username-only",
             "static-challenge OTP 1",
         ] {
             assert!(
@@ -596,6 +624,37 @@ mod tests {
                 "{directive}"
             );
         }
+    }
+
+    #[test]
+    fn credential_files_stage_as_assets_and_inline_blocks_pass_verbatim() {
+        let mut managed = BTreeMap::new();
+        managed.insert("assets/up.txt".to_string(), b"alice\ns3cret\n".to_vec());
+        managed.insert("assets/pass.txt".to_string(), b"key-pass\n".to_vec());
+        let safe = sanitize_openvpn_config(
+            "client\nremote vpn.example\nauth-user-pass \"assets/up.txt\"\naskpass assets/pass.txt\n",
+            &managed,
+            Path::new("/run/network-orchestrator/test"),
+        )
+        .unwrap();
+        assert!(safe
+            .config
+            .contains("auth-user-pass /run/network-orchestrator/test/asset-0\n"));
+        assert!(safe
+            .config
+            .contains("askpass /run/network-orchestrator/test/asset-1\n"));
+        assert_eq!(safe.assets[0].bytes, b"alice\ns3cret\n");
+        assert_eq!(safe.assets[1].bytes, b"key-pass\n");
+        assert!(!format!("{safe:?}").contains("s3cret"));
+        // Inline <auth-user-pass> reaches the runtime config verbatim —
+        // OpenVPN reads embedded credentials without a prompt.
+        let safe = sanitize(
+            "client\nremote vpn.example\n<auth-user-pass>\nalice\ns3cret\n</auth-user-pass>\n",
+        )
+        .unwrap();
+        assert!(safe
+            .config
+            .contains("<auth-user-pass>\nalice\ns3cret\n</auth-user-pass>\n"));
     }
 
     #[test]

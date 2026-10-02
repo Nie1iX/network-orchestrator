@@ -1,8 +1,8 @@
 use net_manager_core::daemon_protocol::OpenVpnCredentials;
 use net_manager_core::openvpn_config::{SanitizedOpenVpnConfig, MAX_ASSET_BYTES, MAX_CONFIG_BYTES};
 use net_manager_core::openvpn_management::{
-    management_password_reply, parse_management_line, ManagementEvent, PasswordPrompt,
-    MAX_MANAGEMENT_LINE_BYTES,
+    management_password_reply, parse_management_line, state_failure_detail, ManagementEvent,
+    PasswordPrompt, MAX_MANAGEMENT_LINE_BYTES,
 };
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -239,8 +239,14 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
             {
                 return Ok(vec![ManagementEvent::AuthenticationFailed]);
             }
-            if let Some(error) = prompt_error {
-                return Err(error);
+            if prompt_error.is_some() {
+                // The server asked for credentials the profile cannot
+                // supply — surface a typed event instead of a bare error so
+                // the failure reason reaches the status.
+                events.push(ManagementEvent::FailureDetail(
+                    net_manager_core::daemon_protocol::OpenVpnFailure::CredentialsRequired,
+                ));
+                return Ok(events);
             }
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -546,6 +552,9 @@ fn drain_management(pending: &mut Vec<u8>, input: &[u8]) -> io::Result<Vec<Manag
                 "OpenVPN management event is invalid",
             )
         })? {
+            if let Some(failure) = state_failure_detail(text) {
+                events.push(ManagementEvent::FailureDetail(failure));
+            }
             events.push(event);
         }
     }
@@ -796,9 +805,14 @@ mod tests {
         let events = runner.poll("ovpn-abcd").unwrap();
         assert!(matches!(
             events.as_slice(),
-            [ManagementEvent::State(
-                net_manager_core::openvpn_management::OpenVpnState::Reconnecting
-            )]
+            [
+                ManagementEvent::FailureDetail(
+                    net_manager_core::daemon_protocol::OpenVpnFailure::ConnectionLost
+                ),
+                ManagementEvent::State(
+                    net_manager_core::openvpn_management::OpenVpnState::Reconnecting
+                )
+            ]
         ));
         let expected = format!("{auth_reply}{key_reply}");
         let mut received = vec![0; expected.len()];
@@ -831,9 +845,14 @@ mod tests {
         );
         peer.write_all(b">PASSWORD:Need 'Private Key' password\n")
             .unwrap();
-        let error = runner.poll("ovpn-abcd").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(!error.to_string().contains("Private Key"));
+        let events = runner.poll("ovpn-abcd").unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [ManagementEvent::FailureDetail(
+                net_manager_core::daemon_protocol::OpenVpnFailure::CredentialsRequired
+            )]
+        ));
+        assert!(!format!("{events:?}").contains("Private Key"));
         runner.stop("ovpn-abcd").unwrap();
     }
 
@@ -876,6 +895,34 @@ mod tests {
             .is_empty());
         assert_eq!(drain_management(&mut pending, b"7\n").unwrap().len(), 1);
         assert!(drain_management(&mut pending, &vec![b'X'; 16 * 1024 + 1]).is_err());
+    }
+
+    #[test]
+    fn state_lines_emit_sanitized_failure_details_before_the_state() {
+        let mut pending = Vec::new();
+        let events = drain_management(
+            &mut pending,
+            b">STATE:1,RECONNECTING,tls-error\n>STATE:2,EXITING,exit-with-error\n>STATE:3,CONNECTED,SUCCESS\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ManagementEvent::FailureDetail(
+                    net_manager_core::daemon_protocol::OpenVpnFailure::TlsError
+                ),
+                ManagementEvent::State(
+                    net_manager_core::openvpn_management::OpenVpnState::Reconnecting
+                ),
+                ManagementEvent::FailureDetail(
+                    net_manager_core::daemon_protocol::OpenVpnFailure::ExitWithError
+                ),
+                ManagementEvent::State(net_manager_core::openvpn_management::OpenVpnState::Exiting),
+                ManagementEvent::State(
+                    net_manager_core::openvpn_management::OpenVpnState::Connected
+                )
+            ]
+        ));
     }
 
     #[test]

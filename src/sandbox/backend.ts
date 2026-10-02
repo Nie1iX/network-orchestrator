@@ -1,6 +1,6 @@
 import type {
   AlwaysOnListResult, BackendAvailability, ConditionalRuleEntry, ConditionalRouteRule,
-  ConfigAnalysis, NetworkInterface, Profile, ProfileInspection, RouteEntry, RouteMap,
+  ConfigAnalysis, DomainPolicy, NetworkInterface, Profile, ProfileInspection, RouteEntry, RouteMap,
   TunnelStatus, VpnAuthMode,
 } from "../types.ts";
 
@@ -35,7 +35,7 @@ export class SandboxBackend {
   private profiles: Profile[] = [
     profile("wg", "QA WireGuard", "wireGuard", "10.77.0.0/24"),
     profile("ovpn", "QA OpenVPN", "openVpn", "10.88.0.0/24"),
-    profile("xray", "AcmeVPN - ⚡ Нидерланды", "xray"),
+    profile("xray", "AcmeVPN · ⚡ Нидерланды", "xray"),
     profile("static", "QA Static routes", "none", "203.0.113.0/24"),
   ];
   private running = new Set<string>();
@@ -49,14 +49,9 @@ export class SandboxBackend {
   private authMode: VpnAuthMode = "fullTunnelOnly";
   private recovered = false;
   private endpoints = [
-    "AcmeVPN - ⚡ Нидерланды",
-    "AcmeVPN - 🇩🇪 Германия",
-    "AcmeVPN - 🇫🇮 Финляндия",
-    "AcmeVPN - 🇯🇵 Япония",
-    "AcmeVPN - 🇺🇸 США",
-    "AcmeVPN - 🇧🇷 Бразилия",
-    "AcmeVPN - 🇸🇬 Сингапур",
-    "AcmeVPN - 🇵🇱 Польша",
+    "AcmeVPN · ⚡ Нидерланды", "AcmeVPN · 🇩🇪 Германия", "AcmeVPN · 🇫🇮 Финляндия",
+    "AcmeVPN · 🇯🇵 Япония", "AcmeVPN · 🇺🇸 США", "AcmeVPN · 🇧🇷 Бразилия",
+    "AcmeVPN · 🇸🇬 Сингапур", "AcmeVPN · 🇬🇧 Великобритания",
   ];
   private backendPaths = new Map<string, string>();
   private xrayManaged = false;
@@ -185,6 +180,10 @@ export class SandboxBackend {
       case "get_routes": return this.routes();
       case "get_tunnel_statuses": return this.statuses();
       case "daemon_status": return { state: "ready", message: "Simulated daemon: host network is never modified." };
+      case "system_proxy_status": {
+        const owner = this.profiles.find((p) => this.running.has(p.id) && p.useSystemProxy);
+        return { ownerProfileId: owner?.id ?? null, ownerName: owner?.name ?? null };
+      }
       case "is_elevated": return false;
       case "get_auto_connect_result": return null;
       case "get_always_on_profiles": return this.enrollment;
@@ -367,6 +366,101 @@ export class SandboxBackend {
         const idx = this.condRules.findIndex((e) => e.rule.id === args.ruleId);
         if (idx >= 0) this.condRules.splice(idx, 1);
         return { removed: idx >= 0 };
+      }
+      case "parse_happ_routing": {
+        // Sandbox preview only understands raw JSON — base64/deeplink
+        // inputs are a native-parser feature.
+        const raw = JSON.parse(String(args.payload)) as Record<string, unknown>;
+        const pick = (key: string) =>
+          Object.entries(raw).find(([k]) => k.toLowerCase() === key.toLowerCase())?.[1];
+        const list = (v: unknown) =>
+          Array.isArray(v) ? v.filter((s): s is string => typeof s === "string") : [];
+        const policies: DomainPolicy[] = [];
+        for (const [target, sites, ips] of [
+          ["block", "BlockSites", "BlockIp"],
+          ["proxy", "ProxySites", "ProxyIp"],
+          ["direct", "DirectSites", "DirectIp"],
+        ] as const) {
+          const domains = [...list(pick(sites)), ...list(pick(ips))];
+          if (domains.length) policies.push({ domains, target });
+        }
+        if (policies.length === 0) throw new Error("invalid Happ routing profile: no recognizable fields");
+        return {
+          name: typeof pick("Name") === "string" ? pick("Name") : null,
+          domainPolicies: policies,
+          privateLanDirect: typeof pick("bypassPrivateIPs") === "boolean" ? pick("bypassPrivateIPs") : null,
+          domainStrategy: null,
+          domainMatcher: null,
+          dns: { servers: [], hosts: {}, fakeDns: false, queryStrategy: null },
+          geoipUrl: null,
+          geositeUrl: null,
+          warnings: [],
+        };
+      }
+      case "xray_test_route": {
+        // Lite simulator: literal domain/keyword selectors only — geo
+        // lookups and DNS pins are native-side.
+        const req = args.request as {
+          target: string;
+          domainPolicies: DomainPolicy[];
+          privateLanDirect: boolean;
+        };
+        const host = String(req.target).split("://").pop()!.split("/")[0].split("@").pop()!;
+        const bare = host.replace(/^\[|\].*$/g, "").split(":")[0].toLowerCase();
+        const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(bare) || bare.includes(":") || /^[0-9a-f:]+$/i.test(bare) && bare.includes(":");
+        const matchSel = (sel: string): boolean | null => {
+          if (sel.startsWith("geosite:") || sel.startsWith("geoip:") || sel.startsWith("regexp:")) return null;
+          if (sel.startsWith("keyword:")) return !isIp && bare.includes(sel.slice(8));
+          if (sel.startsWith("full:")) return !isIp && bare === sel.slice(5);
+          const pat = sel.startsWith("domain:") ? sel.slice(7) : sel;
+          if (isIp) {
+            if (pat.includes("/")) {
+              const [net, bits] = pat.split("/");
+              const toInt = (s: string) => s.split(".").reduce((a, o) => (a << 8) + Number(o), 0) >>> 0;
+              if (!/^\d+\.\d+\.\d+\.\d+$/.test(net)) return false;
+              const mask = bits === "0" ? 0 : (0xffffffff << (32 - Number(bits))) >>> 0;
+              return (toInt(bare) & mask) === (toInt(net) & mask);
+            }
+            return bare === pat;
+          }
+          return bare === pat || bare.endsWith(`.${pat}`);
+        };
+        let outcome: { outbound: string; source: string; policyIndex?: number; selector?: string } =
+          { outbound: "proxy", source: "default" };
+        let sawUnknown = false;
+        const steps: { label: string; selector?: string; outcome: string }[] = [];
+        outer: for (const [index, policy] of (req.domainPolicies ?? []).entries()) {
+          let unknown = false;
+          for (const raw of policy.domains) {
+            const sel = raw.trim();
+            if (!sel || sel.startsWith("#")) continue;
+            const hit = matchSel(sel);
+            if (hit === true) {
+              steps.push({ label: `${policy.target} rules #${index + 1}`, selector: sel, outcome: "match" });
+              outcome = { outbound: policy.target, source: "policy", policyIndex: index, selector: sel };
+              break outer;
+            }
+            if (hit === null) { unknown = true; sawUnknown = true; }
+          }
+          steps.push({ label: `${policy.target} rules #${index + 1}`, outcome: unknown ? "unknown" : "miss" });
+        }
+        if (outcome.source === "default") {
+          if (req.privateLanDirect && isIp && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|169\.254\.)/.test(bare)) {
+            outcome = { outbound: "direct", source: "privateLan", selector: "privateLanDirect" };
+          }
+          steps.push({ label: "default", outcome: "match" });
+        }
+        return {
+          target: bare,
+          targetKind: isIp ? "ip" : "domain",
+          outbound: outcome.outbound,
+          source: outcome.source,
+          policyIndex: outcome.policyIndex,
+          matchedSelector: outcome.selector,
+          certainty: sawUnknown ? "probable" : "certain",
+          steps,
+          notes: sawUnknown ? ["geoip/geosite selectors could not be evaluated: no geo assets on disk"] : [],
+        };
       }
       case "plugin:dialog|ask":
       case "plugin:dialog|confirm": return true;

@@ -168,7 +168,13 @@ impl fmt::Debug for PushedNetworkConfig {
 
 pub enum ManagementEvent {
     State(OpenVpnState),
-    ByteCount { received: u64, sent: u64 },
+    /// Sanitized failure kind parsed from the `STATE` detail field, or
+    /// synthesized by the daemon when a password prompt goes unanswered.
+    FailureDetail(crate::daemon_protocol::OpenVpnFailure),
+    ByteCount {
+        received: u64,
+        sent: u64,
+    },
     PasswordPrompt(PasswordPrompt),
     AuthenticationFailed,
     PushReply(PushedNetworkConfig),
@@ -178,6 +184,7 @@ impl fmt::Debug for ManagementEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::State(state) => f.debug_tuple("State").field(state).finish(),
+            Self::FailureDetail(failure) => f.debug_tuple("FailureDetail").field(failure).finish(),
             Self::ByteCount { received, sent } => f
                 .debug_struct("ByteCount")
                 .field("received", received)
@@ -193,6 +200,10 @@ impl fmt::Debug for ManagementEvent {
 #[derive(Default)]
 pub struct ManagementSnapshot {
     pub state: Option<OpenVpnState>,
+    /// The last sanitized failure detail observed on a
+    /// reconnecting/exiting state, or `CredentialsRequired` synthesized
+    /// when a password prompt could not be answered.
+    pub last_failure: Option<crate::daemon_protocol::OpenVpnFailure>,
     pub received: u64,
     pub sent: u64,
     pub active_push: Option<PushedNetworkConfig>,
@@ -226,10 +237,24 @@ impl ManagementSnapshot {
                     _ => Some(push),
                 };
             }
+            ManagementEvent::FailureDetail(failure) => {
+                // Keep the most informative reason: generic exit wrappers
+                // must not overwrite a specific failure detail.
+                let generic = matches!(
+                    failure,
+                    crate::daemon_protocol::OpenVpnFailure::ExitWithError
+                        | crate::daemon_protocol::OpenVpnFailure::ExitNotification
+                );
+                if self.last_failure.is_none() || !generic {
+                    self.last_failure = Some(failure);
+                }
+            }
             ManagementEvent::AuthenticationFailed => {
                 self.state = Some(OpenVpnState::Exiting);
                 self.active_push = None;
                 self.pending_push = None;
+                self.last_failure =
+                    Some(crate::daemon_protocol::OpenVpnFailure::AuthenticationFailure);
             }
             ManagementEvent::PasswordPrompt(_) => {}
         }
@@ -327,6 +352,34 @@ pub fn parse_management_line(line: &str) -> Result<Option<ManagementEvent>, Mana
         }
     }
     Ok(None)
+}
+
+/// Maps the `STATE` detail field of terminal and reconnecting states to a
+/// sanitized failure kind. Only fixed OpenVPN keywords are recognized —
+/// the detail is a protocol token, never log text. Unknown details return
+/// `None`, leaving the failure reason unset rather than fabricated.
+pub fn state_failure_detail(line: &str) -> Option<crate::daemon_protocol::OpenVpnFailure> {
+    use crate::daemon_protocol::OpenVpnFailure as F;
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let data = line
+        .strip_prefix(">STATE:")
+        .or_else(|| line.strip_prefix("STATE:"))
+        .or_else(|| (line.as_bytes().first().is_some_and(u8::is_ascii_digit)).then_some(line))?;
+    let mut fields = data.split(',');
+    fields.next()?; // timestamp
+    fields.next()?; // state name — the detail is meaningful on any state
+    Some(match fields.next()? {
+        "auth-failure" => F::AuthenticationFailure,
+        "resolve-error" => F::ResolveError,
+        "connect-error" | "proxy-reconnect" => F::ConnectError,
+        "tls-error" | "tls-failed" => F::TlsError,
+        "connection-reset" | "ping-restart" | "ping-exit" | "inactive-exit" | "reconnect"
+        | "suspend" | "network-change" | "primary-changing" => F::ConnectionLost,
+        "exit-with-error" => F::ExitWithError,
+        "exit-with-notification" => F::ExitNotification,
+        "sigint" | "sigterm" | "sighup" | "sigusr1" => F::Terminated,
+        _ => return None,
+    })
 }
 
 /// Parses only network metadata from a PUSH_REPLY; all other pushed options are ignored.
@@ -693,6 +746,47 @@ mod tests {
             parse_management_line(">STATE:1720000000,lowercase,,,,"),
             Err(ManagementParseError::Malformed)
         ));
+    }
+
+    #[test]
+    fn state_detail_maps_to_sanitized_failure_kinds() {
+        use crate::daemon_protocol::OpenVpnFailure as F;
+        for (line, expected) in [
+            (">STATE:1,EXITING,exit-with-error,,,", F::ExitWithError),
+            (">STATE:1,EXITING,auth-failure,,,", F::AuthenticationFailure),
+            (">STATE:1,RECONNECTING,tls-error,,,", F::TlsError),
+            (">STATE:1,RECONNECTING,resolve-error,,,", F::ResolveError),
+            (">STATE:1,TCP_CONNECT,connect-error,,,", F::ConnectError),
+            ("1720000001,RECONNECTING,ping-restart,,,", F::ConnectionLost),
+            (">STATE:1,EXITING,sigterm,,,", F::Terminated),
+            (
+                ">STATE:1,EXITING,exit-with-notification,,,",
+                F::ExitNotification,
+            ),
+            (">STATE:1,RECONNECTING,proxy-reconnect,,,", F::ConnectError),
+        ] {
+            assert_eq!(state_failure_detail(line), Some(expected), "{line}");
+        }
+        for line in [
+            ">STATE:1,CONNECTED,SUCCESS,10.8.0.2",
+            ">STATE:1,EXITING,openvpn-specific-unknown-detail,,,",
+            ">STATE:1,EXITING,,,,",
+            ">LOG:1,N,EXITING,exit-with-error",
+        ] {
+            assert_eq!(state_failure_detail(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn generic_exit_detail_does_not_hide_a_specific_failure() {
+        use crate::daemon_protocol::OpenVpnFailure as F;
+        let mut snapshot = ManagementSnapshot::default();
+        snapshot.apply(ManagementEvent::FailureDetail(F::TlsError));
+        snapshot.apply(ManagementEvent::State(OpenVpnState::Exiting));
+        snapshot.apply(ManagementEvent::FailureDetail(F::ExitWithError));
+        assert_eq!(snapshot.last_failure, Some(F::TlsError));
+        snapshot.apply(ManagementEvent::FailureDetail(F::AuthenticationFailure));
+        assert_eq!(snapshot.last_failure, Some(F::AuthenticationFailure));
     }
 
     #[test]

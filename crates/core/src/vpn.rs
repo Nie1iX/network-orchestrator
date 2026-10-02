@@ -502,7 +502,12 @@ fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
     let with_policies = crate::xray::apply_profile_routing(
         &base,
         &profile.domain_policies,
-        profile.private_lan_direct,
+        &crate::xray::ProfileRoutingOptions {
+            private_lan_direct: profile.private_lan_direct,
+            domain_strategy: profile.xray_domain_strategy,
+            domain_matcher: profile.xray_domain_matcher,
+            dns: profile.xray_dns.clone(),
+        },
     )
     .map_err(|_| invalid_data("failed to apply Xray routing policies"))?;
     let merged = if profile.xray_mode == crate::models::XrayMode::Tun {
@@ -705,7 +710,9 @@ pub fn redact_runtime_log(text: &str) -> String {
         out.push_str(&text[i..i + len]);
         i += len;
     }
-    out
+    // Second pass: mask public IPs and hostnames — runtimes log remote
+    // endpoints freely, and a surfaced tail should not reveal them.
+    crate::log_sanitize::sanitize_log_text(&out)
 }
 
 fn utf8_len(lead: u8) -> usize {
@@ -1887,10 +1894,14 @@ mod tests {
         let bytes = prepare_xray_config(&profile).unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let rules = doc["routing"]["rules"].as_array().unwrap();
-        assert_eq!(rules.len(), 2);
+        assert_eq!(rules.len(), 3);
         assert_eq!(rules[0]["domain"], serde_json::json!(["example.com"]));
         assert_eq!(rules[0]["outboundTag"], "proxy");
         assert_eq!(rules[1]["outboundTag"], "network-orchestrator-direct");
+        assert_eq!(
+            rules[2]["ip"],
+            serde_json::json!(["224.0.0.0/4", "ff00::/8"])
+        );
         assert!(!String::from_utf8_lossy(&bytes).contains(&path.display().to_string()));
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1913,7 +1924,11 @@ mod tests {
             config["routing"]["rules"][0]["ip"],
             serde_json::json!(["geoip:us"])
         );
-        assert_eq!(config["routing"]["rules"][1]["ip"][0], "10.0.0.0/8");
+        assert_eq!(
+            config["routing"]["rules"][1]["ip"],
+            serde_json::json!(["224.0.0.0/4", "ff00::/8"])
+        );
+        assert_eq!(config["routing"]["rules"][2]["ip"][0], "10.0.0.0/8");
         fs::remove_dir_all(&dir).unwrap();
     }
 

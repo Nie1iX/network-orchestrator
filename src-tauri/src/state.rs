@@ -34,7 +34,7 @@ pub(crate) struct AppState {
     #[cfg_attr(all(target_os = "linux", target_arch = "x86_64"), allow(dead_code))]
     pub(crate) managed_xray_root: PathBuf,
     /// Per-profile downloaded geoip.dat/geosite.dat overrides
-    /// (`geoassets/<profile-id>/`).
+    /// (`geoassets/<sha256(url-pair)[:16]>/` — shared between profiles).
     #[cfg(target_os = "linux")]
     pub(crate) geo_assets_root: PathBuf,
     pub(crate) backend_install_lock: tokio::sync::Mutex<()>,
