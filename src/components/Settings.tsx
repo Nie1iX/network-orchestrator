@@ -10,8 +10,10 @@ import {
   AppMode,
   setAppMode,
   setProfileListMode,
+  setScanLocalProxies,
   useAppMode,
   useProfileListMode,
+  useScanLocalProxies,
 } from "../prefs";
 import {
   readAppearance,
@@ -52,6 +54,7 @@ export default function Settings() {
   const [vpnAuthError, setVpnAuthError] = useState<string | null>(null);
   const listMode = useProfileListMode();
   const appMode = useAppMode();
+  const scanLocalProxies = useScanLocalProxies();
   const locale = useLanguage();
   const [appearance, setAppearance] = useState<Appearance>(readAppearance);
   const t = useT();
@@ -242,6 +245,25 @@ export default function Settings() {
                   </option>
                 </select>
               </div>
+              {caps?.os === "linux" && (
+                <div className="settings-row">
+                  <div className="settings-row-main">
+                    <span className="settings-row-label">
+                      {t("settings.scanLocalProxies")}
+                    </span>
+                    <span className="settings-row-sub">
+                      {t("settings.scanLocalProxiesSub")}
+                    </span>
+                  </div>
+                  <ToggleSwitch
+                    checked={scanLocalProxies}
+                    onChange={() =>
+                      setScanLocalProxies(!scanLocalProxies)
+                    }
+                    title={t("settings.scanLocalProxies")}
+                  />
+                </div>
+              )}
             </div>
           </div>
 

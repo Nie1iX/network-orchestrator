@@ -567,6 +567,17 @@ export interface NmListResult {
   available: boolean;
 }
 
+// ── Localhost proxy discovery (opt-in scan) ───────────────────────────
+
+export type LocalProxyKind = "socks5" | "socks4" | "http";
+
+/** A loopback listener that passed a real SOCKS/HTTP proxy handshake probe. */
+export interface LocalProxy {
+  address: string;
+  port: number;
+  kind: LocalProxyKind;
+}
+
 // ── Conditional rules (Linux daemon) ──────────────────────────────────
 
 /** When a conditional rule's routes may be installed. */
