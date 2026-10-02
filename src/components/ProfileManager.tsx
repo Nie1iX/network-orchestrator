@@ -3,7 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation, requiresElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
-import { useAppMode, useProfileListMode } from "../prefs";
+import {
+  useAppMode,
+  useProfileListMode,
+  useScanLocalProxies,
+} from "../prefs";
 import { providerPrefix } from "../subscriptions";
 import { popupNativeMenu, MenuEntry } from "../nativeMenu";
 import { useT } from "../i18n";
@@ -14,6 +18,7 @@ import {
   ChevronIcon,
   InfoIcon,
   kindIcon,
+  LoopbackIcon,
   NetworkIcon,
   PlusIcon,
   TailscaleIcon,
@@ -52,6 +57,7 @@ import {
   AlwaysOnListResult,
   AlwaysOnSetResult,
   BatchImportResult,
+  LocalProxy,
   NetworkInterface,
   NmConnection,
   NmConnectionKind,
@@ -564,6 +570,33 @@ export default function ProfileManager() {
       clearInterval(interval);
     };
   }, [refreshNm]);
+
+  // Opt-in localhost proxy discovery: real SOCKS/HTTP handshake probes,
+  // listed as suggestions only — nothing is routed through them.
+  const scanLocalProxies = useScanLocalProxies();
+  const [proxies, setProxies] = useState<LocalProxy[]>([]);
+  const refreshProxies = useCallback(async () => {
+    if (!scanLocalProxies || caps?.os !== "linux") {
+      setProxies([]);
+      return;
+    }
+    try {
+      setProxies(await invoke<LocalProxy[]>("scan_local_proxies"));
+    } catch {
+      setProxies([]);
+    }
+  }, [scanLocalProxies, caps?.os]);
+
+  useEffect(() => {
+    void refreshProxies();
+    const onChanged = () => void refreshProxies();
+    window.addEventListener("route-changed", onChanged);
+    const interval = setInterval(() => void refreshProxies(), 15000);
+    return () => {
+      window.removeEventListener("route-changed", onChanged);
+      clearInterval(interval);
+    };
+  }, [refreshProxies]);
 
   // NM owns the profile lifecycle; we only ask it to activate/deactivate.
   const onToggleNm = async (conn: NmConnection) => {
@@ -1877,6 +1910,32 @@ export default function ProfileManager() {
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {scanLocalProxies && proxies.length > 0 && (
+        <div className="profile-group">
+          <div className="profile-group-label">
+            {t("profiles.localProxies")}
+          </div>
+          <div className="profile-rows">
+            {proxies.map((p) => (
+              <div
+                key={`${p.address}:${p.port}`}
+                className="profile-row profile-row-external"
+              >
+                <span className="status-dot state-running" />
+                <span className="backend-avatar backend-avatar-service">
+                  <LoopbackIcon size={14} />
+                </span>
+                <span className="profile-row-name">
+                  {p.address}:{p.port}
+                </span>
+                <span className="badge badge-external">{p.kind}</span>
+              </div>
+            ))}
+          </div>
+          <p className="external-note">{t("profiles.localProxiesHint")}</p>
         </div>
       )}
         </div>

@@ -8,6 +8,7 @@ pub(crate) mod happ_routing;
 pub(crate) mod logs;
 pub(crate) mod nm;
 pub(crate) mod profiles;
+pub(crate) mod proxies;
 pub(crate) mod recovery;
 pub(crate) mod route_check;
 pub(crate) mod route_map;
@@ -35,6 +36,7 @@ pub(crate) use profiles::{
     refresh_subscription, reorder_profiles, save_profile, save_vless_profile,
     save_wireguard_profile, set_subscription_refresh_interval, switch_subscription_endpoint,
 };
+pub(crate) use proxies::scan_local_proxies;
 pub(crate) use recovery::{cleanup_recovery, get_recovery_report};
 pub(crate) use route_check::xray_test_route;
 pub(crate) use route_map::get_route_map;

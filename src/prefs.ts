@@ -78,6 +78,35 @@ export function useRoutesPrefs(): RoutesPrefs {
   return prefs;
 }
 
+const SCAN_LOCAL_PROXIES_KEY = "netmanager.scan.localProxies";
+
+export function getScanLocalProxies(): boolean {
+  try {
+    return localStorage.getItem(SCAN_LOCAL_PROXIES_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function setScanLocalProxies(on: boolean): void {
+  try {
+    localStorage.setItem(SCAN_LOCAL_PROXIES_KEY, on ? "1" : "0");
+  } catch {
+    // ignore storage errors (e.g. storage disabled)
+  }
+  window.dispatchEvent(new CustomEvent(PREFS_EVENT));
+}
+
+export function useScanLocalProxies(): boolean {
+  const [on, setOn] = useState<boolean>(getScanLocalProxies);
+  useEffect(() => {
+    const handler = () => setOn(getScanLocalProxies());
+    window.addEventListener(PREFS_EVENT, handler);
+    return () => window.removeEventListener(PREFS_EVENT, handler);
+  }, []);
+  return on;
+}
+
 export type AppMode = "orchestrator" | "manager" | "combined";
 
 const APP_MODE_KEY = "netmanager.app.mode";
