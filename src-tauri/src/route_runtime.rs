@@ -1,6 +1,6 @@
 use net_manager_core::models::{AppliedProfileRoutes, AppliedRoute, NetworkInterface, Profile};
 #[cfg(target_os = "linux")]
-use net_manager_core::policy::plan_profile_routes;
+use net_manager_core::policy::plan_profile;
 use net_manager_core::policy::PolicyManager;
 use net_manager_core::route_state::{
     AppliedRouteDocument, AppliedRouteStore, APPLIED_ROUTE_DOCUMENT_VERSION,
@@ -12,8 +12,8 @@ use std::path::Path;
 use crate::daemon_client::{user_message, DaemonClient};
 #[cfg(target_os = "linux")]
 use net_manager_core::daemon_protocol::{
-    method, OwnedListResult, OwnedResource, OwnerParams, RoutesApplyParams, RoutesApplyResult,
-    RoutesRemoveResult,
+    method, AttachSpecParams, OwnedListResult, OwnedResource, OwnerParams, RoutesApplyParams,
+    RoutesApplyResult, RoutesRemoveResult,
 };
 
 #[allow(dead_code)]
@@ -120,13 +120,26 @@ impl RouteRuntime {
             }
             #[cfg(target_os = "linux")]
             Self::Daemon(client) => {
-                let routes = plan_profile_routes(profile, interfaces).map_err(|e| e.to_string())?;
+                let plan = plan_profile(profile, interfaces).map_err(|e| e.to_string())?;
+                let mut routes = plan.routes.clone();
+                routes.extend(plan.bypasses.iter().cloned());
+                // Deferred binding or endpoint bypasses arm a daemon-side
+                // spec: reconcile re-derives routes from the interface name
+                // and the live uplink instead of trusting one ifindex.
+                let attach = ((profile.wait_for_interface && !profile.interface_name.is_empty())
+                    || !profile.endpoint_bypasses.is_empty())
+                .then(|| AttachSpecParams {
+                    interface_name: profile.interface_name.clone(),
+                    routes: profile.routes.clone(),
+                    endpoint_bypasses: profile.endpoint_bypasses.clone(),
+                });
                 let _: RoutesApplyResult = client
                     .request(
                         method::ROUTES_APPLY,
                         RoutesApplyParams {
                             owner: profile.id.clone(),
                             routes: routes.clone(),
+                            attach,
                         },
                     )
                     .await

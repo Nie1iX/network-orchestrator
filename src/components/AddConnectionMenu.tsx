@@ -31,6 +31,9 @@ interface AddConnectionMenuProps {
   onClose: () => void;
   onChooseImport: () => void;
   onChooseBackend: (backend: TunnelBackend) => void;
+  /** Orchestrator mode: only route-only profiles may be created — no
+   * managed backends and no config import. */
+  allowManaged?: boolean;
 }
 
 export default function AddConnectionMenu({
@@ -38,11 +41,16 @@ export default function AddConnectionMenu({
   onClose,
   onChooseImport,
   onChooseBackend,
+  allowManaged = true,
 }: AddConnectionMenuProps) {
   const t = useT();
+  const options = allowManaged
+    ? BACKEND_OPTIONS
+    : BACKEND_OPTIONS.filter((opt) => opt.backend === "none");
   return (
     <Modal open={open} title={t("add.title")} onClose={onClose} maxWidth="480px">
       <div className="add-connection-list">
+        {allowManaged && (
         <button
           type="button"
           className="add-connection-option"
@@ -60,7 +68,8 @@ export default function AddConnectionMenu({
             </span>
           </span>
         </button>
-        {BACKEND_OPTIONS.map((opt) => (
+        )}
+        {options.map((opt) => (
           <button
             key={opt.backend}
             type="button"

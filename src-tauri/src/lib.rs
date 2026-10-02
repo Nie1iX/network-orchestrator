@@ -118,6 +118,8 @@ pub fn run() {
             lookup_destination,
             set_interface_state,
             stop_external_tunnel,
+            nm_list_connections,
+            nm_set_active,
             get_always_on_profiles,
             set_always_on_profile,
             remove_always_on_profile,

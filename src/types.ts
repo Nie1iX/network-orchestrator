@@ -285,6 +285,10 @@ export interface Profile {
   xrayDns?: XrayDnsConfig;
   /** Linux TUN: def1 halves instead of a single default route. */
   xraySplitDefault?: boolean;
+  /** Hosts pinned to the physical uplink, bypassing foreign capture tunnels. */
+  endpointBypasses?: string[];
+  /** Keep declared routes armed while the target interface is absent. */
+  waitForInterface?: boolean;
 }
 
 export type TunnelState = "stopped" | "running" | "failed";
@@ -538,6 +542,29 @@ export interface TailscaleStatusResult {
   selfIps: string[];
   exitNodeActive: boolean;
   peers: TailscalePeer[];
+}
+
+// ── NetworkManager connections (Linux daemon) ─────────────────────────
+
+export type NmConnectionKind = "wireGuard" | "openVpn" | "vpn" | "other";
+
+export type NmConnectionState = "inactive" | "activating" | "active";
+
+/** A NetworkManager VPN/WireGuard profile. The uuid is the activation
+ * handle only — never shown in the UI. */
+export interface NmConnection {
+  uuid: string;
+  id: string;
+  kind: NmConnectionKind;
+  /** Bound device interface while the connection is active. */
+  interfaceName: string | null;
+  state: NmConnectionState;
+}
+
+export interface NmListResult {
+  connections: NmConnection[];
+  /** False when NetworkManager is absent or D-Bus is unreachable. */
+  available: boolean;
 }
 
 // ── Conditional rules (Linux daemon) ──────────────────────────────────

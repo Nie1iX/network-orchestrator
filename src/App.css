@@ -1809,6 +1809,12 @@ a:focus-visible,
   border-color: var(--warn-border);
 }
 
+.badge-armed {
+  color: var(--info);
+  background-color: var(--info-bg);
+  border-color: var(--info-border);
+}
+
 .profile-row-meta.warn {
   color: var(--warn);
 }
