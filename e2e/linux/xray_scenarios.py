@@ -30,7 +30,9 @@ def run(*args, input_text=None):
         args, input=input_text, text=True, capture_output=True, check=False
     )
     if result.returncode:
-        raise RuntimeError(f"E2E command failed: {args[0]} {args[1]}")
+        raise RuntimeError(
+            f"E2E command failed: {args[0]} {args[1]}: {result.stderr.strip()}"
+        )
     return result.stdout.strip()
 
 
