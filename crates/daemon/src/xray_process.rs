@@ -79,9 +79,12 @@ pub trait XrayProcessRunner: Send {
         ))
     }
     fn health(&mut self, name: &str) -> io::Result<bool>;
-    /// `(rx, tx)` bytes seen by the TUN inbound, queried over the local
-    /// StatsService dokodemo door on `api_port`. Runners without stats
-    /// support keep the default failure and the caller reports `None`.
+    /// `(rx, tx)` bytes seen by the TUN inbound. The primary source is the
+    /// link's sysfs counters (a statsquery subprocess per poll is too slow
+    /// to run while the core mutex is held); the local StatsService
+    /// dokodemo door on `api_port` is the fallback when link stats are
+    /// missing. Runners without stats support keep the default failure and
+    /// the caller reports `None`.
     fn query_stats(&mut self, name: &str, api_port: u16) -> io::Result<(u64, u64)> {
         let _ = (name, api_port);
         Err(io::Error::new(
@@ -370,6 +373,9 @@ impl XrayProcessRunner for TrustedXrayProcess {
                 "Xray child is not tracked",
             ));
         }
+        if let Ok(stats) = tun_byte_counters(&iface_stats_dir(name)) {
+            return Ok(stats);
+        }
         let output = run_statsquery(&trusted_binary()?, api_port)?;
         let stats = parse_statsquery(&output);
         Ok(stats)
@@ -556,6 +562,32 @@ fn ensure_runtime_root() -> io::Result<()> {
 
 #[cfg(target_os = "linux")]
 const STATSQUERY_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Byte counters of the TUN link straight from sysfs. Spawning `xray api
+/// statsquery` per poll takes seconds (fresh gRPC client per call) while
+/// the daemon core mutex is held, so kernel link stats are the primary
+/// source and the stats api stays only as a fallback.
+#[cfg(target_os = "linux")]
+fn tun_byte_counters(stats_dir: &Path) -> io::Result<(u64, u64)> {
+    let counter = |file: &str| -> io::Result<u64> {
+        fs::read_to_string(stats_dir.join(file))?
+            .trim()
+            .parse()
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "interface counter is malformed")
+            })
+    };
+    // tun rx = bytes apps pushed into Xray (upload); tx = bytes Xray wrote
+    // back to apps (download). Callers count rx/tx from the client's point
+    // of view, hence the swap.
+    Ok((counter("tx_bytes")?, counter("rx_bytes")?))
+}
+
+/// `/sys/class/net/<link>/statistics` for the managed TUN link.
+#[cfg(target_os = "linux")]
+fn iface_stats_dir(name: &str) -> PathBuf {
+    Path::new("/sys/class/net").join(name).join("statistics")
+}
 
 /// `xray api statsquery -server=127.0.0.1:<port>` against the managed
 /// binary; the counter list is small enough to read after exit.
@@ -1151,6 +1183,31 @@ mod tests {
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    #[test]
+    fn tun_counters_map_iface_stats_to_client_rx_tx() {
+        let root = temp_root();
+        let stats = root.join("statistics");
+        fs::create_dir(&stats).unwrap();
+        // tun rx = bytes apps fed into Xray (upload); tx = bytes Xray handed
+        // back to apps (download). Client-facing rx/tx swaps them.
+        fs::write(stats.join("rx_bytes"), "1000\n").unwrap();
+        fs::write(stats.join("tx_bytes"), "2000\n").unwrap();
+        assert_eq!(tun_byte_counters(&stats).unwrap(), (2000, 1000));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn tun_counters_reject_missing_or_malformed_stats() {
+        let root = temp_root();
+        assert!(tun_byte_counters(&root.join("statistics")).is_err());
+        let stats = root.join("statistics");
+        fs::create_dir(&stats).unwrap();
+        fs::write(stats.join("rx_bytes"), "nope").unwrap();
+        fs::write(stats.join("tx_bytes"), "1").unwrap();
+        assert!(tun_byte_counters(&stats).is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
