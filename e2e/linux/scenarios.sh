@@ -284,4 +284,80 @@ ip link del e2econd1
 expect_eq "$(python3 "$CLIENT" owned.list)" '{"owners": []}' "no owners left after conditional scenario"
 expect_eq "$(python3 "$CLIENT" condRules.list)" '{"rules": []}' "no rules left after conditional scenario"
 
+step "attach: deferred routes bind to an interface by name"
+
+# The spec arms with no route while e2eext0 does not exist yet.
+out=$(python3 "$CLIENT" routes.apply '{"owner":"attach","routes":[],"attach":{"interfaceName":"e2eext0","routes":[{"destination":"198.51.100.0/24","metric":7}],"endpointBypasses":[]}}' 2>&1) \
+    || fail "attach apply: $out"
+ours -4 | grep -q "198.51.100.0/24" && fail "route installed before the interface exists" || ok "route deferred while e2eext0 absent"
+python3 "$CLIENT" owned.list | python3 -c 'import json,sys; sys.exit(0 if any(r.get("kind")=="attachSpec" for o in json.load(sys.stdin)["owners"] for r in o["resources"]) else 1)' \
+    && ok "attach spec journaled" || fail "owned.list: $(python3 "$CLIENT" owned.list)"
+
+# When the external client creates the interface, reconcile installs the
+# declared routes on its current ifindex.
+ip link add e2eext0 type dummy
+ip link set e2eext0 up
+seen=0
+for _ in $(seq 150); do
+    ours -4 | grep -q "^198.51.100.0/24 dev e2eext0" && { seen=1; break; }
+    sleep 0.2
+done
+[ "$seen" = 1 ] && ok "attach installs the route once e2eext0 appears" || fail "route not installed: $(ours -4)"
+
+# Deleting the interface withdraws the route; recreating it under a new
+# ifindex rebinds — the spec stays armed in between.
+ip link del e2eext0
+gone=0
+for _ in $(seq 100); do
+    ours -4 | grep -q "198.51.100.0/24" || { gone=1; break; }
+    sleep 0.2
+done
+[ "$gone" = 1 ] && ok "route withdrawn while e2eext0 absent" || fail "route survived link delete"
+python3 "$CLIENT" owned.list | python3 -c 'import json,sys; sys.exit(0 if any(r.get("kind")=="attachSpec" for o in json.load(sys.stdin)["owners"] for r in o["resources"]) else 1)' \
+    && ok "spec still armed without the interface" || fail "spec lost"
+ip link add e2eext0 type dummy
+ip link set e2eext0 up
+seen=0
+for _ in $(seq 150); do
+    ours -4 | grep -q "^198.51.100.0/24 dev e2eext0" && { seen=1; break; }
+    sleep 0.2
+done
+[ "$seen" = 1 ] && ok "route rebinds after interface recreation" || fail "rebind: $(ours -4)"
+
+# An endpoint bypass pins a /32 to the physical default gateway, metric 50.
+# routes.apply is not an upsert: update the armed spec via remove + apply,
+# the same sequence the app drives when a profile's bypass list changes.
+GW_DEV=$(ip -j -4 route show default | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(rows[0]["dev"] if rows else "")')
+GW_IP=$(ip -j -4 route show default | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(rows[0].get("gateway","") if rows else "")')
+if [ -n "$GW_DEV" ] && [ -n "$GW_IP" ]; then
+    out=$(python3 "$CLIENT" routes.remove '{"owner":"attach"}' 2>&1) || fail "routes.remove before bypass reapply: $out"
+    out=$(python3 "$CLIENT" routes.apply '{"owner":"attach","routes":[],"attach":{"interfaceName":"e2eext0","routes":[{"destination":"198.51.100.0/24","metric":7}],"endpointBypasses":["192.0.2.87"]}}' 2>&1) \
+        || fail "attach apply with bypass: $out"
+    seen=0
+    for _ in $(seq 100); do
+        ours -4 | grep -q "^192.0.2.87 via $GW_IP dev $GW_DEV" && { seen=1; break; }
+        sleep 0.2
+    done
+    [ "$seen" = 1 ] && ok "endpoint bypass pinned to the uplink gateway" || fail "bypass: $(ours -4)"
+else
+    ok "no default gateway in container — bypass check skipped"
+fi
+
+# Removal withdraws every realized route and drops the spec.
+out=$(python3 "$CLIENT" routes.remove '{"owner":"attach"}' 2>&1) || fail "routes.remove attach: $out"
+gone=0
+for _ in $(seq 100); do
+    ours -4 | grep -qE "198.51.100.0/24|192.0.2.87" || { gone=1; break; }
+    sleep 0.2
+done
+[ "$gone" = 1 ] && ok "routes.remove withdraws attach routes" || fail "attach routes left: $(ours -4)"
+python3 "$CLIENT" owned.list | grep -q 'attach' && fail "attach owner left in journal" || ok "attach owner removed"
+ip link del e2eext0
+
+# Spec validation happens before any side effect.
+out=$(python3 "$CLIENT" routes.apply '{"owner":"attach","routes":[],"attach":{"interfaceName":"e2ebad","routes":[],"endpointBypasses":["bad host!"]}}' || true)
+echo "$out" | grep -q '"invalidParams"' && ok "invalid endpoint bypass rejected" || fail "bad endpoint: $out"
+
+expect_eq "$(python3 "$CLIENT" owned.list)" '{"owners": []}' "no owners left after attach scenario"
+
 printf '\nALL %d CHECKS PASSED\n' "$PASS"
