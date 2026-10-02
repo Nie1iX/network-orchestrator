@@ -70,6 +70,13 @@ pub mod method {
     pub const NM_LIST: &str = "nm.list";
     pub const NM_SET_ACTIVE: &str = "nm.setActive";
     pub const NET_TABLES: &str = "net.tables";
+    pub const NET_ROUTE_ADD: &str = "net.route.add";
+    pub const NET_ROUTE_DEL: &str = "net.route.del";
+    pub const NET_RULE_ADD: &str = "net.rule.add";
+    pub const NET_RULE_DEL: &str = "net.rule.del";
+    pub const NET_EXPLAIN: &str = "net.explain";
+    pub const NET_DNS_STATUS: &str = "net.dns.status";
+    pub const NET_DNS_PROBE: &str = "net.dns.probe";
 
     /// Methods implemented by the daemon and reported in `hello.capabilities`.
     pub const CAPABILITIES: &[&str] = &[
@@ -109,6 +116,13 @@ pub mod method {
         NM_LIST,
         NM_SET_ACTIVE,
         NET_TABLES,
+        NET_ROUTE_ADD,
+        NET_ROUTE_DEL,
+        NET_RULE_ADD,
+        NET_RULE_DEL,
+        NET_EXPLAIN,
+        NET_DNS_STATUS,
+        NET_DNS_PROBE,
     ];
 }
 
@@ -387,6 +401,9 @@ pub struct SystemRoute {
     pub table: u32,
     /// Route type rendered like `ip route`: `unicast`, `local`,
     /// `blackhole`, `unreachable`, … (`"type N"` for unknown codes).
+    /// Serialized as `routeType` — `kind` is the `OwnedResource` tag key
+    /// when a route is journaled as `NetRoute`/`SuppressedRoute`.
+    #[serde(rename = "routeType")]
     pub kind: String,
     /// Scope rendered like `ip route`: `universe`, `site`, `link`, `host`,
     /// `nowhere` (`"scope N"` for unknown codes).
@@ -475,6 +492,217 @@ pub struct NetTablesResult {
     /// should explain instead of showing empty tables.
     #[serde(default)]
     pub available: bool,
+}
+
+/// `net.route.add`: install a daemon-owned (`RTPROT`) unicast route.
+/// Exactly one of `interface_name`/`interface_index` must identify the
+/// output link. Tables `unspec`(0) and `local`(255) are rejected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetRouteAddParams {
+    pub destination: IpNet,
+    /// Target table; `None` means `main` (254).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_index: Option<u32>,
+    /// `None` installs metric 0 like plain `ip route add`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pref_source: Option<IpAddr>,
+}
+
+/// `net.route.del`: delete the route exactly as reported by `net.tables`.
+/// Foreign routes are journaled and re-installed when the manual owner is
+/// cleaned up — deletion is a temporary suppression, never permanent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetRouteDelParams {
+    pub route: SystemRoute,
+}
+
+/// `net.rule.add`: install a daemon-owned policy rule. `action` is
+/// implied `lookup` into `table`; wider actions are not editable yet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetRuleAddParams {
+    pub family: IpFamily,
+    /// `FRA_PRIORITY`; required so ordering is explicit.
+    pub priority: u32,
+    /// Lookup target table (`ip rule ... table N`).
+    pub table: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<IpNet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<IpNet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fwmark: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fwmask: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iifname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oifname: Option<String>,
+    #[serde(default)]
+    pub invert: bool,
+}
+
+/// `net.rule.del`: delete the rule exactly as reported by `net.tables`.
+/// Foreign rules follow the same suppress-and-restore journal contract
+/// as foreign routes. Priority 0 is never deletable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetRuleDelParams {
+    pub rule: SystemRule,
+}
+
+/// What a `net.*.del` call did with the kernel object.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NetEditOutcome {
+    /// A daemon-owned object was removed (journal updated).
+    Deleted,
+    /// A foreign object was removed and journaled for re-installation
+    /// when the manual owner is torn down.
+    Suppressed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetEditResult {
+    pub outcome: NetEditOutcome,
+}
+
+/// Reconciliation status of one intent piece, for `net.explain`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplainStatus {
+    /// Present in the kernel exactly as desired.
+    Effective,
+    /// Realization is pending — e.g. the target interface is absent.
+    Deferred,
+    /// The kernel holds an equivalent object that is not ours.
+    Conflicted,
+    /// Desired but absent from the kernel; reconcile will retry.
+    Missing,
+    /// An override (suppressed foreign object) is holding.
+    Active,
+}
+
+/// One line of `net.explain` output: why a journaled intent looks the way
+/// it does right now.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplainEntry {
+    /// Journal owner (`wg:home`, `manual`, `cond:…`, a client owner).
+    pub owner: String,
+    pub state: OwnedState,
+    /// `route`, `rule`, `attach`, `suppressed-route`, `suppressed-rule`,
+    /// `link`, `dns`, `process`.
+    pub kind: String,
+    /// Human-readable subject, e.g. `10.0.0.0/8 via wg0 table main`.
+    pub subject: String,
+    pub status: ExplainStatus,
+    /// Why it is in this status ("interface wg1 is absent", "foreign
+    /// route occupies destination", …). English, daemon-composed.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetExplainResult {
+    pub entries: Vec<ExplainEntry>,
+    /// False when the kernel dump was unavailable; statuses are unknown.
+    #[serde(default)]
+    pub available: bool,
+}
+
+/// DNS configuration of one link as systemd-resolved reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsLinkStatus {
+    pub interface_index: u32,
+    pub interface_name: String,
+    /// Currently configured DNS servers (`Link.DNS`).
+    pub servers: Vec<IpAddr>,
+    /// The server resolved would use next on this link
+    /// (`Link.CurrentDNSServer`).
+    pub current_server: Option<IpAddr>,
+    /// `Link.Domains` — `~.` style route domains, `true` marks route-only.
+    pub domains: Vec<DnsDomain>,
+    /// `Link.DefaultRoute` — whether general queries may use this link.
+    pub default_route: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsDomain {
+    pub domain: String,
+    pub route_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetDnsStatusResult {
+    pub links: Vec<DnsLinkStatus>,
+    /// False when systemd-resolved is unreachable (stub resolv.conf,
+    /// other resolver, …); the UI then shows the file's `nameserver`s.
+    #[serde(default)]
+    pub available: bool,
+    /// `nameserver` lines from /etc/resolv.conf — the stub view apps use.
+    #[serde(default)]
+    pub resolv_conf: Vec<IpAddr>,
+}
+
+/// `net.dns.probe`: send one real DNS query and report the path it took.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetDnsProbeParams {
+    /// A/AAAA name to resolve.
+    pub hostname: String,
+    /// Resolver to hit; `None` picks the current default-route link's
+    /// server (or the resolv.conf stub).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<IpAddr>,
+    /// Record family; `None` asks for A.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<IpFamily>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetDnsProbeResult {
+    /// Server the query was sent to.
+    pub server: IpAddr,
+    /// Route lookup for that server: source address the kernel picked.
+    pub source: Option<IpAddr>,
+    /// Output interface of the route lookup.
+    pub interface_index: Option<u32>,
+    pub interface_name: Option<String>,
+    /// Gateway the traffic would take (`None` = on-link).
+    pub gateway: Option<IpAddr>,
+    /// Answer RRs rendered like dig (`name TTL A 1.2.3.4`).
+    pub answers: Vec<String>,
+    /// DNS header status (`NOERROR`, `NXDOMAIN`, …).
+    pub status: String,
+    pub rtt_ms: u64,
+}
+
+/// Result of a kernel `RTM_GETROUTE` lookup — where a packet to `to`
+/// would egress right now (source address, output link, gateway, table).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteLookup {
+    pub source: Option<IpAddr>,
+    pub interface_index: Option<u32>,
+    pub interface_name: Option<String>,
+    pub gateway: Option<IpAddr>,
+    pub table: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1192,6 +1420,18 @@ pub enum OwnedResource {
     /// plus uplink bypasses. Carries no kernel artifact by itself; realized
     /// `Route` resources on the same entry are its current derivation.
     AttachSpec(AttachSpecParams),
+    /// A route installed through `net.route.add` (full kernel spec, daemon
+    /// protocol marker). Removed on owner teardown.
+    NetRoute(SystemRoute),
+    /// A policy rule installed through `net.rule.add` (full kernel spec,
+    /// daemon protocol marker). Removed on owner teardown.
+    NetRule(SystemRule),
+    /// A foreign route the user deleted through `net.route.del`. The
+    /// kernel object is gone; teardown *re-installs* the snapshot so the
+    /// system comes back exactly as it was.
+    SuppressedRoute(SystemRoute),
+    /// A foreign rule deleted through `net.rule.del`, restored on teardown.
+    SuppressedRule(SystemRule),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1411,7 +1651,7 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop","nm.list","nm.setActive","net.tables"],"tools":{}}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop","nm.list","nm.setActive","net.tables","net.route.add","net.route.del","net.rule.add","net.rule.del","net.explain","net.dns.status","net.dns.probe"],"tools":{}}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);

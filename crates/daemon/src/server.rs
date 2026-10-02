@@ -19,7 +19,8 @@ use net_manager_core::daemon_protocol::{
     AlwaysOnSetParams, AlwaysOnSetResult, CondRulesListResult, CondRulesPutParams,
     CondRulesPutResult, CondRulesRemoveParams, CondRulesRemoveResult, ConditionalRuleEntry,
     ErrorCode, EventFrame, ExternalTunnelStopParams, HelloParams, HelloResult, LinkSetStateParams,
-    NmListResult, NmSetActiveParams, OpenVpnConnectRequest, OpenVpnConnectResult,
+    NetDnsProbeParams, NetEditResult, NetRouteAddParams, NetRouteDelParams, NetRuleAddParams,
+    NetRuleDelParams, NmListResult, NmSetActiveParams, OpenVpnConnectRequest, OpenVpnConnectResult,
     OpenVpnDisconnectResult, OpenVpnProbeResult, OpenVpnProfileParams, OwnedChanged,
     OwnedListResult, OwnerParams, RequestFrame, ResponseFrame, RoutesApplyParams,
     RoutesApplyResult, RoutesRemoveResult, SettingsResult, SettingsSetParams, VpnAuthMode,
@@ -967,6 +968,57 @@ async fn handle<A: Authorizer>(
         #[cfg(target_os = "linux")]
         method::NET_TABLES => {
             let result = with_core(ctx, move |core| core.net_tables()).await?;
+            to_value(&result)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_ROUTE_ADD => {
+            let params: NetRouteAddParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            with_core(ctx, move |core| core.net_route_add(uid, params)).await?;
+            notify(ctx, uid, "manual".to_string());
+            Ok(Value::Null)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_ROUTE_DEL => {
+            let params: NetRouteDelParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let outcome = with_core(ctx, move |core| core.net_route_del(uid, params.route)).await?;
+            notify(ctx, uid, "manual".to_string());
+            to_value(&NetEditResult { outcome })
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_RULE_ADD => {
+            let params: NetRuleAddParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            with_core(ctx, move |core| core.net_rule_add(uid, params)).await?;
+            notify(ctx, uid, "manual".to_string());
+            Ok(Value::Null)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_RULE_DEL => {
+            let params: NetRuleDelParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let outcome = with_core(ctx, move |core| core.net_rule_del(uid, params.rule)).await?;
+            notify(ctx, uid, "manual".to_string());
+            to_value(&NetEditResult { outcome })
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_EXPLAIN => {
+            let result = with_core(ctx, move |core| core.net_explain(uid)).await?;
+            to_value(&result)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_DNS_STATUS => crate::dns_status::status()
+            .await
+            .map_err(|_| (ErrorCode::Internal, "DNS status failed".into()))
+            .and_then(|result| to_value(&result)),
+        #[cfg(target_os = "linux")]
+        method::NET_DNS_PROBE => {
+            let params: NetDnsProbeParams = params(request.params)?;
+            let observer = ctx.observer.clone();
+            let result = crate::dns_status::probe(observer, params)
+                .await
+                .map_err(|error| (error_code(&error), error.to_string()))?;
             to_value(&result)
         }
         method::LINK_SET_STATE => {

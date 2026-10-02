@@ -42,6 +42,27 @@ pub trait RouteExecutor: Send {
     fn net_tables(&self) -> io::Result<crate::daemon_protocol::NetTablesResult> {
         Err(io::ErrorKind::Unsupported.into())
     }
+    /// Install a route described by the full kernel spec (used by manual
+    /// edits and by restoring a suppressed foreign route). Executors
+    /// without the privileged view return `Unsupported`.
+    fn add_system_route(&mut self, _route: &crate::daemon_protocol::SystemRoute) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Delete a route by its full kernel spec (exactly as `net.tables`
+    /// reported it).
+    fn remove_system_route(
+        &mut self,
+        _route: &crate::daemon_protocol::SystemRoute,
+    ) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// `RTM_GETROUTE` for `to`: the egress the kernel picks right now.
+    fn route_lookup(
+        &self,
+        _to: std::net::IpAddr,
+    ) -> io::Result<crate::daemon_protocol::RouteLookup> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 /// Add `routes` in order; on the first failure remove the ones already

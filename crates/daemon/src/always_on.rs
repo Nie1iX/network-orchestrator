@@ -600,7 +600,7 @@ mod tests {
         let v6 = AppliedRoute::on_link("fd00:77::/64".parse().unwrap(), 2, 0);
         core.apply_routes(1000, "office", vec![v6.clone()]).unwrap();
         let ui_owned = AppliedRoute::on_link("198.18.66.0/24".parse().unwrap(), 2, 5);
-        core.apply_routes(1000, "manual", vec![ui_owned]).unwrap();
+        core.apply_routes(1000, "ui", vec![ui_owned]).unwrap();
         let replayable = HashSet::from([(1000, "office".to_string())]);
         let kernel_v6 = AppliedRoute { metric: 1024, ..v6 };
         assert_eq!(

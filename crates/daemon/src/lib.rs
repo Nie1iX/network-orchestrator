@@ -12,6 +12,8 @@ pub mod cond_rules;
 pub mod core;
 #[cfg(target_os = "linux")]
 pub mod dns;
+#[cfg(target_os = "linux")]
+pub mod dns_status;
 pub mod link_names;
 #[cfg(target_os = "linux")]
 pub mod netlink;

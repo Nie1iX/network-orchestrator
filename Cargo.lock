@@ -2748,6 +2748,7 @@ dependencies = [
  "ipnet",
  "libc",
  "net-manager-core",
+ "netlink-packet-core",
  "netlink-packet-route",
  "netlink-sys",
  "rtnetlink",

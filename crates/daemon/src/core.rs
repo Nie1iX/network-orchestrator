@@ -14,19 +14,19 @@ use crate::xray_process::XrayProcessRunner;
 use ipnet::IpNet;
 use net_manager_core::daemon_protocol::{
     AttachSpecParams, CleanupResult, ConditionalRouteRule, ConditionalRuleState,
-    ConditionalRuleStatus, IpFamily, OpenVpnConnectionState, OpenVpnFailure, OpenVpnPlanConflict,
-    OpenVpnPlanResult, OpenVpnProbeResult, OpenVpnProcessResource, OpenVpnStatusResult,
-    OpenVpnWarning, OwnedEntry, OwnedResource, OwnedRuleResource, OwnedState, RouteCondition,
-    WireGuardAddressResource, WireGuardFullResource, WireGuardLinkResource, WireGuardStatusResult,
-    WireGuardWarning, XrayConnectParams, XrayProcessResource, XrayStatusResult,
+    ConditionalRuleStatus, ExplainEntry, ExplainStatus, IpFamily, NetEditOutcome, NetExplainResult,
+    NetRouteAddParams, NetRuleAddParams, OpenVpnConnectionState, OpenVpnFailure,
+    OpenVpnPlanConflict, OpenVpnPlanResult, OpenVpnProbeResult, OpenVpnProcessResource,
+    OpenVpnStatusResult, OpenVpnWarning, OwnedEntry, OwnedResource, OwnedRuleResource, OwnedState,
+    RouteCondition, SystemRoute, SystemRule, WireGuardAddressResource, WireGuardFullResource,
+    WireGuardLinkResource, WireGuardStatusResult, WireGuardWarning, XrayConnectParams,
+    XrayProcessResource, XrayStatusResult,
 };
 use net_manager_core::journal::{JournalDocument, JournalEntry, JournalStore};
 use net_manager_core::models::TunnelState;
 use net_manager_core::models::{AnalyzedRoute, AppliedRoute};
 use net_manager_core::openvpn_management::{ManagementEvent, ManagementSnapshot, OpenVpnState};
-use net_manager_core::policy::{
-    apply_routes_transactional, remove_routes_best_effort, RouteExecutor, ENDPOINT_BYPASS_METRIC,
-};
+use net_manager_core::policy::{apply_routes_transactional, RouteExecutor, ENDPOINT_BYPASS_METRIC};
 use std::collections::{HashMap, HashSet};
 use std::io;
 #[cfg(target_os = "linux")]
@@ -1404,6 +1404,21 @@ pub trait PolicyRuleExecutor: Send {
     fn rule_present(&mut self, rule: &OwnedRuleResource) -> io::Result<bool> {
         Ok(self.rules_snapshot()?.contains(rule))
     }
+    /// Install a rule described by the full kernel spec (manual edits and
+    /// restoring a suppressed foreign rule). Default: unsupported.
+    fn add_system_rule(
+        &mut self,
+        _rule: &net_manager_core::daemon_protocol::SystemRule,
+    ) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Delete a rule by its full kernel spec.
+    fn remove_system_rule(
+        &mut self,
+        _rule: &net_manager_core::daemon_protocol::SystemRule,
+    ) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 pub trait WgConfigExecutor: Send {
@@ -1439,6 +1454,66 @@ const WIREGUARD_REJECT_AFTER_SECS: u64 = 180;
 /// How long sent packets may go without a handshake before the tunnel is
 /// failed; WireGuard retries the initiation about every 5 s.
 const WIREGUARD_UNANSWERED_SECS: u64 = 20;
+
+/// Journal owner accumulating manual `net.*` overrides (added routes and
+/// rules plus suppressed foreign objects). Torn down by the generic
+/// resource loop and exempt from session cleanup, so overrides survive an
+/// app restart until the user reverts them or the daemon stops.
+pub(crate) const MANUAL_OWNER: &str = "manual";
+
+const RT_TABLE_UNSPEC: u32 = 0;
+const RT_TABLE_MAIN: u32 = 254;
+const RT_TABLE_LOCAL: u32 = 255;
+
+/// Table id rendered like `ip route` knows it.
+fn table_name(table: u32) -> String {
+    match table {
+        RT_TABLE_UNSPEC => "unspec".into(),
+        RT_TABLE_MAIN => "main".into(),
+        253 => "default".into(),
+        RT_TABLE_LOCAL => "local".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether a dumped kernel route is the same object as a journaled
+/// `Route` (AppliedRoute) resource.
+fn same_route(system: &SystemRoute, applied: &AppliedRoute) -> bool {
+    let applied = kernel_route(applied);
+    system.kind == "unicast"
+        && system.destination == applied.destination
+        && system.interface_index == Some(applied.interface_index)
+        && system.metric.unwrap_or(0) == applied.metric
+        && system.gateway == applied.gateway
+        && system.table == applied.table.unwrap_or(RT_TABLE_MAIN)
+}
+
+/// Whether two dumped routes name the same kernel object (key fields
+/// only — name resolution and scope may differ between dumps).
+fn same_system_route(a: &SystemRoute, b: &SystemRoute) -> bool {
+    a.family == b.family
+        && a.destination == b.destination
+        && a.table == b.table
+        && a.interface_index == b.interface_index
+        && a.gateway == b.gateway
+        && a.metric.unwrap_or(0) == b.metric.unwrap_or(0)
+        && a.nexthops.len() == b.nexthops.len()
+        && a.nexthops
+            .iter()
+            .zip(&b.nexthops)
+            .all(|(x, y)| x.interface_index == y.interface_index && x.gateway == y.gateway)
+}
+
+/// Whether a dumped kernel rule is the same object as a journaled
+/// `Rule` (OwnedRuleResource) resource.
+fn same_rule(system: &SystemRule, owned: &OwnedRuleResource) -> bool {
+    system.family == owned.family
+        && system.priority == owned.priority
+        && system.table == owned.table
+        && system.fwmark == owned.fwmark
+        && system.invert == owned.invert
+        && system.suppress_prefix_length == owned.suppress_prefix_length
+}
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -3806,6 +3881,15 @@ impl DaemonCore {
                     let _ = spec;
                     continue;
                 }
+            } else if entry.owner == MANUAL_OWNER {
+                #[cfg(target_os = "linux")]
+                {
+                    Ok(self.reconcile_manual(index))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    continue;
+                }
             } else {
                 match self.tunnel_alive(index) {
                     None => continue,
@@ -4110,6 +4194,91 @@ impl DaemonCore {
         Ok(restored)
     }
 
+    /// Reconcile the `manual` owner against a fresh kernel dump: re-add
+    /// journaled routes/rules the kernel lost, and re-suppress foreign
+    /// objects that came back (an NM profile re-adding its route, a link
+    /// flap). Manual entries are never torn down here — an unreachable
+    /// kernel view just defers the pass.
+    #[cfg(target_os = "linux")]
+    fn reconcile_manual(&mut self, index: usize) -> bool {
+        let tables = match self.routes.net_tables() {
+            Ok(tables) => tables,
+            Err(_) => return false,
+        };
+        let resources = self.journal.entries[index].resources.clone();
+        let mut changed = false;
+        for resource in &resources {
+            match resource {
+                OwnedResource::NetRoute(route) => {
+                    let present = tables
+                        .routes
+                        .iter()
+                        .any(|seen| same_system_route(seen, route));
+                    if !present {
+                        match self.routes.add_system_route(route) {
+                            Ok(()) => changed = true,
+                            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "network-orchestrator-daemon: manual route re-add deferred: {}",
+                                    err.kind()
+                                );
+                            }
+                        }
+                    }
+                }
+                OwnedResource::NetRule(rule) => {
+                    if !tables.rules.iter().any(|seen| seen == rule) {
+                        match self.with_policy(|policy| policy.add_system_rule(rule)) {
+                            Ok(()) => changed = true,
+                            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "network-orchestrator-daemon: manual rule re-add deferred: {}",
+                                    err.kind()
+                                );
+                            }
+                        }
+                    }
+                }
+                OwnedResource::SuppressedRoute(route) => {
+                    let reappeared = tables
+                        .routes
+                        .iter()
+                        .any(|seen| same_system_route(seen, route));
+                    if reappeared {
+                        match self.routes.remove_system_route(route) {
+                            Ok(()) => changed = true,
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "network-orchestrator-daemon: route re-suppress deferred: {}",
+                                    err.kind()
+                                );
+                            }
+                        }
+                    }
+                }
+                OwnedResource::SuppressedRule(rule)
+                    if tables.rules.iter().any(|seen| seen == rule) =>
+                {
+                    match self.with_policy(|policy| policy.remove_system_rule(rule)) {
+                        Ok(()) => changed = true,
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            eprintln!(
+                                "network-orchestrator-daemon: rule re-suppress deferred: {}",
+                                err.kind()
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
     /// Routes the attach spec wants right now: declared CIDRs bound to the
     /// live ifindex of `interface_name` (nothing while the link is absent —
     /// they stay armed, not deleted) and bypass host routes pinned to the
@@ -4325,6 +4494,7 @@ impl DaemonCore {
             || owner.starts_with("ovpn-probe:")
             || owner.starts_with("xray:")
             || owner.starts_with("cond:")
+            || owner == MANUAL_OWNER
         {
             return Err(invalid_input("reserved owner prefix".into()));
         }
@@ -4443,6 +4613,617 @@ impl DaemonCore {
     /// routes across every table plus all policy rules.
     pub fn net_tables(&self) -> io::Result<net_manager_core::daemon_protocol::NetTablesResult> {
         self.routes.net_tables()
+    }
+
+    /// Journal entry index of the `manual` owner, creating it write-ahead
+    /// when the uid has none yet.
+    fn manual_entry(&mut self, uid: u32) -> io::Result<usize> {
+        if let Some(index) = self.position(uid, MANUAL_OWNER) {
+            return Ok(index);
+        }
+        self.journal.entries.push(JournalEntry {
+            uid,
+            owner: MANUAL_OWNER.into(),
+            state: OwnedState::Applying,
+            resources: Vec::new(),
+        });
+        self.store.save(&self.journal)?;
+        Ok(self.journal.entries.len() - 1)
+    }
+
+    /// `net.route.add`: install a daemon-owned unicast route. The journal
+    /// write-aheads the resource so a crash between kernel add and
+    /// finalization still knows what to remove.
+    pub fn net_route_add(&mut self, uid: u32, params: NetRouteAddParams) -> io::Result<()> {
+        let destination = params.destination.trunc();
+        let table = params.table.unwrap_or(RT_TABLE_MAIN);
+        if table == RT_TABLE_UNSPEC || table == RT_TABLE_LOCAL {
+            return Err(invalid_input(
+                "routes in the unspec/local tables are not editable".into(),
+            ));
+        }
+        let interface_index = match (params.interface_index, params.interface_name.as_deref()) {
+            (Some(index), None) => index,
+            (None, Some(name)) => {
+                validate_iface_name(name).map_err(invalid_input)?;
+                self.links
+                    .link_index(name)?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "interface not found"))?
+            }
+            _ => {
+                return Err(invalid_input(
+                    "provide exactly one of interfaceName or interfaceIndex".into(),
+                ))
+            }
+        };
+        let family = if destination.addr().is_ipv4() {
+            IpFamily::Ipv4
+        } else {
+            IpFamily::Ipv6
+        };
+        for address in params.gateway.iter().chain(params.pref_source.iter()) {
+            if address.is_ipv4() != (family == IpFamily::Ipv4) {
+                return Err(invalid_input("address family mismatch".into()));
+            }
+        }
+        let route = SystemRoute {
+            family,
+            destination,
+            table,
+            kind: "unicast".into(),
+            scope: if params.gateway.is_some() {
+                "universe".into()
+            } else {
+                "link".into()
+            },
+            protocol: crate::netlink::RTPROT_NETWORK_ORCHESTRATOR,
+            managed: true,
+            gateway: params.gateway,
+            interface_index: Some(interface_index),
+            interface_name: params.interface_name.clone(),
+            metric: Some(params.metric.unwrap_or(0)),
+            pref_source: params.pref_source,
+            nexthops: Vec::new(),
+        };
+        let index = self.manual_entry(uid)?;
+        self.journal.entries[index]
+            .resources
+            .push(OwnedResource::NetRoute(route.clone()));
+        self.journal.entries[index].state = OwnedState::Applying;
+        self.store.save(&self.journal)?;
+        match self.routes.add_system_route(&route) {
+            Ok(()) => {
+                self.journal.entries[index].state = OwnedState::Applied;
+                self.persist();
+                Ok(())
+            }
+            Err(err) => {
+                let entry = &mut self.journal.entries[index];
+                entry.resources.pop();
+                if entry.resources.is_empty() {
+                    self.journal.entries.remove(index);
+                }
+                self.persist();
+                Err(err)
+            }
+        }
+    }
+
+    /// `net.route.del`: remove a route exactly as `net.tables` reported
+    /// it. Daemon-owned routes must be journaled under `manual` (tunnel
+    /// owners are refused — use disconnect). Foreign routes are journaled
+    /// as [`OwnedResource::SuppressedRoute`] before deletion so teardown
+    /// puts them back.
+    pub fn net_route_del(&mut self, uid: u32, route: SystemRoute) -> io::Result<NetEditOutcome> {
+        if route.table == RT_TABLE_UNSPEC || route.table == RT_TABLE_LOCAL {
+            return Err(invalid_input(
+                "routes in the unspec/local tables are not editable".into(),
+            ));
+        }
+        if route.kind != "unicast" {
+            return Err(invalid_input("only unicast routes are editable".into()));
+        }
+        if route.managed {
+            return self.net_route_del_owned(uid, route);
+        }
+        // Foreign route: journal the suppression before touching the
+        // kernel, so a crash still knows what to restore.
+        let index = self.manual_entry(uid)?;
+        self.journal.entries[index]
+            .resources
+            .push(OwnedResource::SuppressedRoute(route.clone()));
+        self.journal.entries[index].state = OwnedState::Applied;
+        self.store.save(&self.journal)?;
+        match self.routes.remove_system_route(&route) {
+            Ok(()) => {
+                self.persist();
+                Ok(NetEditOutcome::Suppressed)
+            }
+            Err(err) => {
+                let entry = &mut self.journal.entries[index];
+                entry.resources.pop();
+                if entry.resources.is_empty() {
+                    self.journal.entries.remove(index);
+                }
+                self.persist();
+                Err(err)
+            }
+        }
+    }
+
+    /// The managed half of `net_route_del`: only overrides the caller's
+    /// own `manual` entry may be removed this way.
+    fn net_route_del_owned(&mut self, uid: u32, route: SystemRoute) -> io::Result<NetEditOutcome> {
+        let owner = self
+            .journal
+            .entries
+            .iter()
+            .filter(|entry| entry.uid == uid)
+            .find(|entry| {
+                entry.resources.iter().any(|resource| match resource {
+                    OwnedResource::Route(applied) => same_route(&route, applied),
+                    OwnedResource::NetRoute(installed) => same_system_route(installed, &route),
+                    _ => false,
+                })
+            })
+            .map(|entry| entry.owner.clone());
+        match owner.as_deref() {
+            Some(MANUAL_OWNER) => self.net_route_del_manual(uid, route),
+            Some(owner) => Err(invalid_input(format!(
+                "route is managed by {owner}; disconnect it instead"
+            ))),
+            // Protocol marker but no journal entry — a daemon orphan;
+            // deleting it needs no restore record.
+            None => {
+                self.routes.remove_system_route(&route)?;
+                Ok(NetEditOutcome::Deleted)
+            }
+        }
+    }
+
+    /// Delete a `manual`-owned route: kernel first, then unjournal.
+    fn net_route_del_manual(&mut self, uid: u32, route: SystemRoute) -> io::Result<NetEditOutcome> {
+        self.routes.remove_system_route(&route)?;
+        if let Some(index) = self.position(uid, MANUAL_OWNER) {
+            let entry = &mut self.journal.entries[index];
+            entry.resources.retain(|resource| match resource {
+                OwnedResource::NetRoute(installed) => !same_system_route(installed, &route),
+                _ => true,
+            });
+            if entry.resources.is_empty() {
+                self.journal.entries.remove(index);
+            }
+        }
+        self.persist();
+        Ok(NetEditOutcome::Deleted)
+    }
+
+    /// `net.rule.add`: install a daemon-owned `lookup` rule. Priority is
+    /// explicit and must not be 0 (the kernel `local` rule).
+    pub fn net_rule_add(&mut self, uid: u32, params: NetRuleAddParams) -> io::Result<()> {
+        if params.priority == 0 {
+            return Err(invalid_input(
+                "priority 0 is reserved by the kernel local rule".into(),
+            ));
+        }
+        if params.table == RT_TABLE_UNSPEC || params.table == RT_TABLE_LOCAL {
+            return Err(invalid_input(
+                "rules into unspec/local tables are not editable".into(),
+            ));
+        }
+        for net in params.from.iter().chain(params.to.iter()) {
+            if net.addr().is_ipv4() != (params.family == IpFamily::Ipv4) {
+                return Err(invalid_input("selector family mismatch".into()));
+            }
+        }
+        for name in params.iifname.iter().chain(params.oifname.iter()) {
+            validate_iface_name(name).map_err(invalid_input)?;
+        }
+        let rule = SystemRule {
+            family: params.family,
+            priority: params.priority,
+            action: "lookup".into(),
+            table: params.table,
+            goto: None,
+            from: params.from.map(|net| net.trunc()),
+            to: params.to.map(|net| net.trunc()),
+            fwmark: params.fwmark,
+            fwmask: params.fwmask,
+            iifname: params.iifname.clone(),
+            oifname: params.oifname.clone(),
+            uid_range: None,
+            source_port_range: None,
+            destination_port_range: None,
+            ip_protocol: None,
+            suppress_prefix_length: None,
+            suppress_if_group: None,
+            tun_id: None,
+            tos: 0,
+            invert: params.invert,
+            protocol: crate::netlink::RTPROT_NETWORK_ORCHESTRATOR,
+            managed: true,
+        };
+        let index = self.manual_entry(uid)?;
+        self.journal.entries[index]
+            .resources
+            .push(OwnedResource::NetRule(rule.clone()));
+        self.journal.entries[index].state = OwnedState::Applying;
+        self.store.save(&self.journal)?;
+        let result = self.with_policy(|policy| policy.add_system_rule(&rule));
+        match result {
+            Ok(()) => {
+                self.journal.entries[index].state = OwnedState::Applied;
+                self.persist();
+                Ok(())
+            }
+            Err(err) => {
+                let entry = &mut self.journal.entries[index];
+                entry.resources.pop();
+                if entry.resources.is_empty() {
+                    self.journal.entries.remove(index);
+                }
+                self.persist();
+                Err(err)
+            }
+        }
+    }
+
+    /// `net.rule.del`: remove a policy rule exactly as `net.tables`
+    /// reported it. Same suppress-and-restore contract as routes.
+    pub fn net_rule_del(&mut self, uid: u32, rule: SystemRule) -> io::Result<NetEditOutcome> {
+        if rule.priority == 0 {
+            return Err(invalid_input("priority 0 is the kernel local rule".into()));
+        }
+        if !matches!(
+            rule.action.as_str(),
+            "lookup" | "goto" | "nop" | "blackhole" | "unreachable" | "prohibit"
+        ) {
+            return Err(invalid_input(format!(
+                "rule action '{}' is not editable",
+                rule.action
+            )));
+        }
+        if rule.managed {
+            return self.net_rule_del_owned(uid, rule);
+        }
+        let index = self.manual_entry(uid)?;
+        self.journal.entries[index]
+            .resources
+            .push(OwnedResource::SuppressedRule(rule.clone()));
+        self.journal.entries[index].state = OwnedState::Applied;
+        self.store.save(&self.journal)?;
+        match self.with_policy(|policy| policy.remove_system_rule(&rule)) {
+            Ok(()) => {
+                self.persist();
+                Ok(NetEditOutcome::Suppressed)
+            }
+            Err(err) => {
+                let entry = &mut self.journal.entries[index];
+                entry.resources.pop();
+                if entry.resources.is_empty() {
+                    self.journal.entries.remove(index);
+                }
+                self.persist();
+                Err(err)
+            }
+        }
+    }
+
+    /// The managed half of `net_rule_del`: only `manual` overrides may be
+    /// removed this way.
+    fn net_rule_del_owned(&mut self, uid: u32, rule: SystemRule) -> io::Result<NetEditOutcome> {
+        let owner = self
+            .journal
+            .entries
+            .iter()
+            .filter(|entry| entry.uid == uid)
+            .find(|entry| {
+                entry.resources.iter().any(|resource| match resource {
+                    OwnedResource::Rule(owned) => same_rule(&rule, owned),
+                    OwnedResource::NetRule(installed) => installed == &rule,
+                    _ => false,
+                })
+            })
+            .map(|entry| entry.owner.clone());
+        match owner.as_deref() {
+            Some(owner) if owner != MANUAL_OWNER => Err(invalid_input(format!(
+                "rule is managed by {owner}; disconnect it instead"
+            ))),
+            _ => {
+                self.with_policy(|policy| policy.remove_system_rule(&rule))?;
+                if owner.as_deref() == Some(MANUAL_OWNER) {
+                    if let Some(index) = self.position(uid, MANUAL_OWNER) {
+                        let entry = &mut self.journal.entries[index];
+                        entry.resources.retain(|resource| match resource {
+                            OwnedResource::NetRule(installed) => installed != &rule,
+                            _ => true,
+                        });
+                        if entry.resources.is_empty() {
+                            self.journal.entries.remove(index);
+                        }
+                    }
+                }
+                self.persist();
+                Ok(NetEditOutcome::Deleted)
+            }
+        }
+    }
+
+    /// Borrow the policy executor or report the platform as unsupported.
+    fn with_policy<T>(
+        &mut self,
+        f: impl FnOnce(&mut dyn PolicyRuleExecutor) -> io::Result<T>,
+    ) -> io::Result<T> {
+        match self.policy.as_mut() {
+            Some(policy) => f(policy.as_mut()),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "policy executor is unavailable",
+            )),
+        }
+    }
+
+    /// `net.explain`: for every journaled intent of `uid`, why it is in
+    /// its current state — cross-checked against a fresh kernel dump.
+    pub fn net_explain(&mut self, uid: u32) -> io::Result<NetExplainResult> {
+        let tables = match self.routes.net_tables() {
+            Ok(tables) => tables,
+            Err(_) => {
+                return Ok(NetExplainResult {
+                    entries: Vec::new(),
+                    available: false,
+                })
+            }
+        };
+        // Interface index → name, sourced from the same dump so subjects
+        // show names when the kernel resolved them.
+        let names: HashMap<u32, String> = tables
+            .routes
+            .iter()
+            .filter_map(|route| route.interface_index.zip(route.interface_name.clone()))
+            .collect();
+        let mut entries = Vec::new();
+        for entry in self.journal.entries.clone() {
+            if entry.uid != uid {
+                continue;
+            }
+            for resource in &entry.resources {
+                let item =
+                    self.explain_resource(&entry.owner, entry.state, resource, &tables, &names);
+                entries.push(item);
+            }
+        }
+        Ok(NetExplainResult {
+            entries,
+            available: true,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn explain_resource(
+        &mut self,
+        owner: &str,
+        state: OwnedState,
+        resource: &OwnedResource,
+        tables: &net_manager_core::daemon_protocol::NetTablesResult,
+        names: &HashMap<u32, String>,
+    ) -> ExplainEntry {
+        let make =
+            |kind: &str, subject: String, status: ExplainStatus, detail: String| ExplainEntry {
+                owner: owner.to_string(),
+                state,
+                kind: kind.to_string(),
+                subject,
+                status,
+                detail,
+            };
+        match resource {
+            OwnedResource::Route(_) | OwnedResource::NetRoute(_) => {
+                let (wanted_dst, wanted_if, wanted_table) = match resource {
+                    OwnedResource::Route(route) => (
+                        route.destination,
+                        Some(route.interface_index),
+                        route.table.unwrap_or(RT_TABLE_MAIN),
+                    ),
+                    OwnedResource::NetRoute(route) => {
+                        (route.destination, route.interface_index, route.table)
+                    }
+                    _ => unreachable!(),
+                };
+                let subject = format!(
+                    "{} dev {} table {}",
+                    wanted_dst,
+                    wanted_if
+                        .map(|index| {
+                            names
+                                .get(&index)
+                                .cloned()
+                                .unwrap_or_else(|| format!("#{index}"))
+                        })
+                        .unwrap_or_else(|| "?".into()),
+                    table_name(wanted_table)
+                );
+                let present = tables.routes.iter().any(|seen| match resource {
+                    OwnedResource::Route(applied) => same_route(seen, applied),
+                    _ => same_system_route(
+                        seen,
+                        match resource {
+                            OwnedResource::NetRoute(route) => route,
+                            _ => unreachable!(),
+                        },
+                    ),
+                });
+                if present {
+                    return make(
+                        "route",
+                        subject,
+                        ExplainStatus::Effective,
+                        "installed".into(),
+                    );
+                }
+                let occupied = tables.routes.iter().any(|seen| {
+                    !seen.managed
+                        && seen.destination == wanted_dst
+                        && seen.table == wanted_table
+                        && seen.kind == "unicast"
+                });
+                if occupied {
+                    return make(
+                        "route",
+                        subject,
+                        ExplainStatus::Conflicted,
+                        "a foreign route occupies the destination".into(),
+                    );
+                }
+                make(
+                    "route",
+                    subject,
+                    ExplainStatus::Missing,
+                    "absent in the kernel; the next reconcile retries".into(),
+                )
+            }
+            OwnedResource::SuppressedRoute(route) => {
+                let subject = format!(
+                    "{} dev {} table {}",
+                    route.destination,
+                    route.interface_name.clone().unwrap_or_else(|| "?".into()),
+                    table_name(route.table)
+                );
+                if tables
+                    .routes
+                    .iter()
+                    .any(|seen| same_system_route(seen, route))
+                {
+                    make(
+                        "suppressed-route",
+                        subject,
+                        ExplainStatus::Missing,
+                        "the foreign route reappeared; reconcile will re-suppress it".into(),
+                    )
+                } else {
+                    make(
+                        "suppressed-route",
+                        subject,
+                        ExplainStatus::Active,
+                        "suppressed; restored when the override is removed".into(),
+                    )
+                }
+            }
+            OwnedResource::Rule(rule) => {
+                let subject = format!("pref {} lookup {}", rule.priority, table_name(rule.table));
+                if tables.rules.iter().any(|seen| same_rule(seen, rule)) {
+                    make(
+                        "rule",
+                        subject,
+                        ExplainStatus::Effective,
+                        "installed".into(),
+                    )
+                } else {
+                    make(
+                        "rule",
+                        subject,
+                        ExplainStatus::Missing,
+                        "absent in the kernel; the next reconcile retries".into(),
+                    )
+                }
+            }
+            OwnedResource::NetRule(rule) | OwnedResource::SuppressedRule(rule) => {
+                let suppressed = matches!(resource, OwnedResource::SuppressedRule(_));
+                let subject = format!(
+                    "pref {} {} {}",
+                    rule.priority,
+                    rule.action,
+                    table_name(rule.table)
+                );
+                let present = tables.rules.iter().any(|seen| seen == rule);
+                if suppressed {
+                    if present {
+                        make(
+                            "suppressed-rule",
+                            subject,
+                            ExplainStatus::Missing,
+                            "the foreign rule reappeared; reconcile will re-suppress it".into(),
+                        )
+                    } else {
+                        make(
+                            "suppressed-rule",
+                            subject,
+                            ExplainStatus::Active,
+                            "suppressed; restored when the override is removed".into(),
+                        )
+                    }
+                } else if present {
+                    make(
+                        "rule",
+                        subject,
+                        ExplainStatus::Effective,
+                        "installed".into(),
+                    )
+                } else {
+                    make(
+                        "rule",
+                        subject,
+                        ExplainStatus::Missing,
+                        "absent in the kernel; the next reconcile retries".into(),
+                    )
+                }
+            }
+            OwnedResource::AttachSpec(spec) => {
+                let subject = format!("attach {}", spec.interface_name);
+                match self.links.link_index(&spec.interface_name) {
+                    Ok(Some(index)) => make(
+                        "attach",
+                        subject,
+                        ExplainStatus::Effective,
+                        format!("bound to ifindex {index}"),
+                    ),
+                    _ => make(
+                        "attach",
+                        subject,
+                        ExplainStatus::Deferred,
+                        format!("interface {} is absent", spec.interface_name),
+                    ),
+                }
+            }
+            OwnedResource::WireGuardLink(link) => make(
+                "link",
+                link.name.clone(),
+                ExplainStatus::Effective,
+                "managed interface".into(),
+            ),
+            OwnedResource::OpenVpnProcess(process) => make(
+                "process",
+                process.name.clone(),
+                ExplainStatus::Effective,
+                "managed OpenVPN".into(),
+            ),
+            OwnedResource::XrayProcess(process) => make(
+                "process",
+                process.name.clone(),
+                ExplainStatus::Effective,
+                "managed Xray".into(),
+            ),
+            OwnedResource::Address(address) => make(
+                "address",
+                format!("{} dev #{}", address.address, address.interface_index),
+                ExplainStatus::Effective,
+                "interface address".into(),
+            ),
+            OwnedResource::Dns(dns) => make(
+                "dns",
+                format!(
+                    "{} on {}",
+                    dns.servers
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    dns.name
+                ),
+                ExplainStatus::Effective,
+                "link DNS".into(),
+            ),
+        }
     }
 
     /// Forget only always-on static owners (`replayable`) whose routes
@@ -4682,6 +5463,7 @@ impl DaemonCore {
             entry.uid == uid
                 && !keep.contains(&(uid, entry.owner.clone()))
                 && !entry.owner.starts_with("cond:")
+                && entry.owner != MANUAL_OWNER
         })
     }
 
@@ -4776,26 +5558,58 @@ impl DaemonCore {
         if self.journal.entries[index].owner.starts_with("wg:") {
             return self.teardown_wireguard_entry(index);
         }
-        let routes: Vec<AppliedRoute> = self.journal.entries[index]
-            .resources
-            .iter()
-            .filter_map(|resource| match resource {
-                OwnedResource::Route(route) => Some(route.clone()),
-                _ => None,
-            })
-            .collect();
-        match remove_routes_best_effort(&mut IgnoreMissing(self.routes.as_mut()), &routes) {
-            Ok(()) => {
-                self.journal.entries.remove(index);
-                Ok(())
+        // Generic owners (clients, `cond:*`, `manual`) own routes, rules
+        // and manual overrides. `Suppressed*` resources restore the
+        // foreign object instead of deleting it.
+        let resources = self.journal.entries[index].resources.clone();
+        let mut failed = Vec::new();
+        for resource in resources.iter().rev() {
+            let result = match resource {
+                OwnedResource::Route(route) => match self.routes.remove_route(route) {
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                },
+                OwnedResource::NetRoute(route) => match self.routes.remove_system_route(route) {
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                },
+                OwnedResource::NetRule(rule) => {
+                    match self.with_policy(|policy| policy.remove_system_rule(rule)) {
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                        result => result,
+                    }
+                }
+                OwnedResource::SuppressedRoute(route) => {
+                    match self.routes.add_system_route(route) {
+                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                        result => result,
+                    }
+                }
+                OwnedResource::SuppressedRule(rule) => {
+                    match self.with_policy(|policy| policy.add_system_rule(rule)) {
+                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                        result => result,
+                    }
+                }
+                // Intent markers and resources foreign to a generic entry.
+                _ => Ok(()),
+            };
+            if let Err(err) = result {
+                eprintln!(
+                    "network-orchestrator-daemon: teardown of {} failed: {err}",
+                    self.journal.entries[index].owner
+                );
+                failed.push(resource.clone());
             }
-            Err((failed, message)) => {
-                let entry = &mut self.journal.entries[index];
-                entry.state = OwnedState::Stale;
-                // `remove_routes_best_effort` reports failures newest first.
-                entry.resources = failed.into_iter().rev().map(OwnedResource::Route).collect();
-                Err(io::Error::other(message))
-            }
+        }
+        if failed.is_empty() {
+            self.journal.entries.remove(index);
+            Ok(())
+        } else {
+            let entry = &mut self.journal.entries[index];
+            entry.state = OwnedState::Stale;
+            entry.resources = failed.into_iter().rev().collect();
+            Err(io::Error::other("owner teardown left resources behind"))
         }
     }
 
@@ -5089,6 +5903,13 @@ impl DaemonCore {
                     io::ErrorKind::InvalidData,
                     "Xray resource in WireGuard journal entry",
                 )),
+                OwnedResource::NetRoute(_)
+                | OwnedResource::NetRule(_)
+                | OwnedResource::SuppressedRoute(_)
+                | OwnedResource::SuppressedRule(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manual network override in WireGuard journal entry",
+                )),
                 // Pure intent: no kernel artifact to tear down.
                 OwnedResource::AttachSpec(_) => Ok(()),
             };
@@ -5155,9 +5976,6 @@ fn resolve_endpoint_ips(host: &str) -> Vec<IpAddr> {
     ips
 }
 
-/// Removing a route that is already gone is success: the goal state holds.
-struct IgnoreMissing<'a>(&'a mut dyn RouteExecutor);
-
 fn full_policy_rules(full: &WireGuardFullResource) -> Vec<OwnedRuleResource> {
     let mut rules = Vec::new();
     for family in [IpFamily::Ipv4, IpFamily::Ipv6] {
@@ -5182,19 +6000,6 @@ fn full_policy_rules(full: &WireGuardFullResource) -> Vec<OwnedRuleResource> {
         });
     }
     rules
-}
-
-impl RouteExecutor for IgnoreMissing<'_> {
-    fn add_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
-        self.0.add_route(route)
-    }
-
-    fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
-        match self.0.remove_route(route) {
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            other => other,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -9227,6 +10032,544 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert!(recorder.ops().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- Manual route/rule editing (`net.route.*`, `net.rule.*`) ---------
+
+    /// Kernel-like route/rule store for manual-edit tests: `net_tables`
+    /// reflects mutations, adds conflict on an equal key, removes are
+    /// exact-match like `RTM_DELROUTE`/`FRA` deletes.
+    #[derive(Clone, Default)]
+    struct KernelTables {
+        routes: Arc<Mutex<Vec<SystemRoute>>>,
+        rules: Arc<Mutex<Vec<SystemRule>>>,
+    }
+
+    impl KernelTables {
+        fn routes(&self) -> Vec<SystemRoute> {
+            self.routes.lock().unwrap().clone()
+        }
+        fn rules(&self) -> Vec<SystemRule> {
+            self.rules.lock().unwrap().clone()
+        }
+    }
+
+    impl RouteExecutor for KernelTables {
+        fn add_route(&mut self, _: &AppliedRoute) -> io::Result<()> {
+            Ok(())
+        }
+        fn remove_route(&mut self, _: &AppliedRoute) -> io::Result<()> {
+            Ok(())
+        }
+        fn net_tables(&self) -> io::Result<net_manager_core::daemon_protocol::NetTablesResult> {
+            Ok(net_manager_core::daemon_protocol::NetTablesResult {
+                routes: self.routes(),
+                rules: self.rules(),
+                available: true,
+            })
+        }
+        fn add_system_route(&mut self, route: &SystemRoute) -> io::Result<()> {
+            let mut routes = self.routes.lock().unwrap();
+            if routes.iter().any(|seen| same_system_route(seen, route)) {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists"));
+            }
+            routes.push(route.clone());
+            Ok(())
+        }
+        fn remove_system_route(&mut self, route: &SystemRoute) -> io::Result<()> {
+            let mut routes = self.routes.lock().unwrap();
+            let before = routes.len();
+            routes.retain(|seen| !same_system_route(seen, route));
+            if routes.len() == before {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no such route"));
+            }
+            Ok(())
+        }
+    }
+
+    impl PolicyRuleExecutor for KernelTables {
+        fn rules_snapshot(&mut self) -> io::Result<Vec<OwnedRuleResource>> {
+            Ok(Vec::new())
+        }
+        fn table_in_use(&mut self, _: u32) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn add_rule(&mut self, _: &OwnedRuleResource) -> io::Result<()> {
+            Ok(())
+        }
+        fn remove_rule(&mut self, _: &OwnedRuleResource) -> io::Result<()> {
+            Ok(())
+        }
+        fn add_system_rule(&mut self, rule: &SystemRule) -> io::Result<()> {
+            let mut rules = self.rules.lock().unwrap();
+            if rules.iter().any(|seen| seen == rule) {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists"));
+            }
+            rules.push(rule.clone());
+            Ok(())
+        }
+        fn remove_system_rule(&mut self, rule: &SystemRule) -> io::Result<()> {
+            let mut rules = self.rules.lock().unwrap();
+            let before = rules.len();
+            rules.retain(|seen| seen != rule);
+            if rules.len() == before {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no such rule"));
+            }
+            Ok(())
+        }
+    }
+
+    fn open_tables(dir: &Path, kernel: &KernelTables) -> DaemonCore {
+        let recorder = Recorder::default();
+        let mut core = DaemonCore::open(
+            JournalStore::new(dir.join(JOURNAL_FILE)),
+            Box::new(kernel.clone()),
+            Box::new(FakeLinks(recorder)),
+        )
+        .unwrap();
+        core.policy = Some(Box::new(kernel.clone()));
+        core
+    }
+
+    fn kernel_route_fixture(managed: bool) -> SystemRoute {
+        SystemRoute {
+            family: IpFamily::Ipv4,
+            destination: "198.51.100.0/24".parse().unwrap(),
+            table: RT_TABLE_MAIN,
+            kind: "unicast".into(),
+            scope: "universe".into(),
+            protocol: if managed {
+                crate::netlink::RTPROT_NETWORK_ORCHESTRATOR
+            } else {
+                3 // RTPROT_BOOT
+            },
+            managed,
+            gateway: Some("192.168.1.1".parse().unwrap()),
+            interface_index: Some(7),
+            interface_name: Some("enp0s3".into()),
+            metric: Some(100),
+            pref_source: None,
+            nexthops: Vec::new(),
+        }
+    }
+
+    fn kernel_rule_fixture(priority: u32, managed: bool) -> SystemRule {
+        SystemRule {
+            family: IpFamily::Ipv4,
+            priority,
+            action: "lookup".into(),
+            table: 100,
+            goto: None,
+            from: None,
+            to: None,
+            fwmark: Some(0x1),
+            fwmask: Some(0x1),
+            iifname: None,
+            oifname: None,
+            uid_range: None,
+            source_port_range: None,
+            destination_port_range: None,
+            ip_protocol: None,
+            suppress_prefix_length: None,
+            suppress_if_group: None,
+            tun_id: None,
+            tos: 0,
+            invert: false,
+            protocol: if managed {
+                crate::netlink::RTPROT_NETWORK_ORCHESTRATOR
+            } else {
+                0
+            },
+            managed,
+        }
+    }
+
+    #[test]
+    fn manual_route_add_installs_journaled_route() {
+        let dir = unique_dir("manual-route-add");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        let params = NetRouteAddParams {
+            destination: "203.0.113.0/24".parse().unwrap(),
+            table: None,
+            gateway: Some("192.168.1.1".parse().unwrap()),
+            interface_name: None,
+            interface_index: Some(7),
+            metric: Some(50),
+            pref_source: None,
+        };
+        core.net_route_add(1000, params).unwrap();
+        let installed = &kernel.routes()[0];
+        assert_eq!(installed.destination.to_string(), "203.0.113.0/24");
+        assert_eq!(installed.table, RT_TABLE_MAIN);
+        assert_eq!(
+            installed.protocol,
+            crate::netlink::RTPROT_NETWORK_ORCHESTRATOR
+        );
+        let journal = journal_on_disk(&dir);
+        assert_eq!(journal.entries[0].owner, MANUAL_OWNER);
+        assert_eq!(journal.entries[0].state, OwnedState::Applied);
+        assert!(matches!(
+            journal.entries[0].resources[0],
+            OwnedResource::NetRoute(_)
+        ));
+        // Deleting our own manual object is a plain delete.
+        assert_eq!(
+            core.net_route_del(1000, installed.clone()).unwrap(),
+            NetEditOutcome::Deleted
+        );
+        assert!(kernel.routes().is_empty());
+        assert!(journal_on_disk(&dir).entries.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_route_add_rejects_unsafe_input() {
+        let dir = unique_dir("manual-route-guards");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        let base = NetRouteAddParams {
+            destination: "203.0.113.0/24".parse().unwrap(),
+            table: None,
+            gateway: None,
+            interface_name: None,
+            interface_index: Some(7),
+            metric: None,
+            pref_source: None,
+        };
+        for table in [Some(RT_TABLE_UNSPEC), Some(RT_TABLE_LOCAL)] {
+            let params = NetRouteAddParams {
+                table,
+                ..base.clone()
+            };
+            assert_eq!(
+                core.net_route_add(1000, params).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        // Both or neither interface selector.
+        for (name, index) in [(Some("enp0s3".to_string()), Some(7)), (None, None)] {
+            let params = NetRouteAddParams {
+                interface_name: name,
+                interface_index: index,
+                ..base.clone()
+            };
+            assert_eq!(
+                core.net_route_add(1000, params).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        // Gateway family must match the destination family.
+        let params = NetRouteAddParams {
+            gateway: Some("fd00::1".parse().unwrap()),
+            ..base.clone()
+        };
+        assert_eq!(
+            core.net_route_add(1000, params).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(kernel.routes().is_empty());
+        assert!(journal_on_disk(&dir).entries.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_route_del_foreign_suppresses_and_restores() {
+        let dir = unique_dir("manual-route-suppress");
+        let kernel = KernelTables::default();
+        kernel
+            .routes
+            .lock()
+            .unwrap()
+            .push(kernel_route_fixture(false));
+        let mut core = open_tables(&dir, &kernel);
+        assert_eq!(
+            core.net_route_del(1000, kernel_route_fixture(false))
+                .unwrap(),
+            NetEditOutcome::Suppressed
+        );
+        assert!(kernel.routes().is_empty());
+        let journal = journal_on_disk(&dir);
+        assert!(matches!(
+            journal.entries[0].resources[0],
+            OwnedResource::SuppressedRoute(_)
+        ));
+        // Teardown (daemon stop or explicit revert) puts the foreign
+        // route back.
+        core.shutdown().unwrap();
+        assert_eq!(kernel.routes(), vec![kernel_route_fixture(false)]);
+        assert!(journal_on_disk(&dir).entries.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_route_del_refuses_tunnel_owned_route() {
+        let dir = unique_dir("manual-route-owned");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        // A tunnel owner holds the route in its journal.
+        core.journal.entries.push(JournalEntry {
+            uid: 1000,
+            owner: "wg:home".into(),
+            state: OwnedState::Applied,
+            resources: vec![OwnedResource::Route(AppliedRoute::on_link(
+                "198.51.100.0/24".parse().unwrap(),
+                7,
+                100,
+            ))],
+        });
+        // The same object visible in a dump, marked managed.
+        let mut route = kernel_route_fixture(true);
+        route.metric = Some(100);
+        route.gateway = None;
+        route.interface_index = Some(7);
+        let error = core.net_route_del(1000, route).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("wg:home"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_rule_add_and_del_roundtrip() {
+        let dir = unique_dir("manual-rule-add");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        let params = NetRuleAddParams {
+            family: IpFamily::Ipv4,
+            priority: 1000,
+            table: 100,
+            from: Some("10.0.0.0/8".parse().unwrap()),
+            to: None,
+            fwmark: Some(0x9),
+            fwmask: None,
+            iifname: Some("enp0s3".into()),
+            oifname: None,
+            invert: false,
+        };
+        core.net_rule_add(1000, params).unwrap();
+        let installed = &kernel.rules()[0];
+        assert_eq!(
+            installed.protocol,
+            crate::netlink::RTPROT_NETWORK_ORCHESTRATOR
+        );
+        assert_eq!(installed.action, "lookup");
+        // Priority 0 and local/unspec tables are refused.
+        for (priority, table) in [(0, 100), (500, RT_TABLE_LOCAL), (500, RT_TABLE_UNSPEC)] {
+            let rejected = NetRuleAddParams {
+                family: IpFamily::Ipv4,
+                priority,
+                table,
+                from: None,
+                to: None,
+                fwmark: None,
+                fwmask: None,
+                iifname: None,
+                oifname: None,
+                invert: false,
+            };
+            assert_eq!(
+                core.net_rule_add(1000, rejected).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            core.net_rule_del(1000, installed.clone()).unwrap(),
+            NetEditOutcome::Deleted
+        );
+        assert!(kernel.rules().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_rule_del_foreign_suppresses_and_restores() {
+        let dir = unique_dir("manual-rule-suppress");
+        let kernel = KernelTables::default();
+        kernel
+            .rules
+            .lock()
+            .unwrap()
+            .push(kernel_rule_fixture(300, false));
+        let mut core = open_tables(&dir, &kernel);
+        assert_eq!(
+            core.net_rule_del(1000, kernel_rule_fixture(300, false))
+                .unwrap(),
+            NetEditOutcome::Suppressed
+        );
+        assert!(kernel.rules().is_empty());
+        // The kernel local rule is untouchable.
+        let mut local = kernel_rule_fixture(0, false);
+        local.action = "lookup".into();
+        local.table = RT_TABLE_LOCAL;
+        assert_eq!(
+            core.net_rule_del(1000, local).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        core.shutdown().unwrap();
+        assert_eq!(kernel.rules(), vec![kernel_rule_fixture(300, false)]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reconcile_resuppresses_returned_foreign_route() {
+        let dir = unique_dir("manual-resuppress");
+        let kernel = KernelTables::default();
+        kernel
+            .routes
+            .lock()
+            .unwrap()
+            .push(kernel_route_fixture(false));
+        let mut core = open_tables(&dir, &kernel);
+        core.net_route_del(1000, kernel_route_fixture(false))
+            .unwrap();
+        // NM/another client re-adds the route behind our back.
+        kernel
+            .routes
+            .lock()
+            .unwrap()
+            .push(kernel_route_fixture(false));
+        let changed = core.reconcile_network(&[]);
+        assert_eq!(changed, vec![(1000, MANUAL_OWNER.to_string())]);
+        assert!(kernel.routes().is_empty());
+        // The suppression still stands in the journal; teardown restores.
+        core.shutdown().unwrap();
+        assert_eq!(kernel.routes(), vec![kernel_route_fixture(false)]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reconcile_reinstalls_missing_manual_route() {
+        let dir = unique_dir("manual-restore-missing");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        core.net_route_add(
+            1000,
+            NetRouteAddParams {
+                destination: "203.0.113.0/24".parse().unwrap(),
+                table: None,
+                gateway: Some("192.168.1.1".parse().unwrap()),
+                interface_name: None,
+                interface_index: Some(7),
+                metric: None,
+                pref_source: None,
+            },
+        )
+        .unwrap();
+        // The kernel object vanishes (link flush, `ip route flush`).
+        kernel.routes.lock().unwrap().clear();
+        let changed = core.reconcile_network(&[]);
+        assert_eq!(changed, vec![(1000, MANUAL_OWNER.to_string())]);
+        assert_eq!(kernel.routes().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_owner_survives_session_cleanup() {
+        let dir = unique_dir("manual-session");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        core.net_route_add(
+            1000,
+            NetRouteAddParams {
+                destination: "203.0.113.0/24".parse().unwrap(),
+                table: None,
+                gateway: None,
+                interface_name: None,
+                interface_index: Some(7),
+                metric: None,
+                pref_source: None,
+            },
+        )
+        .unwrap();
+        // The last client of the uid disconnects — manual overrides stay.
+        let result = core
+            .cleanup_session_uid(1000, &std::collections::HashSet::new())
+            .unwrap();
+        assert!(result.removed_owners.is_empty());
+        assert_eq!(kernel.routes().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn explain_marks_effective_missing_and_conflicted() {
+        let dir = unique_dir("explain-statuses");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        // Installed route → effective.
+        core.net_route_add(
+            1000,
+            NetRouteAddParams {
+                destination: "203.0.113.0/24".parse().unwrap(),
+                table: None,
+                gateway: Some("192.168.1.1".parse().unwrap()),
+                interface_name: None,
+                interface_index: Some(7),
+                metric: None,
+                pref_source: None,
+            },
+        )
+        .unwrap();
+        // A suppressed foreign route → active while absent, missing when
+        // it reappears.
+        kernel
+            .routes
+            .lock()
+            .unwrap()
+            .push(kernel_route_fixture(false));
+        core.net_route_del(1000, kernel_route_fixture(false))
+            .unwrap();
+        // A deferred attach spec: the interface does not exist.
+        core.journal.entries.push(JournalEntry {
+            uid: 1000,
+            owner: "ext".into(),
+            state: OwnedState::Applied,
+            resources: vec![OwnedResource::AttachSpec(attach_spec(
+                "tun-missing",
+                &[],
+                &[],
+            ))],
+        });
+        let result = core.net_explain(1000).unwrap();
+        assert!(result.available);
+        let by_kind: HashMap<&str, ExplainStatus> = result
+            .entries
+            .iter()
+            .map(|entry| (entry.kind.as_str(), entry.status))
+            .collect();
+        assert_eq!(by_kind["route"], ExplainStatus::Effective);
+        assert_eq!(by_kind["suppressed-route"], ExplainStatus::Active);
+        assert_eq!(by_kind["attach"], ExplainStatus::Deferred);
+        // Bring the suppressed route back — the explain turns "missing"
+        // and reconcile re-suppresses.
+        kernel
+            .routes
+            .lock()
+            .unwrap()
+            .push(kernel_route_fixture(false));
+        let result = core.net_explain(1000).unwrap();
+        let suppressed = result
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "suppressed-route")
+            .unwrap();
+        assert_eq!(suppressed.status, ExplainStatus::Missing);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn explain_reports_unavailable_without_kernel_view() {
+        let dir = unique_dir("explain-unavailable");
+        let mut core = open_core(&dir, &Recorder::default());
+        core.journal.entries.push(JournalEntry {
+            uid: 1000,
+            owner: "ext".into(),
+            state: OwnedState::Applied,
+            resources: vec![OwnedResource::AttachSpec(attach_spec("tun9", &[], &[]))],
+        });
+        // FakeRoutes has no `net_tables` — the result degrades.
+        let result = core.net_explain(1000).unwrap();
+        assert!(!result.available);
+        assert!(result.entries.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 }
