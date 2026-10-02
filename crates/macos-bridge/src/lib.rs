@@ -78,6 +78,29 @@ fn store_error(_: std::io::Error) -> String {
 fn local_port_available(port: u16) -> bool {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
 }
+/// Whether the privileged helper answers on its socket and accepts this app.
+/// The Swift side adds the launchd registration state (`SMAppService`).
+fn helper_status() -> Value {
+    use net_manager_core::helper_client::{is_denied, HelperClient, HelperError};
+    let socket = std::env::var_os("NETORCH_HELPER_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| net_manager_core::daemon_protocol::MACOS_SOCKET_PATH.into());
+    match HelperClient::new(socket)
+        .with_timeout(std::time::Duration::from_secs(3))
+        .hello()
+    {
+        Ok(hello) => json!({
+            "reachable": true, "denied": false, "version": hello.daemon_version,
+            "capabilities": hello.capabilities,
+        }),
+        Err(error) => json!({
+            "reachable": false,
+            "denied": is_denied(&error),
+            "protocolError": matches!(error, HelperError::Protocol(_)),
+            "version": "", "capabilities": [],
+        }),
+    }
+}
 fn subscription_error(error: std::io::Error) -> String {
     if matches!(
         error.kind(),
@@ -353,6 +376,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
         "measure_delays" => return measure_delays(root, args),
         "measure_delay" => return measure_delay(root, args),
         "check_exit_ip" => return check_exit_ip(root, args),
+        "helper_status" => return Ok(helper_status()),
         _ => {}
     }
     let _lock = TRANSACTION
@@ -1432,6 +1456,15 @@ mod tests {
                 "bridge must not implement daemon method {name}"
             );
         }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn helper_status_reports_a_missing_helper_without_touching_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dispatch(dir.path(), "helper_status", &json!({})).unwrap();
+        assert_eq!(status["reachable"], false);
+        assert_eq!(status["capabilities"], json!([]));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 

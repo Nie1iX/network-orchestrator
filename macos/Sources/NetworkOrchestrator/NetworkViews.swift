@@ -654,6 +654,7 @@ struct SettingsView: View {
           ).font(.system(size: 10.92)).foregroundStyle(p.muted)
         }.padding(10.5)
       }
+      settingsGroup("native.helper") { helperRow }
       settingsGroup("settings.groupStartup") {
         HStack {
           settingText("settings.startAtLogin", "native.startAtLoginSub")
@@ -709,6 +710,45 @@ struct SettingsView: View {
         }.padding(.horizontal, 14).padding(.vertical, 10.5)
       }
     }
+  }
+  /// Install state of the privileged helper and its install/remove controls.
+  private var helperState: (title: String, color: String) {
+    let status = model.helperStatus
+    switch model.helperRegistration {
+    case .notFound: return ("native.helperState.missing", "unknown")
+    case .requiresApproval: return ("native.helperState.approval", "warn")
+    case .notRegistered:
+      return status?.reachable == true
+        ? ("native.helperState.ready", "up") : ("native.helperState.absent", "unknown")
+    case .enabled:
+      if status?.reachable == true { return ("native.helperState.ready", "up") }
+      if status?.denied == true { return ("native.helperState.denied", "down") }
+      return ("native.helperState.stopped", "warn")
+    }
+  }
+  private var helperRow: some View {
+    let state = helperState
+    return VStack(alignment: .leading, spacing: 8) {
+      HStack(spacing: 10.5) {
+        AppBadge(text: state.title, color: state.color)
+        if let version = model.helperStatus?.version, !version.isEmpty {
+          Text("v" + version).font(.system(size: 11.48)).foregroundStyle(p.secondary)
+        }
+        Spacer()
+        switch model.helperRegistration {
+        case .notFound: EmptyView()
+        case .requiresApproval:
+          Button(L10n.text("native.helperApprove")) { HelperManager.openSystemSettings() }
+        case .notRegistered:
+          Button(L10n.text("native.helperInstall")) { Task { await model.installHelper() } }
+        case .enabled:
+          Button(L10n.text("native.helperRemove")) { Task { await model.removeHelper() } }
+        }
+      }
+      Text(L10n.text("native.helperHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+        .fixedSize(horizontal: false, vertical: true)
+    }.padding(10.5)
+      .onAppear { Task { await model.refreshHelper() } }
   }
   private func settingText(_ label: String, _ detail: String) -> some View {
     VStack(alignment: .leading, spacing: 2) {

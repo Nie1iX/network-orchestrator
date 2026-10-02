@@ -19,6 +19,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_SOCKET_PATH: &str = "/run/network-orchestrator/daemon.sock";
 pub const SOCKET_ENV: &str = "NETWORK_ORCHESTRATOR_SOCKET";
+/// Socket of the macOS launchd helper.
+pub const MACOS_SOCKET_PATH: &str = "/var/run/network-orchestrator/helper.sock";
 /// Hard cap for one frame; read buffers grow with actual bytes, the cap is
 /// only an abort threshold. `xray.connect` may carry inline base64 geo
 /// assets (two ~10 MiB dat files → ~27 MiB frame); `xray.install` carries a

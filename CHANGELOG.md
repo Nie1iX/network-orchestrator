@@ -8,6 +8,14 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+### Added
+
+- macOS privileged helper, stage 1: the `network-orchestrator-helper` launchd
+  daemon (shared `daemon_protocol` over a Unix socket), console-user and
+  app-path peer verification, `SMAppService` install/remove from Settings, a
+  blocking `core::helper_client` and the bridge's `helper_status`. It performs
+  no network changes yet; WireGuard/OpenVPN executors are the next stage.
+
 ## [0.6.0] - 2026-10-02
 
 ### Added

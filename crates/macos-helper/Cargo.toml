@@ -1,0 +1,22 @@
+[package]
+name = "network-orchestrator-macos-helper"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "network-orchestrator-helper"
+path = "src/main.rs"
+
+[lib]
+name = "network_orchestrator_macos_helper"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+net-manager-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
