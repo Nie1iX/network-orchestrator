@@ -1,7 +1,4 @@
-use crate::commands::profiles::{
-    loopback_port_available, profile_listener_ports, remove_managed_revision,
-    rewrite_generated_proxy_ports, select_available_socks_port,
-};
+use crate::commands::profiles::loopback_port_available;
 use crate::state::{find_profile, AppState, RuntimeState};
 use net_manager_core::analysis;
 use net_manager_core::explorer;
@@ -12,36 +9,14 @@ use std::net::{Ipv4Addr, TcpStream};
 use std::time::{Duration, Instant};
 use tauri::{Emitter, State};
 
+#[cfg(test)]
 fn select_connect_ports(
     profiles: &[Profile],
     profile: &Profile,
     available: impl Fn(u16) -> bool,
 ) -> Result<Option<(u16, Option<u16>)>, String> {
-    let Some(socks_port) = profile.xray_socks_port else {
-        return Ok(None);
-    };
-    let http_port = profile.xray_http_port;
-    let socks_occupied = !available(socks_port);
-    let http_occupied = http_port.is_some_and(|port| !available(port));
-    if !socks_occupied && !http_occupied {
-        return Ok(None);
-    }
-    let mut used = profile_listener_ports(profiles, &profile.id);
-    if let Some(http_port) = http_port {
-        used.insert(http_port);
-    }
-    let socks_port = if socks_occupied {
-        select_available_socks_port(&used, &available)?
-    } else {
-        socks_port
-    };
-    used.insert(socks_port);
-    let http_port = if http_occupied {
-        Some(select_available_socks_port(&used, available)?)
-    } else {
-        http_port
-    };
-    Ok(Some((socks_port, http_port)))
+    net_manager_core::profile_import::select_connect_ports(profiles, profile, available)
+        .map_err(|err| err.to_string())
 }
 
 fn prepare_xray_listener_ports(
@@ -49,40 +24,14 @@ fn prepare_xray_listener_ports(
     profile: &mut Profile,
     profiles: &mut [Profile],
 ) -> Result<Option<String>, String> {
-    let old_socks = profile.xray_socks_port;
-    let old_http = profile.xray_http_port;
-    let Some((new_socks, new_http)) =
-        select_connect_ports(profiles, profile, loopback_port_available)?
-    else {
-        return Ok(None);
-    };
-    let old_path = profile.config_path.clone();
-    rewrite_generated_proxy_ports(&state.config_vault, profile, new_socks, new_http)?;
-    if let Err(err) = state.profiles.upsert(profile.clone()) {
-        let _ = state
-            .config_vault
-            .remove_revision_for_config(&profile.config_path);
-        return Err(err.to_string());
-    }
-    if let Some(stored) = profiles.iter_mut().find(|stored| stored.id == profile.id) {
-        *stored = profile.clone();
-    }
-    remove_managed_revision(
+    net_manager_core::profile_import::prepare_connect_ports(
         &state.config_vault,
-        &profile.id,
-        &old_path,
-        "connection started",
-    )?;
-    let mut notices = Vec::new();
-    if let Some(port) = old_socks.filter(|port| *port != new_socks) {
-        notices.push(format!("SOCKS5 port changed from {port} to {new_socks}."));
-    }
-    if let (Some(port), Some(new_port)) = (old_http, new_http) {
-        if port != new_port {
-            notices.push(format!("HTTP port changed from {port} to {new_port}."));
-        }
-    }
-    Ok(Some(notices.join(" ")))
+        &state.profiles,
+        profile,
+        profiles,
+        loopback_port_available,
+    )
+    .map_err(|err| err.to_string())
 }
 
 #[cfg(target_os = "linux")]

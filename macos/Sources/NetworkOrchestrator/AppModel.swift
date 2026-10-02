@@ -434,16 +434,30 @@ import SystemConfiguration
   func importLog() async -> String {
     (try? await core.call("import_log") as String) ?? ""
   }
-  /// Saves the three rule sets; a running connection restarts to apply them.
-  func setRoutingRules(
-    _ profile: Profile, block: String, proxy: String, direct: String, privateLanDirect: Bool
-  ) async -> Bool {
-    await change(
-      "set_routing_rules",
-      args: [
-        "id": profile.id, "block": block, "proxy": proxy, "direct": direct,
-        "privateLanDirect": privateLanDirect ? "true" : "false",
-      ])
+  /// Saves the rule sets and DNS options; a running connection restarts to apply them.
+  func setRoutingRules(_ profile: Profile, options: RoutingOptions) async -> Bool {
+    var args = options.bridgeArgs
+    args["id"] = profile.id
+    return await change("set_routing_rules", args: args)
+  }
+  func routingOptions(_ profile: Profile) async -> RoutingOptions? {
+    try? await core.call("routing_options", args: ["id": profile.id])
+  }
+  /// Parses a Happ/Incy export without touching the profile.
+  func parseHappRouting(_ payload: String) async -> HappRouting? {
+    do { return try await core.call("parse_happ_routing", args: ["payload": payload]) } catch {
+      self.error = error.localizedDescription
+      return nil
+    }
+  }
+  /// Replays the draft rules for one host or IP, offline.
+  func checkRoute(_ target: String, options: RoutingOptions) async -> RouteCheckResult? {
+    var args = options.bridgeArgs
+    args["target"] = target
+    do { return try await core.call("check_route", args: args) } catch {
+      self.error = error.localizedDescription
+      return nil
+    }
   }
   func remove(_ profile: Profile) async { _ = await change("delete", args: ["id": profile.id]) }
   private func change(_ method: String, args: [String: String]) async -> Bool {

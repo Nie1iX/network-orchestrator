@@ -9,6 +9,7 @@ use std::ffi::{c_char, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+mod routing;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
 // The proxy runtime needs the managed Xray package, pinned for Apple
@@ -362,6 +363,19 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
     if let Some(result) = runtime::handle(root, &store, method, args) {
         return result;
     }
+    let find_profile = || {
+        let id = text_arg(args, "id")?;
+        store
+            .load()
+            .map_err(store_error)?
+            .profiles
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| "Profile not found".to_string())
+    };
+    if let Some(result) = routing::handle(root, find_profile, method, args) {
+        return result;
+    }
     match method {
         "capabilities" => Ok(json!({"os":"macos", "minimumOS":"27.0", "nativeUI":true,
             "profiles":true,"networkInventory":true,"networkMutations":false,
@@ -622,35 +636,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
             if profile.backend != TunnelBackend::Xray {
                 return Err("Routing rules are available for Xray connections".into());
             }
-            // Xray matches the first rule, so blocks win over proxy over direct.
-            let mut policies = Vec::new();
-            for (key, target) in [
-                ("block", DomainRouteTarget::Block),
-                ("proxy", DomainRouteTarget::Proxy),
-                ("direct", DomainRouteTarget::Direct),
-            ] {
-                let domains: Vec<String> = args[key]
-                    .as_str()
-                    .unwrap_or_default()
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                for line in &domains {
-                    let single = [DomainPolicy {
-                        domains: vec![line.clone()],
-                        target,
-                    }];
-                    net_manager_core::xray::validate_routing_policy_selectors(&single)
-                        .map_err(|_| format!("Invalid routing rule ({line})"))?;
-                }
-                if !domains.is_empty() {
-                    policies.push(DomainPolicy { domains, target });
-                }
-            }
-            profile.domain_policies = policies;
-            profile.private_lan_direct = args["privateLanDirect"].as_str() == Some("true");
+            routing::apply_draft(&mut profile, args)?;
             runtime::restart_around(root, &store, id, || {
                 let document = store.upsert(profile).map_err(store_error)?;
                 encode(net_manager_core::subscription::public_profiles(

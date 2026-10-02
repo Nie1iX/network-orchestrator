@@ -33,6 +33,7 @@ struct Profile: Decodable, Identifiable, Sendable {
   let xrayMode: String?
   var domainPolicies: [DomainPolicy]? = nil
   var privateLanDirect: Bool? = nil
+  var xrayDns: DnsSummary? = nil
   /// Rule lines of one target (block / proxy / direct), comments included.
   func rules(_ target: String) -> [String] {
     (domainPolicies ?? []).filter { $0.target == target }.flatMap(\.domains)
@@ -41,14 +42,14 @@ struct Profile: Decodable, Identifiable, Sendable {
   /// reads as the provider group, a user-chosen name is shown as typed.
   var groupName: String {
     guard let title = subscription?.providerTitle, !title.isEmpty,
-      name == title || name.hasPrefix(title + " - ")
+      name == title || [" · ", " - "].contains(where: { name.hasPrefix(title + $0) })
     else { return name }
     return title
   }
   /// A server name without the provider prefix the panel repeats on each.
   func serverLabel(_ server: String) -> String {
     guard let title = subscription?.providerTitle, !title.isEmpty else { return server }
-    for separator in [" - ", " – ", " — ", " | "] where server.hasPrefix(title + separator) {
+    for separator in [" · ", " - ", " – ", " — ", " | "] where server.hasPrefix(title + separator) {
       return String(server.dropFirst(title.count + separator.count))
     }
     return server
@@ -293,4 +294,76 @@ struct ConnectionSet: Codable, Identifiable, Sendable, Equatable {
   var id: String
   var name: String
   var profileIds: [String]
+}
+
+/// Counts of a profile's custom DNS policy, for the detail summary.
+struct DnsSummary: Decodable, Sendable {
+  let servers: [DnsServerStub]?
+  let hosts: [String: [String]]?
+  var serverCount: Int { servers?.count ?? 0 }
+  var hostCount: Int { hosts?.count ?? 0 }
+}
+struct DnsServerStub: Decodable, Sendable {}
+/// Editor state of a profile's Xray routing options, as plain text fields.
+struct RoutingOptions: Decodable, Sendable {
+  var block = ""
+  var proxy = ""
+  var direct = ""
+  var privateLanDirect = false
+  var domainStrategy = ""
+  var domainMatcher = ""
+  var dnsServers = ""
+  var dnsHosts = ""
+  var fakeDns = false
+  var queryStrategy = ""
+}
+/// Fields recovered from a pasted Happ/Incy routing export; absent fields
+/// were not mentioned and keep their current value in the editor.
+struct HappRouting: Decodable, Sendable {
+  let name: String?
+  let block: String
+  let proxy: String
+  let direct: String
+  let privateLanDirect: Bool?
+  let domainStrategy: String?
+  let domainMatcher: String?
+  let dnsServers: String?
+  let dnsHosts: String?
+  let fakeDns: Bool?
+  let queryStrategy: String?
+  let warnings: [String]
+}
+struct RouteCheckResult: Decodable, Sendable {
+  let target: String
+  let outbound: String
+  let source: String
+  let policyIndex: Int?
+  let matchedSelector: String?
+  let certainty: String
+  let notes: [String]
+}
+
+extension RoutingOptions {
+  var bridgeArgs: [String: String] {
+    [
+      "block": block, "proxy": proxy, "direct": direct,
+      "privateLanDirect": privateLanDirect ? "true" : "false",
+      "domainStrategy": domainStrategy, "domainMatcher": domainMatcher,
+      "dnsServers": dnsServers, "dnsHosts": dnsHosts,
+      "fakeDns": fakeDns ? "true" : "false", "queryStrategy": queryStrategy,
+    ]
+  }
+  /// Applies the fields a Happ export mentions and keeps the rest.
+  mutating func apply(_ happ: HappRouting) {
+    block = happ.block
+    proxy = happ.proxy
+    direct = happ.direct
+    if let value = happ.privateLanDirect { privateLanDirect = value }
+    if let value = happ.domainStrategy { domainStrategy = value }
+    if let value = happ.domainMatcher { domainMatcher = value }
+    if let value = happ.dnsServers { dnsServers = value }
+    if let value = happ.dnsHosts { dnsHosts = value }
+    if let value = happ.fakeDns { fakeDns = value }
+    if let value = happ.queryStrategy { queryStrategy = value }
+  }
 }

@@ -8,6 +8,19 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+### Added
+
+- Native domain rules editor gained a DNS tab (resolvers with proxy/direct
+  pinning, static hosts, Fake DNS, query strategy), domain strategy and
+  matcher pickers, an offline route checker and Happ/Incy routing import,
+  sharing the core parsers with the Tauri client.
+
+### Changed
+
+- The native client moves a connection off occupied SOCKS/HTTP listener ports
+  before starting it (shared `prepare_connect_ports` in the core); subscription
+  names use a centered dot, matching the other clients.
+
 ## [0.5.0] - 2026-10-01
 
 ### Added
