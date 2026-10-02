@@ -15,6 +15,8 @@ pub mod dns;
 pub mod link_names;
 #[cfg(target_os = "linux")]
 pub mod netlink;
+#[cfg(target_os = "linux")]
+pub mod nm;
 pub mod openvpn;
 #[cfg(target_os = "linux")]
 pub mod openvpn_process;

@@ -7,30 +7,32 @@ use crate::cond_rules::{match_interface, plan_routes, IfaceAddr, OWNER_PREFIX};
 use crate::dns::{DnsApply, DnsExecutor};
 use crate::openvpn::OpenVpnPlan;
 use crate::openvpn_process::OpenVpnProcessRunner;
-use crate::validate::{validate_apply, validate_iface_name, validate_owner};
+use crate::validate::{validate_apply, validate_attach, validate_iface_name, validate_owner};
 use crate::wireguard::{WireGuardPlan, WireGuardPlanWarning};
 use crate::xray::prepare_xray;
 use crate::xray_process::XrayProcessRunner;
 use ipnet::IpNet;
 use net_manager_core::daemon_protocol::{
-    CleanupResult, ConditionalRouteRule, ConditionalRuleState, ConditionalRuleStatus, IpFamily,
-    OpenVpnConnectionState, OpenVpnFailure, OpenVpnPlanConflict, OpenVpnPlanResult,
-    OpenVpnProbeResult, OpenVpnProcessResource, OpenVpnStatusResult, OpenVpnWarning, OwnedEntry,
-    OwnedResource, OwnedRuleResource, OwnedState, RouteCondition, WireGuardAddressResource,
-    WireGuardFullResource, WireGuardLinkResource, WireGuardStatusResult, WireGuardWarning,
-    XrayConnectParams, XrayProcessResource, XrayStatusResult,
+    AttachSpecParams, CleanupResult, ConditionalRouteRule, ConditionalRuleState,
+    ConditionalRuleStatus, IpFamily, OpenVpnConnectionState, OpenVpnFailure, OpenVpnPlanConflict,
+    OpenVpnPlanResult, OpenVpnProbeResult, OpenVpnProcessResource, OpenVpnStatusResult,
+    OpenVpnWarning, OwnedEntry, OwnedResource, OwnedRuleResource, OwnedState, RouteCondition,
+    WireGuardAddressResource, WireGuardFullResource, WireGuardLinkResource, WireGuardStatusResult,
+    WireGuardWarning, XrayConnectParams, XrayProcessResource, XrayStatusResult,
 };
 use net_manager_core::journal::{JournalDocument, JournalEntry, JournalStore};
 use net_manager_core::models::TunnelState;
 use net_manager_core::models::{AnalyzedRoute, AppliedRoute};
 use net_manager_core::openvpn_management::{ManagementEvent, ManagementSnapshot, OpenVpnState};
 use net_manager_core::policy::{
-    apply_routes_transactional, remove_routes_best_effort, RouteExecutor,
+    apply_routes_transactional, remove_routes_best_effort, RouteExecutor, ENDPOINT_BYPASS_METRIC,
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
 #[cfg(target_os = "linux")]
 use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::net::{IpAddr, ToSocketAddrs};
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
@@ -52,6 +54,10 @@ pub trait LinkExecutor: Send {
     fn remove_link(&mut self, name: &str) -> io::Result<()>;
     /// Probe a netdev's tunnel kind without mutating it.
     fn link_kind(&mut self, name: &str) -> io::Result<ExternalLinkKind>;
+    /// Live ifindex for a link name; `None` when the link does not exist.
+    /// Attach specs re-resolve on every reconcile — external tunnels
+    /// re-create their links under fresh ifindices.
+    fn link_index(&self, name: &str) -> io::Result<Option<u32>>;
 }
 
 #[cfg(test)]
@@ -2064,13 +2070,15 @@ impl DaemonCore {
             (None, true) => {}
             _ => return Err(incompatible()),
         }
-        // Tunnel routes: the journaled gateway-less Route resources must match
-        // the plan's explicit routes (a default route's table is derived from
-        // the recorded full-capture slot).
+        // Tunnel routes ride the TUN's own ifindex; bypass host routes ride
+        // the physical uplink, `via` the gateway or `dev`-scoped when the
+        // endpoint is on-link there. The journaled on-TUN routes must match
+        // the plan's explicit routes (a default route's table is derived
+        // from the recorded full-capture slot).
         let mut journaled: Vec<_> = resources
             .iter()
             .filter_map(|resource| match resource {
-                OwnedResource::Route(route) if route.gateway.is_none() => {
+                OwnedResource::Route(route) if route.interface_index == process.index => {
                     Some((route.destination, route.metric, route.table))
                 }
                 _ => None,
@@ -2102,12 +2110,14 @@ impl DaemonCore {
         if journaled != desired {
             return Err(incompatible());
         }
-        // Bypass host routes (journaled with a physical gateway) must cover
-        // the same upstream/DNS destinations the plan would install.
+        // Bypass host routes (journaled on the uplink, not the TUN) must
+        // cover the same upstream/DNS destinations the plan would install.
         let mut bypassed: Vec<_> = resources
             .iter()
             .filter_map(|resource| match resource {
-                OwnedResource::Route(route) if route.gateway.is_some() => Some(route.destination),
+                OwnedResource::Route(route) if route.interface_index != process.index => {
+                    Some(route.destination)
+                }
                 _ => None,
             })
             .collect();
@@ -2317,24 +2327,10 @@ impl DaemonCore {
         if targets.is_empty() {
             return Ok(());
         }
-        let gateways = self.routes.default_gateways().unwrap_or_default();
         for ip in targets {
-            let Some((gateway, oif)) = gateways
-                .iter()
-                .copied()
-                .find(|(gateway, _)| gateway.is_ipv4() == ip.is_ipv4())
-            else {
+            let Some(applied) = self.uplink_host_route(ip, 5) else {
                 eprintln!("network-orchestrator-daemon: no uplink gateway for an xray bypass route, skipping");
                 continue;
-            };
-            let prefix = if ip.is_ipv4() { 32 } else { 128 };
-            let applied = AppliedRoute {
-                destination: IpNet::new(ip, prefix)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad bypass"))?,
-                interface_index: oif,
-                metric: 5,
-                gateway: Some(gateway),
-                table: None,
             };
             self.journal.entries[index]
                 .resources
@@ -3796,22 +3792,40 @@ impl DaemonCore {
                 continue;
             }
             let key = (entry.uid, entry.owner.clone());
-            let restored = match self.tunnel_alive(index) {
-                None => continue,
-                Some(false) => {
-                    // A dead xray child first gets an in-place respawn; only
-                    // an exhausted budget or a respawn failure tears the
-                    // tunnel down.
-                    if key.1.starts_with("xray:") {
-                        match self.heal_xray(index) {
-                            Ok(true) => self.restore_owned_network(index, observed),
-                            Ok(false) | Err(_) => Err(io::Error::other("tunnel transport is gone")),
-                        }
-                    } else {
-                        Err(io::Error::other("tunnel transport is gone"))
-                    }
+            let attach = entry.resources.iter().find_map(|resource| match resource {
+                OwnedResource::AttachSpec(spec) => Some(spec.clone()),
+                _ => None,
+            });
+            let restored = if let Some(spec) = attach {
+                #[cfg(target_os = "linux")]
+                {
+                    self.reconcile_attach(index, &spec, observed)
                 }
-                Some(true) => self.restore_owned_network(index, observed),
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = spec;
+                    continue;
+                }
+            } else {
+                match self.tunnel_alive(index) {
+                    None => continue,
+                    Some(false) => {
+                        // A dead xray child first gets an in-place respawn; only
+                        // an exhausted budget or a respawn failure tears the
+                        // tunnel down.
+                        if key.1.starts_with("xray:") {
+                            match self.heal_xray(index) {
+                                Ok(true) => self.restore_owned_network(index, observed),
+                                Ok(false) | Err(_) => {
+                                    Err(io::Error::other("tunnel transport is gone"))
+                                }
+                            }
+                        } else {
+                            Err(io::Error::other("tunnel transport is gone"))
+                        }
+                    }
+                    Some(true) => self.restore_owned_network(index, observed),
+                }
             };
             match restored {
                 Ok(false) => {}
@@ -3990,21 +4004,16 @@ impl DaemonCore {
         Ok(())
     }
 
-    /// A bypass host route pointing at the *current* physical default
-    /// gateway for its address family, or `None` when no such gateway
-    /// exists right now.
+    /// The same bypass route re-pointed at the *current* physical uplink
+    /// for its address family — `via` the live default gateway, or
+    /// `dev`-scoped when the destination is on-link there. `None` when no
+    /// such uplink exists right now.
     #[cfg(target_os = "linux")]
     fn fresh_bypass_route(&self, route: &AppliedRoute) -> Option<AppliedRoute> {
-        let (gateway, oif) = self
-            .routes
-            .default_gateways()
-            .ok()?
-            .iter()
-            .copied()
-            .find(|(gateway, _)| gateway.is_ipv4() == route.destination.addr().is_ipv4())?;
+        let (gateway, oif) = self.uplink_next_hop(route.destination)?;
         Some(AppliedRoute {
             interface_index: oif,
-            gateway: Some(gateway),
+            gateway,
             ..route.clone()
         })
     }
@@ -4019,6 +4028,18 @@ impl DaemonCore {
         observed: &[AppliedRoute],
     ) -> io::Result<bool> {
         let resources = self.journal.entries[index].resources.clone();
+        // Tunnel routes ride the tunnel's own ifindex (journaled on the
+        // process resource); bypass host routes ride the physical uplink —
+        // either `via` the default gateway or `dev`-scoped when the host is
+        // on-link there. Entries with no tunnel index (static route owners)
+        // only ever treat gateway-carrying routes as bypasses.
+        let tun_indices: Vec<u32> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) if process.index != 0 => Some(process.index),
+                _ => None,
+            })
+            .collect();
         let mut restored = false;
         for resource in &resources {
             let OwnedResource::Route(route) = resource else {
@@ -4030,12 +4051,14 @@ impl DaemonCore {
             {
                 continue;
             }
-            // Bypass host routes point at a physical gateway that can vanish
-            // on roam/DHCP renew/suspend — re-point at the live default
-            // gateway and update the journal instead of re-adding a stale
-            // route. No gateway at all is transient: skip and retry next pass.
+            // Bypass host routes point at a physical uplink that can change
+            // on roam/DHCP renew/suspend — re-derive against the live
+            // uplink and update the journal instead of re-adding a stale
+            // route. No uplink at all is transient: skip and retry next pass.
+            let is_bypass = route.gateway.is_some()
+                || (!tun_indices.is_empty() && !tun_indices.contains(&route.interface_index));
             let mut desired = route.clone();
-            if route.gateway.is_some() {
+            if is_bypass {
                 match self.fresh_bypass_route(route) {
                     Some(fresh) => {
                         if fresh != *route {
@@ -4060,7 +4083,7 @@ impl DaemonCore {
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
                 // A bypass add failing while the uplink is flaky must not
                 // kill the tunnel; the next reconcile pass retries.
-                Err(err) if route.gateway.is_some() => {
+                Err(err) if is_bypass => {
                     eprintln!(
                         "network-orchestrator-daemon: bypass route re-add deferred: {}",
                         err.kind()
@@ -4087,6 +4110,186 @@ impl DaemonCore {
         Ok(restored)
     }
 
+    /// Routes the attach spec wants right now: declared CIDRs bound to the
+    /// live ifindex of `interface_name` (nothing while the link is absent —
+    /// they stay armed, not deleted) and bypass host routes pinned to the
+    /// current physical uplink.
+    #[cfg(target_os = "linux")]
+    fn attach_desired(&mut self, spec: &AttachSpecParams) -> Vec<AppliedRoute> {
+        let mut desired = Vec::new();
+        if !spec.interface_name.is_empty() {
+            if let Ok(Some(index)) = self.links.link_index(&spec.interface_name) {
+                // Mirrors `interface_gateway_for` in the planner: tunnel
+                // links take routes on-link, physical uplinks need their
+                // default gateway as next hop.
+                let physical = matches!(
+                    self.links.link_kind(&spec.interface_name),
+                    Ok(ExternalLinkKind::Other)
+                );
+                let gateways = self.routes.default_gateways().unwrap_or_default();
+                let on_link = self.routes.on_link_networks().unwrap_or_default();
+                desired.extend(spec.routes.iter().map(|route| {
+                    let destination = route.destination.trunc();
+                    // A declared route fully inside a connected subnet on
+                    // this interface is on-link: emit `dev`, not a gateway
+                    // hop that would hairpin one-sidedly.
+                    let on_link_here = || {
+                        on_link
+                            .iter()
+                            .any(|(oif, net)| *oif == index && net.contains(&destination))
+                    };
+                    let gateway = route.via.or_else(|| {
+                        (physical && !on_link_here()).then(|| {
+                            gateways
+                                .iter()
+                                .copied()
+                                .find(|(gateway, oif)| {
+                                    *oif == index
+                                        && gateway.is_ipv4() == destination.addr().is_ipv4()
+                                })
+                                .map(|(gateway, _)| gateway)
+                        })?
+                    });
+                    AppliedRoute {
+                        destination,
+                        interface_index: index,
+                        metric: route.metric,
+                        gateway,
+                        table: None,
+                    }
+                }));
+            }
+        }
+        for host in &spec.endpoint_bypasses {
+            for ip in resolve_endpoint_ips(host) {
+                if let Some(route) = self.uplink_bypass_route(ip) {
+                    if !desired
+                        .iter()
+                        .any(|seen| seen.destination == route.destination)
+                    {
+                        desired.push(route);
+                    }
+                }
+            }
+        }
+        desired
+    }
+
+    /// The next hop a bypass route through the *current* physical uplink
+    /// should take for `destination`: `(gateway, interface)`. The gateway
+    /// is `None` when the destination lies inside a subnet directly
+    /// connected to that uplink — a `via` hop would hairpin the flow
+    /// through a middlebox that only ever sees one direction, and strict
+    /// conntrack/firewall setups drop those one-sided streams. `None`
+    /// overall while no uplink of the family exists.
+    #[cfg(target_os = "linux")]
+    fn uplink_next_hop(&self, destination: IpNet) -> Option<(Option<IpAddr>, u32)> {
+        let (gateway, oif) = self
+            .routes
+            .default_gateways()
+            .ok()?
+            .iter()
+            .copied()
+            .find(|(gateway, _)| gateway.is_ipv4() == destination.addr().is_ipv4())?;
+        let on_link = self
+            .routes
+            .on_link_networks()
+            .unwrap_or_default()
+            .iter()
+            .any(|(iif, net)| *iif == oif && net.contains(&destination));
+        Some(((!on_link).then_some(gateway), oif))
+    }
+
+    /// A bypass host route through the *current* physical uplink of the
+    /// host's family, or `None` while no such uplink exists.
+    #[cfg(target_os = "linux")]
+    fn uplink_host_route(&self, host: IpAddr, metric: u32) -> Option<AppliedRoute> {
+        let (gateway, oif) = self.uplink_next_hop(host.into())?;
+        Some(AppliedRoute {
+            destination: host.into(),
+            interface_index: oif,
+            metric,
+            gateway,
+            table: None,
+        })
+    }
+
+    /// A bypass host route through the *current* physical default gateway
+    /// of the host's family, or `None` while no such uplink exists.
+    #[cfg(target_os = "linux")]
+    fn uplink_bypass_route(&self, host: IpAddr) -> Option<AppliedRoute> {
+        self.uplink_host_route(host, ENDPOINT_BYPASS_METRIC)
+    }
+
+    /// Converge an armed attach entry with the spec's current derivation:
+    /// withdraw journaled routes the spec no longer wants, install missing
+    /// desired ones, and rewrite the entry's `Route` resources to the live
+    /// derivation. Foreign routes are never touched — only resources the
+    /// journal itself recorded. Errors are logged and retried next pass
+    /// instead of tearing the armed owner down.
+    #[cfg(target_os = "linux")]
+    fn reconcile_attach(
+        &mut self,
+        index: usize,
+        spec: &AttachSpecParams,
+        observed: &[AppliedRoute],
+    ) -> io::Result<bool> {
+        let desired = self.attach_desired(spec);
+        let mut changed = false;
+        let mut retained: Vec<AppliedRoute> = Vec::new();
+        for resource in self.journal.entries[index].resources.clone() {
+            let OwnedResource::Route(route) = resource else {
+                continue;
+            };
+            if desired
+                .iter()
+                .any(|target| kernel_route(target) == kernel_route(&route))
+            {
+                continue;
+            }
+            match self.routes.remove_route(&route) {
+                Ok(()) => changed = true,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => changed = true,
+                Err(err) => {
+                    eprintln!(
+                        "network-orchestrator-daemon: attach route withdraw deferred: {}",
+                        err.kind()
+                    );
+                    retained.push(route);
+                }
+            }
+        }
+        for route in &desired {
+            if observed
+                .iter()
+                .any(|seen| kernel_route(seen) == kernel_route(route))
+            {
+                continue;
+            }
+            match self.routes.add_route(route) {
+                Ok(()) => changed = true,
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    eprintln!(
+                        "network-orchestrator-daemon: attach route install deferred: {}",
+                        err.kind()
+                    );
+                }
+            }
+        }
+        let mut resources = vec![OwnedResource::AttachSpec(spec.clone())];
+        resources.extend(desired.iter().cloned().map(OwnedResource::Route));
+        resources.extend(retained.into_iter().map(OwnedResource::Route));
+        if self.journal.entries[index].resources != resources {
+            self.journal.entries[index].resources = resources;
+            changed = true;
+        }
+        if changed {
+            self.persist();
+        }
+        Ok(changed)
+    }
+
     /// Apply `routes` for `(uid, owner)` all-or-nothing. The journal entry is
     /// persisted as `applying` before the first kernel change.
     pub fn apply_routes(
@@ -4095,6 +4298,27 @@ impl DaemonCore {
         owner: &str,
         routes: Vec<AppliedRoute>,
     ) -> io::Result<usize> {
+        self.check_client_owner(owner)?;
+        self.apply_routes_inner(uid, owner, routes, None)
+    }
+
+    /// `apply_routes` carrying an attach spec: the spec is journaled beside
+    /// the concrete routes so every later reconcile re-derives them from the
+    /// live interface name and the current physical uplink, instead of
+    /// trusting one ifindex forever.
+    pub fn apply_attach(
+        &mut self,
+        uid: u32,
+        owner: &str,
+        spec: AttachSpecParams,
+        routes: Vec<AppliedRoute>,
+    ) -> io::Result<usize> {
+        self.check_client_owner(owner)?;
+        validate_attach(&spec).map_err(invalid_input)?;
+        self.apply_routes_inner(uid, owner, routes, Some(spec))
+    }
+
+    fn check_client_owner(&self, owner: &str) -> io::Result<()> {
         validate_owner(owner).map_err(invalid_input)?;
         if owner.starts_with("wg:")
             || owner.starts_with("ovpn:")
@@ -4104,7 +4328,7 @@ impl DaemonCore {
         {
             return Err(invalid_input("reserved owner prefix".into()));
         }
-        self.apply_routes_inner(uid, owner, routes)
+        Ok(())
     }
 
     /// `apply_routes` for daemon-internal owners (`cond:*`): skips the
@@ -4114,6 +4338,7 @@ impl DaemonCore {
         uid: u32,
         owner: &str,
         routes: Vec<AppliedRoute>,
+        attach: Option<AttachSpecParams>,
     ) -> io::Result<usize> {
         validate_apply(&routes).map_err(invalid_input)?;
         if self.position(uid, owner).is_some() {
@@ -4122,11 +4347,17 @@ impl DaemonCore {
                 "owner already has routes applied; remove them first",
             ));
         }
+        let mut resources: Vec<OwnedResource> = attach
+            .iter()
+            .cloned()
+            .map(OwnedResource::AttachSpec)
+            .collect();
+        resources.extend(routes.iter().cloned().map(OwnedResource::Route));
         self.journal.entries.push(JournalEntry {
             uid,
             owner: owner.to_string(),
             state: OwnedState::Applying,
-            resources: routes.iter().cloned().map(OwnedResource::Route).collect(),
+            resources,
         });
         if let Err(err) = self.store.save(&self.journal) {
             self.journal.entries.pop();
@@ -4140,16 +4371,19 @@ impl DaemonCore {
                 Ok(routes.len())
             }
             Err((err, still_applied)) => {
-                if still_applied.is_empty() {
+                if still_applied.is_empty() && attach.is_none() {
                     self.journal.entries.remove(index);
                 } else {
                     // Rollback left routes behind: keep them owned so a later
-                    // remove or startup recovery can clean them up.
+                    // remove or startup recovery can clean them up. A failed
+                    // attach keeps its spec so reconcile retries it.
                     let entry = &mut self.journal.entries[index];
                     entry.state = OwnedState::Stale;
-                    entry.resources = still_applied
-                        .into_iter()
-                        .map(OwnedResource::Route)
+                    entry.resources = attach
+                        .iter()
+                        .cloned()
+                        .map(OwnedResource::AttachSpec)
+                        .chain(still_applied.into_iter().map(OwnedResource::Route))
                         .collect();
                 }
                 self.persist();
@@ -4337,7 +4571,7 @@ impl DaemonCore {
                         changed.push((*uid, owner.clone()));
                     }
                 }
-                (None, Some(routes)) => match self.apply_routes_inner(*uid, &owner, routes) {
+                (None, Some(routes)) => match self.apply_routes_inner(*uid, &owner, routes, None) {
                     Ok(_) => changed.push((*uid, owner.clone())),
                     Err(err) => eval.error = Some(err.to_string()),
                 },
@@ -4362,7 +4596,7 @@ impl DaemonCore {
                     if !in_sync {
                         match self
                             .remove_owner_inner(*uid, &owner)
-                            .and_then(|_| self.apply_routes_inner(*uid, &owner, routes))
+                            .and_then(|_| self.apply_routes_inner(*uid, &owner, routes, None))
                         {
                             Ok(_) => changed.push((*uid, owner.clone())),
                             Err(err) => eval.error = Some(err.to_string()),
@@ -4849,6 +5083,8 @@ impl DaemonCore {
                     io::ErrorKind::InvalidData,
                     "Xray resource in WireGuard journal entry",
                 )),
+                // Pure intent: no kernel artifact to tear down.
+                OwnedResource::AttachSpec(_) => Ok(()),
             };
             let removed = match result {
                 Ok(()) => true,
@@ -4887,6 +5123,30 @@ fn kernel_route(route: &AppliedRoute) -> AppliedRoute {
         route.metric = 1024;
     }
     route
+}
+
+/// Resolve a bypass host to addresses. Literal IPs return immediately; DNS
+/// names resolve on a helper thread so a hung resolver cannot stall the
+/// reconcile loop — a slow pass just yields no bypass this round.
+#[cfg(target_os = "linux")]
+fn resolve_endpoint_ips(host: &str) -> Vec<IpAddr> {
+    if let Ok(ip) = host.parse() {
+        return vec![ip];
+    }
+    let host = host.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            (host.as_str(), 0)
+                .to_socket_addrs()
+                .map(|addrs| addrs.map(|a| a.ip()).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+    });
+    let mut ips = rx.recv_timeout(Duration::from_secs(3)).unwrap_or_default();
+    ips.sort_unstable();
+    ips.dedup();
+    ips
 }
 
 /// Removing a route that is already gone is success: the goal state holds.
@@ -4975,6 +5235,7 @@ mod xray_core_tests {
     struct GatewayRoutes {
         events: Events,
         gateways: Arc<Mutex<Vec<(std::net::IpAddr, u32)>>>,
+        on_link: Arc<Mutex<Vec<(u32, IpNet)>>>,
     }
     impl GatewayRoutes {
         fn new(events: Events) -> Self {
@@ -4984,10 +5245,14 @@ mod xray_core_tests {
                     ("192.0.2.1".parse().unwrap(), 3),
                     ("fe80::abcd".parse().unwrap(), 3),
                 ])),
+                on_link: Arc::new(Mutex::new(Vec::new())),
             }
         }
         fn shared_gateways(&self) -> Arc<Mutex<Vec<(std::net::IpAddr, u32)>>> {
             self.gateways.clone()
+        }
+        fn shared_on_link(&self) -> Arc<Mutex<Vec<(u32, IpNet)>>> {
+            self.on_link.clone()
         }
     }
     impl RouteExecutor for GatewayRoutes {
@@ -5002,6 +5267,9 @@ mod xray_core_tests {
         fn default_gateways(&self) -> io::Result<Vec<(std::net::IpAddr, u32)>> {
             Ok(self.gateways.lock().unwrap().clone())
         }
+        fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
+            Ok(self.on_link.lock().unwrap().clone())
+        }
     }
     struct Links;
     impl LinkExecutor for Links {
@@ -5013,6 +5281,9 @@ mod xray_core_tests {
         }
         fn link_kind(&mut self, _: &str) -> io::Result<ExternalLinkKind> {
             Ok(ExternalLinkKind::Missing)
+        }
+        fn link_index(&self, _: &str) -> io::Result<Option<u32>> {
+            Ok(None)
         }
     }
     struct Tun(Events);
@@ -5683,6 +5954,61 @@ mod xray_core_tests {
     }
 
     #[test]
+    fn xray_bypass_on_link_server_uses_dev_route() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-onlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let routes = GatewayRoutes::new(events.clone());
+        // The proxy server lives inside a subnet directly connected to the
+        // uplink: pinning it `via` the default gateway would hairpin the
+        // transport through a box that never sees replies.
+        routes
+            .shared_on_link()
+            .lock()
+            .unwrap()
+            .push((3, "10.9.0.0/24".parse().unwrap()));
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(routes),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Process(events.clone())),
+        )
+        .unwrap();
+        core.policy = Some(Box::new(Policy(events.clone())));
+        let mut input = params();
+        input.config = json!({
+            "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[
+                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"10.9.0.7","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                {"tag":"direct","protocol":"freedom"}
+            ],
+            "routing":{"domainStrategy":"AsIs","rules":[]}
+        })
+        .to_string();
+        input.routes = vec![PolicyRoute {
+            destination: "0.0.0.0/0".parse().unwrap(),
+            metric: 5,
+            via: None,
+        }];
+        core.connect_xray(1000, input).unwrap();
+        let owned = core.owned(1000);
+        let bypass = owned[0]
+            .resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) => Some(route),
+                _ => None,
+            })
+            .find(|route| route.destination.to_string() == "10.9.0.7/32")
+            .expect("server bypass route");
+        assert_eq!(bypass.interface_index, 3);
+        assert_eq!(bypass.gateway, None);
+        core.disconnect_xray(1000, "home").unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn split_xray_bypasses_server_but_keeps_dns_inside_tunnel() {
         let events = Events::default();
         let dir =
@@ -6255,6 +6581,7 @@ impl WgConfigExecutor for TrustedWgCommand {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::{ExternalLinkKind, LinkExecutor};
+    use ipnet::IpNet;
     use net_manager_core::models::AppliedRoute;
     use net_manager_core::policy::RouteExecutor;
     use std::collections::HashMap;
@@ -6278,6 +6605,13 @@ pub(crate) mod testing {
         pub missing_on_remove: Arc<Mutex<Vec<String>>>,
         /// Foreign-link kinds probed by `FakeLinks::link_kind`; absent = Missing.
         pub link_kinds: Arc<Mutex<HashMap<String, ExternalLinkKind>>>,
+        /// Link name → ifindex for `FakeLinks::link_index`; absent = gone.
+        /// Tests mutate it between reconciles to simulate re-created tunnels.
+        pub link_indexes: Arc<Mutex<HashMap<String, u32>>>,
+        /// Physical default gateways reported by `FakeRoutes`.
+        pub gateways: Arc<Mutex<Vec<(std::net::IpAddr, u32)>>>,
+        /// Connected (gateway-less) subnets reported by `FakeRoutes`.
+        pub on_link: Arc<Mutex<Vec<(u32, IpNet)>>>,
     }
 
     impl Recorder {
@@ -6339,6 +6673,14 @@ pub(crate) mod testing {
             }
             Ok(())
         }
+
+        fn default_gateways(&self) -> io::Result<Vec<(std::net::IpAddr, u32)>> {
+            Ok(self.recorder.gateways.lock().unwrap().clone())
+        }
+
+        fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
+            Ok(self.recorder.on_link.lock().unwrap().clone())
+        }
     }
 
     pub struct FakeLinks(pub Recorder);
@@ -6361,6 +6703,9 @@ pub(crate) mod testing {
                 .get(name)
                 .copied()
                 .unwrap_or(ExternalLinkKind::Missing))
+        }
+        fn link_index(&self, name: &str) -> io::Result<Option<u32>> {
+            Ok(self.0.link_indexes.lock().unwrap().get(name).copied())
         }
     }
 }
@@ -8598,6 +8943,277 @@ mod tests {
         );
         assert_eq!(
             core.stop_external_link("-wg").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(recorder.ops().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn spec_route(dest: &str) -> net_manager_core::models::PolicyRoute {
+        net_manager_core::models::PolicyRoute {
+            destination: dest.parse().unwrap(),
+            metric: 5,
+            via: None,
+        }
+    }
+
+    fn attach_spec(iface: &str, dests: &[&str], bypasses: &[&str]) -> AttachSpecParams {
+        AttachSpecParams {
+            interface_name: iface.into(),
+            routes: dests.iter().map(|d| spec_route(d)).collect(),
+            endpoint_bypasses: bypasses.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn route_at(dest: &str, index: u32) -> AppliedRoute {
+        AppliedRoute::on_link(dest.parse().unwrap(), index, 5)
+    }
+
+    fn set_link(recorder: &Recorder, name: &str, index: Option<u32>) {
+        let mut indexes = recorder.link_indexes.lock().unwrap();
+        match index {
+            Some(index) => indexes.insert(name.into(), index),
+            None => indexes.remove(name),
+        };
+    }
+
+    fn clear_ops(recorder: &Recorder) {
+        recorder.ops.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn attach_arms_routes_until_interface_appears() {
+        let dir = unique_dir("attach-arm");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &["10.20.0.0/16"], &[]),
+            vec![],
+        )
+        .unwrap();
+        let owned = core.owned(1000);
+        assert_eq!(owned.len(), 1);
+        assert!(matches!(
+            owned[0].resources[0],
+            OwnedResource::AttachSpec(_)
+        ));
+        // Nothing installed while the link is absent; reconcile is a no-op.
+        assert!(recorder.ops().is_empty());
+        assert!(core.reconcile_network(&[]).is_empty());
+        // The interface appears under ifindex 9: the armed route installs.
+        set_link(&recorder, "tun9", Some(9));
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(recorder.ops(), vec![add("10.20.0.0/16")]);
+        let owned = core.owned(1000);
+        let route = match &owned[0].resources[1] {
+            OwnedResource::Route(route) => route,
+            other => panic!("expected route, got {other:?}"),
+        };
+        assert_eq!(route.interface_index, 9);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attach_rebinds_when_interface_is_recreated() {
+        let dir = unique_dir("attach-rebind");
+        let recorder = Recorder::default();
+        set_link(&recorder, "tun9", Some(9));
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &["10.20.0.0/16"], &[]),
+            vec![route_at("10.20.0.0/16", 9)],
+        )
+        .unwrap();
+        clear_ops(&recorder);
+        // The client re-creates the link: old ifindex dies with its routes.
+        set_link(&recorder, "tun9", Some(10));
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(
+            recorder.ops(),
+            vec![remove("10.20.0.0/16"), add("10.20.0.0/16")]
+        );
+        let owned = core.owned(1000);
+        let route = owned[0]
+            .resources
+            .iter()
+            .find_map(|r| match r {
+                OwnedResource::Route(route) => Some(route),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(route.interface_index, 10);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attach_withdraws_routes_when_interface_disappears() {
+        let dir = unique_dir("attach-withdraw");
+        let recorder = Recorder::default();
+        set_link(&recorder, "tun9", Some(9));
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &["10.20.0.0/16"], &[]),
+            vec![route_at("10.20.0.0/16", 9)],
+        )
+        .unwrap();
+        clear_ops(&recorder);
+        set_link(&recorder, "tun9", None);
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(recorder.ops(), vec![remove("10.20.0.0/16")]);
+        // The spec stays armed: the link returning reinstalls the route.
+        set_link(&recorder, "tun9", Some(11));
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(
+            recorder.ops(),
+            vec![remove("10.20.0.0/16"), add("10.20.0.0/16")]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attach_bypass_follows_the_uplink_gateway() {
+        let dir = unique_dir("attach-bypass");
+        let recorder = Recorder::default();
+        recorder
+            .gateways
+            .lock()
+            .unwrap()
+            .push(("192.0.2.1".parse().unwrap(), 3));
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &[], &["203.0.113.7"]),
+            vec![],
+        )
+        .unwrap();
+        // The bypass derives on the first reconcile, pinned to the uplink.
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(recorder.ops(), vec![add("203.0.113.7/32")]);
+        let owned = core.owned(1000);
+        let route = owned[0]
+            .resources
+            .iter()
+            .find_map(|r| match r {
+                OwnedResource::Route(route) => Some(route),
+                _ => None,
+            })
+            .unwrap()
+            .clone();
+        assert_eq!(route.gateway, Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(route.interface_index, 3);
+        // Uplink roams: the bypass is retargeted, not re-added stale.
+        *recorder.gateways.lock().unwrap() = vec![("198.51.100.1".parse().unwrap(), 4)];
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(
+            recorder.ops(),
+            vec![
+                add("203.0.113.7/32"),
+                remove("203.0.113.7/32"),
+                add("203.0.113.7/32")
+            ]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attach_bypass_on_link_host_uses_dev_route() {
+        let dir = unique_dir("attach-bypass-onlink");
+        let recorder = Recorder::default();
+        recorder
+            .gateways
+            .lock()
+            .unwrap()
+            .push(("192.0.2.1".parse().unwrap(), 3));
+        // The uplink owns a connected subnet; a bypass host inside it is
+        // reached directly — `via` the gateway would hairpin one-sidedly.
+        recorder
+            .on_link
+            .lock()
+            .unwrap()
+            .push((3, "10.9.0.0/24".parse().unwrap()));
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &[], &["10.9.0.7", "203.0.113.7"]),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(
+            recorder.ops(),
+            vec![add("10.9.0.7/32"), add("203.0.113.7/32")]
+        );
+        let owned = core.owned(1000);
+        let mut routes = owned[0].resources.iter().filter_map(|r| match r {
+            OwnedResource::Route(route) => Some(route),
+            _ => None,
+        });
+        let on_link = routes.next().unwrap();
+        assert_eq!(on_link.destination.to_string(), "10.9.0.7/32");
+        assert_eq!(on_link.interface_index, 3);
+        assert_eq!(on_link.gateway, None);
+        let remote = routes.next().unwrap();
+        assert_eq!(remote.destination.to_string(), "203.0.113.7/32");
+        assert_eq!(remote.gateway, Some("192.0.2.1".parse().unwrap()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attach_tolerates_a_foreign_duplicate_route() {
+        let dir = unique_dir("attach-foreign");
+        let recorder = Recorder::default();
+        set_link(&recorder, "tun9", Some(9));
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &["10.20.0.0/16"], &[]),
+            vec![route_at("10.20.0.0/16", 9)],
+        )
+        .unwrap();
+        clear_ops(&recorder);
+        // The kernel (or another manager) already carries the exact route:
+        // no redundant add, nothing claimed or removed.
+        let foreign = route_at("10.20.0.0/16", 9);
+        assert!(core.reconcile_network(&[foreign]).is_empty());
+        assert!(recorder.ops().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_attach_validates_spec_and_owner() {
+        let dir = unique_dir("attach-validate");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        assert_eq!(
+            core.apply_attach(1000, "wg:internal", attach_spec("tun9", &[], &[]), vec![],)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            core.apply_attach(1000, "ext", attach_spec("bad name!", &[], &[]), vec![],)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            core.apply_attach(
+                1000,
+                "ext",
+                attach_spec("tun9", &[], &["not a host!"]),
+                vec![],
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::InvalidInput
         );
         assert!(recorder.ops().is_empty());
