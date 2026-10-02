@@ -79,6 +79,16 @@ fn string(value: &Value) -> io::Result<&str> {
         .ok_or_else(rejected)
 }
 
+/// Panels encode "not set" as an explicit empty string (`"shortId": ""`,
+/// `"spiderX": ""`) — accept empty where a field is optional for Xray.
+fn maybe_string(value: &Value) -> io::Result<()> {
+    if value.as_str().is_some_and(|s| s.len() <= 256) {
+        Ok(())
+    } else {
+        Err(rejected())
+    }
+}
+
 fn port(value: &Value) -> io::Result<()> {
     if value
         .as_u64()
@@ -123,12 +133,18 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         return Err(rejected());
     }
     for inbound in inbounds {
-        let map = object(inbound, &["tag", "listen", "port", "protocol", "settings"])?;
+        let map = object(
+            inbound,
+            &["tag", "listen", "port", "protocol", "settings", "sniffing"],
+        )?;
         if inbound["listen"] != "127.0.0.1" {
             return Err(rejected());
         }
         port(&inbound["port"])?;
         string(&inbound["tag"])?;
+        if let Some(sniffing) = map.get("sniffing") {
+            validate_sniffing(sniffing)?;
+        }
         match string(&inbound["protocol"])? {
             "socks" => {
                 if let Some(settings) = map.get("settings") {
@@ -146,15 +162,21 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         .get("outbounds")
         .and_then(Value::as_array)
         .ok_or_else(rejected)?;
-    if outbounds.len() < 2 || outbounds.len() > 4 {
+    if outbounds.len() < 2 || outbounds.len() > 8 {
         return Err(rejected());
     }
     let mut tags = HashSet::new();
     for (index, outbound) in outbounds.iter().enumerate() {
-        let map = object(outbound, &["tag", "protocol", "settings", "streamSettings"])?;
+        let map = object(
+            outbound,
+            &["tag", "protocol", "settings", "streamSettings", "mux"],
+        )?;
         let tag = string(&outbound["tag"])?;
         if !tags.insert(tag) {
             return Err(rejected());
+        }
+        if let Some(mux) = map.get("mux") {
+            validate_mux(mux)?;
         }
         match string(&outbound["protocol"])? {
             "vless" if index == 0 => {
@@ -169,8 +191,15 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                 if user["encryption"] != "none" {
                     return Err(rejected());
                 }
-                if !user["flow"].is_null() {
-                    string(&user["flow"])?;
+                // Panels emit `"flow": ""` for non-vision endpoints; only the
+                // known XTLS flow names besides empty are accepted.
+                if let Some(flow) = user.get("flow") {
+                    let flow = flow.as_str().ok_or_else(rejected)?;
+                    if !flow.is_empty()
+                        && !matches!(flow, "xtls-rprx-vision" | "xtls-rprx-vision-udp443")
+                    {
+                        return Err(rejected());
+                    }
                 }
                 validate_vless_stream(&outbound["streamSettings"])?;
             }
@@ -183,10 +212,20 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                 port(&outbound["settings"]["port"])?;
                 validate_hysteria_stream(&outbound["streamSettings"])?;
             }
-            "freedom" | "blackhole" | "dns"
-                if index > 0
-                    && !map.contains_key("settings")
-                    && !map.contains_key("streamSettings") => {}
+            "freedom" | "blackhole" | "dns" if index > 0 => {
+                // Auxiliary outbounds cannot open listeners; their settings
+                // only shape outbound behaviour, so validate the emitted
+                // inner shapes rather than forbid them outright.
+                if let Some(settings) = map.get("settings") {
+                    validate_auxiliary_settings(
+                        string(&outbound["protocol"]).unwrap_or_default(),
+                        settings,
+                    )?;
+                }
+                if let Some(stream) = map.get("streamSettings") {
+                    validate_auxiliary_stream(stream)?;
+                }
+            }
             _ => return Err(rejected()),
         }
     }
@@ -217,10 +256,37 @@ fn validate_generated(config: &Value) -> io::Result<()> {
     for rule in rules {
         object(
             rule,
-            &["type", "domain", "ip", "port", "network", "outboundTag"],
+            &[
+                "type",
+                "domain",
+                "ip",
+                "port",
+                "network",
+                "outboundTag",
+                "inboundTag",
+            ],
         )?;
-        if rule["type"] != "field" || !tags.contains(string(&rule["outboundTag"])?) {
+        // `type` is optional in panel exports; Xray treats a missing type as
+        // "field". Whatever is present must still be the field kind.
+        if let Some(kind) = rule.get("type") {
+            if kind != "field" {
+                return Err(rejected());
+            }
+        }
+        if !tags.contains(string(&rule["outboundTag"])?) {
             return Err(rejected());
+        }
+        if let Some(inbound_tag) = rule.get("inboundTag") {
+            let items = inbound_tag.as_array().ok_or_else(rejected)?;
+            if items.is_empty() || items.len() > 8 {
+                return Err(rejected());
+            }
+            for item in items {
+                let item = string(item)?;
+                if item.len() > 64 {
+                    return Err(rejected());
+                }
+            }
         }
         if let Some(rule_port) = rule.get("port") {
             match rule_port {
@@ -262,9 +328,33 @@ fn validate_generated(config: &Value) -> io::Result<()> {
 /// or `{address, port, domains, skipFallback}` objects; hosts map names to
 /// one or more literal addresses.
 fn validate_dns(dns: &Value) -> io::Result<()> {
-    let dns = object(dns, &["hosts", "servers", "queryStrategy"])?;
+    let dns = object(
+        dns,
+        &[
+            "hosts",
+            "servers",
+            "queryStrategy",
+            "tag",
+            "enableParallelQuery",
+            "disableCache",
+            "serveStale",
+            "clientIp",
+        ],
+    )?;
     if let Some(query) = dns.get("queryStrategy") {
         string(query)?;
+    }
+    for key in ["tag", "clientIp"] {
+        if let Some(value) = dns.get(key) {
+            string(value)?;
+        }
+    }
+    for key in ["enableParallelQuery", "disableCache", "serveStale"] {
+        if let Some(value) = dns.get(key) {
+            if !value.is_boolean() {
+                return Err(rejected());
+            }
+        }
     }
     if let Some(hosts) = dns.get("hosts") {
         let hosts = hosts.as_object().ok_or_else(rejected)?;
@@ -362,6 +452,287 @@ fn validate_fakedns(fakedns: &Value) -> io::Result<()> {
     Ok(())
 }
 
+/// Inbound `sniffing` blocks generated or imported by the app: enable flag,
+/// destOverride/metatada lists, and boolean modifiers only.
+fn validate_sniffing(sniffing: &Value) -> io::Result<()> {
+    let map = object(
+        sniffing,
+        &[
+            "enabled",
+            "destOverride",
+            "routeOnly",
+            "metadataOnly",
+            "domainsExcluded",
+        ],
+    )?;
+    for key in ["enabled", "routeOnly", "metadataOnly"] {
+        if let Some(value) = map.get(key) {
+            if !value.is_boolean() {
+                return Err(rejected());
+            }
+        }
+    }
+    for key in ["destOverride", "domainsExcluded"] {
+        if let Some(list) = map.get(key) {
+            let list = list.as_array().ok_or_else(rejected)?;
+            if list.len() > 8 {
+                return Err(rejected());
+            }
+            for item in list {
+                let item = string(item)?;
+                if item.len() > 64 {
+                    return Err(rejected());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `mux` multiplexing options on a proxy outbound.
+fn validate_mux(mux: &Value) -> io::Result<()> {
+    let map = object(
+        mux,
+        &[
+            "enabled",
+            "concurrency",
+            "xudpConcurrency",
+            "xudpProxyUDP443",
+        ],
+    )?;
+    if let Some(enabled) = map.get("enabled") {
+        if !enabled.is_boolean() {
+            return Err(rejected());
+        }
+    }
+    for key in ["concurrency", "xudpConcurrency"] {
+        if let Some(value) = map.get(key) {
+            if !value.as_i64().is_some_and(|n| (1..=1024).contains(&n)) {
+                return Err(rejected());
+            }
+        }
+    }
+    if let Some(policy) = map.get("xudpProxyUDP443") {
+        let policy = string(policy)?;
+        if policy.len() > 64 {
+            return Err(rejected());
+        }
+    }
+    Ok(())
+}
+
+/// `tcpSettings.header` masquerade — only the shape emitted by the generator.
+fn validate_tcp_settings(tcp: &Value) -> io::Result<()> {
+    let map = object(tcp, &["header"])?;
+    if let Some(header) = map.get("header") {
+        let header = object(header, &["type"])?;
+        string(&header["type"])?;
+    }
+    Ok(())
+}
+
+/// `streamSettings.sockopt` — kernel knobs and dialer chaining. `mark` is
+/// written by the daemon itself; callers may set the rest.
+fn validate_sockopt(sockopt: &Value) -> io::Result<()> {
+    let map = object(
+        sockopt,
+        &[
+            "mark",
+            "dialerProxy",
+            "domainStrategy",
+            "tcpFastOpen",
+            "tproxy",
+            "tcpKeepAliveInterval",
+            "tcpKeepAliveIdle",
+            "tcpcongestion",
+            "interface",
+            "V6Only",
+            "tcpWindowClamp",
+            "tcpMptcp",
+            "tcpNoDelay",
+        ],
+    )?;
+    for (key, value) in map {
+        match key.as_str() {
+            "mark" | "tcpKeepAliveInterval" | "tcpKeepAliveIdle" | "tcpWindowClamp" => {
+                value
+                    .as_u64()
+                    .filter(|n| *n <= u32::MAX as u64)
+                    .ok_or_else(rejected)?;
+            }
+            "tcpFastOpen" | "V6Only" | "tcpMptcp" | "tcpNoDelay" => {
+                value.as_bool().ok_or_else(rejected)?;
+            }
+            "tproxy" => {
+                if !matches!(value.as_str(), Some("off" | "redirect" | "tproxy")) {
+                    return Err(rejected());
+                }
+            }
+            _ => {
+                string(value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `settings` on freedom/blackhole/dns outbounds — none of them can open a
+/// listener, so validating the emitted key shapes keeps the allowlist honest
+/// without shrinking the importer's vocabulary.
+fn validate_auxiliary_settings(protocol: &str, settings: &Value) -> io::Result<()> {
+    match protocol {
+        "freedom" => {
+            let map = object(
+                settings,
+                &[
+                    "domainStrategy",
+                    "redirect",
+                    "timeout",
+                    "userLevel",
+                    "fragment",
+                ],
+            )?;
+            for (key, value) in map {
+                match key.as_str() {
+                    "timeout" | "userLevel" => {
+                        value.as_u64().ok_or_else(rejected)?;
+                    }
+                    "fragment" => {
+                        object(value, &["packets", "length", "interval"])?;
+                    }
+                    _ => {
+                        string(value)?;
+                    }
+                }
+            }
+        }
+        "blackhole" => {
+            let map = object(settings, &["response"])?;
+            if let Some(response) = map.get("response") {
+                let response = object(response, &["type"])?;
+                string(&response["type"])?;
+            }
+        }
+        "dns" => {
+            // Covers both vanilla Xray dns fields and the panel/fork
+            // rewrite table (`rewriteAddress`/`rewriteNetwork`/`rewritePort`
+            // plus `rules` with action/qType/rCode filters).
+            let map = object(
+                settings,
+                &[
+                    "address",
+                    "port",
+                    "network",
+                    "userLevel",
+                    "nonIPQuery",
+                    "blockTypes",
+                    "skipFallback",
+                    "queryStrategy",
+                    "rewriteAddress",
+                    "rewriteNetwork",
+                    "rewritePort",
+                    "rules",
+                ],
+            )?;
+            for (key, value) in map {
+                match key.as_str() {
+                    "port" => port(value)?,
+                    "userLevel" | "rewritePort" => {
+                        value.as_u64().ok_or_else(rejected)?;
+                    }
+                    "skipFallback" => {
+                        value.as_bool().ok_or_else(rejected)?;
+                    }
+                    "blockTypes" => {
+                        let items = value.as_array().ok_or_else(rejected)?;
+                        if items.is_empty() || items.len() > 16 {
+                            return Err(rejected());
+                        }
+                        for item in items {
+                            value_u64(item)?;
+                        }
+                    }
+                    "rules" => {
+                        let rules = value.as_array().ok_or_else(rejected)?;
+                        if rules.is_empty() || rules.len() > 64 {
+                            return Err(rejected());
+                        }
+                        for rule in rules {
+                            validate_dns_rewrite_rule(rule)?;
+                        }
+                    }
+                    _ => {
+                        string(value)?;
+                    }
+                }
+            }
+        }
+        _ => return Err(rejected()),
+    }
+    Ok(())
+}
+
+fn validate_dns_rewrite_rule(rule: &Value) -> io::Result<()> {
+    let map = object(rule, &["action", "qType", "rCode", "domain", "domains"])?;
+    if let Some(action) = map.get("action") {
+        let action = string(action)?;
+        if !matches!(action, "return" | "hijack" | "direct" | "reject" | "skip") {
+            return Err(rejected());
+        }
+    }
+    if let Some(qtype) = map.get("qType") {
+        let qtype = string(qtype)?;
+        if qtype.len() > 128
+            || !qtype
+                .split(',')
+                .all(|item| !item.is_empty() && item.parse::<u16>().is_ok())
+        {
+            return Err(rejected());
+        }
+    }
+    if let Some(rcode) = map.get("rCode") {
+        value_u64(rcode)?;
+    }
+    for key in ["domain", "domains"] {
+        if let Some(list) = map.get(key) {
+            let list = list.as_array().ok_or_else(rejected)?;
+            if list.is_empty() || list.len() > 128 {
+                return Err(rejected());
+            }
+            for item in list {
+                routing_selector("domain", string(item)?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn value_u64(value: &Value) -> io::Result<()> {
+    if value.as_u64().is_some() {
+        Ok(())
+    } else {
+        Err(rejected())
+    }
+}
+
+/// `streamSettings` on auxiliary outbounds: transport extras only — sockopt
+/// for fwmark/dialer chaining, tcpSettings for masquerade headers.
+fn validate_auxiliary_stream(stream: &Value) -> io::Result<()> {
+    let map = object(stream, &["network", "security", "tcpSettings", "sockopt"])?;
+    for key in ["network", "security"] {
+        if let Some(value) = map.get(key) {
+            string(value)?;
+        }
+    }
+    if let Some(tcp) = map.get("tcpSettings") {
+        validate_tcp_settings(tcp)?;
+    }
+    if let Some(sockopt) = map.get("sockopt") {
+        validate_sockopt(sockopt)?;
+    }
+    Ok(())
+}
+
 /// Root Xray resolves `ext:`-style selectors to files next to its assets, so
 /// accept only the selector forms the app generates.
 fn routing_selector(key: &str, item: &str) -> io::Result<()> {
@@ -415,7 +786,7 @@ fn routing_selector(key: &str, item: &str) -> io::Result<()> {
 }
 
 fn validate_vless_stream(stream: &Value) -> io::Result<()> {
-    object(
+    let map = object(
         stream,
         &[
             "network",
@@ -426,8 +797,16 @@ fn validate_vless_stream(stream: &Value) -> io::Result<()> {
             "httpupgradeSettings",
             "tlsSettings",
             "realitySettings",
+            "tcpSettings",
+            "sockopt",
         ],
     )?;
+    if let Some(tcp) = map.get("tcpSettings") {
+        validate_tcp_settings(tcp)?;
+    }
+    if let Some(sockopt) = map.get("sockopt") {
+        validate_sockopt(sockopt)?;
+    }
     if !matches!(
         stream["network"].as_str(),
         Some("tcp" | "raw" | "ws" | "grpc" | "xhttp" | "httpupgrade")
@@ -469,7 +848,7 @@ fn validate_vless_stream(stream: &Value) -> io::Result<()> {
                         string(item)?;
                     }
                 } else {
-                    string(value)?;
+                    maybe_string(value)?;
                 }
             }
         }
@@ -664,7 +1043,19 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
             if outbound["streamSettings"].is_null() {
                 outbound["streamSettings"] = json!({});
             }
-            outbound["streamSettings"]["sockopt"] = json!({"mark": mark});
+            let stream = outbound["streamSettings"]
+                .as_object_mut()
+                .ok_or_else(rejected)?;
+            // Imported configs may already carry sockopt knobs (dialerProxy
+            // chains the dns outbound through the proxy, domainStrategy
+            // pins the address family) — merge the daemon mark instead of
+            // replacing the object.
+            match stream.entry("sockopt").or_insert_with(|| json!({})) {
+                Value::Object(sockopt) => {
+                    sockopt.insert("mark".into(), json!(mark));
+                }
+                _ => return Err(rejected()),
+            }
         }
     }
     Ok(XrayPlan {
@@ -1008,6 +1399,68 @@ mod tests {
     }
 
     #[test]
+    fn plan_accepts_imported_panel_config_shape() {
+        // Subscription/panel configs keep richer machinery than the narrow
+        // generated schema: mux on the proxy outbound, dialerProxy on the
+        // dns outbound, DNS rewrite tables, inboundTag rules without an
+        // explicit type field, and dns.tag/enableParallelQuery.
+        let mut input = params();
+        input.config = json!({
+            "inbounds": [
+                {"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true},"sniffing":{"enabled":true,"destOverride":["http","tls"]}},
+                {"tag":"http-in","listen":"127.0.0.1","port":1081,"protocol":"http"}
+            ],
+            "outbounds": [
+                {"tag":"proxy","protocol":"vless","mux":{"enabled":true,"concurrency":6,"xudpConcurrency":4,"xudpProxyUDP443":"reject"},
+                 "settings":{"vnext":[{"address":"nl.example.test","port":443,"users":[{"id":"SECRET-ID","encryption":"none","flow":""}]}]},
+                 "streamSettings":{"network":"tcp","security":"reality","tcpSettings":{},"realitySettings":{"serverName":"www.example.test","fingerprint":"chrome","publicKey":"KEY","shortId":"","spiderX":""}}},
+                {"tag":"direct","protocol":"freedom","streamSettings":{"sockopt":{"domainStrategy":"ForceIPv4"}}},
+                {"tag":"dns","protocol":"dns",
+                 "settings":{"rewriteAddress":"8.8.8.8","rewriteNetwork":"udp","rewritePort":53,
+                    "rules":[{"action":"return","qType":"65,28","rCode":5},{"action":"hijack","domain":["geosite:private"],"qType":"1"},{"action":"direct"}]},
+                 "streamSettings":{"sockopt":{"dialerProxy":"proxy"}}},
+                {"tag":"block","protocol":"blackhole"},
+                {"tag":"block-http","protocol":"blackhole","settings":{"response":{"type":"http"}}}
+            ],
+            "dns":{
+                "enableParallelQuery": false,
+                "tag": "dns-inbound",
+                "hosts": {"dot.example.test": ["77.88.8.8"]},
+                "queryStrategy": "UseIPv4",
+                "servers": ["https://dot.example.test/dns-query", "77.88.8.8", "194.85.254.37"]
+            },
+            "routing":{
+                "domainStrategy":"AsIs",
+                "rules":[
+                    {"inboundTag":["socks-direct","dns-inbound"],"outboundTag":"direct"},
+                    {"network":"tcp,udp","outboundTag":"dns","port":"53"},
+                    {"inboundTag":["dns-in"],"outboundTag":"dns"},
+                    {"ip":["8.8.8.8"],"network":"tcp","outboundTag":"block","port":"853"},
+                    {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
+                    {"type":"field","domain":["geosite:private"],"outboundTag":"direct"}
+                ]
+            }
+        })
+        .to_string();
+        let plan = prepare_xray(1000, input, 51820).unwrap();
+        let config: Value = serde_json::from_str(&plan.config).unwrap();
+        // dialerProxy chains the dns outbound through the proxy; the daemon
+        // mark must merge into sockopt, not replace it.
+        assert_eq!(
+            config["outbounds"][2]["streamSettings"]["sockopt"]["dialerProxy"],
+            "proxy"
+        );
+        assert_eq!(
+            config["outbounds"][2]["streamSettings"]["sockopt"]["mark"],
+            51820
+        );
+        assert_eq!(
+            config["outbounds"][1]["streamSettings"]["sockopt"]["domainStrategy"],
+            "ForceIPv4"
+        );
+    }
+
+    #[test]
     fn plan_rejects_malformed_dns_sections() {
         let with_dns = |dns: Value| {
             let mut config: Value = serde_json::from_str(&params().config).unwrap();
@@ -1025,6 +1478,50 @@ mod tests {
         input.config = config.to_string();
         assert!(prepare_xray(1000, input, 51820).is_err());
     }
+    /// Opt-in end-to-end check against a real config and the pinned binary:
+    /// `XRAY_PANEL_CONFIG=/path/config.json XRAY_TEST_BIN=/path/to/xray`
+    /// runs `prepare_xray` on the file and asks `xray run -test` whether the
+    /// resulting TUN plan actually loads. Skips silently without both vars.
+    /// Secrets in the source config never leave the process — the assertion
+    /// is the process exit status only.
+    #[test]
+    fn env_gated_plan_loads_in_real_xray() {
+        let (Ok(config_path), Ok(binary)) = (
+            std::env::var("XRAY_PANEL_CONFIG"),
+            std::env::var("XRAY_TEST_BIN"),
+        ) else {
+            return;
+        };
+        let mut input = params();
+        input.config = std::fs::read_to_string(&config_path).expect("read panel config");
+        let plan = prepare_xray(1000, input, 51820).expect("plan");
+        let staged =
+            std::env::temp_dir().join(format!("xray-plan-test-{}.json", std::process::id()));
+        std::fs::write(&staged, &plan.config).expect("write staged plan");
+        let assets = std::path::Path::new(&binary)
+            .parent()
+            .expect("binary parent dir");
+        // `run -test` still instantiates the TUN device, so an unprivileged
+        // run fails with EPERM after parsing. Inside a disposable user+net
+        // namespace the check fully loads the config.
+        let output = std::process::Command::new("unshare")
+            .args(["-Urn", &binary, "run", "-test", "-config"])
+            .arg(&staged)
+            .env("XRAY_LOCATION_ASSET", assets)
+            .output()
+            .expect("spawn xray");
+        let _ = std::fs::remove_file(&staged);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Without namespace support the parse still has to succeed: xray
+        // may then only fail at TUN creation with EPERM.
+        let parsed =
+            stdout.contains("Configuration OK") || stdout.contains("operation not permitted");
+        assert!(
+            parsed,
+            "xray -test rejected the generated TUN plan: {stdout}"
+        );
+    }
+
     #[test]
     fn dns_bypass_hosts_are_carried_into_the_plan() {
         let mut input = params();
