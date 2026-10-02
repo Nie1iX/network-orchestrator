@@ -49,7 +49,14 @@ fn text(value: Option<&OwnedValue>) -> Option<String> {
 }
 
 fn number(value: Option<&OwnedValue>) -> Option<u32> {
-    u64::try_from(value?.clone()).ok().map(|v| v as u32)
+    // zvariant TryFrom is type-exact — a D-Bus `u` (U32) fails u64
+    // conversion — so try the unsigned widths NM actually emits.
+    let value = value?.clone();
+    u32::try_from(value.clone())
+        .ok()
+        .or_else(|| u64::try_from(value.clone()).ok().map(|v| v as u32))
+        .or_else(|| u16::try_from(value.clone()).ok().map(u32::from))
+        .or_else(|| u8::try_from(value).ok().map(u32::from))
 }
 
 fn object_paths(value: Option<&OwnedValue>) -> Vec<String> {
@@ -293,6 +300,19 @@ mod tests {
             map.insert("vpn".to_string(), section(vpn));
         }
         map
+    }
+
+    #[test]
+    fn number_accepts_all_unsigned_widths() {
+        // Regression: NM's `u` props deserialize as U32 and zvariant's
+        // TryFrom is type-exact — u64-only conversion silently dropped
+        // every ActiveConnection State, marking live tunnels inactive.
+        let u32v = OwnedValue::from(2u32);
+        assert_eq!(number(Some(&u32v)), Some(2));
+        let u64v = OwnedValue::from(2u64);
+        assert_eq!(number(Some(&u64v)), Some(2));
+        let bogus = OwnedValue::from(true);
+        assert_eq!(number(Some(&bogus)), None);
     }
 
     #[test]
