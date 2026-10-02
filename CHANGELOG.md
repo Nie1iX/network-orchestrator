@@ -8,6 +8,8 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-02
+
 ### Added
 
 - macOS privileged helper, stage 1: the `network-orchestrator-helper` launchd
