@@ -24,7 +24,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
-const RUNTIME_ROOT: &str = "/run/network-orchestrator";
+use crate::openvpn::runtime_root;
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const BINARY_ROOT: &str = "/usr/lib/network-orchestrator/xray";
 #[cfg(target_os = "linux")]
@@ -218,12 +219,12 @@ impl XrayProcessRunner for TrustedXrayProcess {
         }
         let binary = trusted_binary()?;
         ensure_runtime_root()?;
-        let directory = stage_config_at(Path::new(RUNTIME_ROOT), uid, name, config)?;
+        let directory = stage_config_at(runtime_root().as_path(), uid, name, config)?;
         let managed_dir = binary.parent().expect("fixed managed binary");
         let asset_dir = match geo_assets {
             Some(assets) => {
                 if let Err(err) = stage_geo_assets(assets, &directory, managed_dir) {
-                    let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
+                    let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
                     return Err(err);
                 }
                 directory.as_path()
@@ -237,7 +238,7 @@ impl XrayProcessRunner for TrustedXrayProcess {
                 Ok(())
             }
             Err(error) => {
-                let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
+                let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
                 Err(error)
             }
         }
@@ -402,14 +403,14 @@ impl XrayProcessRunner for TrustedXrayProcess {
         ensure_runtime_root()?;
         // Preserve the last log lines in the daemon journal before the
         // staging directory (and its xray.log) is removed.
-        let log_path = Path::new(RUNTIME_ROOT)
+        let log_path = runtime_root()
             .join(uid.to_string())
             .join(name)
             .join("xray.log");
         for line in log_tail(&log_path).lines().take(LOG_JOURNAL_LINES) {
             eprintln!("network-orchestrator-daemon: xray[{name}] {line}");
         }
-        cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name)
+        cleanup_stage_at(runtime_root().as_path(), uid, name)
     }
 }
 
@@ -541,7 +542,7 @@ pub fn remove_managed_package_at(_root: &Path) -> io::Result<bool> {
 
 #[cfg(target_os = "linux")]
 fn ensure_runtime_root() -> io::Result<()> {
-    let root = Path::new(RUNTIME_ROOT);
+    let root = runtime_root();
     let metadata = fs::symlink_metadata(root)
         .map_err(|_| io::Error::other("Xray runtime directory unavailable"))?;
     if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
@@ -693,7 +694,7 @@ fn stage_config_at(root: &Path, uid: u32, name: &str, config: &str) -> io::Resul
 /// root-owned and private before reusing it (respawn/reload).
 #[cfg(target_os = "linux")]
 fn assert_staging_dir(uid: u32, name: &str) -> io::Result<PathBuf> {
-    let directory = Path::new(RUNTIME_ROOT).join(uid.to_string()).join(name);
+    let directory = runtime_root().join(uid.to_string()).join(name);
     for path in [
         directory.parent().expect("fixed runtime path"),
         directory.as_path(),
@@ -942,7 +943,7 @@ fn read_starttime(pid: u32) -> io::Result<u64> {
 #[cfg(target_os = "linux")]
 fn recover_child(uid: u32, name: &str) -> io::Result<()> {
     ensure_runtime_root()?;
-    let directory = Path::new(RUNTIME_ROOT).join(uid.to_string()).join(name);
+    let directory = runtime_root().join(uid.to_string()).join(name);
     for path in [
         directory.parent().expect("fixed runtime path"),
         directory.as_path(),

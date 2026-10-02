@@ -7,14 +7,25 @@ use net_manager_core::openvpn_management::validate_openvpn_credentials;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Root of per-user runtime staging directories on the daemon host.
 pub(crate) const RUNTIME_ROOT: &str = "/run/network-orchestrator";
 
+/// `NETWORK_ORCHESTRATOR_RUNTIME_DIR` relocates the staging root: a second
+/// (dev) daemon instance sets it in its unit so its /run tree never
+/// collides with the packaged daemon's. Unset means the packaged path.
+const RUNTIME_ROOT_ENV: &str = "NETWORK_ORCHESTRATOR_RUNTIME_DIR";
+
+pub fn runtime_root() -> PathBuf {
+    std::env::var_os(RUNTIME_ROOT_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(RUNTIME_ROOT))
+}
+
 /// The deterministic runtime staging directory for a (uid, name) pair.
 pub fn stage_dir(uid: u32, name: &str) -> PathBuf {
-    Path::new(RUNTIME_ROOT).join(uid.to_string()).join(name)
+    runtime_root().join(uid.to_string()).join(name)
 }
 
 pub struct OpenVpnPlan {

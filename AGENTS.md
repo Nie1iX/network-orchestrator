@@ -49,7 +49,10 @@ npm run build
 - `scripts/macos-dev.sh build|run|test|preview|check|du|clean` — native
   macOS loop: `release-fast` bridge (no LTO, incremental) + Swift debug,
   isolated QA data for `run`, offscreen renders for `preview`.
-- `npm run tauri dev` — dev run; on Windows,
+- `npm run dev:app` — Linux dev run against the dev daemon
+  (`network-orchestrator-dev.service`, socket `/run/network-orchestrator-dev/`,
+  data dir `~/.local/share/com.netmanager.app.dev/`, "(Dev)" window title);
+  `npm run tauri dev` keeps the production identity; on Windows,
   `npm run tauri build -- --bundles nsis` builds unsigned NSIS under
   `target/release/bundle/nsis/`; on Linux use `scripts/build-linux-deb.sh`
   (`.deb`), `scripts/build-linux-deb.sh rpm` (Fedora `.rpm`) or

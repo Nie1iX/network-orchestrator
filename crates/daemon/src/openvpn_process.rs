@@ -16,7 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::openvpn::{stage_dir, RUNTIME_ROOT};
+use crate::openvpn::{runtime_root, stage_dir};
 const MAX_POLL_BYTES: usize = 64 * 1024;
 const MANAGEMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -110,7 +110,7 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
         }
         let binary = trusted_binary()?;
         ensure_runtime_root()?;
-        let directory = stage_config_at(Path::new(RUNTIME_ROOT), uid, name, config)?;
+        let directory = stage_config_at(runtime_root().as_path(), uid, name, config)?;
         let socket = directory.join("management.sock");
         let args = openvpn_args(&directory.join("config.ovpn"), name, &socket, mark);
         let mut child = match Command::new(binary)
@@ -123,7 +123,7 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
         {
             Ok(child) => child,
             Err(_) => {
-                let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
+                let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
                 return Err(io::Error::other("failed to start OpenVPN"));
             }
         };
@@ -137,7 +137,7 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
                         .map_err(|_| io::Error::other("OpenVPN child check failed"))?
                         .is_some()
                     {
-                        let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
+                        let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
                         return Err(io::Error::new(
                             io::ErrorKind::NotConnected,
                             "OpenVPN exited before management connection",
@@ -147,7 +147,7 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
                 }
                 Err(_) => {
                     terminate_child(&mut child)?;
-                    let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
+                    let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "OpenVPN management connection timed out",
@@ -160,7 +160,7 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
             .is_err()
         {
             terminate_child(&mut child)?;
-            let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
+            let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
             return Err(io::Error::other("OpenVPN management setup failed"));
         }
         let mut management = management;
@@ -170,7 +170,7 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
             || management.set_nonblocking(true).is_err()
         {
             terminate_child(&mut child)?;
-            let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
+            let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
             return Err(io::Error::other("OpenVPN management setup failed"));
         }
         self.children.insert(
@@ -284,7 +284,7 @@ impl OpenVpnProcessRunner for TrustedOpenVpnProcess {
             ));
         }
         ensure_runtime_root()?;
-        cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name)
+        cleanup_stage_at(runtime_root().as_path(), uid, name)
     }
 }
 
@@ -338,14 +338,14 @@ fn safe_trusted_path(path: &Path, owner_uid: u32, root: &Path) -> bool {
 }
 
 fn ensure_runtime_root() -> io::Result<()> {
-    let root = Path::new(RUNTIME_ROOT);
+    let root = runtime_root();
     if !root.exists() {
         DirBuilder::new()
             .mode(0o700)
-            .create(root)
+            .create(&root)
             .map_err(|_| io::Error::other("OpenVPN runtime directory is unavailable"))?;
     }
-    let metadata = fs::symlink_metadata(root)
+    let metadata = fs::symlink_metadata(&root)
         .map_err(|_| io::Error::other("OpenVPN runtime directory is unavailable"))?;
     if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
         return Err(io::Error::new(
