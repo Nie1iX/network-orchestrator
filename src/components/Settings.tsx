@@ -6,7 +6,13 @@ import UpdateChecker from "./UpdateChecker";
 import Page from "./Page";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import { usePlatformCapabilities } from "../platform";
-import { setProfileListMode, useProfileListMode } from "../prefs";
+import {
+  AppMode,
+  setAppMode,
+  setProfileListMode,
+  useAppMode,
+  useProfileListMode,
+} from "../prefs";
 import {
   readAppearance,
   saveAppearance,
@@ -45,6 +51,7 @@ export default function Settings() {
   const [vpnAuthBusy, setVpnAuthBusy] = useState(false);
   const [vpnAuthError, setVpnAuthError] = useState<string | null>(null);
   const listMode = useProfileListMode();
+  const appMode = useAppMode();
   const locale = useLanguage();
   const [appearance, setAppearance] = useState<Appearance>(readAppearance);
   const t = useT();
@@ -209,6 +216,31 @@ export default function Settings() {
                   }
                   title={t("settings.groupByBackend")}
                 />
+              </div>
+              <div className="settings-row">
+                <div className="settings-row-main">
+                  <span className="settings-row-label">
+                    {t("settings.appMode")}
+                  </span>
+                  <span className="settings-row-sub">
+                    {t("settings.appModeSub")}
+                  </span>
+                </div>
+                <select
+                  aria-label={t("settings.appMode")}
+                  value={appMode}
+                  onChange={(e) => setAppMode(e.target.value as AppMode)}
+                >
+                  <option value="combined">
+                    {t("settings.modeCombined")}
+                  </option>
+                  <option value="orchestrator">
+                    {t("settings.modeOrchestrator")}
+                  </option>
+                  <option value="manager">
+                    {t("settings.modeManager")}
+                  </option>
+                </select>
               </div>
             </div>
           </div>

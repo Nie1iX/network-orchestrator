@@ -1243,20 +1243,25 @@ async fn connect_profile_inner(
         derive_installable_routes(&candidate_analysis, &pushed, profile.backend)
     };
 
-    if !install_routes.is_empty() {
+    let wants_attach = profile.wait_for_interface || !profile.endpoint_bypasses.is_empty();
+    if !install_routes.is_empty() || wants_attach {
         let install_interface = match resolve_install_interface(&profile) {
             Some(name) => name,
             None => {
-                // No interface name available — skip route installation with a
-                // notice. This happens for OpenVPN profiles without an explicit
-                // interface name; the backend is up but routes are not installed.
-                status.message = Some(
-                    "tunnel is up but routes were not installed: \
-                     set a target interface in the profile to enable app-owned routing"
-                        .into(),
-                );
-                let _ = app.emit("route-changed", ());
-                return Ok(status);
+                if !install_routes.is_empty() {
+                    // No interface name available — skip route installation with a
+                    // notice. This happens for OpenVPN profiles without an explicit
+                    // interface name; the backend is up but routes are not installed.
+                    status.message = Some(
+                        "tunnel is up but routes were not installed: \
+                         set a target interface in the profile to enable app-owned routing"
+                            .into(),
+                    );
+                    let _ = app.emit("route-changed", ());
+                    return Ok(status);
+                }
+                // Bypass-only profile: nothing binds to a link by name.
+                String::new()
             }
         };
         let install_profile = Profile {
@@ -1264,50 +1269,69 @@ async fn connect_profile_inner(
             routes: install_routes,
             ..profile.clone()
         };
-        let mut matched_interfaces: Option<Vec<NetworkInterface>> = None;
-        let mut list_error: Option<String> = None;
-        for _ in 0..40 {
-            match explorer::list_interfaces() {
-                Ok(interfaces) => {
-                    if has_target_interface(&install_profile, &interfaces) {
-                        matched_interfaces = Some(interfaces);
+        // Deferred attach profiles arm the daemon and return immediately —
+        // reconcile installs the routes when the link appears. Others keep
+        // polling briefly for the freshly created tunnel interface.
+        let interfaces = if profile.wait_for_interface {
+            explorer::list_interfaces().unwrap_or_default()
+        } else {
+            let mut matched_interfaces: Option<Vec<NetworkInterface>> = None;
+            let mut list_error: Option<String> = None;
+            for _ in 0..40 {
+                match explorer::list_interfaces() {
+                    Ok(interfaces) => {
+                        if has_target_interface(&install_profile, &interfaces) {
+                            matched_interfaces = Some(interfaces);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        list_error = Some(e.to_string());
                         break;
                     }
                 }
-                Err(e) => {
-                    list_error = Some(e.to_string());
-                    break;
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            if let Some(err) = list_error {
+                let mut message = format!("failed to enumerate interfaces: {err}");
+                if proxy_applied {
+                    if let Err(cleanup) = runtime.proxy.restore(&id) {
+                        message.push_str(&format!("; proxy restore failed: {cleanup}"));
+                    }
+                }
+                if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
+                    message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
+                }
+                return Err(message);
+            }
+            match matched_interfaces {
+                Some(interfaces) => interfaces,
+                None => {
+                    let mut message = format!(
+                        "timed out waiting for interface '{}' to come up",
+                        install_profile.interface_name
+                    );
+                    if proxy_applied {
+                        if let Err(cleanup) = runtime.proxy.restore(&id) {
+                            message.push_str(&format!("; proxy restore failed: {cleanup}"));
+                        }
+                    }
+                    if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
+                        message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
+                    }
+                    return Err(message);
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        }
-        if let Some(err) = list_error {
-            let mut message = format!("failed to enumerate interfaces: {err}");
-            if proxy_applied {
-                if let Err(cleanup) = runtime.proxy.restore(&id) {
-                    message.push_str(&format!("; proxy restore failed: {cleanup}"));
-                }
-            }
-            if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
-                message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
-            }
-            return Err(message);
-        }
-        let Some(interfaces) = matched_interfaces else {
-            let mut message = format!(
-                "timed out waiting for interface '{}' to come up",
-                install_profile.interface_name
-            );
-            if proxy_applied {
-                if let Err(cleanup) = runtime.proxy.restore(&id) {
-                    message.push_str(&format!("; proxy restore failed: {cleanup}"));
-                }
-            }
-            if let Err(cleanup) = runtime.tunnels.disconnect(&profile) {
-                message.push_str(&format!("; cleanup disconnect failed: {cleanup}"));
-            }
-            return Err(message);
         };
+        if profile.wait_for_interface
+            && !install_profile.routes.is_empty()
+            && !has_target_interface(&install_profile, &interfaces)
+        {
+            status.message = Some(format!(
+                "routes are armed and will install when interface '{}' appears",
+                install_profile.interface_name
+            ));
+        }
         if let Err(err) = runtime
             .routes
             .apply_profile(&install_profile, &interfaces)
