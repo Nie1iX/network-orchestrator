@@ -2757,6 +2757,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "network-orchestrator-macos-helper"
+version = "0.6.0"
+dependencies = [
+ "libc",
+ "net-manager-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

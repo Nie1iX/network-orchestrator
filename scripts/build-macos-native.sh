@@ -29,11 +29,32 @@ cd "$REPO_ROOT"
 python3 scripts/generate-ui-theme.py --check
 python3 scripts/generate-localizations.py --check
 bash "$REPO_ROOT/scripts/stage-macos-bridge.sh" "$CARGO_PROFILE"
+cargo build --profile "$CARGO_PROFILE" -p network-orchestrator-macos-helper
 swift build --package-path macos --configuration "$SWIFT_CONFIG" --scratch-path target/macos-swift
 VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "net-manager-macos-bridge"))')"
 BIN_DIR="$(swift build --package-path macos --configuration "$SWIFT_CONFIG" --scratch-path target/macos-swift --show-bin-path)"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 install -m 0755 "$BIN_DIR/NetworkOrchestrator" "$APP_DIR/Contents/MacOS/NetworkOrchestrator"
+# Privileged helper: a launchd daemon the app registers through SMAppService.
+# It lives next to the app executable, which is how it finds the one client
+# process it serves.
+HELPER_LABEL="com.netmanager.app.helper"
+install -m 0755 "$REPO_ROOT/target/$CARGO_PROFILE/network-orchestrator-helper" "$APP_DIR/Contents/MacOS/network-orchestrator-helper"
+mkdir -p "$APP_DIR/Contents/Library/LaunchDaemons"
+python3 - "$APP_DIR/Contents/Library/LaunchDaemons/$HELPER_LABEL.plist" "$HELPER_LABEL" <<'PY'
+import plistlib, sys
+daemon = {
+    'Label': sys.argv[2],
+    'BundleProgram': 'Contents/MacOS/network-orchestrator-helper',
+    'AssociatedBundleIdentifiers': ['com.netmanager.app.macos'],
+    'RunAtLoad': True,
+    'KeepAlive': True,
+    'ProcessType': 'Interactive',
+    'StandardErrorPath': '/var/log/network-orchestrator-helper.log',
+}
+with open(sys.argv[1], 'wb') as output:
+    plistlib.dump(daemon, output)
+PY
 cp "$REPO_ROOT/src-tauri/icons/icon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 RESOURCE_BUNDLE="NetworkOrchestratorMac_NetworkOrchestrator.bundle"
 ditto "$BIN_DIR/$RESOURCE_BUNDLE" "$APP_DIR/Contents/Resources/$RESOURCE_BUNDLE"
@@ -61,6 +82,7 @@ with open(sys.argv[1], 'wb') as output:
     plistlib.dump(info, output)
 PY
 # Local ad-hoc signature; Developer ID/notarization are separate release steps.
+codesign --force --sign - "$APP_DIR/Contents/MacOS/network-orchestrator-helper"
 codesign --force --sign - "$APP_DIR"
 codesign --verify --strict "$APP_DIR"
 echo "$APP_DIR"

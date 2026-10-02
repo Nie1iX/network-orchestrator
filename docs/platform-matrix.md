@@ -37,7 +37,7 @@ waits for the launchd helper
 
 | Feature | Windows | Linux | macOS | Notes |
 |---|---|---|---|---|
-| Privileged ops | ✅ elevated relaunch | ✅ daemon | ❌ | Win: `elevationRelaunch` respawn; Linux: `net-manager-daemon` (systemd + polkit + Unix socket); no elevation path exists for macOS |
+| Privileged ops | ✅ elevated relaunch | ✅ daemon | ⚠️ helper installs, no mutations yet | Win: `elevationRelaunch` respawn; Linux: `net-manager-daemon` (systemd + polkit + Unix socket); macOS: launchd helper (`SMAppService.daemon`) answers `hello` and verifies the app, but has no tunnel executors yet — see the helper plan |
 | Ask for admin password (polkit policy) | — | ✅ | — | `get/set_vpn_auth_mode`; Settings → System |
 | Always-on before sign-in | — | ✅ | — | WG + static routes only; daemon journal; OVPN/Xray unsupported |
 | Start at login | — | ✅ | — | `get/set_login_autostart` |

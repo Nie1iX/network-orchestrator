@@ -7,6 +7,8 @@ pub mod daemon_protocol;
 pub mod exit_ip;
 pub mod explorer;
 pub mod happ_routing;
+#[cfg(unix)]
+pub mod helper_client;
 pub mod journal;
 pub mod log_sanitize;
 #[cfg(target_os = "macos")]

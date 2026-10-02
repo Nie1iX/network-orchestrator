@@ -44,6 +44,8 @@ import SystemConfiguration
   /// Interface carrying the system default route, e.g. `en0` or a VPN `utun9`.
   var primaryInterface: String?
   var notice: String?
+  var helperRegistration: HelperRegistration = .notRegistered
+  var helperStatus: HelperStatus?
 
   init(dataDirectory: URL? = nil) {
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -427,6 +429,19 @@ import SystemConfiguration
         checkingExitIP.remove(route)
       }
     }
+  }
+  /// Re-reads the launchd registration and asks the helper's socket who answers.
+  func refreshHelper() async {
+    helperRegistration = HelperManager.registration
+    helperStatus = try? await core.callConcurrently("helper_status")
+  }
+  func installHelper() async {
+    do { try HelperManager.register() } catch { self.error = "native.helperFailed" }
+    await refreshHelper()
+  }
+  func removeHelper() async {
+    do { try await HelperManager.unregister() } catch { self.error = "native.helperFailed" }
+    await refreshHelper()
   }
   func connectionLog(_ profile: Profile) async -> String {
     (try? await core.call("log", args: ["id": profile.id]) as String) ?? ""

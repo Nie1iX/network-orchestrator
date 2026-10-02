@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/daemon", "crates/macos-bridge", "src-tauri"]
+members = ["crates/core", "crates/daemon", "crates/macos-bridge", "crates/macos-helper", "src-tauri"]
 resolver = "2"
 
 [workspace.package]
