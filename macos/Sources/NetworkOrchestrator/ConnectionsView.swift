@@ -569,6 +569,13 @@ struct ProfileDetailView: View {
     if profile.privateLanDirect ?? false {
       Text(L10n.text("form.privateLanDirect")).font(.system(size: 10.92)).foregroundStyle(p.muted)
     }
+    if let dns = profile.xrayDns, dns.serverCount + dns.hostCount > 0 {
+      Text(
+        L10n.text(
+          "rules.dnsSummary",
+          ["servers": String(dns.serverCount), "hosts": String(dns.hostCount)])
+      ).font(.system(size: 10.92)).foregroundStyle(p.muted)
+    }
   }
   @ViewBuilder private var tunnelConfig: some View {
     if let inspection = model.inspections[profile.id],
@@ -1107,7 +1114,8 @@ struct InspectionView: View {
   }
 }
 
-/// Full-size editor for the three Xray rule sets (block → proxy → direct).
+/// Full-size editor for the Xray rule sets (block → proxy → direct), split
+/// DNS and domain strategy, with a Happ/Incy import and an offline checker.
 struct RoutingRulesEditor: View {
   struct RuleSet { let target: String; let title: String; let color: String }
   static let sets = [
@@ -1115,71 +1123,223 @@ struct RoutingRulesEditor: View {
     RuleSet(target: "proxy", title: "rules.proxy", color: "accent"),
     RuleSet(target: "direct", title: "rules.direct", color: "up"),
   ]
+  private static let strategies = [
+    ("", "rules.strategyDefault"), ("asIs", "AsIs"), ("ipIfNonMatch", "IPIfNonMatch"),
+    ("ipOnDemand", "IPOnDemand"),
+  ]
+  private static let matchers = [
+    ("", "rules.matcherDefault"), ("mph", "mph"), ("hybrid", "hybrid"), ("linear", "linear"),
+  ]
+  private static let queryStrategies = [
+    ("", "rules.matcherDefault"), ("useIp", "UseIP"), ("useIpv4", "UseIPv4"), ("useIpv6", "UseIPv6"),
+  ]
   @Environment(\.palette) private var p
   @Bindable var model: AppModel
   let profile: Profile
   let onClose: () -> Void
   @State private var selected = "proxy"
-  @State private var texts: [String: String] = [:]
-  @State private var privateLanDirect = false
+  @State private var options = RoutingOptions()
+  @State private var importing = false
+  @State private var happPayload = ""
+  @State private var happWarnings: [String] = []
+  @State private var testTarget = ""
+  @State private var checking = false
+  @State private var verdict: RouteCheckResult?
+
+  private func text(_ target: String) -> Binding<String> {
+    switch target {
+    case "block": $options.block
+    case "direct": $options.direct
+    default: $options.proxy
+    }
+  }
+  private func count(_ target: String) -> Int {
+    text(target).wrappedValue.split(separator: "\n")
+      .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !$0.hasPrefix("#") }.count
+  }
+  private func tab(_ id: String, title: String, color: String?, badge: String?) -> some View {
+    Button {
+      selected = id
+    } label: {
+      HStack(spacing: 6) {
+        if let color { Circle().fill(p[color]).frame(width: 7, height: 7) }
+        Text(L10n.text(title))
+        if let badge { Text(badge).foregroundStyle(p.muted) }
+      }.font(.system(size: 11.9, weight: selected == id ? .semibold : .regular))
+        .padding(.horizontal, 10).padding(.vertical, 5)
+        .background(selected == id ? p["bg-elev"] : .clear, in: RoundedRectangle(cornerRadius: 6))
+    }.buttonStyle(.plain)
+  }
+  private func editor(_ binding: Binding<String>, height: CGFloat, label: String) -> some View {
+    TextEditor(text: binding)
+      .font(.system(size: 11.9, design: .monospaced)).scrollContentBackground(.hidden)
+      .padding(7).frame(height: height)
+      .background(p.input, in: RoundedRectangle(cornerRadius: 6))
+      .overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
+      .accessibilityLabel(L10n.text(label))
+  }
+  private func picker(_ title: String, _ value: Binding<String>, _ items: [(String, String)])
+    -> some View
+  {
+    HStack {
+      Text(L10n.text(title)).font(.system(size: 11.9))
+      Spacer()
+      Picker("", selection: value) {
+        ForEach(items, id: \.0) { Text(L10n.text($0.1)).tag($0.0) }
+      }.labelsHidden().frame(width: 190)
+    }
+  }
+  private var dnsPane: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      picker("rules.domainStrategy", $options.domainStrategy, Self.strategies)
+      picker("rules.domainMatcher", $options.domainMatcher, Self.matchers)
+      picker("native.queryStrategy", $options.queryStrategy, Self.queryStrategies)
+      Text(L10n.text("rules.outboundDns")).font(.system(size: 11.9, weight: .semibold))
+      editor($options.dnsServers, height: 110, label: "rules.outboundDns")
+      Text(L10n.text("native.dnsServersHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+        .fixedSize(horizontal: false, vertical: true)
+      Text(L10n.text("native.staticHosts")).font(.system(size: 11.9, weight: .semibold))
+      editor($options.dnsHosts, height: 70, label: "native.staticHosts")
+      Toggle(L10n.text("native.fakeDns"), isOn: $options.fakeDns).toggleStyle(.checkbox)
+        .font(.system(size: 11.9))
+    }
+  }
+  private var checker: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      HStack(spacing: 8) {
+        TextField(L10n.text("rules.testPlaceholder"), text: $testTarget)
+          .textFieldStyle(.roundedBorder).font(.system(size: 11.9, design: .monospaced))
+          .onSubmit(runCheck)
+        Button(L10n.text(checking ? "rules.testChecking" : "rules.testCheck"), action: runCheck)
+          .disabled(checking || testTarget.trimmingCharacters(in: .whitespaces).isEmpty)
+      }
+      if let verdict {
+        HStack(spacing: 6) {
+          Circle().fill(p[Self.outboundColor(verdict.outbound)]).frame(width: 7, height: 7)
+          Text(L10n.text(Self.outboundTitle(verdict.outbound))).fontWeight(.semibold)
+          Text("· " + sourceText(verdict)).foregroundStyle(p.muted)
+        }.font(.system(size: 11.9))
+        if let selector = verdict.matchedSelector {
+          Text(selector).font(.system(size: 10.92, design: .monospaced)).foregroundStyle(p.muted)
+        }
+        if verdict.certainty == "probable" {
+          Text(L10n.text("rules.testProbable")).font(.system(size: 10.92)).foregroundStyle(p["warn"])
+        }
+        ForEach(verdict.notes, id: \.self) {
+          Text($0).font(.system(size: 10.92)).foregroundStyle(p.muted)
+        }
+      }
+    }
+  }
+  private static func outboundColor(_ outbound: String) -> String {
+    switch outbound {
+    case "block": "down"
+    case "direct": "up"
+    case "dns": "info"
+    default: "accent"
+    }
+  }
+  private static func outboundTitle(_ outbound: String) -> String {
+    switch outbound {
+    case "block": "rules.block"
+    case "direct": "rules.direct"
+    case "dns": "rules.outboundDns"
+    default: "rules.proxy"
+    }
+  }
+  private func sourceText(_ verdict: RouteCheckResult) -> String {
+    switch verdict.source {
+    case "dnsCapture": L10n.text("rules.srcDnsCapture")
+    case "policy": L10n.text("rules.srcPolicy", ["index": String((verdict.policyIndex ?? 0) + 1)])
+    case "resolverPin": L10n.text("rules.srcResolverPin")
+    case "multicast": L10n.text("rules.srcMulticast")
+    case "privateLan": L10n.text("rules.srcPrivateLan")
+    default: L10n.text("rules.srcDefault")
+    }
+  }
+  private func runCheck() {
+    let target = testTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !target.isEmpty, !checking else { return }
+    model.error = nil
+    checking = true
+    Task {
+      verdict = await model.checkRoute(target, options: options)
+      checking = false
+    }
+  }
+  private var happPane: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text(L10n.text("rules.happHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+      editor($happPayload, height: 120, label: "rules.importHapp")
+      HStack {
+        Spacer()
+        Button(L10n.text("rules.back")) { importing = false }
+        Button(L10n.text("rules.happApply")) {
+          Task {
+            guard let happ = await model.parseHappRouting(happPayload) else { return }
+            options.apply(happ)
+            happWarnings = happ.warnings
+            happPayload = ""
+            importing = false
+          }
+        }.buttonStyle(TauriButtonStyle(kind: .accent))
+          .disabled(happPayload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+      }
+    }
+  }
   var body: some View {
     AppModal(title: "detail.domainRules", width: 720, onClose: onClose) {
       VStack(alignment: .leading, spacing: 10.5) {
-        HStack(spacing: 6) {
-          ForEach(Self.sets, id: \.target) { set in
-            let count = (texts[set.target] ?? "").split(separator: "\n")
-              .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !$0.hasPrefix("#") }.count
-            Button {
-              selected = set.target
-            } label: {
-              HStack(spacing: 6) {
-                Circle().fill(p[set.color]).frame(width: 7, height: 7)
-                Text(L10n.text(set.title))
-                Text("\(count)").foregroundStyle(p.muted)
-              }.font(.system(size: 11.9, weight: selected == set.target ? .semibold : .regular))
-                .padding(.horizontal, 10).padding(.vertical, 5)
-                .background(
-                  selected == set.target ? p["bg-elev"] : .clear,
-                  in: RoundedRectangle(cornerRadius: 6))
-            }.buttonStyle(.plain)
+        if importing {
+          happPane
+        } else {
+          HStack(spacing: 6) {
+            ForEach(Self.sets, id: \.target) { set in
+              tab(set.target, title: set.title, color: set.color, badge: "\(count(set.target))")
+            }
+            tab("dns", title: "DNS", color: nil, badge: nil)
+            Spacer()
+            Button(L10n.text("rules.importHapp")) {
+              model.error = nil
+              importing = true
+            }.font(.system(size: 11.9))
           }
-          Spacer()
+          if selected == "dns" {
+            dnsPane
+          } else {
+            editor(text(selected), height: 300, label: "detail.domainRules")
+            Text(L10n.text("form.rulesHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+              .fixedSize(horizontal: false, vertical: true)
+            Toggle(L10n.text("form.privateLanDirect"), isOn: $options.privateLanDirect)
+              .toggleStyle(.checkbox).font(.system(size: 11.9))
+          }
+          Divider()
+          checker
+          ForEach(happWarnings, id: \.self) {
+            Text($0).font(.system(size: 10.92)).foregroundStyle(p["warn"])
+          }
         }
-        TextEditor(
-          text: Binding(get: { texts[selected] ?? "" }, set: { texts[selected] = $0 })
-        )
-        .font(.system(size: 11.9, design: .monospaced)).scrollContentBackground(.hidden)
-        .padding(7).frame(height: 340)
-        .background(p.input, in: RoundedRectangle(cornerRadius: 6))
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
-        .accessibilityLabel(L10n.text("detail.domainRules"))
-        Text(L10n.text("form.rulesHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
-          .fixedSize(horizontal: false, vertical: true)
-        Toggle(L10n.text("form.privateLanDirect"), isOn: $privateLanDirect)
-          .toggleStyle(.checkbox).font(.system(size: 11.9))
         if let error = model.error {
           Text(L10n.text(error)).foregroundStyle(p["down"]).font(.system(size: 11.9))
         }
-        HStack {
-          Spacer()
-          Button(L10n.text("Cancel"), action: onClose)
-          Button(L10n.text("Save")) {
-            Task {
-              if await model.setRoutingRules(
-                profile, block: texts["block"] ?? "", proxy: texts["proxy"] ?? "",
-                direct: texts["direct"] ?? "", privateLanDirect: privateLanDirect)
-              {
-                onClose()
-              }
-            }
-          }.buttonStyle(TauriButtonStyle(kind: .accent)).disabled(model.busy)
+        if !importing {
+          HStack {
+            Spacer()
+            Button(L10n.text("Cancel"), action: onClose)
+            Button(L10n.text("Save")) {
+              Task { if await model.setRoutingRules(profile, options: options) { onClose() } }
+            }.buttonStyle(TauriButtonStyle(kind: .accent)).disabled(model.busy)
+          }
         }
       }.padding(14)
     }
     .onAppear {
       model.error = nil
-      for set in Self.sets { texts[set.target] = profile.rules(set.target).joined(separator: "\n") }
-      privateLanDirect = profile.privateLanDirect ?? false
+      options.block = profile.rules("block").joined(separator: "\n")
+      options.proxy = profile.rules("proxy").joined(separator: "\n")
+      options.direct = profile.rules("direct").joined(separator: "\n")
+      options.privateLanDirect = profile.privateLanDirect ?? false
+      Task { if let loaded = await model.routingOptions(profile) { options = loaded } }
     }
   }
 }

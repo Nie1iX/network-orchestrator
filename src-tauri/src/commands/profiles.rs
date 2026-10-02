@@ -1,5 +1,6 @@
 use crate::elevation;
 use crate::state::{existing_profile_for_update, find_profile, AppState};
+#[cfg(test)]
 use net_manager_core::config_security;
 use net_manager_core::config_vault::{ConfigImport, ConfigVault};
 use net_manager_core::models::*;
@@ -42,6 +43,7 @@ fn should_auto_refresh(profile: &Profile, now: u64, active: bool) -> bool {
 }
 use net_manager_core::subscription::{DELAY_PROBE_TIMEOUT, DELAY_PROBE_URL};
 
+#[cfg(test)]
 pub(crate) fn select_available_socks_port(
     used: &HashSet<u16>,
     available: impl Fn(u16) -> bool,
@@ -79,50 +81,20 @@ pub(crate) fn store_generated_xray(
     vault.store_generated_xray(profile_id, plaintext_json)
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_generated_proxy_ports(
     vault: &ConfigVault,
     profile: &mut Profile,
     new_socks_port: u16,
     new_http_port: Option<u16>,
 ) -> Result<PathBuf, String> {
-    if profile.backend != TunnelBackend::Xray
-        || profile.xray_socks_port.is_none()
-        || !vault.is_managed_profile_path(&profile.id, &profile.config_path)
-    {
-        return Err("profile does not use a managed generated Xray config".into());
-    }
-    if new_socks_port == 0
-        || new_http_port == Some(0)
-        || new_http_port == Some(new_socks_port)
-        || profile.xray_http_port.is_some() != new_http_port.is_some()
-    {
-        return Err("generated Xray listener ports are invalid".into());
-    }
-    let bytes = config_security::read_xray_config(&profile.config_path, &profile.id)
-        .map_err(|e| e.to_string())?;
-    let mut doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    let inbounds = doc
-        .get_mut("inbounds")
-        .and_then(|v| v.as_array_mut())
-        .ok_or_else(|| "generated config has no inbounds array".to_string())?;
-    let inbound = inbounds
-        .iter_mut()
-        .find(|i| i.get("tag").and_then(|t| t.as_str()) == Some("socks-in"))
-        .ok_or_else(|| "generated config has no 'socks-in' inbound".to_string())?;
-    inbound["port"] = serde_json::json!(new_socks_port);
-    if let Some(http_port) = new_http_port {
-        let inbound = inbounds
-            .iter_mut()
-            .find(|i| i.get("tag").and_then(|t| t.as_str()) == Some("http-in"))
-            .ok_or_else(|| "generated config has no 'http-in' inbound".to_string())?;
-        inbound["port"] = serde_json::json!(http_port);
-    }
-    let body = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
-    let import = store_generated_xray(vault, &profile.id, &body).map_err(|e| e.to_string())?;
-    profile.config_path = import.config_path.clone();
-    profile.xray_socks_port = Some(new_socks_port);
-    profile.xray_http_port = new_http_port;
-    Ok(import.config_path)
+    net_manager_core::profile_import::rewrite_generated_proxy_ports(
+        vault,
+        profile,
+        new_socks_port,
+        new_http_port,
+    )
+    .map_err(|err| err.to_string())
 }
 
 pub(crate) fn remove_managed_revision(

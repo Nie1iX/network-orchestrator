@@ -1,8 +1,10 @@
 //! Unprivileged runtime for the native client: Xray in loopback SOCKS/HTTP
 //! mode plus the per-user macOS system proxy. Routes, interfaces and DNS stay
 //! out of this crate; they belong to the privileged launchd helper (plan 14).
+use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::managed_xray;
 use net_manager_core::models::{Profile, TunnelBackend, TunnelState, TunnelStatus, XrayMode};
+use net_manager_core::profile_import;
 use net_manager_core::profiles::ProfileStore;
 use net_manager_core::system_proxy::SystemProxyManager;
 use net_manager_core::vpn::TunnelManager;
@@ -154,12 +156,27 @@ pub(crate) fn is_running(root: &Path, profile: &Profile) -> Result<bool, String>
     })
 }
 
+/// Move the profile off listener ports another process already holds; the
+/// new ports are persisted so the system proxy and the UI follow them.
+fn free_listener_ports(root: &Path, store: &ProfileStore, profile: &mut Profile) {
+    let Ok(mut profiles) = store.load().map(|document| document.profiles) else {
+        return;
+    };
+    let vault = ConfigVault::new(root.join("configs"));
+    let _ = profile_import::prepare_connect_ports(&vault, store, profile, &mut profiles, |port| {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+    });
+}
+
 /// Start a loopback Xray connection and confirm it survived startup.
-fn start(root: &Path, profile: &Profile) -> Result<(), String> {
+fn start(root: &Path, store: &ProfileStore, profile: &Profile) -> Result<(), String> {
+    let mut profile = profile.clone();
     if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Socks {
         return Err(HELPER_REQUIRED.into());
     }
     let executable = managed_executable(root).ok_or("Install Xray to start this connection")?;
+    free_listener_ports(root, store, &mut profile);
+    let profile = &profile;
     with_session(root, |session| {
         session
             .tunnels
@@ -212,7 +229,7 @@ pub(crate) fn restart_around(
     let result = change();
     if was_running {
         let after = find(&load()?, &id_arg)?;
-        start(root, &after)?;
+        start(root, store, &after)?;
     }
     result
 }
@@ -236,7 +253,8 @@ pub(crate) fn handle(
         "install_xray" => install_xray(root, args["archivePath"].as_str()),
         "connect" => load().and_then(|profiles| {
             let profile = find(&profiles, args)?;
-            start(root, &profile)?;
+            start(root, store, &profile)?;
+            let profiles = load()?;
             with_session(root, |session| Ok(snapshot(root, session, &profiles)))
         }),
         "disconnect" => load().and_then(|profiles| {

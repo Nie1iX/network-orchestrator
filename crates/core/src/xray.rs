@@ -680,7 +680,7 @@ pub(crate) fn classify_routing_selector(
 
 const DNS_SCHEMES: &[&str] = &["udp", "tcp", "tls", "https", "https+local", "quic+local"];
 
-fn validate_dns_config(dns: &XrayDnsConfig) -> io::Result<()> {
+pub fn validate_dns_config(dns: &XrayDnsConfig) -> io::Result<()> {
     for server in &dns.servers {
         let address = server.address.trim();
         if address.is_empty()

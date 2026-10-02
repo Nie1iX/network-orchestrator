@@ -44,6 +44,130 @@ pub fn select_generated_ports(
     Ok((socks, http))
 }
 
+/// Replacement listener ports for a connect, when the profile's own SOCKS or
+/// HTTP port is already taken by another process. `None` keeps the stored ports.
+pub fn select_connect_ports(
+    profiles: &[Profile],
+    profile: &Profile,
+    available: impl Fn(u16) -> bool,
+) -> io::Result<Option<(u16, Option<u16>)>> {
+    let Some(socks_port) = profile.xray_socks_port else {
+        return Ok(None);
+    };
+    let http_port = profile.xray_http_port;
+    let socks_occupied = !available(socks_port);
+    let http_occupied = http_port.is_some_and(|port| !available(port));
+    if !socks_occupied && !http_occupied {
+        return Ok(None);
+    }
+    let mut used = profile_listener_ports(profiles, &profile.id);
+    if let Some(http_port) = http_port {
+        used.insert(http_port);
+    }
+    let socks_port = if socks_occupied {
+        select_available_socks_port(&used, &available)?
+    } else {
+        socks_port
+    };
+    used.insert(socks_port);
+    let http_port = if http_occupied {
+        Some(select_available_socks_port(&used, available)?)
+    } else {
+        http_port
+    };
+    Ok(Some((socks_port, http_port)))
+}
+
+/// Rewrite the SOCKS/HTTP inbound ports of a managed generated Xray config
+/// into a new vault revision and point the profile at it.
+pub fn rewrite_generated_proxy_ports(
+    vault: &ConfigVault,
+    profile: &mut Profile,
+    new_socks_port: u16,
+    new_http_port: Option<u16>,
+) -> io::Result<std::path::PathBuf> {
+    if profile.backend != TunnelBackend::Xray
+        || profile.xray_socks_port.is_none()
+        || !vault.is_managed_profile_path(&profile.id, &profile.config_path)
+    {
+        return Err(io::Error::other(
+            "profile does not use a managed generated Xray config",
+        ));
+    }
+    if new_socks_port == 0
+        || new_http_port == Some(0)
+        || new_http_port == Some(new_socks_port)
+        || profile.xray_http_port.is_some() != new_http_port.is_some()
+    {
+        return Err(io::Error::other(
+            "generated Xray listener ports are invalid",
+        ));
+    }
+    let bytes = crate::config_security::read_xray_config(&profile.config_path, &profile.id)?;
+    let mut doc: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let inbounds = doc
+        .get_mut("inbounds")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| io::Error::other("generated config has no inbounds array"))?;
+    let inbound = inbounds
+        .iter_mut()
+        .find(|i| i.get("tag").and_then(|t| t.as_str()) == Some("socks-in"))
+        .ok_or_else(|| io::Error::other("generated config has no 'socks-in' inbound"))?;
+    inbound["port"] = serde_json::json!(new_socks_port);
+    if let Some(http_port) = new_http_port {
+        let inbound = inbounds
+            .iter_mut()
+            .find(|i| i.get("tag").and_then(|t| t.as_str()) == Some("http-in"))
+            .ok_or_else(|| io::Error::other("generated config has no 'http-in' inbound"))?;
+        inbound["port"] = serde_json::json!(http_port);
+    }
+    let body = serde_json::to_vec_pretty(&doc)?;
+    let import = vault.store_generated_xray(&profile.id, &body)?;
+    profile.config_path = import.config_path.clone();
+    profile.xray_socks_port = Some(new_socks_port);
+    profile.xray_http_port = new_http_port;
+    Ok(import.config_path)
+}
+
+/// Move a profile off occupied listener ports before connecting: pick free
+/// ports, store a new vault revision, persist the profile and drop the old
+/// revision. Returns a user-facing notice when a port changed.
+pub fn prepare_connect_ports(
+    vault: &ConfigVault,
+    store: &ProfileStore,
+    profile: &mut Profile,
+    profiles: &mut [Profile],
+    available: impl Fn(u16) -> bool,
+) -> io::Result<Option<String>> {
+    let old_socks = profile.xray_socks_port;
+    let old_http = profile.xray_http_port;
+    let Some((new_socks, new_http)) = select_connect_ports(profiles, profile, available)? else {
+        return Ok(None);
+    };
+    let old_path = profile.config_path.clone();
+    rewrite_generated_proxy_ports(vault, profile, new_socks, new_http)?;
+    if let Err(err) = store.upsert(profile.clone()) {
+        let _ = vault.remove_revision_for_config(&profile.config_path);
+        return Err(err);
+    }
+    if let Some(stored) = profiles.iter_mut().find(|stored| stored.id == profile.id) {
+        *stored = profile.clone();
+    }
+    if vault.is_managed_profile_path(&profile.id, &old_path) {
+        vault.remove_revision_for_config(&old_path)?;
+    }
+    let mut notices = Vec::new();
+    if let Some(port) = old_socks.filter(|port| *port != new_socks) {
+        notices.push(format!("SOCKS5 port changed from {port} to {new_socks}."));
+    }
+    if let (Some(port), Some(new_port)) = (old_http, new_http) {
+        if port != new_port {
+            notices.push(format!("HTTP port changed from {port} to {new_port}."));
+        }
+    }
+    Ok(Some(notices.join(" ")))
+}
+
 pub fn profile_listener_ports(profiles: &[Profile], exclude_id: &str) -> HashSet<u16> {
     let mut ports = HashSet::new();
     for profile in profiles {
@@ -128,6 +252,29 @@ pub fn import_share_link(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connect_ports_move_only_when_a_listener_port_is_taken() {
+        let mut profile = Profile {
+            id: "a".into(),
+            backend: TunnelBackend::Xray,
+            xray_socks_port: Some(10808),
+            xray_http_port: Some(10809),
+            ..Profile::default()
+        };
+        assert_eq!(select_connect_ports(&[], &profile, |_| true).unwrap(), None);
+        assert_eq!(
+            select_connect_ports(&[], &profile, |port| port != 10809).unwrap(),
+            Some((10808, Some(10810)))
+        );
+        let both = select_connect_ports(&[], &profile, |port| !matches!(port, 10808 | 10809));
+        assert_eq!(both.unwrap(), Some((10810, Some(10811))));
+        profile.xray_socks_port = None;
+        assert_eq!(
+            select_connect_ports(&[], &profile, |_| false).unwrap(),
+            None
+        );
+    }
+
     use super::*;
     const LINK: &str = "vless://synthetic-id@node.test:443?security=tls#Lab%20Node";
 
