@@ -5018,6 +5018,7 @@ impl DaemonCore {
     ) -> io::Result<NetIntentResult> {
         let owner = intent_owner(&params.id)?;
         let spec = intent_spec(&params)?;
+        let enabled = params.enabled.unwrap_or(true);
         let store = self.intents.clone().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "intent store is unavailable")
         })?;
@@ -5029,7 +5030,11 @@ impl DaemonCore {
             self.teardown_entry(index)?;
             self.persist();
         }
-        self.apply_routes_inner(uid, &owner, desired, Some(spec))?;
+        // A disabled intent keeps only its durable record — the journal
+        // stays empty so reconcile never touches its destinations.
+        if enabled {
+            self.apply_routes_inner(uid, &owner, desired, Some(spec))?;
+        }
         if let Err(err) = store.upsert(uid, params.clone()) {
             // The kernel half succeeded but the durable record did not —
             // undo so the intent does not die silently on restart.
@@ -5076,6 +5081,7 @@ impl DaemonCore {
             let Ok(spec) = intent_spec(&params) else {
                 continue;
             };
+            let enabled = params.enabled.unwrap_or(true);
             #[cfg(target_os = "linux")]
             let desired = self.attach_desired(&spec);
             #[cfg(not(target_os = "linux"))]
@@ -5088,7 +5094,14 @@ impl DaemonCore {
                     })
                 })
                 .count();
-            let (status, detail) = intent_view_status(&spec, &desired, installed, tables.as_ref());
+            let (status, detail) = if enabled {
+                intent_view_status(&spec, &desired, installed, tables.as_ref())
+            } else {
+                (
+                    ExplainStatus::Disabled,
+                    "disabled — routes are withdrawn".into(),
+                )
+            };
             intents.push(NetIntentView {
                 id: params.id.clone(),
                 destinations: spec
@@ -5112,6 +5125,7 @@ impl DaemonCore {
                     .first()
                     .map(|route| route.metric)
                     .unwrap_or(INTENT_DEFAULT_METRIC),
+                enabled,
                 status,
                 detail,
                 installed,
@@ -5136,6 +5150,11 @@ impl DaemonCore {
         let mut failed = 0;
         for (uid, document) in documents {
             for params in document.intents {
+                // Disabled intents stay in the store untouched — the
+                // user re-arms them explicitly via net.intent.set.
+                if params.enabled == Some(false) {
+                    continue;
+                }
                 let Ok(spec) = intent_spec(&params) else {
                     failed += 1;
                     continue;
@@ -10544,6 +10563,7 @@ mod tests {
                 interface: Some(iface.into()),
             },
             metric: None,
+            enabled: None,
         }
     }
 
@@ -10556,6 +10576,7 @@ mod tests {
                 interface: None,
             },
             metric: None,
+            enabled: None,
         }
     }
 
@@ -10640,6 +10661,52 @@ mod tests {
         assert!(core.net_intent_list(1000).unwrap().intents.is_empty());
         // Delete is idempotent: neither the store nor the journal holds it.
         core.net_intent_del(1000, "office").unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn intent_disable_pauses_and_reenable_reinstalls() {
+        let dir = unique_dir("intent-toggle");
+        let kernel = KernelTables::default();
+        let recorder = Recorder::default();
+        set_link(&recorder, "tun9", Some(9));
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        core.net_intent_set(1000, intent_iface("office", &["10.20.0.0/16"], "tun9"))
+            .unwrap();
+        assert_eq!(kernel.routes().len(), 1);
+
+        // Disable: routes leave the kernel, the record stays.
+        let mut paused = intent_iface("office", &["10.20.0.0/16"], "tun9");
+        paused.enabled = Some(false);
+        core.net_intent_set(1000, paused).unwrap();
+        assert!(kernel.routes().is_empty());
+        let view = &core.net_intent_list(1000).unwrap().intents[0];
+        assert!(!view.enabled);
+        assert_eq!(view.status, ExplainStatus::Disabled);
+        // Reconcile must not resurrect a disabled intent.
+        assert!(core.reconcile_network(&[]).is_empty());
+        assert!(kernel.routes().is_empty());
+
+        // Re-enable: the spec re-arms and the route returns; the link
+        // appearing later still works because only enabled intents
+        // replay on startup.
+        core.net_intent_set(1000, intent_iface("office", &["10.20.0.0/16"], "tun9"))
+            .unwrap();
+        assert_eq!(kernel.routes().len(), 1);
+        let view = &core.net_intent_list(1000).unwrap().intents[0];
+        assert!(view.enabled);
+        assert_eq!(view.status, ExplainStatus::Effective);
+
+        // A disabled intent survives restart as a stored-but-idle record.
+        let mut paused = intent_iface("office", &["10.20.0.0/16"], "tun9");
+        paused.enabled = Some(false);
+        core.net_intent_set(1000, paused).unwrap();
+        drop(core);
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        assert_eq!(core.replay_intents(), (0, 0));
+        let view = &core.net_intent_list(1000).unwrap().intents[0];
+        assert!(!view.enabled);
+        assert!(kernel.routes().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 

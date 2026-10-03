@@ -604,6 +604,8 @@ pub enum ExplainStatus {
     Missing,
     /// An override (suppressed foreign object) is holding.
     Active,
+    /// Stored but deliberately not enforced — disabled by the user.
+    Disabled,
 }
 
 /// One line of `net.explain` output: why a journaled intent looks the way
@@ -659,6 +661,9 @@ pub struct NetIntentSetParams {
     /// Metric for the installed routes; defaults to 100.
     #[serde(default)]
     pub metric: Option<u32>,
+    /// `false` stores the intent without enforcing it; absent means on.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -683,6 +688,8 @@ pub struct NetIntentView {
     pub path: NetIntentPath,
     /// Route metric the intent installs with.
     pub metric: u32,
+    /// False when the intent is stored but not enforced.
+    pub enabled: bool,
     pub status: ExplainStatus,
     pub detail: String,
     /// Desired routes currently present in the kernel.
