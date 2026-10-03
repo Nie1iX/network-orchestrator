@@ -5,11 +5,12 @@
 
 #[cfg(target_os = "linux")]
 use net_manager_core::daemon_protocol::{
-    method, NetDnsProbeParams, NetRouteDelParams, NetRuleDelParams,
+    method, NetDnsProbeParams, NetIntentDelParams, NetRouteDelParams, NetRuleDelParams,
 };
 use net_manager_core::daemon_protocol::{
-    NetDnsProbeResult, NetDnsStatusResult, NetEditResult, NetExplainResult, NetRouteAddParams,
-    NetRuleAddParams, NetTablesResult, SystemRoute, SystemRule,
+    NetDnsProbeResult, NetDnsStatusResult, NetEditResult, NetExplainResult, NetIntentListResult,
+    NetIntentResult, NetIntentSetParams, NetRouteAddParams, NetRuleAddParams, NetTablesResult,
+    SystemRoute, SystemRule,
 };
 
 #[cfg(target_os = "linux")]
@@ -172,5 +173,49 @@ pub(crate) async fn net_dns_probe(
     {
         let _ = (hostname, server, family);
         Err("DNS probing is not supported on this platform".into())
+    }
+}
+
+/// `net.intent.list`: stored routing intents with their live status.
+#[tauri::command]
+pub(crate) async fn net_intent_list() -> Result<NetIntentListResult, String> {
+    #[cfg(target_os = "linux")]
+    {
+        request(method::NET_INTENT_LIST, serde_json::Value::Null).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(NetIntentListResult {
+            intents: Vec::new(),
+        })
+    }
+}
+
+/// `net.intent.set`: upsert a routing intent — destinations routed via an
+/// interface or pinned to the physical uplink, enforced by reconcile.
+#[tauri::command]
+pub(crate) async fn net_intent_set(params: NetIntentSetParams) -> Result<NetIntentResult, String> {
+    #[cfg(target_os = "linux")]
+    {
+        request(method::NET_INTENT_SET, &params).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = params;
+        Err("routing intents are not supported on this platform".into())
+    }
+}
+
+/// `net.intent.del`: remove the intent and withdraw its routes.
+#[tauri::command]
+pub(crate) async fn net_intent_del(id: String) -> Result<NetIntentResult, String> {
+    #[cfg(target_os = "linux")]
+    {
+        request(method::NET_INTENT_DEL, NetIntentDelParams { id }).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = id;
+        Err("routing intents are not supported on this platform".into())
     }
 }

@@ -31,8 +31,8 @@ pub(crate) use explorer::{
 pub(crate) use happ_routing::parse_happ_routing;
 pub(crate) use logs::{clear_logs, daemon_log_tail, get_logs};
 pub(crate) use net_tables::{
-    get_net_tables, net_dns_probe, net_dns_status, net_explain, net_route_add, net_route_del,
-    net_rule_add, net_rule_del,
+    get_net_tables, net_dns_probe, net_dns_status, net_explain, net_intent_del, net_intent_list,
+    net_intent_set, net_route_add, net_route_del, net_rule_add, net_rule_del,
 };
 pub(crate) use nm::{nm_list_connections, nm_set_active};
 pub(crate) use profiles::{
