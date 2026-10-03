@@ -2429,6 +2429,11 @@ a:focus-visible,
   background-color: var(--down-bg);
 }
 
+.state-disabled {
+  color: var(--text-muted);
+  background-color: var(--bg-input);
+}
+
 .system-head-row {
   display: flex;
   align-items: center;
@@ -2441,6 +2446,9 @@ a:focus-visible,
 }
 
 .system-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-1);
   text-align: right;
   white-space: nowrap;
 }

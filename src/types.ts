@@ -737,7 +737,8 @@ export type ExplainStatus =
   | "deferred"
   | "conflicted"
   | "missing"
-  | "active";
+  | "active"
+  | "disabled";
 
 export interface ExplainEntry {
   /** Journal owner: `wg:…`, `manual`, `cond:…`, a client owner. */
@@ -771,6 +772,8 @@ export interface NetIntentSetParams {
   destinations: string[];
   path: NetIntentPath;
   metric?: number;
+  /** false stores the intent without enforcing it; absent means on. */
+  enabled?: boolean;
 }
 
 /** One stored intent with its live reconciliation status. */
@@ -779,6 +782,8 @@ export interface NetIntentView {
   destinations: string[];
   path: NetIntentPath;
   metric: number;
+  /** False when the intent is stored but not enforced. */
+  enabled: boolean;
   status: ExplainStatus;
   detail: string;
   /** Desired routes currently present in the kernel. */

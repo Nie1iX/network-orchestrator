@@ -19,6 +19,7 @@ const STATUS_CLASS: Record<ExplainStatus, string> = {
   deferred: "state-deferred",
   conflicted: "state-down",
   missing: "state-missing",
+  disabled: "state-disabled",
 };
 
 interface IntentDraft {
@@ -27,6 +28,8 @@ interface IntentDraft {
   /** `direct` or an interface name. */
   path: string;
   metric: string;
+  /** Set when editing an existing intent — the id is the identity. */
+  editing: boolean;
 }
 
 const EMPTY_DRAFT: IntentDraft = {
@@ -34,6 +37,7 @@ const EMPTY_DRAFT: IntentDraft = {
   destinations: "",
   path: "direct",
   metric: "",
+  editing: false,
 };
 
 function pathLabel(intent: NetIntentView): string {
@@ -103,6 +107,10 @@ export default function IntentsPanel() {
       }
       const path = draft.path.trim();
       const metric = draft.metric.trim();
+      const metricNum = metric === "" ? undefined : Number(metric);
+      if (metricNum !== undefined && (!Number.isInteger(metricNum) || metricNum < 0)) {
+        throw new Error(t("intents.badMetric"));
+      }
       const params: NetIntentSetParams = {
         id: draft.id.trim(),
         destinations,
@@ -110,7 +118,7 @@ export default function IntentsPanel() {
           path === "direct" || path === ""
             ? { kind: "direct" }
             : { kind: "interface", interface: path },
-        metric: metric ? Number(metric) : undefined,
+        metric: metricNum,
       };
       await invoke("net_intent_set", { params });
       setDraft(null);
@@ -120,6 +128,36 @@ export default function IntentsPanel() {
       setFormError(String(err));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const openEdit = (intent: NetIntentView) => {
+    setFormError(null);
+    setDraft({
+      id: intent.id,
+      destinations: intent.destinations.join(" "),
+      path: intent.path.kind === "direct" ? "direct" : (intent.path.interface ?? ""),
+      metric: String(intent.metric),
+      editing: true,
+    });
+  };
+
+  const toggle = async (intent: NetIntentView) => {
+    setBusy(intent.id);
+    try {
+      const params: NetIntentSetParams = {
+        id: intent.id,
+        destinations: intent.destinations,
+        path: intent.path,
+        metric: intent.metric,
+        enabled: !intent.enabled,
+      };
+      await invoke("net_intent_set", { params });
+      await refresh();
+    } catch (err) {
+      toast("error", t("routes.editError", { err: String(err) }));
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -205,6 +243,25 @@ export default function IntentsPanel() {
                 <td className="system-actions">
                   <button
                     type="button"
+                    className="btn-sm"
+                    disabled={busy === intent.id}
+                    title={
+                      intent.enabled ? t("intents.disable") : t("intents.enable")
+                    }
+                    onClick={() => toggle(intent)}
+                  >
+                    {intent.enabled ? t("intents.disable") : t("intents.enable")}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={busy === intent.id}
+                    onClick={() => openEdit(intent)}
+                  >
+                    {t("intents.edit")}
+                  </button>
+                  <button
+                    type="button"
                     className="btn-sm btn-danger"
                     disabled={busy === intent.id}
                     onClick={() => del(intent)}
@@ -220,7 +277,7 @@ export default function IntentsPanel() {
 
       <Modal
         open={draft !== null}
-        title={t("intents.addTitle")}
+        title={draft?.editing ? t("intents.editTitle") : t("intents.addTitle")}
         onClose={() => setDraft(null)}
         footer={
           <>
@@ -252,7 +309,8 @@ export default function IntentsPanel() {
               <input
                 type="text"
                 value={draft.id}
-                autoFocus
+                autoFocus={!draft.editing}
+                disabled={draft.editing}
                 placeholder={t("intents.fieldIdPlaceholder")}
                 onChange={(e) =>
                   setDraft({ ...draft, id: e.currentTarget.value })
