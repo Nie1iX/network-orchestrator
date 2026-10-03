@@ -7,7 +7,13 @@ import {
   NetIntentSetParams,
   NetIntentView,
   NetTablesResult,
+  NetworkInterface,
+  Profile,
 } from "../types";
+import {
+  analyzeIntents,
+  IntentSuggestion,
+} from "../intentDoctor";
 import { useT } from "../i18n";
 import { useToast } from "./ui/Toast";
 import Modal from "./Modal";
@@ -22,8 +28,14 @@ const STATUS_CLASS: Record<ExplainStatus, string> = {
   disabled: "state-disabled",
 };
 
+/** What the rule captures: hand-picked prefixes or default traffic. */
+type Scope = "networks" | "all";
+
+const ALL_V4_DESTINATIONS = "0.0.0.0/1 128.0.0.0/1";
+
 interface IntentDraft {
   id: string;
+  scope: Scope;
   destinations: string;
   /** `direct` or an interface name. */
   path: string;
@@ -34,6 +46,7 @@ interface IntentDraft {
 
 const EMPTY_DRAFT: IntentDraft = {
   id: "",
+  scope: "networks",
   destinations: "",
   path: "direct",
   metric: "",
@@ -46,12 +59,23 @@ function pathLabel(intent: NetIntentView): string {
     : (intent.path.interface ?? "?");
 }
 
+function slug(text: string): string {
+  return (
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "path"
+  );
+}
+
 /** "Which destinations go through which path" — the user-facing routing
  *  rules the daemon enforces and re-arms across restarts. */
 export default function IntentsPanel() {
   const t = useT();
   const toast = useToast();
   const [intents, setIntents] = useState<NetIntentView[] | null>(null);
+  const [suggestions, setSuggestions] = useState<IntentSuggestion[]>([]);
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [ifaces, setIfaces] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -62,11 +86,21 @@ export default function IntentsPanel() {
 
   const refresh = useCallback(async () => {
     try {
-      const [result, tables] = await Promise.all([
+      const [result, tables, interfaces, profiles] = await Promise.all([
         invoke<NetIntentListResult>("net_intent_list"),
         invoke<NetTablesResult>("get_net_tables").catch(() => null),
+        invoke<NetworkInterface[]>("get_interfaces").catch(() => []),
+        invoke<Profile[]>("get_profiles").catch(() => []),
       ]);
       setIntents(result.intents);
+      setSuggestions(
+        analyzeIntents({
+          intents: result.intents,
+          routes: tables?.routes ?? [],
+          interfaces,
+          profiles,
+        }),
+      );
       if (tables) {
         setIfaces(
           [
@@ -98,21 +132,29 @@ export default function IntentsPanel() {
     setSaving(true);
     setFormError(null);
     try {
-      const destinations = draft.destinations
-        .split(/[\s,;]+/)
-        .map((item) => item.trim())
-        .filter(Boolean);
-      if (destinations.length === 0 || !draft.id.trim()) {
+      const destinations =
+        draft.scope === "all"
+          ? ALL_V4_DESTINATIONS.split(" ")
+          : draft.destinations
+              .split(/[\s,;]+/)
+              .map((item) => item.trim())
+              .filter(Boolean);
+      const path = draft.path.trim();
+      const id =
+        draft.id.trim() ||
+        (path === "direct" || path === ""
+          ? `via-uplink`
+          : `via-${slug(path)}`);
+      if (destinations.length === 0) {
         throw new Error(t("intents.required"));
       }
-      const path = draft.path.trim();
       const metric = draft.metric.trim();
       const metricNum = metric === "" ? undefined : Number(metric);
       if (metricNum !== undefined && (!Number.isInteger(metricNum) || metricNum < 0)) {
         throw new Error(t("intents.badMetric"));
       }
       const params: NetIntentSetParams = {
-        id: draft.id.trim(),
+        id,
         destinations,
         path:
           path === "direct" || path === ""
@@ -135,6 +177,9 @@ export default function IntentsPanel() {
     setFormError(null);
     setDraft({
       id: intent.id,
+      scope: intent.destinations.some((d) => d === "0.0.0.0/1" || d === "128.0.0.0/1" || d === "0.0.0.0/0")
+        ? "all"
+        : "networks",
       destinations: intent.destinations.join(" "),
       path: intent.path.kind === "direct" ? "direct" : (intent.path.interface ?? ""),
       metric: String(intent.metric),
@@ -179,6 +224,41 @@ export default function IntentsPanel() {
     }
   };
 
+  const applySuggestion = async (suggestion: IntentSuggestion) => {
+    setBusy(suggestion.key);
+    try {
+      for (const fix of suggestion.fixes) {
+        await invoke("net_intent_set", { params: fix });
+      }
+      toast("success", t("intents.savedToast"));
+      await refresh();
+    } catch (err) {
+      toast("error", t("routes.editError", { err: String(err) }));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const suppressForeign = async (suggestion: IntentSuggestion) => {
+    if (!suggestion.foreignRoute) return;
+    setBusy(suggestion.key);
+    try {
+      await invoke("net_route_del", { route: suggestion.foreignRoute });
+      toast("success", t("intents.suppressedToast"));
+      await refresh();
+    } catch (err) {
+      toast("error", t("routes.editError", { err: String(err) }));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const visibleSuggestions = suggestions.filter((s) => !dismissed.has(s.key));
+  const canSave =
+    !saving &&
+    !!draft &&
+    (draft.scope === "all" || !!draft.destinations.trim());
+
   return (
     <section>
       <div className="system-head-row">
@@ -196,12 +276,80 @@ export default function IntentsPanel() {
         </button>
       </div>
       <p className="flow-hint">{t("intents.hint")}</p>
+
+      {visibleSuggestions.length > 0 && (
+        <div className="intent-doctor">
+          {visibleSuggestions.map((suggestion) => (
+            <div key={suggestion.key} className="intent-doctor-card">
+              <div className="intent-doctor-text">
+                <strong>
+                  {suggestion.kind === "endpointViaTunnel"
+                    ? t("intents.doctor.endpointTitle", {
+                        iface: suggestion.viaInterface ?? "?",
+                      })
+                    : suggestion.kind === "uncoveredEndpoints"
+                      ? t("intents.doctor.uncoveredTitle", {
+                          iface: suggestion.viaInterface ?? "?",
+                        })
+                      : t("intents.doctor.conflictTitle", {
+                          id: suggestion.intentId ?? "?",
+                        })}
+                </strong>
+                <span>
+                  {suggestion.kind === "conflict"
+                    ? t("intents.doctor.conflictDetail", {
+                        dest: suggestion.destination ?? "?",
+                        via: suggestion.foreignRoute?.interfaceName ?? "?",
+                      })
+                    : t("intents.doctor.endpointDetail", {
+                        ips: suggestion.endpoints.join(", "),
+                      })}
+                </span>
+              </div>
+              <div className="intent-doctor-actions">
+                {suggestion.kind === "conflict" ? (
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={busy === suggestion.key}
+                    onClick={() => suppressForeign(suggestion)}
+                  >
+                    {t("intents.doctor.suppress")}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn-sm btn-primary"
+                    disabled={busy === suggestion.key}
+                    onClick={() => applySuggestion(suggestion)}
+                  >
+                    {t("intents.doctor.fix")}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn-sm btn-ghost"
+                  onClick={() =>
+                    setDismissed(new Set([...dismissed, suggestion.key]))
+                  }
+                >
+                  {t("intents.doctor.dismiss")}
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       {loading ? (
         <p>{t("routes.systemLoading")}</p>
       ) : error ? (
         <p className="error">{t("routes.systemError", { err: error })}</p>
       ) : !intents || intents.length === 0 ? (
-        <p className="system-intent-empty">{t("intents.empty")}</p>
+        <div className="system-intent-empty">
+          <p>{t("intents.empty")}</p>
+          <p className="flow-hint">{t("intents.emptySteps")}</p>
+        </div>
       ) : (
         <table className="route-table">
           <thead>
@@ -292,9 +440,7 @@ export default function IntentsPanel() {
               type="button"
               className="btn-primary"
               onClick={save}
-              disabled={
-                saving || !draft?.id.trim() || !draft?.destinations.trim()
-              }
+              disabled={!canSave}
             >
               {saving ? t("common.saving") : t("common.save")}
             </button>
@@ -305,30 +451,37 @@ export default function IntentsPanel() {
           <div className="modal-tab-body">
             {formError && <p className="error">{formError}</p>}
             <label>
-              {t("intents.fieldId")}
-              <input
-                type="text"
-                value={draft.id}
-                autoFocus={!draft.editing}
+              {t("intents.fieldScope")}
+              <select
+                value={draft.scope}
                 disabled={draft.editing}
-                placeholder={t("intents.fieldIdPlaceholder")}
                 onChange={(e) =>
-                  setDraft({ ...draft, id: e.currentTarget.value })
+                  setDraft({
+                    ...draft,
+                    scope: e.currentTarget.value as Scope,
+                  })
                 }
-              />
+              >
+                <option value="networks">{t("intents.scopeNetworks")}</option>
+                <option value="all">{t("intents.scopeAll")}</option>
+              </select>
             </label>
-            <label>
-              {t("intents.fieldDestinations")}
-              <input
-                type="text"
-                className="mono"
-                value={draft.destinations}
-                placeholder="10.0.0.0/8, 192.168.9.0/24"
-                onChange={(e) =>
-                  setDraft({ ...draft, destinations: e.currentTarget.value })
-                }
-              />
-            </label>
+            {draft.scope === "all" ? (
+              <p className="row-hint">{t("intents.scopeAllHint")}</p>
+            ) : (
+              <label>
+                {t("intents.fieldDestinations")}
+                <input
+                  type="text"
+                  className="mono"
+                  value={draft.destinations}
+                  placeholder="10.0.0.0/8, 192.168.9.0/24"
+                  onChange={(e) =>
+                    setDraft({ ...draft, destinations: e.currentTarget.value })
+                  }
+                />
+              </label>
+            )}
             <label>
               {t("intents.fieldPath")}
               <input
@@ -346,6 +499,21 @@ export default function IntentsPanel() {
                   <option key={name} value={name} />
                 ))}
               </datalist>
+            </label>
+            <label>
+              {t("intents.fieldId")}
+              <input
+                type="text"
+                value={draft.id}
+                autoFocus={!draft.editing}
+                disabled={draft.editing}
+                placeholder={
+                  draft.editing ? undefined : t("intents.fieldIdAuto")
+                }
+                onChange={(e) =>
+                  setDraft({ ...draft, id: e.currentTarget.value })
+                }
+              />
             </label>
             <label>
               {t("intents.fieldMetric")}

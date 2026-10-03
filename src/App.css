@@ -2462,6 +2462,43 @@ a:focus-visible,
   font-size: var(--fs-sm);
 }
 
+/* Doctor cards — detected problems with one-click fixes. */
+.intent-doctor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+.intent-doctor-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--warn);
+  border-radius: var(--r-md);
+  background: var(--warn-bg);
+}
+
+.intent-doctor-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+  font-size: var(--fs-sm);
+}
+
+.intent-doctor-text span {
+  color: var(--text-secondary);
+}
+
+.intent-doctor-actions {
+  display: flex;
+  gap: var(--sp-1);
+  flex-shrink: 0;
+}
+
 .system-form-grid {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
