@@ -132,6 +132,7 @@ impl RouteRuntime {
                     interface_name: profile.interface_name.clone(),
                     routes: profile.routes.clone(),
                     endpoint_bypasses: profile.endpoint_bypasses.clone(),
+                    uplink: false,
                 });
                 let _: RoutesApplyResult = client
                     .request(

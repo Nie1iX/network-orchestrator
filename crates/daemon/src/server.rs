@@ -19,15 +19,15 @@ use net_manager_core::daemon_protocol::{
     AlwaysOnSetParams, AlwaysOnSetResult, CondRulesListResult, CondRulesPutParams,
     CondRulesPutResult, CondRulesRemoveParams, CondRulesRemoveResult, ConditionalRuleEntry,
     ErrorCode, EventFrame, ExternalTunnelStopParams, HelloParams, HelloResult, LinkSetStateParams,
-    NetDnsProbeParams, NetEditResult, NetRouteAddParams, NetRouteDelParams, NetRuleAddParams,
-    NetRuleDelParams, NmListResult, NmSetActiveParams, OpenVpnConnectRequest, OpenVpnConnectResult,
-    OpenVpnDisconnectResult, OpenVpnProbeResult, OpenVpnProfileParams, OwnedChanged,
-    OwnedListResult, OwnerParams, RequestFrame, ResponseFrame, RoutesApplyParams,
-    RoutesApplyResult, RoutesRemoveResult, SettingsResult, SettingsSetParams, VpnAuthMode,
-    WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
-    WireGuardProfileParams, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
-    XrayInstallParams, XrayInstallResult, XrayProfileParams, XrayRemoveResult, HELLO_TIMEOUT_SECS,
-    MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    NetDnsProbeParams, NetEditResult, NetIntentDelParams, NetIntentResult, NetIntentSetParams,
+    NetRouteAddParams, NetRouteDelParams, NetRuleAddParams, NetRuleDelParams, NmListResult,
+    NmSetActiveParams, OpenVpnConnectRequest, OpenVpnConnectResult, OpenVpnDisconnectResult,
+    OpenVpnProbeResult, OpenVpnProfileParams, OwnedChanged, OwnedListResult, OwnerParams,
+    RequestFrame, ResponseFrame, RoutesApplyParams, RoutesApplyResult, RoutesRemoveResult,
+    SettingsResult, SettingsSetParams, VpnAuthMode, WireGuardConnectParams, WireGuardConnectResult,
+    WireGuardDisconnectResult, WireGuardProfileParams, XrayConnectParams, XrayConnectResult,
+    XrayDisconnectResult, XrayInstallParams, XrayInstallResult, XrayProfileParams,
+    XrayRemoveResult, HELLO_TIMEOUT_SECS, MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -1020,6 +1020,30 @@ async fn handle<A: Authorizer>(
                 .await
                 .map_err(|error| (error_code(&error), error.to_string()))?;
             to_value(&result)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_INTENT_LIST => {
+            let result = with_core(ctx, move |core| core.net_intent_list(uid)).await?;
+            to_value(&result)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_INTENT_SET => {
+            let params: NetIntentSetParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let owner = format!("intent:{}", params.id);
+            let result = with_core(ctx, move |core| core.net_intent_set(uid, params)).await?;
+            notify(ctx, uid, owner);
+            to_value(&result)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_INTENT_DEL => {
+            let params: NetIntentDelParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let owner = format!("intent:{}", params.id);
+            let id = params.id.clone();
+            with_core(ctx, move |core| core.net_intent_del(uid, &params.id)).await?;
+            notify(ctx, uid, owner);
+            to_value(&NetIntentResult { id })
         }
         method::LINK_SET_STATE => {
             let params: LinkSetStateParams = params(request.params)?;
@@ -2537,6 +2561,85 @@ mod tests {
             Err(()),
             "another uid must not see the event"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn intent_set_list_and_del_round_trip() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        harness.ctx.core.lock().unwrap().intents = Some(crate::intents::IntentStore::new(
+            harness.dir.join("intents"),
+        ));
+        let mut watcher = harness.hello(1000).await;
+        assert_eq!(
+            watcher.call(2, "subscribe", Value::Null).await["ok"],
+            json!(true)
+        );
+        let mut client = harness.hello(1000).await;
+
+        // set returns the public id, not the journal owner
+        let set = client
+            .call(
+                2,
+                method::NET_INTENT_SET,
+                json!({
+                    "id": "office",
+                    "destinations": ["10.20.0.0/16", "10.30.0.0/16"],
+                    "path": {"kind": "direct"}
+                }),
+            )
+            .await;
+        assert_eq!(set["result"]["id"], json!("office"), "{set}");
+        assert_eq!(
+            watcher.recv().await,
+            Some(json!({"event":"owned.changed","data":{"owner":"intent:office"}}))
+        );
+
+        let list = client.call(3, method::NET_INTENT_LIST, Value::Null).await;
+        let intents = &list["result"]["intents"];
+        assert_eq!(intents.as_array().unwrap().len(), 1, "{list}");
+        assert_eq!(intents[0]["id"], json!("office"));
+        assert_eq!(intents[0]["path"]["kind"], json!("direct"));
+        assert_eq!(intents[0]["metric"], json!(100));
+
+        let del = client
+            .call(4, method::NET_INTENT_DEL, json!({"id": "office"}))
+            .await;
+        assert_eq!(del["result"]["id"], json!("office"), "{del}");
+        assert_eq!(
+            watcher.recv().await,
+            Some(json!({"event":"owned.changed","data":{"owner":"intent:office"}}))
+        );
+        let list = client.call(5, method::NET_INTENT_LIST, Value::Null).await;
+        assert_eq!(list["result"]["intents"], json!([]), "{list}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn intent_mutations_require_authorization_list_does_not() {
+        let harness = Harness::new(AuthDecision::Denied);
+        let mut client = harness.hello(1000).await;
+        let denied = client
+            .call(
+                2,
+                method::NET_INTENT_SET,
+                json!({
+                    "id": "office",
+                    "destinations": ["10.20.0.0/16"],
+                    "path": {"kind": "direct"}
+                }),
+            )
+            .await;
+        assert_eq!(error_code(&denied), "notAuthorized");
+        let denied = client
+            .call(3, method::NET_INTENT_DEL, json!({"id": "office"}))
+            .await;
+        assert_eq!(error_code(&denied), "notAuthorized");
+        assert_eq!(harness.auth_calls(), 2);
+
+        let list = client.call(4, method::NET_INTENT_LIST, Value::Null).await;
+        assert_eq!(list["ok"], json!(true), "{list}");
+        assert_eq!(harness.auth_calls(), 2, "list must stay read-only");
     }
 
     #[tokio::test]
