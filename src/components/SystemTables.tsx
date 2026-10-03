@@ -240,25 +240,36 @@ function DnsPanel({
             </tr>
           </thead>
           <tbody>
-            {links.map((link) => (
-              <tr key={link.interfaceIndex}>
-                <td>
-                  {link.interfaceName}
-                  {link.defaultRoute && (
-                    <span className="badge badge-armed system-badge-gap">
-                      {t("dns.defaultRoute")}
-                    </span>
-                  )}
-                </td>
-                <td className="mono">{link.servers.join(" ") || "—"}</td>
-                <td className="mono">{link.currentServer ?? "—"}</td>
-                <td className="mono system-route-details">
-                  {link.domains
-                    .map((d) => (d.routeOnly ? `~${d.domain}` : d.domain))
-                    .join(" ") || "—"}
-                </td>
-              </tr>
-            ))}
+            {links.map((link) => {
+              // A link can carry ~70 zones (tailscale arpa domains): a
+              // space-joined blob starves sibling columns down to their
+              // min-content. Show the first few; the rest stay in the tooltip.
+              const domains = link.domains.map((d) =>
+                d.routeOnly ? `~${d.domain}` : d.domain,
+              );
+              const hidden = domains.length - 4;
+              return (
+                <tr key={link.interfaceIndex}>
+                  <td>
+                    {link.interfaceName}
+                    {link.defaultRoute && (
+                      <span className="badge badge-armed system-badge-gap">
+                        {t("dns.defaultRoute")}
+                      </span>
+                    )}
+                  </td>
+                  <td className="mono">{link.servers.join(" ") || "—"}</td>
+                  <td className="mono">{link.currentServer ?? "—"}</td>
+                  <td
+                    className="mono system-route-details"
+                    title={hidden > 0 ? domains.join(" ") : undefined}
+                  >
+                    {domains.slice(0, 4).join(" ") || "—"}
+                    {hidden > 0 && ` +${hidden}`}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}
