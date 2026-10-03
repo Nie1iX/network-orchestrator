@@ -38,6 +38,7 @@ export class SandboxBackend {
       destinations: ["10.88.0.0/24", "10.20.0.0/16"],
       path: { kind: "interface", interface: "qa-ovpn" },
       metric: 100,
+      enabled: true,
       status: "deferred",
       detail: "interface qa-ovpn is absent; armed until it appears",
       installed: 0,
@@ -48,6 +49,7 @@ export class SandboxBackend {
       destinations: ["0.0.0.0/1", "128.0.0.0/1"],
       path: { kind: "interface", interface: "Mihomo" },
       metric: 100,
+      enabled: true,
       status: "effective",
       detail: "2 route(s) enforced",
       installed: 2,
@@ -58,6 +60,7 @@ export class SandboxBackend {
       destinations: ["91.245.41.31/32"],
       path: { kind: "direct" },
       metric: 50,
+      enabled: true,
       status: "effective",
       detail: "pinned to the physical uplink",
       installed: 1,
@@ -68,8 +71,20 @@ export class SandboxBackend {
       destinations: ["203.0.113.0/24"],
       path: { kind: "interface", interface: "qa-wg" },
       metric: 100,
+      enabled: true,
       status: "conflicted",
       detail: "a foreign route occupies the destination",
+      installed: 0,
+      wanted: 1,
+    },
+    {
+      id: "paused-media",
+      destinations: ["192.0.2.0/24"],
+      path: { kind: "interface", interface: "qa-wg" },
+      metric: 100,
+      enabled: false,
+      status: "disabled",
+      detail: "disabled — routes are withdrawn",
       installed: 0,
       wanted: 1,
     },
@@ -526,20 +541,25 @@ export class SandboxBackend {
       case "net_intent_set": {
         const p = args.params as {
           id: string; destinations: string[];
-          path: { kind: string; interface?: string }; metric?: number;
+          path: { kind: string; interface?: string };
+          metric?: number; enabled?: boolean;
         };
         const wanted = p.destinations.length;
+        const enabled = p.enabled !== false;
         const effective = p.path.kind === "direct" || p.path.interface === "Mihomo";
         const view: NetIntentView = {
           id: p.id,
           destinations: p.destinations,
           path: p.path,
           metric: p.metric ?? 100,
-          status: effective ? "effective" : "deferred",
-          detail: effective
-            ? `${wanted} route(s) enforced`
-            : `interface ${p.path.interface ?? ""} is absent; armed until it appears`,
-          installed: effective ? wanted : 0,
+          enabled,
+          status: !enabled ? "disabled" : effective ? "effective" : "deferred",
+          detail: !enabled
+            ? "disabled — routes are withdrawn"
+            : effective
+              ? `${wanted} route(s) enforced`
+              : `interface ${p.path.interface ?? ""} is absent; armed until it appears`,
+          installed: enabled && effective ? wanted : 0,
           wanted,
         };
         this.intents = [...this.intents.filter((i) => i.id !== p.id), view];

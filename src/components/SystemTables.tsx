@@ -121,6 +121,7 @@ const STATUS_CLASS: Record<ExplainStatus, string> = {
   deferred: "state-deferred",
   conflicted: "state-down",
   missing: "state-missing",
+  disabled: "state-disabled",
 };
 
 function explainBadge(entry: ExplainEntry, t: ReturnType<typeof useT>) {
