@@ -6,7 +6,7 @@ import type {
 
 // This module intentionally has no I/O imports, fetch, or process calls.
 // It models UI transitions only; Rust tests verify actual backend behavior.
-function profile(id: string, name: string, backend: Profile["backend"], cidr?: string): Profile {
+function profile(id: string, name: string, backend: Profile["backend"], cidr?: string, endpointBypasses?: string[]): Profile {
   return {
     id, name, backend, configPath: backend === "none" ? "" : `/sandbox/${id}.${backend === "xray" ? "json" : backend === "openVpn" ? "ovpn" : "conf"}`,
     interfaceName: backend === "none" ? "qa-ethernet" : `qa-${id}`,
@@ -16,6 +16,7 @@ function profile(id: string, name: string, backend: Profile["backend"], cidr?: s
     xrayHttpPort: backend === "xray" ? 10809 : null,
     useSystemProxy: false, proxyBypass: [], subscription: null,
     xrayMode: "socks", xrayTunInterface: null, xrayTunIp: null,
+    endpointBypasses,
   };
 }
 
@@ -91,7 +92,7 @@ export class SandboxBackend {
   ];
   private profiles: Profile[] = [
     profile("wg", "QA WireGuard", "wireGuard", "10.77.0.0/24"),
-    profile("ovpn", "QA OpenVPN", "openVpn", "10.88.0.0/24"),
+    profile("ovpn", "QA OpenVPN", "openVpn", "10.88.0.0/24", ["203.0.113.7"]),
     profile("xray", "AcmeVPN · ⚡ Нидерланды", "xray"),
     profile("static", "QA Static routes", "none", "203.0.113.0/24"),
   ];
@@ -523,6 +524,8 @@ export class SandboxBackend {
         available: true,
         routes: [
           { family: "ipv4", destination: "0.0.0.0/0", table: 254, routeType: "unicast", scope: "universe", protocol: 16, managed: false, gateway: "192.168.1.1", interfaceIndex: 23, interfaceName: "enp59s0u2", metric: 100, prefSource: null, nexthops: [] },
+          { family: "ipv4", destination: "0.0.0.0/1", table: 254, routeType: "unicast", scope: "universe", protocol: 3, managed: false, gateway: null, interfaceIndex: 91, interfaceName: "tun-happ", metric: 0, prefSource: null, nexthops: [] },
+          { family: "ipv4", destination: "128.0.0.0/1", table: 254, routeType: "unicast", scope: "universe", protocol: 3, managed: false, gateway: null, interfaceIndex: 91, interfaceName: "tun-happ", metric: 0, prefSource: null, nexthops: [] },
           { family: "ipv4", destination: "198.51.100.88/32", table: 254, routeType: "unicast", scope: "universe", protocol: 79, managed: true, gateway: "192.168.1.1", interfaceIndex: 23, interfaceName: "enp59s0u2", metric: 51, prefSource: null, nexthops: [] },
           { family: "ipv4", destination: "0.0.0.0/1", table: 2022, routeType: "unicast", scope: "universe", protocol: 3, managed: false, gateway: "198.18.0.2", interfaceIndex: 132, interfaceName: "Mihomo", metric: 0, prefSource: null, nexthops: [] },
         ],
