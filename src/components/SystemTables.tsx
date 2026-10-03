@@ -56,8 +56,7 @@ function ruleSelector(rule: SystemRule): string {
   }
   if (rule.uidRange) parts.push("uidrange", rule.uidRange.join("-"));
   if (rule.ipProtocol) parts.push("ipproto", rule.ipProtocol);
-  if (rule.sourcePortRange)
-    parts.push("sport", rule.sourcePortRange.join("-"));
+  if (rule.sourcePortRange) parts.push("sport", rule.sourcePortRange.join("-"));
   if (rule.destinationPortRange)
     parts.push("dport", rule.destinationPortRange.join("-"));
   if (rule.tos) parts.push("tos", `0x${rule.tos.toString(16)}`);
@@ -125,7 +124,8 @@ const STATUS_CLASS: Record<ExplainStatus, string> = {
 };
 
 function explainBadge(entry: ExplainEntry, t: ReturnType<typeof useT>) {
-  const stale = entry.state !== "applied" ? ` · ${t(`routes.state.${entry.state}`)}` : "";
+  const stale =
+    entry.state !== "applied" ? ` · ${t(`routes.state.${entry.state}`)}` : "";
   return (
     <span className={`state-badge ${STATUS_CLASS[entry.status]}`}>
       {t(`routes.status.${entry.status}`)}
@@ -199,9 +199,7 @@ function DnsPanel({
     (link) => !hideIpv6 || link.servers.some((s) => !s.includes(":")),
   );
   const serverOptions = [
-    ...new Set(
-      links.flatMap((link) => link.servers).concat(status.resolvConf),
-    ),
+    ...new Set(links.flatMap((link) => link.servers).concat(status.resolvConf)),
   ];
 
   const probe = async () => {
@@ -411,9 +409,10 @@ const EMPTY_RULE: RuleDraft = {
 function parseNum(text: string): number | undefined {
   const trimmed = text.trim();
   if (!trimmed) return undefined;
-  const value = trimmed.startsWith("0x") || trimmed.startsWith("0X")
-    ? parseInt(trimmed, 16)
-    : Number(trimmed);
+  const value =
+    trimmed.startsWith("0x") || trimmed.startsWith("0X")
+      ? parseInt(trimmed, 16)
+      : Number(trimmed);
   if (!Number.isFinite(value) || value < 0 || !Number.isInteger(value)) {
     throw new Error(`invalid number: ${trimmed}`);
   }
@@ -459,7 +458,10 @@ export default function SystemTables({ hideIpv6 }: { hideIpv6: boolean }) {
     return () => window.removeEventListener("route-changed", handler);
   }, [refresh]);
 
-  const afterEdit = async (outcome: NetEditResult["outcome"], subject: string) => {
+  const afterEdit = async (
+    outcome: NetEditResult["outcome"],
+    subject: string,
+  ) => {
     toast(
       "info",
       outcome === "suppressed"
@@ -567,7 +569,8 @@ export default function SystemTables({ hideIpv6 }: { hideIpv6: boolean }) {
   };
 
   if (loading) return <p>{t("routes.systemLoading")}</p>;
-  if (error) return <p className="error">{t("routes.systemError", { err: error })}</p>;
+  if (error)
+    return <p className="error">{t("routes.systemError", { err: error })}</p>;
   if (!data || !data.available) return <p>{t("routes.systemUnavailable")}</p>;
 
   const rules = data.rules.filter(
@@ -797,7 +800,10 @@ export default function SystemTables({ hideIpv6 }: { hideIpv6: boolean }) {
                 value={routeDraft.interfaceName}
                 placeholder="enp59s0u2"
                 onChange={(e) =>
-                  setRouteDraft({ ...routeDraft, interfaceName: e.target.value })
+                  setRouteDraft({
+                    ...routeDraft,
+                    interfaceName: e.target.value,
+                  })
                 }
               />
               <datalist id="system-iface-options">

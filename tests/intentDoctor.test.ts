@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { analyzeIntents, cidrCovers } from "../src/intentDoctor.ts";
+import {
+  analyzeIntents,
+  cidrCovers,
+  uncoveredEndpointIntents,
+} from "../src/intentDoctor.ts";
 import type {
   NetIntentView,
   NetworkInterface,
@@ -8,7 +12,10 @@ import type {
   SystemRoute,
 } from "../src/types.ts";
 
-function iface(name: string, category: NetworkInterface["category"]): NetworkInterface {
+function iface(
+  name: string,
+  category: NetworkInterface["category"],
+): NetworkInterface {
   return {
     name,
     friendlyName: name,
@@ -33,7 +40,11 @@ function iface(name: string, category: NetworkInterface["category"]): NetworkInt
   };
 }
 
-function route(destination: string, interfaceName: string, managed = false): SystemRoute {
+function route(
+  destination: string,
+  interfaceName: string,
+  managed = false,
+): SystemRoute {
   return {
     family: "ipv4",
     destination,
@@ -165,7 +176,10 @@ test("a broad intent through a tunnel surfaces uncovered endpoints early", () =>
     ],
     routes: [route("0.0.0.0/0", "enp1s0")],
     interfaces: [iface("enp1s0", "physical")],
-    profiles: [profile("office", ["91.245.41.31"]), profile("media", ["203.0.113.7"])],
+    profiles: [
+      profile("office", ["91.245.41.31"]),
+      profile("media", ["203.0.113.7"]),
+    ],
   });
   assert.equal(suggestions.length, 1);
   const s = suggestions[0];
@@ -195,4 +209,36 @@ test("a conflicted intent points at the occupying foreign route", () => {
   assert.equal(s.intentId, "media");
   assert.equal(s.foreignRoute, foreign);
   assert.equal(s.fixes.length, 0);
+});
+
+test("uncoveredEndpointIntents pins every unknown endpoint to the uplink", () => {
+  const fixes = uncoveredEndpointIntents(
+    [profile("office", ["91.245.41.31"]), profile("media", ["203.0.113.7"])],
+    [],
+    "Mihomo",
+    ["everything"],
+  );
+  assert.equal(fixes.length, 1);
+  assert.equal(fixes[0].id, "bypass-mihomo");
+  assert.deepEqual(fixes[0].destinations, [
+    "203.0.113.7/32",
+    "91.245.41.31/32",
+  ]);
+  assert.equal(fixes[0].path.kind, "direct");
+  assert.equal(fixes[0].metric, 50);
+});
+
+test("uncoveredEndpointIntents skips endpoints a direct intent already covers", () => {
+  const fixes = uncoveredEndpointIntents(
+    [profile("office", ["91.245.41.31"])],
+    [
+      intent({
+        id: "ep",
+        destinations: ["91.245.41.31/32"],
+        path: { kind: "direct" },
+      }),
+    ],
+    "Mihomo",
+  );
+  assert.deepEqual(fixes, []);
 });
