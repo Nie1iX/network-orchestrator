@@ -675,79 +675,78 @@ export default function SystemTables({ hideIpv6 }: { hideIpv6: boolean }) {
       {groups.length === 0 ? (
         <p>{t("routes.systemNone")}</p>
       ) : (
-        groups.map(([table, routes]) => (
-          <div key={table} className="system-table-group">
-            <h4 className="system-tables-heading">
-              {t("routes.tableN", { n: tableLabel(table) })}
-            </h4>
-            <table className="route-table">
-              <thead>
-                <tr>
-                  <th>{t("routes.destination")}</th>
-                  <th>{t("routes.gateway")}</th>
-                  <th>{t("routes.interfaceCol")}</th>
-                  <th className="num">{t("routes.metricCol")}</th>
-                  <th>{t("routes.systemDetails")}</th>
-                  <th>{t("routes.owner")}</th>
-                  <th aria-label={t("routes.colActions")} />
-                </tr>
-              </thead>
-              <tbody>
-                {routes.map((route, i) => {
-                  const key = `r${route.table}:${route.destination}`;
-                  return (
-                    <tr key={i}>
-                      <td className="mono">
-                        {route.family === "ipv6" ? "IPv6 " : ""}
-                        {routeDestination(route)}
-                      </td>
-                      <td className="mono">
-                        {route.nexthops.length > 0
-                          ? route.nexthops.map((hop, j) => (
-                              <div key={j}>
-                                {hop.gateway ?? "—"} dev{" "}
-                                {hop.interfaceName ?? `if${hop.interfaceIndex}`}
-                                {hop.weight > 0 ? ` weight ${hop.weight}` : ""}
-                              </div>
-                            ))
-                          : (route.gateway ?? "—")}
-                      </td>
-                      <td>
-                        {route.interfaceName ??
-                          (route.interfaceIndex != null
-                            ? `if${route.interfaceIndex}`
-                            : "—")}
-                      </td>
-                      <td className="num">{route.metric ?? "—"}</td>
-                      <td className="mono system-route-details">
-                        {routeDetails(route)}
-                      </td>
-                      <td>
-                        {route.managed && (
-                          <span className="badge badge-managed">
-                            {t("routes.systemManaged")}
-                          </span>
-                        )}
-                      </td>
-                      <td className="system-actions">
-                        {routeEditable(route) && (
-                          <button
-                            type="button"
-                            className="btn-sm btn-danger"
-                            disabled={busy === key}
-                            onClick={() => delRoute(route)}
-                          >
-                            {t("common.delete")}
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        ))
+        <table className="route-table">
+          <thead>
+            <tr>
+              <th>{t("routes.field.table")}</th>
+              <th>{t("routes.destination")}</th>
+              <th>{t("routes.gateway")}</th>
+              <th>{t("routes.interfaceCol")}</th>
+              <th className="num">{t("routes.metricCol")}</th>
+              <th>{t("routes.systemDetails")}</th>
+              <th>{t("routes.owner")}</th>
+              <th aria-label={t("routes.colActions")} />
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map(([table, routes]) =>
+              routes.map((route, i) => {
+                const key = `r${route.table}:${route.destination}`;
+                return (
+                  <tr key={`${table}:${i}`}>
+                    <td className="mono system-route-details">
+                      {tableLabel(table)}
+                    </td>
+                    <td className="mono">
+                      {route.family === "ipv6" ? "IPv6 " : ""}
+                      {routeDestination(route)}
+                    </td>
+                    <td className="mono">
+                      {route.nexthops.length > 0
+                        ? route.nexthops.map((hop, j) => (
+                            <div key={j}>
+                              {hop.gateway ?? "—"} dev{" "}
+                              {hop.interfaceName ?? `if${hop.interfaceIndex}`}
+                              {hop.weight > 0 ? ` weight ${hop.weight}` : ""}
+                            </div>
+                          ))
+                        : (route.gateway ?? "—")}
+                    </td>
+                    <td>
+                      {route.interfaceName ??
+                        (route.interfaceIndex != null
+                          ? `if${route.interfaceIndex}`
+                          : "—")}
+                    </td>
+                    <td className="num">{route.metric ?? "—"}</td>
+                    <td className="mono system-route-details">
+                      {routeDetails(route)}
+                    </td>
+                    <td>
+                      {route.managed && (
+                        <span className="badge badge-managed">
+                          {t("routes.systemManaged")}
+                        </span>
+                      )}
+                    </td>
+                    <td className="system-actions">
+                      {routeEditable(route) && (
+                        <button
+                          type="button"
+                          className="btn-sm btn-danger"
+                          disabled={busy === key}
+                          onClick={() => delRoute(route)}
+                        >
+                          {t("common.delete")}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              }),
+            )}
+          </tbody>
+        </table>
       )}
 
       <Modal

@@ -2409,7 +2409,6 @@ a:focus-visible,
   color: var(--text-secondary);
 }
 
-.system-table-group:first-of-type .system-tables-heading,
 .system-tables-heading:first-of-type {
   margin-top: var(--sp-2);
 }

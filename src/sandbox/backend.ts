@@ -467,6 +467,7 @@ export class SandboxBackend {
         routes: [
           { family: "ipv4", destination: "0.0.0.0/0", table: 254, routeType: "unicast", scope: "universe", protocol: 16, managed: false, gateway: "192.168.1.1", interfaceIndex: 23, interfaceName: "enp59s0u2", metric: 100, prefSource: null, nexthops: [] },
           { family: "ipv4", destination: "198.51.100.88/32", table: 254, routeType: "unicast", scope: "universe", protocol: 79, managed: true, gateway: "192.168.1.1", interfaceIndex: 23, interfaceName: "enp59s0u2", metric: 51, prefSource: null, nexthops: [] },
+          { family: "ipv4", destination: "0.0.0.0/1", table: 2022, routeType: "unicast", scope: "universe", protocol: 3, managed: false, gateway: "198.18.0.2", interfaceIndex: 132, interfaceName: "Mihomo", metric: 0, prefSource: null, nexthops: [] },
         ],
         rules: [
           { family: "ipv4", priority: 0, action: "lookup", table: 255, goto: null, from: null, to: null, fwmark: null, fwmask: null, iifname: null, oifname: null, uidRange: null, sourcePortRange: null, destinationPortRange: null, ipProtocol: null, suppressPrefixLength: null, suppressIfGroup: null, tunId: null, tos: 0, invert: false, protocol: 0, managed: false },
