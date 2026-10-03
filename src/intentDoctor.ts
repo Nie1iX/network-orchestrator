@@ -77,7 +77,8 @@ export function cidrCovers(cidr: string, ip: string): boolean {
   const ipInt = ipToInt(ip);
   const baseInt = ipToInt(base ?? "");
   const len = Number(lenText);
-  if (ipInt === null || baseInt === null || !Number.isInteger(len)) return false;
+  if (ipInt === null || baseInt === null || !Number.isInteger(len))
+    return false;
   if (len < 0 || len > 32) return false;
   if (len === 0) return true;
   const mask = len === 32 ? 0xffffffff : (0xffffffff << (32 - len)) >>> 0;
@@ -111,7 +112,9 @@ function tunnelish(name: string, ifaces: NetworkInterface[]): boolean {
 }
 
 /** Literal IPv4 endpoints every profile wants pinned to the uplink. */
-function knownEndpoints(profiles: Profile[]): { ip: string; profile: string }[] {
+function knownEndpoints(
+  profiles: Profile[],
+): { ip: string; profile: string }[] {
   const seen = new Map<string, string>();
   for (const profile of profiles) {
     for (const raw of profile.endpointBypasses ?? []) {
@@ -134,18 +137,48 @@ function coveredByDirectIntent(ip: string, intents: NetIntentView[]): boolean {
   );
 }
 
-/** A free `bypass-…` id that does not collide with stored intents. */
-function bypassId(base: string, intents: NetIntentView[]): string {
+/** A free `bypass-…` id that does not collide with stored intents — also
+ *  avoids clashing with an id about to be created by the caller. */
+function bypassId(
+  base: string,
+  intents: NetIntentView[],
+  takenExtra: string[] = [],
+): string {
   const slug =
     base
       .toLowerCase()
       .replace(/[^a-z0-9_-]+/g, "-")
       .replace(/^-+|-+$/g, "") || "uplink";
   let id = `bypass-${slug}`;
-  const taken = new Set(intents.map((intent) => intent.id));
+  const taken = new Set([...intents.map((intent) => intent.id), ...takenExtra]);
   let n = 2;
   while (taken.has(id)) id = `bypass-${slug}-${n++}`;
   return id;
+}
+
+/** Intent params pinning every known endpoint that is not yet covered by
+ *  a `direct` rule to the physical uplink. Created alongside an
+ *  "all traffic → tunnel" rule so the rule does not swallow the very
+ *  endpoints its own clients need to reach. */
+export function uncoveredEndpointIntents(
+  profiles: Profile[],
+  intents: NetIntentView[],
+  via: string,
+  takenExtra: string[] = [],
+): NetIntentSetParams[] {
+  const endpoints = knownEndpoints(profiles)
+    .map(({ ip }) => ip)
+    .filter((ip) => !coveredByDirectIntent(ip, intents))
+    .sort();
+  if (endpoints.length === 0) return [];
+  return [
+    {
+      id: bypassId(via, intents, takenExtra),
+      destinations: endpoints.map((ip) => `${ip}/32`),
+      path: { kind: "direct" },
+      metric: BYPASS_METRIC,
+    },
+  ];
 }
 
 export function analyzeIntents(input: {

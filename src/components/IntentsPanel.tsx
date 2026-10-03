@@ -13,6 +13,7 @@ import {
 import {
   analyzeIntents,
   IntentSuggestion,
+  uncoveredEndpointIntents,
 } from "../intentDoctor";
 import { useT } from "../i18n";
 import { useToast } from "./ui/Toast";
@@ -40,6 +41,8 @@ interface IntentDraft {
   /** `direct` or an interface name. */
   path: string;
   metric: string;
+  /** Preserved on edit — absent in a fresh draft (defaults to on). */
+  enabled?: boolean;
   /** Set when editing an existing intent — the id is the identity. */
   editing: boolean;
 }
@@ -74,6 +77,7 @@ export default function IntentsPanel() {
   const t = useT();
   const toast = useToast();
   const [intents, setIntents] = useState<NetIntentView[] | null>(null);
+  const [profiles, setProfiles] = useState<Profile[]>([]);
   const [suggestions, setSuggestions] = useState<IntentSuggestion[]>([]);
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [ifaces, setIfaces] = useState<string[]>([]);
@@ -93,6 +97,7 @@ export default function IntentsPanel() {
         invoke<Profile[]>("get_profiles").catch(() => []),
       ]);
       setIntents(result.intents);
+      setProfiles(profiles);
       setSuggestions(
         analyzeIntents({
           intents: result.intents,
@@ -142,15 +147,16 @@ export default function IntentsPanel() {
       const path = draft.path.trim();
       const id =
         draft.id.trim() ||
-        (path === "direct" || path === ""
-          ? `via-uplink`
-          : `via-${slug(path)}`);
+        (path === "direct" || path === "" ? `via-uplink` : `via-${slug(path)}`);
       if (destinations.length === 0) {
         throw new Error(t("intents.required"));
       }
       const metric = draft.metric.trim();
       const metricNum = metric === "" ? undefined : Number(metric);
-      if (metricNum !== undefined && (!Number.isInteger(metricNum) || metricNum < 0)) {
+      if (
+        metricNum !== undefined &&
+        (!Number.isInteger(metricNum) || metricNum < 0)
+      ) {
         throw new Error(t("intents.badMetric"));
       }
       const params: NetIntentSetParams = {
@@ -161,10 +167,28 @@ export default function IntentsPanel() {
             ? { kind: "direct" }
             : { kind: "interface", interface: path },
         metric: metricNum,
+        enabled: draft.editing ? draft.enabled : undefined,
       };
       await invoke("net_intent_set", { params });
+      let bypassed = 0;
+      if (draft.scope === "all" && params.path.kind === "interface") {
+        for (const fix of uncoveredEndpointIntents(
+          profiles,
+          intents ?? [],
+          params.path.interface ?? "uplink",
+          [params.id],
+        )) {
+          await invoke("net_intent_set", { params: fix });
+          bypassed += fix.destinations.length;
+        }
+      }
       setDraft(null);
-      toast("success", t("intents.savedToast"));
+      toast(
+        "success",
+        bypassed > 0
+          ? t("intents.savedWithBypass", { n: bypassed })
+          : t("intents.savedToast"),
+      );
       await refresh();
     } catch (err) {
       setFormError(String(err));
@@ -177,12 +201,18 @@ export default function IntentsPanel() {
     setFormError(null);
     setDraft({
       id: intent.id,
-      scope: intent.destinations.some((d) => d === "0.0.0.0/1" || d === "128.0.0.0/1" || d === "0.0.0.0/0")
+      scope: intent.destinations.some(
+        (d) => d === "0.0.0.0/1" || d === "128.0.0.0/1" || d === "0.0.0.0/0",
+      )
         ? "all"
         : "networks",
       destinations: intent.destinations.join(" "),
-      path: intent.path.kind === "direct" ? "direct" : (intent.path.interface ?? ""),
+      path:
+        intent.path.kind === "direct"
+          ? "direct"
+          : (intent.path.interface ?? ""),
       metric: String(intent.metric),
+      enabled: intent.enabled,
       editing: true,
     });
   };
@@ -207,10 +237,10 @@ export default function IntentsPanel() {
   };
 
   const del = async (intent: NetIntentView) => {
-    const ok = await confirm(
-      t("intents.delConfirm", { id: intent.id }),
-      { title: t("routes.delTitle"), kind: "warning" },
-    );
+    const ok = await confirm(t("intents.delConfirm", { id: intent.id }), {
+      title: t("routes.delTitle"),
+      kind: "warning",
+    });
     if (!ok) return;
     setBusy(intent.id);
     try {
@@ -394,11 +424,15 @@ export default function IntentsPanel() {
                     className="btn-sm"
                     disabled={busy === intent.id}
                     title={
-                      intent.enabled ? t("intents.disable") : t("intents.enable")
+                      intent.enabled
+                        ? t("intents.disable")
+                        : t("intents.enable")
                     }
                     onClick={() => toggle(intent)}
                   >
-                    {intent.enabled ? t("intents.disable") : t("intents.enable")}
+                    {intent.enabled
+                      ? t("intents.disable")
+                      : t("intents.enable")}
                   </button>
                   <button
                     type="button"

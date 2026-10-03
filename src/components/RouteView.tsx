@@ -91,7 +91,9 @@ export default function RouteView() {
         </nav>
         {map && (
           <div className="routes-summary">
-            <span className="route-stat">{t("routes.activeCount", { n: activeCount ?? 0 })}</span>
+            <span className="route-stat">
+              {t("routes.activeCount", { n: activeCount ?? 0 })}
+            </span>
             <button
               type="button"
               className={`route-stat route-stat-btn ${conflicts ? "bad" : ""}`}

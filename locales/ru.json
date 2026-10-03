@@ -698,6 +698,7 @@
     "intents.pathDirect": "Напрямую — физический uplink",
     "intents.required": "Нужны имя и хотя бы одно назначение.",
     "intents.savedToast": "Правило сохранено.",
+    "intents.savedWithBypass": "Правило сохранено; {n} endpoint-байпас(ов) закреплено за uplink.",
     "intents.scopeAll": "Весь трафик",
     "intents.scopeAllHint": "Ставится как 0.0.0.0/1 + 128.0.0.0/1 — половинки выигрывают у обычного default-маршрута, не заменяя его, поэтому другие клиенты продолжают работать.",
     "intents.scopeNetworks": "Эти сети (CIDR)",
