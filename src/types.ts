@@ -757,6 +757,40 @@ export interface NetExplainResult {
   available: boolean;
 }
 
+// ── Routing intents (Linux daemon) ────────────────────────────────────
+
+/** Where an intent sends its destinations: a named link or the uplink. */
+export interface NetIntentPath {
+  /** `interface` | `direct` */
+  kind: string;
+  interface?: string;
+}
+
+export interface NetIntentSetParams {
+  id: string;
+  destinations: string[];
+  path: NetIntentPath;
+  metric?: number;
+}
+
+/** One stored intent with its live reconciliation status. */
+export interface NetIntentView {
+  id: string;
+  destinations: string[];
+  path: NetIntentPath;
+  metric: number;
+  status: ExplainStatus;
+  detail: string;
+  /** Desired routes currently present in the kernel. */
+  installed: number;
+  /** Routes the spec wants right now (0 while deferred). */
+  wanted: number;
+}
+
+export interface NetIntentListResult {
+  intents: NetIntentView[];
+}
+
 // ── DNS inventory + probe (Linux daemon) ─────────────────────────────
 
 export interface DnsDomain {

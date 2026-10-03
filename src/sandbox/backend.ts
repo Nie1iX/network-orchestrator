@@ -1,7 +1,7 @@
 import type {
   AlwaysOnListResult, BackendAvailability, ConditionalRuleEntry, ConditionalRouteRule,
-  ConfigAnalysis, DomainPolicy, NetworkInterface, Profile, ProfileInspection, RouteEntry, RouteMap,
-  TunnelStatus, VpnAuthMode,
+  ConfigAnalysis, DomainPolicy, NetIntentView, NetworkInterface, Profile, ProfileInspection,
+  RouteEntry, RouteMap, TunnelStatus, VpnAuthMode,
 } from "../types.ts";
 
 // This module intentionally has no I/O imports, fetch, or process calls.
@@ -32,6 +32,48 @@ function iface(name: string, index: number, physical: boolean, state: NetworkInt
 }
 
 export class SandboxBackend {
+  private intents: NetIntentView[] = [
+    {
+      id: "office-via-openvpn",
+      destinations: ["10.88.0.0/24", "10.20.0.0/16"],
+      path: { kind: "interface", interface: "qa-ovpn" },
+      metric: 100,
+      status: "deferred",
+      detail: "interface qa-ovpn is absent; armed until it appears",
+      installed: 0,
+      wanted: 2,
+    },
+    {
+      id: "everything-via-mihomo",
+      destinations: ["0.0.0.0/1", "128.0.0.0/1"],
+      path: { kind: "interface", interface: "Mihomo" },
+      metric: 100,
+      status: "effective",
+      detail: "2 route(s) enforced",
+      installed: 2,
+      wanted: 2,
+    },
+    {
+      id: "vpn-endpoint-direct",
+      destinations: ["91.245.41.31/32"],
+      path: { kind: "direct" },
+      metric: 50,
+      status: "effective",
+      detail: "pinned to the physical uplink",
+      installed: 1,
+      wanted: 1,
+    },
+    {
+      id: "stale-conflict",
+      destinations: ["203.0.113.0/24"],
+      path: { kind: "interface", interface: "qa-wg" },
+      metric: 100,
+      status: "conflicted",
+      detail: "a foreign route occupies the destination",
+      installed: 0,
+      wanted: 1,
+    },
+  ];
   private profiles: Profile[] = [
     profile("wg", "QA WireGuard", "wireGuard", "10.77.0.0/24"),
     profile("ovpn", "QA OpenVPN", "openVpn", "10.88.0.0/24"),
@@ -480,6 +522,33 @@ export class SandboxBackend {
           { owner: "manual", state: "applied", kind: "route", subject: "198.51.100.88/32 dev enp59s0u2 table main", status: "effective", detail: "installed" },
         ],
       };
+      case "net_intent_list": return { intents: this.intents };
+      case "net_intent_set": {
+        const p = args.params as {
+          id: string; destinations: string[];
+          path: { kind: string; interface?: string }; metric?: number;
+        };
+        const wanted = p.destinations.length;
+        const effective = p.path.kind === "direct" || p.path.interface === "Mihomo";
+        const view: NetIntentView = {
+          id: p.id,
+          destinations: p.destinations,
+          path: p.path,
+          metric: p.metric ?? 100,
+          status: effective ? "effective" : "deferred",
+          detail: effective
+            ? `${wanted} route(s) enforced`
+            : `interface ${p.path.interface ?? ""} is absent; armed until it appears`,
+          installed: effective ? wanted : 0,
+          wanted,
+        };
+        this.intents = [...this.intents.filter((i) => i.id !== p.id), view];
+        return { id: p.id };
+      }
+      case "net_intent_del": {
+        this.intents = this.intents.filter((i) => i.id !== args.id);
+        return { id: args.id };
+      }
       case "net_dns_status": return {
         available: true,
         resolvConf: ["127.0.0.53"],

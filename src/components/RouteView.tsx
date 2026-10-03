@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Page from "./Page";
+import IntentsPanel from "./IntentsPanel";
 import RouteFlow from "./RouteFlow";
 import RouteMap from "./RouteMap";
 import RouteTable from "./RouteTable";
@@ -9,9 +10,10 @@ import { RouteLookupResult, RouteMap as RouteMapData } from "../types";
 import { TranslationKey, useT } from "../i18n";
 import { setRoutesPrefs, useRoutesPrefs } from "../prefs";
 
-type RouteTab = "flow" | "tree" | "table" | "system";
+type RouteTab = "intents" | "flow" | "tree" | "table" | "system";
 
 const TABS: { id: RouteTab; labelKey: TranslationKey }[] = [
+  { id: "intents", labelKey: "routes.intents" },
   { id: "flow", labelKey: "routes.flow" },
   { id: "tree", labelKey: "routes.tree" },
   { id: "table", labelKey: "routes.table" },
@@ -21,7 +23,7 @@ const TABS: { id: RouteTab; labelKey: TranslationKey }[] = [
 export default function RouteView() {
   const t = useT();
   const prefs = useRoutesPrefs();
-  const [tab, setTab] = useState<RouteTab>("flow");
+  const [tab, setTab] = useState<RouteTab>("intents");
   const [map, setMap] = useState<RouteMapData | null>(null);
   const [lookupDest, setLookupDest] = useState("");
   const [lookupResult, setLookupResult] = useState<RouteLookupResult | null>(
@@ -194,6 +196,7 @@ export default function RouteView() {
       )}
 
       <div className="route-tab-content">
+        {tab === "intents" && <IntentsPanel />}
         {tab === "flow" && <RouteFlow hideIpv6={prefs.hideIpv6} />}
         {tab === "tree" && (
           <RouteMap
