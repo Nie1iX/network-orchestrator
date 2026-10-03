@@ -30,15 +30,24 @@ pub(crate) enum RouteRuntime {
 #[cfg(target_os = "linux")]
 pub(crate) const TUNNEL_OWNER_PREFIXES: [&str; 4] = ["wg:", "ovpn:", "ovpn-probe:", "xray:"];
 
+/// Owner namespaces the daemon manages itself — routing intents, conditional
+/// rules and manual edits are journaled policies, not profiles, so the
+/// recovery report must never flag them as orphans.
+#[cfg(target_os = "linux")]
+pub(crate) fn daemon_managed_owner(owner: &str) -> bool {
+    owner == "manual" || owner.starts_with("intent:") || owner.starts_with("cond:")
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn static_route_snapshot(result: OwnedListResult) -> Vec<AppliedProfileRoutes> {
     result
         .owners
         .into_iter()
         .filter(|entry| {
-            !TUNNEL_OWNER_PREFIXES
-                .iter()
-                .any(|prefix| entry.owner.starts_with(prefix))
+            !daemon_managed_owner(&entry.owner)
+                && !TUNNEL_OWNER_PREFIXES
+                    .iter()
+                    .any(|prefix| entry.owner.starts_with(prefix))
                 && !entry.resources.iter().any(|resource| {
                     matches!(
                         resource,
