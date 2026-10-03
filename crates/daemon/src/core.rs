@@ -15,7 +15,8 @@ use ipnet::IpNet;
 use net_manager_core::daemon_protocol::{
     AttachSpecParams, CleanupResult, ConditionalRouteRule, ConditionalRuleState,
     ConditionalRuleStatus, ExplainEntry, ExplainStatus, IpFamily, NetEditOutcome, NetExplainResult,
-    NetRouteAddParams, NetRuleAddParams, OpenVpnConnectionState, OpenVpnFailure,
+    NetIntentListResult, NetIntentPath, NetIntentResult, NetIntentSetParams, NetIntentView,
+    NetRouteAddParams, NetRuleAddParams, NetTablesResult, OpenVpnConnectionState, OpenVpnFailure,
     OpenVpnPlanConflict, OpenVpnPlanResult, OpenVpnProbeResult, OpenVpnProcessResource,
     OpenVpnStatusResult, OpenVpnWarning, OwnedEntry, OwnedResource, OwnedRuleResource, OwnedState,
     RouteCondition, SystemRoute, SystemRule, WireGuardAddressResource, WireGuardFullResource,
@@ -24,7 +25,7 @@ use net_manager_core::daemon_protocol::{
 };
 use net_manager_core::journal::{JournalDocument, JournalEntry, JournalStore};
 use net_manager_core::models::TunnelState;
-use net_manager_core::models::{AnalyzedRoute, AppliedRoute};
+use net_manager_core::models::{AnalyzedRoute, AppliedRoute, PolicyRoute};
 use net_manager_core::openvpn_management::{ManagementEvent, ManagementSnapshot, OpenVpnState};
 use net_manager_core::policy::{apply_routes_transactional, RouteExecutor, ENDPOINT_BYPASS_METRIC};
 use std::collections::{HashMap, HashSet};
@@ -1271,6 +1272,7 @@ mod openvpn_tests {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             policy: Some(Box::new(policy.clone())),
             dns: Some(Box::new(dns.clone())),
         };
@@ -1461,6 +1463,17 @@ const WIREGUARD_UNANSWERED_SECS: u64 = 20;
 /// app restart until the user reverts them or the daemon stops.
 pub(crate) const MANUAL_OWNER: &str = "manual";
 
+/// Journal owner prefix for user routing intents (`net.intent.*`). Each
+/// intent persists as an armed attach spec, so reconcile re-derives and
+/// enforces it — intents survive restarts and link re-creation.
+pub(crate) const INTENT_OWNER_PREFIX: &str = "intent:";
+
+/// Route metric intents install with when the caller does not override
+/// it. Note prefix length still rules over metrics: a full-tunnel /1
+/// pair beats any metric for covered destinations and surfaces as a
+/// conflict instead of being silently outvoted.
+const INTENT_DEFAULT_METRIC: u32 = 100;
+
 const RT_TABLE_UNSPEC: u32 = 0;
 const RT_TABLE_MAIN: u32 = 254;
 const RT_TABLE_LOCAL: u32 = 255;
@@ -1601,6 +1614,10 @@ pub struct DaemonCore {
     /// interface matched, or why the apply failed. Not journaled — the
     /// journal already records what was installed.
     cond_eval: HashMap<(u32, String), CondRuleEval>,
+    /// Durable routing-intent store (`net.intent.*`); `None` in tests that
+    /// do not exercise intents and in degraded setups — the `net.intent`
+    /// methods then report `NotConnected`.
+    pub intents: Option<crate::intents::IntentStore>,
     #[cfg(target_os = "linux")]
     policy: Option<Box<dyn PolicyRuleExecutor>>,
     #[cfg(target_os = "linux")]
@@ -1737,6 +1754,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1779,6 +1797,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1819,6 +1838,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -1853,6 +1873,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1891,6 +1912,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1934,6 +1956,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -4286,7 +4309,25 @@ impl DaemonCore {
     #[cfg(target_os = "linux")]
     fn attach_desired(&mut self, spec: &AttachSpecParams) -> Vec<AppliedRoute> {
         let mut desired = Vec::new();
-        if !spec.interface_name.is_empty() {
+        if spec.uplink {
+            // "Direct" intent: every declared prefix takes the current
+            // physical uplink's next hop (or on-link when the destination
+            // is already connected). Re-derived per pass, so the routes
+            // follow uplink and gateway changes.
+            for route in &spec.routes {
+                let destination = route.destination.trunc();
+                let Some((gateway, index)) = self.uplink_next_hop(destination) else {
+                    continue;
+                };
+                desired.push(AppliedRoute {
+                    destination,
+                    interface_index: index,
+                    metric: route.metric,
+                    gateway,
+                    table: None,
+                });
+            }
+        } else if !spec.interface_name.is_empty() {
             if let Ok(Some(index)) = self.links.link_index(&spec.interface_name) {
                 // Mirrors `interface_gateway_for` in the planner: tunnel
                 // links take routes on-link, physical uplinks need their
@@ -4494,6 +4535,7 @@ impl DaemonCore {
             || owner.starts_with("ovpn-probe:")
             || owner.starts_with("xray:")
             || owner.starts_with("cond:")
+            || owner.starts_with(INTENT_OWNER_PREFIX)
             || owner == MANUAL_OWNER
         {
             return Err(invalid_input("reserved owner prefix".into()));
@@ -4963,6 +5005,168 @@ impl DaemonCore {
         }
     }
 
+    /// `net.intent.set`: upsert a routing intent. The durable record goes
+    /// to the intent store; the journal entry (`intent:<id>` owner, armed
+    /// attach spec) tracks the kernel artifacts. An absent target link
+    /// installs nothing but stays armed — every reconcile re-derives
+    /// routes from live kernel state, and startup replay re-arms intents
+    /// after restarts.
+    pub fn net_intent_set(
+        &mut self,
+        uid: u32,
+        params: NetIntentSetParams,
+    ) -> io::Result<NetIntentResult> {
+        let owner = intent_owner(&params.id)?;
+        let spec = intent_spec(&params)?;
+        let store = self.intents.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "intent store is unavailable")
+        })?;
+        #[cfg(target_os = "linux")]
+        let desired = self.attach_desired(&spec);
+        #[cfg(not(target_os = "linux"))]
+        let desired: Vec<AppliedRoute> = Vec::new();
+        if let Some(index) = self.position(uid, &owner) {
+            self.teardown_entry(index)?;
+            self.persist();
+        }
+        self.apply_routes_inner(uid, &owner, desired, Some(spec))?;
+        if let Err(err) = store.upsert(uid, params.clone()) {
+            // The kernel half succeeded but the durable record did not —
+            // undo so the intent does not die silently on restart.
+            if let Some(index) = self.position(uid, &owner) {
+                let _ = self.teardown_entry(index);
+                self.persist();
+            }
+            return Err(err);
+        }
+        Ok(NetIntentResult { id: params.id })
+    }
+
+    /// `net.intent.del`: drop the durable record and tear the intent's
+    /// routes down. A journaled-but-unstored intent is torn down too —
+    /// delete is idempotent over the store, not over the journal.
+    pub fn net_intent_del(&mut self, uid: u32, id: &str) -> io::Result<()> {
+        let owner = intent_owner(id)?;
+        let store = self.intents.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "intent store is unavailable")
+        })?;
+        store.remove(uid, id)?;
+        if self.position(uid, &owner).is_some() {
+            self.remove_owner_inner(uid, &owner)?;
+        }
+        Ok(())
+    }
+
+    /// `net.intent.list`: stored intents with their live status — the
+    /// user-facing "what is routed where right now" view. The store is
+    /// the source of truth; the journal only tracks installed artifacts.
+    pub fn net_intent_list(&mut self, uid: u32) -> io::Result<NetIntentListResult> {
+        let Some(store) = self.intents.clone() else {
+            return Ok(NetIntentListResult {
+                intents: Vec::new(),
+            });
+        };
+        let document = store.load_uid(uid)?;
+        #[cfg(target_os = "linux")]
+        let tables = self.routes.net_tables().ok();
+        #[cfg(not(target_os = "linux"))]
+        let tables: Option<NetTablesResult> = None;
+        let mut intents = Vec::with_capacity(document.intents.len());
+        for params in document.intents {
+            let Ok(spec) = intent_spec(&params) else {
+                continue;
+            };
+            #[cfg(target_os = "linux")]
+            let desired = self.attach_desired(&spec);
+            #[cfg(not(target_os = "linux"))]
+            let desired: Vec<AppliedRoute> = Vec::new();
+            let installed = desired
+                .iter()
+                .filter(|route| {
+                    tables.as_ref().is_some_and(|tables| {
+                        tables.routes.iter().any(|seen| same_route(seen, route))
+                    })
+                })
+                .count();
+            let (status, detail) = intent_view_status(&spec, &desired, installed, tables.as_ref());
+            intents.push(NetIntentView {
+                id: params.id.clone(),
+                destinations: spec
+                    .routes
+                    .iter()
+                    .map(|route| route.destination.to_string())
+                    .collect(),
+                path: if spec.uplink {
+                    NetIntentPath {
+                        kind: "direct".into(),
+                        interface: None,
+                    }
+                } else {
+                    NetIntentPath {
+                        kind: "interface".into(),
+                        interface: Some(spec.interface_name.clone()),
+                    }
+                },
+                metric: spec
+                    .routes
+                    .first()
+                    .map(|route| route.metric)
+                    .unwrap_or(INTENT_DEFAULT_METRIC),
+                status,
+                detail,
+                installed,
+                wanted: desired.len(),
+            });
+        }
+        Ok(NetIntentListResult { intents })
+    }
+
+    /// Startup replay: re-arm every stored intent after `open` tore the
+    /// journal down — the same pattern `always_on::replay` uses for
+    /// persistent profiles. Best effort per intent; failures are logged.
+    pub fn replay_intents(&mut self) -> (usize, usize) {
+        let Some(store) = self.intents.clone() else {
+            return (0, 0);
+        };
+        let documents = match store.load_all() {
+            Ok(documents) => documents,
+            Err(_) => return (0, 0),
+        };
+        let mut armed = 0;
+        let mut failed = 0;
+        for (uid, document) in documents {
+            for params in document.intents {
+                let Ok(spec) = intent_spec(&params) else {
+                    failed += 1;
+                    continue;
+                };
+                let owner = match intent_owner(&params.id) {
+                    Ok(owner) => owner,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+                #[cfg(target_os = "linux")]
+                let desired = self.attach_desired(&spec);
+                #[cfg(not(target_os = "linux"))]
+                let desired: Vec<AppliedRoute> = Vec::new();
+                match self.apply_routes_inner(uid, &owner, desired, Some(spec)) {
+                    Ok(_) => armed += 1,
+                    Err(err) => {
+                        failed += 1;
+                        eprintln!(
+                            "network-orchestrator-daemon: intent {} replay deferred: {}",
+                            params.id,
+                            err.kind()
+                        );
+                    }
+                }
+            }
+        }
+        (armed, failed)
+    }
+
     /// `net.explain`: for every journaled intent of `uid`, why it is in
     /// its current state — cross-checked against a fresh kernel dump.
     pub fn net_explain(&mut self, uid: u32) -> io::Result<NetExplainResult> {
@@ -5169,6 +5373,28 @@ impl DaemonCore {
                 }
             }
             OwnedResource::AttachSpec(spec) => {
+                if spec.uplink {
+                    let has_uplink = self
+                        .routes
+                        .default_gateways()
+                        .map(|gateways| !gateways.is_empty())
+                        .unwrap_or(false);
+                    return if has_uplink {
+                        make(
+                            "attach",
+                            "uplink".into(),
+                            ExplainStatus::Effective,
+                            "pinned to the physical uplink".into(),
+                        )
+                    } else {
+                        make(
+                            "attach",
+                            "uplink".into(),
+                            ExplainStatus::Deferred,
+                            "no physical uplink is available".into(),
+                        )
+                    };
+                }
                 let subject = format!("attach {}", spec.interface_name);
                 match self.links.link_index(&spec.interface_name) {
                     Ok(Some(index)) => make(
@@ -5463,6 +5689,7 @@ impl DaemonCore {
             entry.uid == uid
                 && !keep.contains(&(uid, entry.owner.clone()))
                 && !entry.owner.starts_with("cond:")
+                && !entry.owner.starts_with(INTENT_OWNER_PREFIX)
                 && entry.owner != MANUAL_OWNER
         })
     }
@@ -6953,6 +7180,117 @@ mod xray_core_tests {
 
 fn invalid_input(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+/// Compile intent params into the journaled attach spec: destinations
+/// become spec routes (host bits truncated) and the path picks either a
+/// named link or the live physical uplink.
+fn intent_spec(params: &NetIntentSetParams) -> io::Result<AttachSpecParams> {
+    if params.destinations.is_empty() {
+        return Err(invalid_input(
+            "an intent needs at least one destination".into(),
+        ));
+    }
+    let metric = params.metric.unwrap_or(INTENT_DEFAULT_METRIC);
+    let mut routes = Vec::with_capacity(params.destinations.len());
+    for raw in &params.destinations {
+        let parsed: IpNet = raw
+            .trim()
+            .parse()
+            .map_err(|_| invalid_input(format!("destination {raw:?} is not a CIDR prefix")))?;
+        routes.push(PolicyRoute {
+            destination: parsed.trunc(),
+            metric,
+            via: None,
+        });
+    }
+    let spec = match params.path.kind.as_str() {
+        "interface" => AttachSpecParams {
+            interface_name: params.path.interface.clone().unwrap_or_default(),
+            routes,
+            endpoint_bypasses: Vec::new(),
+            uplink: false,
+        },
+        "direct" => AttachSpecParams {
+            interface_name: String::new(),
+            routes,
+            endpoint_bypasses: Vec::new(),
+            uplink: true,
+        },
+        other => return Err(invalid_input(format!("unknown intent path kind {other:?}"))),
+    };
+    validate_attach(&spec).map_err(invalid_input)?;
+    Ok(spec)
+}
+
+/// `intent:<id>` journal owner. Ids stay slugs — short, no whitespace or
+/// ':' (the separator other owner prefixes use), within owner limits.
+fn intent_owner(id: &str) -> io::Result<String> {
+    if id.is_empty()
+        || id.len() > 96
+        || id
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == ':')
+    {
+        return Err(invalid_input(
+            "intent id must be 1-96 characters without ':' or whitespace".into(),
+        ));
+    }
+    let owner = format!("{INTENT_OWNER_PREFIX}{id}");
+    validate_owner(&owner).map_err(invalid_input)?;
+    Ok(owner)
+}
+
+/// Aggregate one intent's desired-vs-kernel diff into an explain status.
+/// `installed` counts desired routes present in `tables` right now.
+fn intent_view_status(
+    spec: &AttachSpecParams,
+    desired: &[AppliedRoute],
+    installed: usize,
+    tables: Option<&NetTablesResult>,
+) -> (ExplainStatus, String) {
+    if desired.is_empty() {
+        return (
+            ExplainStatus::Deferred,
+            if spec.uplink {
+                "no physical uplink is available".into()
+            } else {
+                format!(
+                    "interface {} is absent; armed until it appears",
+                    spec.interface_name
+                )
+            },
+        );
+    }
+    if installed == desired.len() {
+        return (
+            ExplainStatus::Effective,
+            format!("{} route(s) enforced", desired.len()),
+        );
+    }
+    let blocked = desired.iter().any(|route| {
+        tables.is_some_and(|tables| {
+            tables.routes.iter().any(|seen| {
+                !seen.managed
+                    && seen.destination == route.destination
+                    && seen.table == RT_TABLE_MAIN
+                    && seen.kind == "unicast"
+            })
+        })
+    });
+    if blocked {
+        return (
+            ExplainStatus::Conflicted,
+            "a foreign route occupies the destination".into(),
+        );
+    }
+    (
+        ExplainStatus::Missing,
+        format!(
+            "{installed}/{} installed; the next reconcile retries",
+            desired.len()
+        ),
+    )
 }
 
 fn xray_stage(stage: &'static str, error: io::Error) -> io::Error {
@@ -9777,6 +10115,7 @@ mod tests {
             interface_name: iface.into(),
             routes: dests.iter().map(|d| spec_route(d)).collect(),
             endpoint_bypasses: bypasses.iter().map(|s| s.to_string()).collect(),
+            uplink: false,
         }
     }
 
@@ -10044,6 +10383,8 @@ mod tests {
     struct KernelTables {
         routes: Arc<Mutex<Vec<SystemRoute>>>,
         rules: Arc<Mutex<Vec<SystemRule>>>,
+        gateways: Arc<Mutex<Vec<(std::net::IpAddr, u32)>>>,
+        on_link: Arc<Mutex<Vec<(u32, IpNet)>>>,
     }
 
     impl KernelTables {
@@ -10055,12 +10396,59 @@ mod tests {
         }
     }
 
+    /// The kernel object an AppliedRoute install leaves behind — protocol
+    /// marks it managed, `same_route` then matches it for explain/list.
+    fn kernel_of(applied: &AppliedRoute) -> SystemRoute {
+        let applied = kernel_route(applied);
+        SystemRoute {
+            family: if applied.destination.addr().is_ipv4() {
+                IpFamily::Ipv4
+            } else {
+                IpFamily::Ipv6
+            },
+            destination: applied.destination,
+            table: applied.table.unwrap_or(RT_TABLE_MAIN),
+            kind: "unicast".into(),
+            scope: if applied.gateway.is_some() {
+                "universe"
+            } else {
+                "link"
+            }
+            .into(),
+            protocol: crate::netlink::RTPROT_NETWORK_ORCHESTRATOR,
+            managed: true,
+            gateway: applied.gateway,
+            interface_index: Some(applied.interface_index),
+            interface_name: None,
+            metric: Some(applied.metric),
+            pref_source: None,
+            nexthops: Vec::new(),
+        }
+    }
+
     impl RouteExecutor for KernelTables {
-        fn add_route(&mut self, _: &AppliedRoute) -> io::Result<()> {
+        fn add_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+            let mut routes = self.routes.lock().unwrap();
+            if routes.iter().any(|seen| same_route(seen, route)) {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists"));
+            }
+            routes.push(kernel_of(route));
             Ok(())
         }
-        fn remove_route(&mut self, _: &AppliedRoute) -> io::Result<()> {
+        fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+            let mut routes = self.routes.lock().unwrap();
+            let before = routes.len();
+            routes.retain(|seen| !same_route(seen, route));
+            if routes.len() == before {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no such route"));
+            }
             Ok(())
+        }
+        fn default_gateways(&self) -> io::Result<Vec<(std::net::IpAddr, u32)>> {
+            Ok(self.gateways.lock().unwrap().clone())
+        }
+        fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
+            Ok(self.on_link.lock().unwrap().clone())
         }
         fn net_tables(&self) -> io::Result<net_manager_core::daemon_protocol::NetTablesResult> {
             Ok(net_manager_core::daemon_protocol::NetTablesResult {
@@ -10130,6 +10518,186 @@ mod tests {
         .unwrap();
         core.policy = Some(Box::new(kernel.clone()));
         core
+    }
+
+    /// `open_tables` but the caller keeps the link recorder and intents
+    /// persist under `dir` — intent tests simulate interfaces appearing
+    /// between reconciles and daemon restarts.
+    fn open_tables_links(dir: &Path, kernel: &KernelTables, recorder: &Recorder) -> DaemonCore {
+        let mut core = DaemonCore::open(
+            JournalStore::new(dir.join(JOURNAL_FILE)),
+            Box::new(kernel.clone()),
+            Box::new(FakeLinks(recorder.clone())),
+        )
+        .unwrap();
+        core.policy = Some(Box::new(kernel.clone()));
+        core.intents = Some(crate::intents::IntentStore::new(dir.join("intents")));
+        core
+    }
+
+    fn intent_iface(id: &str, dests: &[&str], iface: &str) -> NetIntentSetParams {
+        NetIntentSetParams {
+            id: id.into(),
+            destinations: dests.iter().map(|d| d.to_string()).collect(),
+            path: NetIntentPath {
+                kind: "interface".into(),
+                interface: Some(iface.into()),
+            },
+            metric: None,
+        }
+    }
+
+    fn intent_direct(id: &str, dests: &[&str]) -> NetIntentSetParams {
+        NetIntentSetParams {
+            id: id.into(),
+            destinations: dests.iter().map(|d| d.to_string()).collect(),
+            path: NetIntentPath {
+                kind: "direct".into(),
+                interface: None,
+            },
+            metric: None,
+        }
+    }
+
+    #[test]
+    fn intent_arms_until_interface_appears() {
+        let dir = unique_dir("intent-arm");
+        let kernel = KernelTables::default();
+        let recorder = Recorder::default();
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        core.net_intent_set(1000, intent_iface("office", &["10.20.0.0/16"], "tun9"))
+            .unwrap();
+        let view = &core.net_intent_list(1000).unwrap().intents[0];
+        assert_eq!(view.status, ExplainStatus::Deferred);
+        assert_eq!(view.wanted, 0);
+        assert!(kernel.routes().is_empty());
+        // The link appears: reconcile installs the armed route.
+        set_link(&recorder, "tun9", Some(9));
+        assert_eq!(
+            core.reconcile_network(&[]),
+            vec![(1000, "intent:office".into())]
+        );
+        let view = &core.net_intent_list(1000).unwrap().intents[0];
+        assert_eq!(view.status, ExplainStatus::Effective);
+        assert_eq!(view.installed, 1);
+        assert_eq!(kernel.routes()[0].interface_index, Some(9));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn intent_direct_follows_the_uplink() {
+        let dir = unique_dir("intent-direct");
+        let kernel = KernelTables::default();
+        kernel
+            .gateways
+            .lock()
+            .unwrap()
+            .push(("192.0.2.1".parse().unwrap(), 3));
+        let recorder = Recorder::default();
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        core.net_intent_set(1000, intent_direct("escape", &["198.51.100.0/24"]))
+            .unwrap();
+        let routes = kernel.routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].gateway, Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(routes[0].interface_index, Some(3));
+        // The uplink roams: reconcile retargets the route, not leaves it.
+        *kernel.gateways.lock().unwrap() = vec![("203.0.113.1".parse().unwrap(), 4)];
+        assert_eq!(
+            core.reconcile_network(&[]),
+            vec![(1000, "intent:escape".into())]
+        );
+        let routes = kernel.routes();
+        assert_eq!(routes[0].gateway, Some("203.0.113.1".parse().unwrap()));
+        assert_eq!(routes[0].interface_index, Some(4));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn intent_set_replaces_and_del_removes() {
+        let dir = unique_dir("intent-upsert");
+        let kernel = KernelTables::default();
+        let recorder = Recorder::default();
+        set_link(&recorder, "tun9", Some(9));
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        core.net_intent_set(1000, intent_iface("office", &["10.20.0.0/16"], "tun9"))
+            .unwrap();
+        core.net_intent_set(
+            1000,
+            intent_iface("office", &["10.30.0.0/16", "10.40.0.0/16"], "tun9"),
+        )
+        .unwrap();
+        let routes = kernel.routes();
+        assert_eq!(
+            routes
+                .iter()
+                .map(|r| r.destination.to_string())
+                .collect::<Vec<_>>(),
+            vec!["10.30.0.0/16", "10.40.0.0/16"]
+        );
+        core.net_intent_del(1000, "office").unwrap();
+        assert!(kernel.routes().is_empty());
+        assert!(core.net_intent_list(1000).unwrap().intents.is_empty());
+        // Delete is idempotent: neither the store nor the journal holds it.
+        core.net_intent_del(1000, "office").unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn intent_validates_id_destinations_and_path() {
+        let dir = unique_dir("intent-validate");
+        let kernel = KernelTables::default();
+        let recorder = Recorder::default();
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        // "ns:forged" would smuggle a second ':' into the owner prefix.
+        for params in [
+            intent_iface("bad id", &["10.0.0.0/8"], "tun9"),
+            intent_iface("ns:forged", &["10.0.0.0/8"], "tun9"),
+            intent_iface("empty", &[], "tun9"),
+            intent_iface("bad-cidr", &["not a cidr"], "tun9"),
+        ] {
+            assert_eq!(
+                core.net_intent_set(1000, params).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let mut bad_path = intent_iface("x", &["10.0.0.0/8"], "tun9");
+        bad_path.path.kind = "sideways".into();
+        assert_eq!(
+            core.net_intent_set(1000, bad_path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // Client-facing apply cannot forge an intent owner either.
+        assert_eq!(
+            core.apply_routes(1000, "intent:fake", vec![])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn intent_iface_absent_stays_armed_across_reopen() {
+        let dir = unique_dir("intent-reopen");
+        let kernel = KernelTables::default();
+        let recorder = Recorder::default();
+        {
+            let mut core = open_tables_links(&dir, &kernel, &recorder);
+            core.net_intent_set(1000, intent_iface("office", &["10.20.0.0/16"], "tun9"))
+                .unwrap();
+        }
+        // Daemon restart: the journal entry is gone but the stored intent
+        // re-arms on replay and stays listed.
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        let list = core.net_intent_list(1000).unwrap();
+        assert_eq!(list.intents.len(), 1);
+        assert_eq!(list.intents[0].status, ExplainStatus::Deferred);
+        assert_eq!(core.replay_intents(), (1, 0));
+        set_link(&recorder, "tun9", Some(9));
+        core.reconcile_network(&[]);
+        assert_eq!(kernel.routes().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn kernel_route_fixture(managed: bool) -> SystemRoute {

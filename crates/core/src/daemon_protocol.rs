@@ -77,6 +77,9 @@ pub mod method {
     pub const NET_EXPLAIN: &str = "net.explain";
     pub const NET_DNS_STATUS: &str = "net.dns.status";
     pub const NET_DNS_PROBE: &str = "net.dns.probe";
+    pub const NET_INTENT_LIST: &str = "net.intent.list";
+    pub const NET_INTENT_SET: &str = "net.intent.set";
+    pub const NET_INTENT_DEL: &str = "net.intent.del";
 
     /// Methods implemented by the daemon and reported in `hello.capabilities`.
     pub const CAPABILITIES: &[&str] = &[
@@ -123,6 +126,9 @@ pub mod method {
         NET_EXPLAIN,
         NET_DNS_STATUS,
         NET_DNS_PROBE,
+        NET_INTENT_LIST,
+        NET_INTENT_SET,
+        NET_INTENT_DEL,
     ];
 }
 
@@ -320,6 +326,12 @@ pub struct AttachSpecParams {
     pub interface_name: String,
     pub routes: Vec<PolicyRoute>,
     pub endpoint_bypasses: Vec<String>,
+    /// `true` pins `routes` to the current physical uplink instead of a
+    /// named link — a "direct, do not tunnel" intent. The next hop is
+    /// re-derived from the live default gateway on every reconcile, so the
+    /// routes follow uplink changes and Wi-Fi/Ethernet switches.
+    #[serde(default)]
+    pub uplink: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -620,6 +632,69 @@ pub struct NetExplainResult {
     /// False when the kernel dump was unavailable; statuses are unknown.
     #[serde(default)]
     pub available: bool,
+}
+
+/// Where a user intent sends its destinations: `interface` binds to a
+/// link (tunnel, uplink, any netdev — armed until it appears), `direct`
+/// pins to the current physical uplink so the traffic bypasses tunnels.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentPath {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+}
+
+/// `net.intent.set`: upsert a routing intent. `id` is a stable slug that
+/// becomes journal owner `intent:<id>`; the daemon journaled attach spec
+/// re-derives and enforces the routes on every reconcile, so the intent
+/// survives interface re-creation, uplink changes and daemon restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentSetParams {
+    pub id: String,
+    /// Destination prefixes (CIDR) the intent captures.
+    pub destinations: Vec<String>,
+    pub path: NetIntentPath,
+    /// Metric for the installed routes; defaults to 100.
+    #[serde(default)]
+    pub metric: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentDelParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentResult {
+    pub id: String,
+}
+
+/// One intent in `net.intent.list`: the declared spec plus its live
+/// reconciliation status against the kernel inventory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentView {
+    pub id: String,
+    pub destinations: Vec<String>,
+    pub path: NetIntentPath,
+    /// Route metric the intent installs with.
+    pub metric: u32,
+    pub status: ExplainStatus,
+    pub detail: String,
+    /// Desired routes currently present in the kernel.
+    pub installed: usize,
+    /// Desired routes the spec wants right now (0 while deferred).
+    pub wanted: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentListResult {
+    pub intents: Vec<NetIntentView>,
 }
 
 /// DNS configuration of one link as systemd-resolved reports it.
@@ -1651,7 +1726,7 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop","nm.list","nm.setActive","net.tables","net.route.add","net.route.del","net.rule.add","net.rule.del","net.explain","net.dns.status","net.dns.probe"],"tools":{}}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop","nm.list","nm.setActive","net.tables","net.route.add","net.route.del","net.rule.add","net.rule.del","net.explain","net.dns.status","net.dns.probe","net.intent.list","net.intent.set","net.intent.del"],"tools":{}}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);

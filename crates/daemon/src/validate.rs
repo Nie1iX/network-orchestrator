@@ -63,9 +63,15 @@ pub fn validate_owner(owner: &str) -> Result<(), String> {
 /// names an on-link peer (e.g. a tun gateway); it must be unicast and match
 /// the destination family, same as `AppliedRoute.gateway`.
 pub fn validate_attach(spec: &AttachSpecParams) -> Result<(), String> {
+    if spec.uplink {
+        // Uplink ("direct") specs bind routes to whatever the physical
+        // uplink is at reconcile time — naming a link contradicts that.
+        if !spec.interface_name.is_empty() {
+            return Err("uplink specs do not take an interface name".into());
+        }
     // An empty interface name is legal for bypass-only specs — there is no
     // link to bind — but declared routes always need a binding target.
-    if !spec.interface_name.is_empty() {
+    } else if !spec.interface_name.is_empty() {
         validate_iface_name(&spec.interface_name)?;
     } else if !spec.routes.is_empty() {
         return Err("attach routes need an interface name".into());
