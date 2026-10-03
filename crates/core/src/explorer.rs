@@ -983,8 +983,11 @@ fn classify_linux_name(name: &str) -> InterfaceKind {
     if name.contains("tailscale") {
         return InterfaceKind::Other("Tailscale".into());
     }
-    if name.starts_with("tun") || name.starts_with("tap") || name.contains("openvpn") {
+    if name.contains("openvpn") {
         return InterfaceKind::OpenVpn;
+    }
+    if name.starts_with("tun") || name.starts_with("tap") {
+        return classify_linux_tun_name(name);
     }
     if name.starts_with("eth") || name.starts_with("en") {
         return InterfaceKind::Ethernet;
@@ -999,6 +1002,8 @@ fn classify_linux_name(name: &str) -> InterfaceKind {
 }
 
 /// tun/tap device: the name hints at the owning userspace daemon.
+/// Unknown `tun*`/`tap*` names stay `TUN` — guessing OpenVPN for every
+/// foreign client (INCY, Happ, Mihomo, …) mislabels them in the UI.
 #[cfg(any(target_os = "linux", test))]
 fn classify_linux_tun_name(name: &str) -> InterfaceKind {
     let lower = name.to_lowercase();
@@ -1008,12 +1013,23 @@ fn classify_linux_tun_name(name: &str) -> InterfaceKind {
     if lower.contains("xray") || lower.contains("sing-box") || lower.contains("singbox") {
         return InterfaceKind::Xray;
     }
-    if lower.contains("openvpn")
-        || lower.contains("ovpn")
-        || lower.starts_with("tun")
-        || lower.starts_with("tap")
-    {
+    if lower.contains("openvpn") || lower.contains("ovpn") {
         return InterfaceKind::OpenVpn;
+    }
+    if lower.contains("mihomo") || lower.contains("clash") {
+        return InterfaceKind::Other("Mihomo".into());
+    }
+    if lower.contains("incy") {
+        return InterfaceKind::Other("INCY".into());
+    }
+    if lower.contains("happ") {
+        return InterfaceKind::Other("Happ".into());
+    }
+    if lower.contains("zerotier") {
+        return InterfaceKind::Other("ZeroTier".into());
+    }
+    if lower.contains("warp") {
+        return InterfaceKind::Other("WARP".into());
     }
     InterfaceKind::Other("TUN".into())
 }
@@ -1035,8 +1051,12 @@ fn classify_category_linux(kind: &InterfaceKind, physical: bool, _name: &str) ->
         InterfaceKind::Other(s) => {
             // Foreign tunnels we detected but do not manage (system wg-quick,
             // other apps' tun devices, tailscaled) belong with the VPN group
-            // so conflicts surface next to our own tunnels.
-            if s == "Tailscale" || s == "TUN" {
+            // so conflicts surface next to our own tunnels. The set mirrors
+            // the labels `classify_linux_tun_name` hands out.
+            if matches!(
+                s.as_str(),
+                "Tailscale" | "TUN" | "Mihomo" | "INCY" | "Happ" | "ZeroTier" | "WARP"
+            ) {
                 InterfaceCategory::Vpn
             } else if physical {
                 InterfaceCategory::Physical
@@ -1428,9 +1448,22 @@ garbage line\n";
             classify_linux_tun_name("tailscale0"),
             InterfaceKind::Other(ref s) if s == "Tailscale"
         ));
+        // An unrecognized tun* name is a TUN, not a guessed OpenVPN.
         assert!(matches!(
             classify_linux_tun_name("tun0"),
+            InterfaceKind::Other(ref s) if s == "TUN"
+        ));
+        assert!(matches!(
+            classify_linux_tun_name("tun-ovpn"),
             InterfaceKind::OpenVpn
+        ));
+        assert!(matches!(
+            classify_linux_tun_name("tun_incy"),
+            InterfaceKind::Other(ref s) if s == "INCY"
+        ));
+        assert!(matches!(
+            classify_linux_tun_name("tun-happ"),
+            InterfaceKind::Other(ref s) if s == "Happ"
         ));
         assert!(matches!(
             classify_linux_tun_name("devpn"),
