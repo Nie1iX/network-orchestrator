@@ -60,7 +60,7 @@ function ruleSelector(rule: SystemRule): string {
     parts.push("sport", rule.sourcePortRange.join("-"));
   if (rule.destinationPortRange)
     parts.push("dport", rule.destinationPortRange.join("-"));
-  if (rule.tos !== 0) parts.push("tos", `0x${rule.tos.toString(16)}`);
+  if (rule.tos) parts.push("tos", `0x${rule.tos.toString(16)}`);
   if (rule.tunId != null) parts.push("tun_id", `${rule.tunId}`);
   if (rule.suppressPrefixLength != null)
     parts.push("suppress_prefixlen", `${rule.suppressPrefixLength}`);
