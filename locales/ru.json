@@ -326,6 +326,7 @@
     "common.expand": "Развернуть",
     "common.more": "Ещё",
     "common.off": "Выкл",
+    "common.panelError": "Панель не смогла отобразиться",
     "common.refresh": "Обновить",
     "common.remove": "Удалить",
     "common.retry": "Повторить",

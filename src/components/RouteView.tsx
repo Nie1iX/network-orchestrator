@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Page from "./Page";
 import IntentsPanel from "./IntentsPanel";
+import PanelBoundary from "./PanelBoundary";
 import RouteFlow from "./RouteFlow";
 import RouteMap from "./RouteMap";
 import RouteTable from "./RouteTable";
@@ -196,16 +197,18 @@ export default function RouteView() {
       )}
 
       <div className="route-tab-content">
-        {tab === "intents" && <IntentsPanel />}
-        {tab === "flow" && <RouteFlow hideIpv6={prefs.hideIpv6} />}
-        {tab === "tree" && (
-          <RouteMap
-            hideIpv6={prefs.hideIpv6}
-            includeInactive={prefs.includeStopped}
-          />
-        )}
-        {tab === "table" && <RouteTable hideIpv6={prefs.hideIpv6} />}
-        {tab === "system" && <SystemTables hideIpv6={prefs.hideIpv6} />}
+        <PanelBoundary key={tab}>
+          {tab === "intents" && <IntentsPanel />}
+          {tab === "flow" && <RouteFlow hideIpv6={prefs.hideIpv6} />}
+          {tab === "tree" && (
+            <RouteMap
+              hideIpv6={prefs.hideIpv6}
+              includeInactive={prefs.includeStopped}
+            />
+          )}
+          {tab === "table" && <RouteTable hideIpv6={prefs.hideIpv6} />}
+          {tab === "system" && <SystemTables hideIpv6={prefs.hideIpv6} />}
+        </PanelBoundary>
       </div>
     </Page>
   );
