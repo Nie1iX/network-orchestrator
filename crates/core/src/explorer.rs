@@ -1019,11 +1019,11 @@ fn classify_linux_tun_name(name: &str) -> InterfaceKind {
     if lower.contains("mihomo") || lower.contains("clash") {
         return InterfaceKind::Other("Mihomo".into());
     }
-    if lower.contains("incy") {
-        return InterfaceKind::Other("INCY".into());
-    }
-    if lower.contains("happ") {
-        return InterfaceKind::Other("Happ".into());
+    // INCY and Happ embed xray-core (e.g. /opt/incy/.../bin/xray,
+    // /opt/happ/bin/core/xray) — they are Xray tunnels even when the
+    // device name lacks an "xray" token.
+    if lower.contains("incy") || lower.contains("happ") {
+        return InterfaceKind::Xray;
     }
     if lower.contains("zerotier") {
         return InterfaceKind::Other("ZeroTier".into());
@@ -1055,7 +1055,7 @@ fn classify_category_linux(kind: &InterfaceKind, physical: bool, _name: &str) ->
             // the labels `classify_linux_tun_name` hands out.
             if matches!(
                 s.as_str(),
-                "Tailscale" | "TUN" | "Mihomo" | "INCY" | "Happ" | "ZeroTier" | "WARP"
+                "Tailscale" | "TUN" | "Mihomo" | "ZeroTier" | "WARP"
             ) {
                 InterfaceCategory::Vpn
             } else if physical {
@@ -1457,13 +1457,14 @@ garbage line\n";
             classify_linux_tun_name("tun-ovpn"),
             InterfaceKind::OpenVpn
         ));
+        // INCY and Happ embed xray-core — they classify as Xray.
         assert!(matches!(
             classify_linux_tun_name("tun_incy"),
-            InterfaceKind::Other(ref s) if s == "INCY"
+            InterfaceKind::Xray
         ));
         assert!(matches!(
             classify_linux_tun_name("tun-happ"),
-            InterfaceKind::Other(ref s) if s == "Happ"
+            InterfaceKind::Xray
         ));
         assert!(matches!(
             classify_linux_tun_name("devpn"),
