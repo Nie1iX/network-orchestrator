@@ -1303,10 +1303,7 @@ export default function ProfileManager() {
   const isTailscaleIface = (i: NetworkInterface) =>
     i.name.toLowerCase().startsWith("tailscale") ||
     (typeof i.kind === "object" && i.kind.other === "Tailscale");
-  const isTunnelIface = (i: NetworkInterface) =>
-    typeof i.kind === "string"
-      ? i.kind === "wireGuard" || i.kind === "openVpn" || i.kind === "xray"
-      : i.kind.other === "TUN";
+  const isTunnelIface = (i: NetworkInterface) => i.category === "vpn";
   const managedIfaces = new Set(
     profiles
       .filter((p) => statusFor(p.id).state === "running")
