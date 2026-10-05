@@ -8,6 +8,18 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+### Added
+
+- Merged from `main` (Linux): persistent routing intents, kernel route/rule
+  System tab, DNS path probing, NetworkManager inventory, external-tunnel
+  attach with endpoint bypasses, opt-in localhost proxy discovery and the
+  orchestrator/manager/combined app modes.
+
+### Fixed
+
+- Linux-only intents and proxy-discovery helpers no longer break
+  `cargo clippy` on non-Linux hosts.
+
 ## [0.7.0] - 2026-10-02
 
 ### Added
