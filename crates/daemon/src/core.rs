@@ -7,28 +7,35 @@ use crate::cond_rules::{match_interface, plan_routes, IfaceAddr, OWNER_PREFIX};
 use crate::dns::{DnsApply, DnsExecutor};
 use crate::openvpn::OpenVpnPlan;
 use crate::openvpn_process::OpenVpnProcessRunner;
-use crate::validate::{validate_apply, validate_iface_name, validate_owner};
+use crate::validate::{validate_apply, validate_attach, validate_iface_name, validate_owner};
 use crate::wireguard::{WireGuardPlan, WireGuardPlanWarning};
 use crate::xray::prepare_xray;
 use crate::xray_process::XrayProcessRunner;
 use ipnet::IpNet;
 use net_manager_core::daemon_protocol::{
-    CleanupResult, ConditionalRouteRule, ConditionalRuleState, ConditionalRuleStatus, IpFamily,
-    OpenVpnConnectionState, OpenVpnFailure, OpenVpnPlanConflict, OpenVpnPlanResult,
-    OpenVpnProbeResult, OpenVpnProcessResource, OpenVpnStatusResult, OpenVpnWarning, OwnedEntry,
-    OwnedResource, OwnedRuleResource, OwnedState, RouteCondition, WireGuardAddressResource,
-    WireGuardFullResource, WireGuardLinkResource, WireGuardStatusResult, WireGuardWarning,
-    XrayConnectParams, XrayProcessResource, XrayStatusResult,
+    AttachSpecParams, CleanupResult, ConditionalRouteRule, ConditionalRuleState,
+    ConditionalRuleStatus, ExplainEntry, ExplainStatus, IpFamily, NetEditOutcome, NetExplainResult,
+    NetIntentListResult, NetIntentPath, NetIntentResult, NetIntentSetParams, NetIntentView,
+    NetRouteAddParams, NetRuleAddParams, NetTablesResult, OpenVpnConnectionState, OpenVpnFailure,
+    OpenVpnPlanConflict, OpenVpnPlanResult, OpenVpnProbeResult, OpenVpnProcessResource,
+    OpenVpnStatusResult, OpenVpnWarning, OwnedEntry, OwnedResource, OwnedRuleResource, OwnedState,
+    RouteCondition, SystemRoute, SystemRule, WireGuardAddressResource, WireGuardFullResource,
+    WireGuardLinkResource, WireGuardStatusResult, WireGuardWarning, XrayConnectParams,
+    XrayProcessResource, XrayStatusResult,
 };
 use net_manager_core::journal::{JournalDocument, JournalEntry, JournalStore};
 use net_manager_core::models::TunnelState;
-use net_manager_core::models::{AnalyzedRoute, AppliedRoute};
+use net_manager_core::models::{AnalyzedRoute, AppliedRoute, PolicyRoute};
 use net_manager_core::openvpn_management::{ManagementEvent, ManagementSnapshot, OpenVpnState};
-use net_manager_core::policy::{
-    apply_routes_transactional, remove_routes_best_effort, RouteExecutor,
-};
+use net_manager_core::policy::{apply_routes_transactional, RouteExecutor, ENDPOINT_BYPASS_METRIC};
 use std::collections::{HashMap, HashSet};
 use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::net::{IpAddr, ToSocketAddrs};
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 /// What a netdev the daemon does not own is, decided via sysfs by the
 /// executor. Drives `stop_external_link`: WireGuard can be unlinked, foreign
@@ -48,6 +55,10 @@ pub trait LinkExecutor: Send {
     fn remove_link(&mut self, name: &str) -> io::Result<()>;
     /// Probe a netdev's tunnel kind without mutating it.
     fn link_kind(&mut self, name: &str) -> io::Result<ExternalLinkKind>;
+    /// Live ifindex for a link name; `None` when the link does not exist.
+    /// Attach specs re-resolve on every reconcile — external tunnels
+    /// re-create their links under fresh ifindices.
+    fn link_index(&self, name: &str) -> io::Result<Option<u32>>;
 }
 
 #[cfg(test)]
@@ -1261,6 +1272,7 @@ mod openvpn_tests {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             policy: Some(Box::new(policy.clone())),
             dns: Some(Box::new(dns.clone())),
         };
@@ -1394,6 +1406,21 @@ pub trait PolicyRuleExecutor: Send {
     fn rule_present(&mut self, rule: &OwnedRuleResource) -> io::Result<bool> {
         Ok(self.rules_snapshot()?.contains(rule))
     }
+    /// Install a rule described by the full kernel spec (manual edits and
+    /// restoring a suppressed foreign rule). Default: unsupported.
+    fn add_system_rule(
+        &mut self,
+        _rule: &net_manager_core::daemon_protocol::SystemRule,
+    ) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Delete a rule by its full kernel spec.
+    fn remove_system_rule(
+        &mut self,
+        _rule: &net_manager_core::daemon_protocol::SystemRule,
+    ) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 pub trait WgConfigExecutor: Send {
@@ -1429,6 +1456,77 @@ const WIREGUARD_REJECT_AFTER_SECS: u64 = 180;
 /// How long sent packets may go without a handshake before the tunnel is
 /// failed; WireGuard retries the initiation about every 5 s.
 const WIREGUARD_UNANSWERED_SECS: u64 = 20;
+
+/// Journal owner accumulating manual `net.*` overrides (added routes and
+/// rules plus suppressed foreign objects). Torn down by the generic
+/// resource loop and exempt from session cleanup, so overrides survive an
+/// app restart until the user reverts them or the daemon stops.
+pub(crate) const MANUAL_OWNER: &str = "manual";
+
+/// Journal owner prefix for user routing intents (`net.intent.*`). Each
+/// intent persists as an armed attach spec, so reconcile re-derives and
+/// enforces it — intents survive restarts and link re-creation.
+pub(crate) const INTENT_OWNER_PREFIX: &str = "intent:";
+
+/// Route metric intents install with when the caller does not override
+/// it. Note prefix length still rules over metrics: a full-tunnel /1
+/// pair beats any metric for covered destinations and surfaces as a
+/// conflict instead of being silently outvoted.
+const INTENT_DEFAULT_METRIC: u32 = 100;
+
+const RT_TABLE_UNSPEC: u32 = 0;
+const RT_TABLE_MAIN: u32 = 254;
+const RT_TABLE_LOCAL: u32 = 255;
+
+/// Table id rendered like `ip route` knows it.
+fn table_name(table: u32) -> String {
+    match table {
+        RT_TABLE_UNSPEC => "unspec".into(),
+        RT_TABLE_MAIN => "main".into(),
+        253 => "default".into(),
+        RT_TABLE_LOCAL => "local".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether a dumped kernel route is the same object as a journaled
+/// `Route` (AppliedRoute) resource.
+fn same_route(system: &SystemRoute, applied: &AppliedRoute) -> bool {
+    let applied = kernel_route(applied);
+    system.kind == "unicast"
+        && system.destination == applied.destination
+        && system.interface_index == Some(applied.interface_index)
+        && system.metric.unwrap_or(0) == applied.metric
+        && system.gateway == applied.gateway
+        && system.table == applied.table.unwrap_or(RT_TABLE_MAIN)
+}
+
+/// Whether two dumped routes name the same kernel object (key fields
+/// only — name resolution and scope may differ between dumps).
+fn same_system_route(a: &SystemRoute, b: &SystemRoute) -> bool {
+    a.family == b.family
+        && a.destination == b.destination
+        && a.table == b.table
+        && a.interface_index == b.interface_index
+        && a.gateway == b.gateway
+        && a.metric.unwrap_or(0) == b.metric.unwrap_or(0)
+        && a.nexthops.len() == b.nexthops.len()
+        && a.nexthops
+            .iter()
+            .zip(&b.nexthops)
+            .all(|(x, y)| x.interface_index == y.interface_index && x.gateway == y.gateway)
+}
+
+/// Whether a dumped kernel rule is the same object as a journaled
+/// `Rule` (OwnedRuleResource) resource.
+fn same_rule(system: &SystemRule, owned: &OwnedRuleResource) -> bool {
+    system.family == owned.family
+        && system.priority == owned.priority
+        && system.table == owned.table
+        && system.fwmark == owned.fwmark
+        && system.invert == owned.invert
+        && system.suppress_prefix_length == owned.suppress_prefix_length
+}
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -1516,6 +1614,10 @@ pub struct DaemonCore {
     /// interface matched, or why the apply failed. Not journaled — the
     /// journal already records what was installed.
     cond_eval: HashMap<(u32, String), CondRuleEval>,
+    /// Durable routing-intent store (`net.intent.*`); `None` in tests that
+    /// do not exercise intents and in degraded setups — the `net.intent`
+    /// methods then report `NotConnected`.
+    pub intents: Option<crate::intents::IntentStore>,
     #[cfg(target_os = "linux")]
     policy: Option<Box<dyn PolicyRuleExecutor>>,
     #[cfg(target_os = "linux")]
@@ -1652,6 +1754,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1694,6 +1797,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1734,6 +1838,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -1768,6 +1873,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1806,6 +1912,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             #[cfg(target_os = "linux")]
             policy: None,
             #[cfg(target_os = "linux")]
@@ -1849,6 +1956,7 @@ impl DaemonCore {
             tunnel_failed: HashSet::new(),
             xray_restarts: HashMap::new(),
             cond_eval: HashMap::new(),
+            intents: None,
             policy: Some(policy),
             dns: Some(dns),
         };
@@ -2060,13 +2168,15 @@ impl DaemonCore {
             (None, true) => {}
             _ => return Err(incompatible()),
         }
-        // Tunnel routes: the journaled gateway-less Route resources must match
-        // the plan's explicit routes (a default route's table is derived from
-        // the recorded full-capture slot).
+        // Tunnel routes ride the TUN's own ifindex; bypass host routes ride
+        // the physical uplink, `via` the gateway or `dev`-scoped when the
+        // endpoint is on-link there. The journaled on-TUN routes must match
+        // the plan's explicit routes (a default route's table is derived
+        // from the recorded full-capture slot).
         let mut journaled: Vec<_> = resources
             .iter()
             .filter_map(|resource| match resource {
-                OwnedResource::Route(route) if route.gateway.is_none() => {
+                OwnedResource::Route(route) if route.interface_index == process.index => {
                     Some((route.destination, route.metric, route.table))
                 }
                 _ => None,
@@ -2098,12 +2208,14 @@ impl DaemonCore {
         if journaled != desired {
             return Err(incompatible());
         }
-        // Bypass host routes (journaled with a physical gateway) must cover
-        // the same upstream/DNS destinations the plan would install.
+        // Bypass host routes (journaled on the uplink, not the TUN) must
+        // cover the same upstream/DNS destinations the plan would install.
         let mut bypassed: Vec<_> = resources
             .iter()
             .filter_map(|resource| match resource {
-                OwnedResource::Route(route) if route.gateway.is_some() => Some(route.destination),
+                OwnedResource::Route(route) if route.interface_index != process.index => {
+                    Some(route.destination)
+                }
                 _ => None,
             })
             .collect();
@@ -2313,24 +2425,10 @@ impl DaemonCore {
         if targets.is_empty() {
             return Ok(());
         }
-        let gateways = self.routes.default_gateways().unwrap_or_default();
         for ip in targets {
-            let Some((gateway, oif)) = gateways
-                .iter()
-                .copied()
-                .find(|(gateway, _)| gateway.is_ipv4() == ip.is_ipv4())
-            else {
+            let Some(applied) = self.uplink_host_route(ip, 5) else {
                 eprintln!("network-orchestrator-daemon: no uplink gateway for an xray bypass route, skipping");
                 continue;
-            };
-            let prefix = if ip.is_ipv4() { 32 } else { 128 };
-            let applied = AppliedRoute {
-                destination: IpNet::new(ip, prefix)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad bypass"))?,
-                interface_index: oif,
-                metric: 5,
-                gateway: Some(gateway),
-                table: None,
             };
             self.journal.entries[index]
                 .resources
@@ -3792,22 +3890,49 @@ impl DaemonCore {
                 continue;
             }
             let key = (entry.uid, entry.owner.clone());
-            let restored = match self.tunnel_alive(index) {
-                None => continue,
-                Some(false) => {
-                    // A dead xray child first gets an in-place respawn; only
-                    // an exhausted budget or a respawn failure tears the
-                    // tunnel down.
-                    if key.1.starts_with("xray:") {
-                        match self.heal_xray(index) {
-                            Ok(true) => self.restore_owned_network(index, observed),
-                            Ok(false) | Err(_) => Err(io::Error::other("tunnel transport is gone")),
-                        }
-                    } else {
-                        Err(io::Error::other("tunnel transport is gone"))
-                    }
+            let attach = entry.resources.iter().find_map(|resource| match resource {
+                OwnedResource::AttachSpec(spec) => Some(spec.clone()),
+                _ => None,
+            });
+            let restored = if let Some(spec) = attach {
+                #[cfg(target_os = "linux")]
+                {
+                    self.reconcile_attach(index, &spec, observed)
                 }
-                Some(true) => self.restore_owned_network(index, observed),
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = spec;
+                    continue;
+                }
+            } else if entry.owner == MANUAL_OWNER {
+                #[cfg(target_os = "linux")]
+                {
+                    Ok(self.reconcile_manual(index))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    continue;
+                }
+            } else {
+                match self.tunnel_alive(index) {
+                    None => continue,
+                    Some(false) => {
+                        // A dead xray child first gets an in-place respawn; only
+                        // an exhausted budget or a respawn failure tears the
+                        // tunnel down.
+                        if key.1.starts_with("xray:") {
+                            match self.heal_xray(index) {
+                                Ok(true) => self.restore_owned_network(index, observed),
+                                Ok(false) | Err(_) => {
+                                    Err(io::Error::other("tunnel transport is gone"))
+                                }
+                            }
+                        } else {
+                            Err(io::Error::other("tunnel transport is gone"))
+                        }
+                    }
+                    Some(true) => self.restore_owned_network(index, observed),
+                }
             };
             match restored {
                 Ok(false) => {}
@@ -3986,21 +4111,16 @@ impl DaemonCore {
         Ok(())
     }
 
-    /// A bypass host route pointing at the *current* physical default
-    /// gateway for its address family, or `None` when no such gateway
-    /// exists right now.
+    /// The same bypass route re-pointed at the *current* physical uplink
+    /// for its address family — `via` the live default gateway, or
+    /// `dev`-scoped when the destination is on-link there. `None` when no
+    /// such uplink exists right now.
     #[cfg(target_os = "linux")]
     fn fresh_bypass_route(&self, route: &AppliedRoute) -> Option<AppliedRoute> {
-        let (gateway, oif) = self
-            .routes
-            .default_gateways()
-            .ok()?
-            .iter()
-            .copied()
-            .find(|(gateway, _)| gateway.is_ipv4() == route.destination.addr().is_ipv4())?;
+        let (gateway, oif) = self.uplink_next_hop(route.destination)?;
         Some(AppliedRoute {
             interface_index: oif,
-            gateway: Some(gateway),
+            gateway,
             ..route.clone()
         })
     }
@@ -4015,6 +4135,18 @@ impl DaemonCore {
         observed: &[AppliedRoute],
     ) -> io::Result<bool> {
         let resources = self.journal.entries[index].resources.clone();
+        // Tunnel routes ride the tunnel's own ifindex (journaled on the
+        // process resource); bypass host routes ride the physical uplink —
+        // either `via` the default gateway or `dev`-scoped when the host is
+        // on-link there. Entries with no tunnel index (static route owners)
+        // only ever treat gateway-carrying routes as bypasses.
+        let tun_indices: Vec<u32> = resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) if process.index != 0 => Some(process.index),
+                _ => None,
+            })
+            .collect();
         let mut restored = false;
         for resource in &resources {
             let OwnedResource::Route(route) = resource else {
@@ -4026,12 +4158,14 @@ impl DaemonCore {
             {
                 continue;
             }
-            // Bypass host routes point at a physical gateway that can vanish
-            // on roam/DHCP renew/suspend — re-point at the live default
-            // gateway and update the journal instead of re-adding a stale
-            // route. No gateway at all is transient: skip and retry next pass.
+            // Bypass host routes point at a physical uplink that can change
+            // on roam/DHCP renew/suspend — re-derive against the live
+            // uplink and update the journal instead of re-adding a stale
+            // route. No uplink at all is transient: skip and retry next pass.
+            let is_bypass = route.gateway.is_some()
+                || (!tun_indices.is_empty() && !tun_indices.contains(&route.interface_index));
             let mut desired = route.clone();
-            if route.gateway.is_some() {
+            if is_bypass {
                 match self.fresh_bypass_route(route) {
                     Some(fresh) => {
                         if fresh != *route {
@@ -4056,7 +4190,7 @@ impl DaemonCore {
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
                 // A bypass add failing while the uplink is flaky must not
                 // kill the tunnel; the next reconcile pass retries.
-                Err(err) if route.gateway.is_some() => {
+                Err(err) if is_bypass => {
                     eprintln!(
                         "network-orchestrator-daemon: bypass route re-add deferred: {}",
                         err.kind()
@@ -4083,6 +4217,289 @@ impl DaemonCore {
         Ok(restored)
     }
 
+    /// Reconcile the `manual` owner against a fresh kernel dump: re-add
+    /// journaled routes/rules the kernel lost, and re-suppress foreign
+    /// objects that came back (an NM profile re-adding its route, a link
+    /// flap). Manual entries are never torn down here — an unreachable
+    /// kernel view just defers the pass.
+    #[cfg(target_os = "linux")]
+    fn reconcile_manual(&mut self, index: usize) -> bool {
+        let tables = match self.routes.net_tables() {
+            Ok(tables) => tables,
+            Err(_) => return false,
+        };
+        let resources = self.journal.entries[index].resources.clone();
+        let mut changed = false;
+        for resource in &resources {
+            match resource {
+                OwnedResource::NetRoute(route) => {
+                    let present = tables
+                        .routes
+                        .iter()
+                        .any(|seen| same_system_route(seen, route));
+                    if !present {
+                        match self.routes.add_system_route(route) {
+                            Ok(()) => changed = true,
+                            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "network-orchestrator-daemon: manual route re-add deferred: {}",
+                                    err.kind()
+                                );
+                            }
+                        }
+                    }
+                }
+                OwnedResource::NetRule(rule) => {
+                    if !tables.rules.iter().any(|seen| seen == rule) {
+                        match self.with_policy(|policy| policy.add_system_rule(rule)) {
+                            Ok(()) => changed = true,
+                            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "network-orchestrator-daemon: manual rule re-add deferred: {}",
+                                    err.kind()
+                                );
+                            }
+                        }
+                    }
+                }
+                OwnedResource::SuppressedRoute(route) => {
+                    let reappeared = tables
+                        .routes
+                        .iter()
+                        .any(|seen| same_system_route(seen, route));
+                    if reappeared {
+                        match self.routes.remove_system_route(route) {
+                            Ok(()) => changed = true,
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "network-orchestrator-daemon: route re-suppress deferred: {}",
+                                    err.kind()
+                                );
+                            }
+                        }
+                    }
+                }
+                OwnedResource::SuppressedRule(rule)
+                    if tables.rules.iter().any(|seen| seen == rule) =>
+                {
+                    match self.with_policy(|policy| policy.remove_system_rule(rule)) {
+                        Ok(()) => changed = true,
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            eprintln!(
+                                "network-orchestrator-daemon: rule re-suppress deferred: {}",
+                                err.kind()
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
+    /// Routes the attach spec wants right now: declared CIDRs bound to the
+    /// live ifindex of `interface_name` (nothing while the link is absent —
+    /// they stay armed, not deleted) and bypass host routes pinned to the
+    /// current physical uplink.
+    #[cfg(target_os = "linux")]
+    fn attach_desired(&mut self, spec: &AttachSpecParams) -> Vec<AppliedRoute> {
+        let mut desired = Vec::new();
+        if spec.uplink {
+            // "Direct" intent: every declared prefix takes the current
+            // physical uplink's next hop (or on-link when the destination
+            // is already connected). Re-derived per pass, so the routes
+            // follow uplink and gateway changes.
+            for route in &spec.routes {
+                let destination = route.destination.trunc();
+                let Some((gateway, index)) = self.uplink_next_hop(destination) else {
+                    continue;
+                };
+                desired.push(AppliedRoute {
+                    destination,
+                    interface_index: index,
+                    metric: route.metric,
+                    gateway,
+                    table: None,
+                });
+            }
+        } else if !spec.interface_name.is_empty() {
+            if let Ok(Some(index)) = self.links.link_index(&spec.interface_name) {
+                // Mirrors `interface_gateway_for` in the planner: tunnel
+                // links take routes on-link, physical uplinks need their
+                // default gateway as next hop.
+                let physical = matches!(
+                    self.links.link_kind(&spec.interface_name),
+                    Ok(ExternalLinkKind::Other)
+                );
+                let gateways = self.routes.default_gateways().unwrap_or_default();
+                let on_link = self.routes.on_link_networks().unwrap_or_default();
+                desired.extend(spec.routes.iter().map(|route| {
+                    let destination = route.destination.trunc();
+                    // A declared route fully inside a connected subnet on
+                    // this interface is on-link: emit `dev`, not a gateway
+                    // hop that would hairpin one-sidedly.
+                    let on_link_here = || {
+                        on_link
+                            .iter()
+                            .any(|(oif, net)| *oif == index && net.contains(&destination))
+                    };
+                    let gateway = route.via.or_else(|| {
+                        (physical && !on_link_here()).then(|| {
+                            gateways
+                                .iter()
+                                .copied()
+                                .find(|(gateway, oif)| {
+                                    *oif == index
+                                        && gateway.is_ipv4() == destination.addr().is_ipv4()
+                                })
+                                .map(|(gateway, _)| gateway)
+                        })?
+                    });
+                    AppliedRoute {
+                        destination,
+                        interface_index: index,
+                        metric: route.metric,
+                        gateway,
+                        table: None,
+                    }
+                }));
+            }
+        }
+        for host in &spec.endpoint_bypasses {
+            for ip in resolve_endpoint_ips(host) {
+                if let Some(route) = self.uplink_bypass_route(ip) {
+                    if !desired
+                        .iter()
+                        .any(|seen| seen.destination == route.destination)
+                    {
+                        desired.push(route);
+                    }
+                }
+            }
+        }
+        desired
+    }
+
+    /// The next hop a bypass route through the *current* physical uplink
+    /// should take for `destination`: `(gateway, interface)`. The gateway
+    /// is `None` when the destination lies inside a subnet directly
+    /// connected to that uplink — a `via` hop would hairpin the flow
+    /// through a middlebox that only ever sees one direction, and strict
+    /// conntrack/firewall setups drop those one-sided streams. `None`
+    /// overall while no uplink of the family exists.
+    #[cfg(target_os = "linux")]
+    fn uplink_next_hop(&self, destination: IpNet) -> Option<(Option<IpAddr>, u32)> {
+        let (gateway, oif) = self
+            .routes
+            .default_gateways()
+            .ok()?
+            .iter()
+            .copied()
+            .find(|(gateway, _)| gateway.is_ipv4() == destination.addr().is_ipv4())?;
+        let on_link = self
+            .routes
+            .on_link_networks()
+            .unwrap_or_default()
+            .iter()
+            .any(|(iif, net)| *iif == oif && net.contains(&destination));
+        Some(((!on_link).then_some(gateway), oif))
+    }
+
+    /// A bypass host route through the *current* physical uplink of the
+    /// host's family, or `None` while no such uplink exists.
+    #[cfg(target_os = "linux")]
+    fn uplink_host_route(&self, host: IpAddr, metric: u32) -> Option<AppliedRoute> {
+        let (gateway, oif) = self.uplink_next_hop(host.into())?;
+        Some(AppliedRoute {
+            destination: host.into(),
+            interface_index: oif,
+            metric,
+            gateway,
+            table: None,
+        })
+    }
+
+    /// A bypass host route through the *current* physical default gateway
+    /// of the host's family, or `None` while no such uplink exists.
+    #[cfg(target_os = "linux")]
+    fn uplink_bypass_route(&self, host: IpAddr) -> Option<AppliedRoute> {
+        self.uplink_host_route(host, ENDPOINT_BYPASS_METRIC)
+    }
+
+    /// Converge an armed attach entry with the spec's current derivation:
+    /// withdraw journaled routes the spec no longer wants, install missing
+    /// desired ones, and rewrite the entry's `Route` resources to the live
+    /// derivation. Foreign routes are never touched — only resources the
+    /// journal itself recorded. Errors are logged and retried next pass
+    /// instead of tearing the armed owner down.
+    #[cfg(target_os = "linux")]
+    fn reconcile_attach(
+        &mut self,
+        index: usize,
+        spec: &AttachSpecParams,
+        observed: &[AppliedRoute],
+    ) -> io::Result<bool> {
+        let desired = self.attach_desired(spec);
+        let mut changed = false;
+        let mut retained: Vec<AppliedRoute> = Vec::new();
+        for resource in self.journal.entries[index].resources.clone() {
+            let OwnedResource::Route(route) = resource else {
+                continue;
+            };
+            if desired
+                .iter()
+                .any(|target| kernel_route(target) == kernel_route(&route))
+            {
+                continue;
+            }
+            match self.routes.remove_route(&route) {
+                Ok(()) => changed = true,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => changed = true,
+                Err(err) => {
+                    eprintln!(
+                        "network-orchestrator-daemon: attach route withdraw deferred: {}",
+                        err.kind()
+                    );
+                    retained.push(route);
+                }
+            }
+        }
+        for route in &desired {
+            if observed
+                .iter()
+                .any(|seen| kernel_route(seen) == kernel_route(route))
+            {
+                continue;
+            }
+            match self.routes.add_route(route) {
+                Ok(()) => changed = true,
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    eprintln!(
+                        "network-orchestrator-daemon: attach route install deferred: {}",
+                        err.kind()
+                    );
+                }
+            }
+        }
+        let mut resources = vec![OwnedResource::AttachSpec(spec.clone())];
+        resources.extend(desired.iter().cloned().map(OwnedResource::Route));
+        resources.extend(retained.into_iter().map(OwnedResource::Route));
+        if self.journal.entries[index].resources != resources {
+            self.journal.entries[index].resources = resources;
+            changed = true;
+        }
+        if changed {
+            self.persist();
+        }
+        Ok(changed)
+    }
+
     /// Apply `routes` for `(uid, owner)` all-or-nothing. The journal entry is
     /// persisted as `applying` before the first kernel change.
     pub fn apply_routes(
@@ -4091,16 +4508,39 @@ impl DaemonCore {
         owner: &str,
         routes: Vec<AppliedRoute>,
     ) -> io::Result<usize> {
+        self.check_client_owner(owner)?;
+        self.apply_routes_inner(uid, owner, routes, None)
+    }
+
+    /// `apply_routes` carrying an attach spec: the spec is journaled beside
+    /// the concrete routes so every later reconcile re-derives them from the
+    /// live interface name and the current physical uplink, instead of
+    /// trusting one ifindex forever.
+    pub fn apply_attach(
+        &mut self,
+        uid: u32,
+        owner: &str,
+        spec: AttachSpecParams,
+        routes: Vec<AppliedRoute>,
+    ) -> io::Result<usize> {
+        self.check_client_owner(owner)?;
+        validate_attach(&spec).map_err(invalid_input)?;
+        self.apply_routes_inner(uid, owner, routes, Some(spec))
+    }
+
+    fn check_client_owner(&self, owner: &str) -> io::Result<()> {
         validate_owner(owner).map_err(invalid_input)?;
         if owner.starts_with("wg:")
             || owner.starts_with("ovpn:")
             || owner.starts_with("ovpn-probe:")
             || owner.starts_with("xray:")
             || owner.starts_with("cond:")
+            || owner.starts_with(INTENT_OWNER_PREFIX)
+            || owner == MANUAL_OWNER
         {
             return Err(invalid_input("reserved owner prefix".into()));
         }
-        self.apply_routes_inner(uid, owner, routes)
+        Ok(())
     }
 
     /// `apply_routes` for daemon-internal owners (`cond:*`): skips the
@@ -4110,6 +4550,7 @@ impl DaemonCore {
         uid: u32,
         owner: &str,
         routes: Vec<AppliedRoute>,
+        attach: Option<AttachSpecParams>,
     ) -> io::Result<usize> {
         validate_apply(&routes).map_err(invalid_input)?;
         if self.position(uid, owner).is_some() {
@@ -4118,11 +4559,17 @@ impl DaemonCore {
                 "owner already has routes applied; remove them first",
             ));
         }
+        let mut resources: Vec<OwnedResource> = attach
+            .iter()
+            .cloned()
+            .map(OwnedResource::AttachSpec)
+            .collect();
+        resources.extend(routes.iter().cloned().map(OwnedResource::Route));
         self.journal.entries.push(JournalEntry {
             uid,
             owner: owner.to_string(),
             state: OwnedState::Applying,
-            resources: routes.iter().cloned().map(OwnedResource::Route).collect(),
+            resources,
         });
         if let Err(err) = self.store.save(&self.journal) {
             self.journal.entries.pop();
@@ -4136,16 +4583,19 @@ impl DaemonCore {
                 Ok(routes.len())
             }
             Err((err, still_applied)) => {
-                if still_applied.is_empty() {
+                if still_applied.is_empty() && attach.is_none() {
                     self.journal.entries.remove(index);
                 } else {
                     // Rollback left routes behind: keep them owned so a later
-                    // remove or startup recovery can clean them up.
+                    // remove or startup recovery can clean them up. A failed
+                    // attach keeps its spec so reconcile retries it.
                     let entry = &mut self.journal.entries[index];
                     entry.state = OwnedState::Stale;
-                    entry.resources = still_applied
-                        .into_iter()
-                        .map(OwnedResource::Route)
+                    entry.resources = attach
+                        .iter()
+                        .cloned()
+                        .map(OwnedResource::AttachSpec)
+                        .chain(still_applied.into_iter().map(OwnedResource::Route))
                         .collect();
                 }
                 self.persist();
@@ -4199,6 +4649,826 @@ impl DaemonCore {
                 resources: entry.resources.clone(),
             })
             .collect()
+    }
+
+    /// Full kernel routing inventory (`ip route`/`ip rule` equivalent):
+    /// routes across every table plus all policy rules.
+    pub fn net_tables(&self) -> io::Result<net_manager_core::daemon_protocol::NetTablesResult> {
+        self.routes.net_tables()
+    }
+
+    /// Journal entry index of the `manual` owner, creating it write-ahead
+    /// when the uid has none yet.
+    fn manual_entry(&mut self, uid: u32) -> io::Result<usize> {
+        if let Some(index) = self.position(uid, MANUAL_OWNER) {
+            return Ok(index);
+        }
+        self.journal.entries.push(JournalEntry {
+            uid,
+            owner: MANUAL_OWNER.into(),
+            state: OwnedState::Applying,
+            resources: Vec::new(),
+        });
+        self.store.save(&self.journal)?;
+        Ok(self.journal.entries.len() - 1)
+    }
+
+    /// `net.route.add`: install a daemon-owned unicast route. The journal
+    /// write-aheads the resource so a crash between kernel add and
+    /// finalization still knows what to remove.
+    pub fn net_route_add(&mut self, uid: u32, params: NetRouteAddParams) -> io::Result<()> {
+        let destination = params.destination.trunc();
+        let table = params.table.unwrap_or(RT_TABLE_MAIN);
+        if table == RT_TABLE_UNSPEC || table == RT_TABLE_LOCAL {
+            return Err(invalid_input(
+                "routes in the unspec/local tables are not editable".into(),
+            ));
+        }
+        let interface_index = match (params.interface_index, params.interface_name.as_deref()) {
+            (Some(index), None) => index,
+            (None, Some(name)) => {
+                validate_iface_name(name).map_err(invalid_input)?;
+                self.links
+                    .link_index(name)?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "interface not found"))?
+            }
+            _ => {
+                return Err(invalid_input(
+                    "provide exactly one of interfaceName or interfaceIndex".into(),
+                ))
+            }
+        };
+        let family = if destination.addr().is_ipv4() {
+            IpFamily::Ipv4
+        } else {
+            IpFamily::Ipv6
+        };
+        for address in params.gateway.iter().chain(params.pref_source.iter()) {
+            if address.is_ipv4() != (family == IpFamily::Ipv4) {
+                return Err(invalid_input("address family mismatch".into()));
+            }
+        }
+        let route = SystemRoute {
+            family,
+            destination,
+            table,
+            kind: "unicast".into(),
+            scope: if params.gateway.is_some() {
+                "universe".into()
+            } else {
+                "link".into()
+            },
+            protocol: crate::netlink::RTPROT_NETWORK_ORCHESTRATOR,
+            managed: true,
+            gateway: params.gateway,
+            interface_index: Some(interface_index),
+            interface_name: params.interface_name.clone(),
+            metric: Some(params.metric.unwrap_or(0)),
+            pref_source: params.pref_source,
+            nexthops: Vec::new(),
+        };
+        let index = self.manual_entry(uid)?;
+        self.journal.entries[index]
+            .resources
+            .push(OwnedResource::NetRoute(route.clone()));
+        self.journal.entries[index].state = OwnedState::Applying;
+        self.store.save(&self.journal)?;
+        match self.routes.add_system_route(&route) {
+            Ok(()) => {
+                self.journal.entries[index].state = OwnedState::Applied;
+                self.persist();
+                Ok(())
+            }
+            Err(err) => {
+                let entry = &mut self.journal.entries[index];
+                entry.resources.pop();
+                if entry.resources.is_empty() {
+                    self.journal.entries.remove(index);
+                }
+                self.persist();
+                Err(err)
+            }
+        }
+    }
+
+    /// `net.route.del`: remove a route exactly as `net.tables` reported
+    /// it. Daemon-owned routes must be journaled under `manual` (tunnel
+    /// owners are refused — use disconnect). Foreign routes are journaled
+    /// as [`OwnedResource::SuppressedRoute`] before deletion so teardown
+    /// puts them back.
+    pub fn net_route_del(&mut self, uid: u32, route: SystemRoute) -> io::Result<NetEditOutcome> {
+        if route.table == RT_TABLE_UNSPEC || route.table == RT_TABLE_LOCAL {
+            return Err(invalid_input(
+                "routes in the unspec/local tables are not editable".into(),
+            ));
+        }
+        if route.kind != "unicast" {
+            return Err(invalid_input("only unicast routes are editable".into()));
+        }
+        if route.managed {
+            return self.net_route_del_owned(uid, route);
+        }
+        // Foreign route: journal the suppression before touching the
+        // kernel, so a crash still knows what to restore.
+        let index = self.manual_entry(uid)?;
+        self.journal.entries[index]
+            .resources
+            .push(OwnedResource::SuppressedRoute(route.clone()));
+        self.journal.entries[index].state = OwnedState::Applied;
+        self.store.save(&self.journal)?;
+        match self.routes.remove_system_route(&route) {
+            Ok(()) => {
+                self.persist();
+                Ok(NetEditOutcome::Suppressed)
+            }
+            Err(err) => {
+                let entry = &mut self.journal.entries[index];
+                entry.resources.pop();
+                if entry.resources.is_empty() {
+                    self.journal.entries.remove(index);
+                }
+                self.persist();
+                Err(err)
+            }
+        }
+    }
+
+    /// The managed half of `net_route_del`: only overrides the caller's
+    /// own `manual` entry may be removed this way.
+    fn net_route_del_owned(&mut self, uid: u32, route: SystemRoute) -> io::Result<NetEditOutcome> {
+        let owner = self
+            .journal
+            .entries
+            .iter()
+            .filter(|entry| entry.uid == uid)
+            .find(|entry| {
+                entry.resources.iter().any(|resource| match resource {
+                    OwnedResource::Route(applied) => same_route(&route, applied),
+                    OwnedResource::NetRoute(installed) => same_system_route(installed, &route),
+                    _ => false,
+                })
+            })
+            .map(|entry| entry.owner.clone());
+        match owner.as_deref() {
+            Some(MANUAL_OWNER) => self.net_route_del_manual(uid, route),
+            Some(owner) => Err(invalid_input(format!(
+                "route is managed by {owner}; disconnect it instead"
+            ))),
+            // Protocol marker but no journal entry — a daemon orphan;
+            // deleting it needs no restore record.
+            None => {
+                self.routes.remove_system_route(&route)?;
+                Ok(NetEditOutcome::Deleted)
+            }
+        }
+    }
+
+    /// Delete a `manual`-owned route: kernel first, then unjournal.
+    fn net_route_del_manual(&mut self, uid: u32, route: SystemRoute) -> io::Result<NetEditOutcome> {
+        self.routes.remove_system_route(&route)?;
+        if let Some(index) = self.position(uid, MANUAL_OWNER) {
+            let entry = &mut self.journal.entries[index];
+            entry.resources.retain(|resource| match resource {
+                OwnedResource::NetRoute(installed) => !same_system_route(installed, &route),
+                _ => true,
+            });
+            if entry.resources.is_empty() {
+                self.journal.entries.remove(index);
+            }
+        }
+        self.persist();
+        Ok(NetEditOutcome::Deleted)
+    }
+
+    /// `net.rule.add`: install a daemon-owned `lookup` rule. Priority is
+    /// explicit and must not be 0 (the kernel `local` rule).
+    pub fn net_rule_add(&mut self, uid: u32, params: NetRuleAddParams) -> io::Result<()> {
+        if params.priority == 0 {
+            return Err(invalid_input(
+                "priority 0 is reserved by the kernel local rule".into(),
+            ));
+        }
+        if params.table == RT_TABLE_UNSPEC || params.table == RT_TABLE_LOCAL {
+            return Err(invalid_input(
+                "rules into unspec/local tables are not editable".into(),
+            ));
+        }
+        for net in params.from.iter().chain(params.to.iter()) {
+            if net.addr().is_ipv4() != (params.family == IpFamily::Ipv4) {
+                return Err(invalid_input("selector family mismatch".into()));
+            }
+        }
+        for name in params.iifname.iter().chain(params.oifname.iter()) {
+            validate_iface_name(name).map_err(invalid_input)?;
+        }
+        let rule = SystemRule {
+            family: params.family,
+            priority: params.priority,
+            action: "lookup".into(),
+            table: params.table,
+            goto: None,
+            from: params.from.map(|net| net.trunc()),
+            to: params.to.map(|net| net.trunc()),
+            fwmark: params.fwmark,
+            fwmask: params.fwmask,
+            iifname: params.iifname.clone(),
+            oifname: params.oifname.clone(),
+            uid_range: None,
+            source_port_range: None,
+            destination_port_range: None,
+            ip_protocol: None,
+            suppress_prefix_length: None,
+            suppress_if_group: None,
+            tun_id: None,
+            tos: 0,
+            invert: params.invert,
+            protocol: crate::netlink::RTPROT_NETWORK_ORCHESTRATOR,
+            managed: true,
+        };
+        let index = self.manual_entry(uid)?;
+        self.journal.entries[index]
+            .resources
+            .push(OwnedResource::NetRule(rule.clone()));
+        self.journal.entries[index].state = OwnedState::Applying;
+        self.store.save(&self.journal)?;
+        let result = self.with_policy(|policy| policy.add_system_rule(&rule));
+        match result {
+            Ok(()) => {
+                self.journal.entries[index].state = OwnedState::Applied;
+                self.persist();
+                Ok(())
+            }
+            Err(err) => {
+                let entry = &mut self.journal.entries[index];
+                entry.resources.pop();
+                if entry.resources.is_empty() {
+                    self.journal.entries.remove(index);
+                }
+                self.persist();
+                Err(err)
+            }
+        }
+    }
+
+    /// `net.rule.del`: remove a policy rule exactly as `net.tables`
+    /// reported it. Same suppress-and-restore contract as routes.
+    pub fn net_rule_del(&mut self, uid: u32, rule: SystemRule) -> io::Result<NetEditOutcome> {
+        if rule.priority == 0 {
+            return Err(invalid_input("priority 0 is the kernel local rule".into()));
+        }
+        if !matches!(
+            rule.action.as_str(),
+            "lookup" | "goto" | "nop" | "blackhole" | "unreachable" | "prohibit"
+        ) {
+            return Err(invalid_input(format!(
+                "rule action '{}' is not editable",
+                rule.action
+            )));
+        }
+        if rule.managed {
+            return self.net_rule_del_owned(uid, rule);
+        }
+        let index = self.manual_entry(uid)?;
+        self.journal.entries[index]
+            .resources
+            .push(OwnedResource::SuppressedRule(rule.clone()));
+        self.journal.entries[index].state = OwnedState::Applied;
+        self.store.save(&self.journal)?;
+        match self.with_policy(|policy| policy.remove_system_rule(&rule)) {
+            Ok(()) => {
+                self.persist();
+                Ok(NetEditOutcome::Suppressed)
+            }
+            Err(err) => {
+                let entry = &mut self.journal.entries[index];
+                entry.resources.pop();
+                if entry.resources.is_empty() {
+                    self.journal.entries.remove(index);
+                }
+                self.persist();
+                Err(err)
+            }
+        }
+    }
+
+    /// The managed half of `net_rule_del`: only `manual` overrides may be
+    /// removed this way.
+    fn net_rule_del_owned(&mut self, uid: u32, rule: SystemRule) -> io::Result<NetEditOutcome> {
+        let owner = self
+            .journal
+            .entries
+            .iter()
+            .filter(|entry| entry.uid == uid)
+            .find(|entry| {
+                entry.resources.iter().any(|resource| match resource {
+                    OwnedResource::Rule(owned) => same_rule(&rule, owned),
+                    OwnedResource::NetRule(installed) => installed == &rule,
+                    _ => false,
+                })
+            })
+            .map(|entry| entry.owner.clone());
+        match owner.as_deref() {
+            Some(owner) if owner != MANUAL_OWNER => Err(invalid_input(format!(
+                "rule is managed by {owner}; disconnect it instead"
+            ))),
+            _ => {
+                self.with_policy(|policy| policy.remove_system_rule(&rule))?;
+                if owner.as_deref() == Some(MANUAL_OWNER) {
+                    if let Some(index) = self.position(uid, MANUAL_OWNER) {
+                        let entry = &mut self.journal.entries[index];
+                        entry.resources.retain(|resource| match resource {
+                            OwnedResource::NetRule(installed) => installed != &rule,
+                            _ => true,
+                        });
+                        if entry.resources.is_empty() {
+                            self.journal.entries.remove(index);
+                        }
+                    }
+                }
+                self.persist();
+                Ok(NetEditOutcome::Deleted)
+            }
+        }
+    }
+
+    /// Borrow the policy executor or report the platform as unsupported.
+    fn with_policy<T>(
+        &mut self,
+        f: impl FnOnce(&mut dyn PolicyRuleExecutor) -> io::Result<T>,
+    ) -> io::Result<T> {
+        match self.policy.as_mut() {
+            Some(policy) => f(policy.as_mut()),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "policy executor is unavailable",
+            )),
+        }
+    }
+
+    /// `net.intent.set`: upsert a routing intent. The durable record goes
+    /// to the intent store; the journal entry (`intent:<id>` owner, armed
+    /// attach spec) tracks the kernel artifacts. An absent target link
+    /// installs nothing but stays armed — every reconcile re-derives
+    /// routes from live kernel state, and startup replay re-arms intents
+    /// after restarts.
+    pub fn net_intent_set(
+        &mut self,
+        uid: u32,
+        params: NetIntentSetParams,
+    ) -> io::Result<NetIntentResult> {
+        let owner = intent_owner(&params.id)?;
+        let spec = intent_spec(&params)?;
+        let enabled = params.enabled.unwrap_or(true);
+        let store = self.intents.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "intent store is unavailable")
+        })?;
+        #[cfg(target_os = "linux")]
+        let desired = self.attach_desired(&spec);
+        #[cfg(not(target_os = "linux"))]
+        let desired: Vec<AppliedRoute> = Vec::new();
+        if let Some(index) = self.position(uid, &owner) {
+            self.teardown_entry(index)?;
+            self.persist();
+        }
+        // A disabled intent keeps only its durable record — the journal
+        // stays empty so reconcile never touches its destinations.
+        if enabled {
+            self.apply_routes_inner(uid, &owner, desired, Some(spec))?;
+        }
+        if let Err(err) = store.upsert(uid, params.clone()) {
+            // The kernel half succeeded but the durable record did not —
+            // undo so the intent does not die silently on restart.
+            if let Some(index) = self.position(uid, &owner) {
+                let _ = self.teardown_entry(index);
+                self.persist();
+            }
+            return Err(err);
+        }
+        Ok(NetIntentResult { id: params.id })
+    }
+
+    /// `net.intent.del`: drop the durable record and tear the intent's
+    /// routes down. A journaled-but-unstored intent is torn down too —
+    /// delete is idempotent over the store, not over the journal.
+    pub fn net_intent_del(&mut self, uid: u32, id: &str) -> io::Result<()> {
+        let owner = intent_owner(id)?;
+        let store = self.intents.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "intent store is unavailable")
+        })?;
+        store.remove(uid, id)?;
+        if self.position(uid, &owner).is_some() {
+            self.remove_owner_inner(uid, &owner)?;
+        }
+        Ok(())
+    }
+
+    /// `net.intent.list`: stored intents with their live status — the
+    /// user-facing "what is routed where right now" view. The store is
+    /// the source of truth; the journal only tracks installed artifacts.
+    pub fn net_intent_list(&mut self, uid: u32) -> io::Result<NetIntentListResult> {
+        let Some(store) = self.intents.clone() else {
+            return Ok(NetIntentListResult {
+                intents: Vec::new(),
+            });
+        };
+        let document = store.load_uid(uid)?;
+        #[cfg(target_os = "linux")]
+        let tables = self.routes.net_tables().ok();
+        #[cfg(not(target_os = "linux"))]
+        let tables: Option<NetTablesResult> = None;
+        let mut intents = Vec::with_capacity(document.intents.len());
+        for params in document.intents {
+            let Ok(spec) = intent_spec(&params) else {
+                continue;
+            };
+            let enabled = params.enabled.unwrap_or(true);
+            #[cfg(target_os = "linux")]
+            let desired = self.attach_desired(&spec);
+            #[cfg(not(target_os = "linux"))]
+            let desired: Vec<AppliedRoute> = Vec::new();
+            let installed = desired
+                .iter()
+                .filter(|route| {
+                    tables.as_ref().is_some_and(|tables| {
+                        tables.routes.iter().any(|seen| same_route(seen, route))
+                    })
+                })
+                .count();
+            let (status, detail) = if enabled {
+                intent_view_status(&spec, &desired, installed, tables.as_ref())
+            } else {
+                (
+                    ExplainStatus::Disabled,
+                    "disabled — routes are withdrawn".into(),
+                )
+            };
+            intents.push(NetIntentView {
+                id: params.id.clone(),
+                destinations: spec
+                    .routes
+                    .iter()
+                    .map(|route| route.destination.to_string())
+                    .collect(),
+                path: if spec.uplink {
+                    NetIntentPath {
+                        kind: "direct".into(),
+                        interface: None,
+                    }
+                } else {
+                    NetIntentPath {
+                        kind: "interface".into(),
+                        interface: Some(spec.interface_name.clone()),
+                    }
+                },
+                metric: spec
+                    .routes
+                    .first()
+                    .map(|route| route.metric)
+                    .unwrap_or(INTENT_DEFAULT_METRIC),
+                enabled,
+                status,
+                detail,
+                installed,
+                wanted: desired.len(),
+            });
+        }
+        Ok(NetIntentListResult { intents })
+    }
+
+    /// Startup replay: re-arm every stored intent after `open` tore the
+    /// journal down — the same pattern `always_on::replay` uses for
+    /// persistent profiles. Best effort per intent; failures are logged.
+    pub fn replay_intents(&mut self) -> (usize, usize) {
+        let Some(store) = self.intents.clone() else {
+            return (0, 0);
+        };
+        let documents = match store.load_all() {
+            Ok(documents) => documents,
+            Err(_) => return (0, 0),
+        };
+        let mut armed = 0;
+        let mut failed = 0;
+        for (uid, document) in documents {
+            for params in document.intents {
+                // Disabled intents stay in the store untouched — the
+                // user re-arms them explicitly via net.intent.set.
+                if params.enabled == Some(false) {
+                    continue;
+                }
+                let Ok(spec) = intent_spec(&params) else {
+                    failed += 1;
+                    continue;
+                };
+                let owner = match intent_owner(&params.id) {
+                    Ok(owner) => owner,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+                #[cfg(target_os = "linux")]
+                let desired = self.attach_desired(&spec);
+                #[cfg(not(target_os = "linux"))]
+                let desired: Vec<AppliedRoute> = Vec::new();
+                match self.apply_routes_inner(uid, &owner, desired, Some(spec)) {
+                    Ok(_) => armed += 1,
+                    Err(err) => {
+                        failed += 1;
+                        eprintln!(
+                            "network-orchestrator-daemon: intent {} replay deferred: {}",
+                            params.id,
+                            err.kind()
+                        );
+                    }
+                }
+            }
+        }
+        (armed, failed)
+    }
+
+    /// `net.explain`: for every journaled intent of `uid`, why it is in
+    /// its current state — cross-checked against a fresh kernel dump.
+    pub fn net_explain(&mut self, uid: u32) -> io::Result<NetExplainResult> {
+        let tables = match self.routes.net_tables() {
+            Ok(tables) => tables,
+            Err(_) => {
+                return Ok(NetExplainResult {
+                    entries: Vec::new(),
+                    available: false,
+                })
+            }
+        };
+        // Interface index → name, sourced from the same dump so subjects
+        // show names when the kernel resolved them.
+        let names: HashMap<u32, String> = tables
+            .routes
+            .iter()
+            .filter_map(|route| route.interface_index.zip(route.interface_name.clone()))
+            .collect();
+        let mut entries = Vec::new();
+        for entry in self.journal.entries.clone() {
+            if entry.uid != uid {
+                continue;
+            }
+            for resource in &entry.resources {
+                let item =
+                    self.explain_resource(&entry.owner, entry.state, resource, &tables, &names);
+                entries.push(item);
+            }
+        }
+        Ok(NetExplainResult {
+            entries,
+            available: true,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn explain_resource(
+        &mut self,
+        owner: &str,
+        state: OwnedState,
+        resource: &OwnedResource,
+        tables: &net_manager_core::daemon_protocol::NetTablesResult,
+        names: &HashMap<u32, String>,
+    ) -> ExplainEntry {
+        let make =
+            |kind: &str, subject: String, status: ExplainStatus, detail: String| ExplainEntry {
+                owner: owner.to_string(),
+                state,
+                kind: kind.to_string(),
+                subject,
+                status,
+                detail,
+            };
+        match resource {
+            OwnedResource::Route(_) | OwnedResource::NetRoute(_) => {
+                let (wanted_dst, wanted_if, wanted_table) = match resource {
+                    OwnedResource::Route(route) => (
+                        route.destination,
+                        Some(route.interface_index),
+                        route.table.unwrap_or(RT_TABLE_MAIN),
+                    ),
+                    OwnedResource::NetRoute(route) => {
+                        (route.destination, route.interface_index, route.table)
+                    }
+                    _ => unreachable!(),
+                };
+                let subject = format!(
+                    "{} dev {} table {}",
+                    wanted_dst,
+                    wanted_if
+                        .map(|index| {
+                            names
+                                .get(&index)
+                                .cloned()
+                                .unwrap_or_else(|| format!("#{index}"))
+                        })
+                        .unwrap_or_else(|| "?".into()),
+                    table_name(wanted_table)
+                );
+                let present = tables.routes.iter().any(|seen| match resource {
+                    OwnedResource::Route(applied) => same_route(seen, applied),
+                    _ => same_system_route(
+                        seen,
+                        match resource {
+                            OwnedResource::NetRoute(route) => route,
+                            _ => unreachable!(),
+                        },
+                    ),
+                });
+                if present {
+                    return make(
+                        "route",
+                        subject,
+                        ExplainStatus::Effective,
+                        "installed".into(),
+                    );
+                }
+                let occupied = tables.routes.iter().any(|seen| {
+                    !seen.managed
+                        && seen.destination == wanted_dst
+                        && seen.table == wanted_table
+                        && seen.kind == "unicast"
+                });
+                if occupied {
+                    return make(
+                        "route",
+                        subject,
+                        ExplainStatus::Conflicted,
+                        "a foreign route occupies the destination".into(),
+                    );
+                }
+                make(
+                    "route",
+                    subject,
+                    ExplainStatus::Missing,
+                    "absent in the kernel; the next reconcile retries".into(),
+                )
+            }
+            OwnedResource::SuppressedRoute(route) => {
+                let subject = format!(
+                    "{} dev {} table {}",
+                    route.destination,
+                    route.interface_name.clone().unwrap_or_else(|| "?".into()),
+                    table_name(route.table)
+                );
+                if tables
+                    .routes
+                    .iter()
+                    .any(|seen| same_system_route(seen, route))
+                {
+                    make(
+                        "suppressed-route",
+                        subject,
+                        ExplainStatus::Missing,
+                        "the foreign route reappeared; reconcile will re-suppress it".into(),
+                    )
+                } else {
+                    make(
+                        "suppressed-route",
+                        subject,
+                        ExplainStatus::Active,
+                        "suppressed; restored when the override is removed".into(),
+                    )
+                }
+            }
+            OwnedResource::Rule(rule) => {
+                let subject = format!("pref {} lookup {}", rule.priority, table_name(rule.table));
+                if tables.rules.iter().any(|seen| same_rule(seen, rule)) {
+                    make(
+                        "rule",
+                        subject,
+                        ExplainStatus::Effective,
+                        "installed".into(),
+                    )
+                } else {
+                    make(
+                        "rule",
+                        subject,
+                        ExplainStatus::Missing,
+                        "absent in the kernel; the next reconcile retries".into(),
+                    )
+                }
+            }
+            OwnedResource::NetRule(rule) | OwnedResource::SuppressedRule(rule) => {
+                let suppressed = matches!(resource, OwnedResource::SuppressedRule(_));
+                let subject = format!(
+                    "pref {} {} {}",
+                    rule.priority,
+                    rule.action,
+                    table_name(rule.table)
+                );
+                let present = tables.rules.iter().any(|seen| seen == rule);
+                if suppressed {
+                    if present {
+                        make(
+                            "suppressed-rule",
+                            subject,
+                            ExplainStatus::Missing,
+                            "the foreign rule reappeared; reconcile will re-suppress it".into(),
+                        )
+                    } else {
+                        make(
+                            "suppressed-rule",
+                            subject,
+                            ExplainStatus::Active,
+                            "suppressed; restored when the override is removed".into(),
+                        )
+                    }
+                } else if present {
+                    make(
+                        "rule",
+                        subject,
+                        ExplainStatus::Effective,
+                        "installed".into(),
+                    )
+                } else {
+                    make(
+                        "rule",
+                        subject,
+                        ExplainStatus::Missing,
+                        "absent in the kernel; the next reconcile retries".into(),
+                    )
+                }
+            }
+            OwnedResource::AttachSpec(spec) => {
+                if spec.uplink {
+                    let has_uplink = self
+                        .routes
+                        .default_gateways()
+                        .map(|gateways| !gateways.is_empty())
+                        .unwrap_or(false);
+                    return if has_uplink {
+                        make(
+                            "attach",
+                            "uplink".into(),
+                            ExplainStatus::Effective,
+                            "pinned to the physical uplink".into(),
+                        )
+                    } else {
+                        make(
+                            "attach",
+                            "uplink".into(),
+                            ExplainStatus::Deferred,
+                            "no physical uplink is available".into(),
+                        )
+                    };
+                }
+                let subject = format!("attach {}", spec.interface_name);
+                match self.links.link_index(&spec.interface_name) {
+                    Ok(Some(index)) => make(
+                        "attach",
+                        subject,
+                        ExplainStatus::Effective,
+                        format!("bound to ifindex {index}"),
+                    ),
+                    _ => make(
+                        "attach",
+                        subject,
+                        ExplainStatus::Deferred,
+                        format!("interface {} is absent", spec.interface_name),
+                    ),
+                }
+            }
+            OwnedResource::WireGuardLink(link) => make(
+                "link",
+                link.name.clone(),
+                ExplainStatus::Effective,
+                "managed interface".into(),
+            ),
+            OwnedResource::OpenVpnProcess(process) => make(
+                "process",
+                process.name.clone(),
+                ExplainStatus::Effective,
+                "managed OpenVPN".into(),
+            ),
+            OwnedResource::XrayProcess(process) => make(
+                "process",
+                process.name.clone(),
+                ExplainStatus::Effective,
+                "managed Xray".into(),
+            ),
+            OwnedResource::Address(address) => make(
+                "address",
+                format!("{} dev #{}", address.address, address.interface_index),
+                ExplainStatus::Effective,
+                "interface address".into(),
+            ),
+            OwnedResource::Dns(dns) => make(
+                "dns",
+                format!(
+                    "{} on {}",
+                    dns.servers
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    dns.name
+                ),
+                ExplainStatus::Effective,
+                "link DNS".into(),
+            ),
+        }
     }
 
     /// Forget only always-on static owners (`replayable`) whose routes
@@ -4333,7 +5603,7 @@ impl DaemonCore {
                         changed.push((*uid, owner.clone()));
                     }
                 }
-                (None, Some(routes)) => match self.apply_routes_inner(*uid, &owner, routes) {
+                (None, Some(routes)) => match self.apply_routes_inner(*uid, &owner, routes, None) {
                     Ok(_) => changed.push((*uid, owner.clone())),
                     Err(err) => eval.error = Some(err.to_string()),
                 },
@@ -4358,7 +5628,7 @@ impl DaemonCore {
                     if !in_sync {
                         match self
                             .remove_owner_inner(*uid, &owner)
-                            .and_then(|_| self.apply_routes_inner(*uid, &owner, routes))
+                            .and_then(|_| self.apply_routes_inner(*uid, &owner, routes, None))
                         {
                             Ok(_) => changed.push((*uid, owner.clone())),
                             Err(err) => eval.error = Some(err.to_string()),
@@ -4438,6 +5708,8 @@ impl DaemonCore {
             entry.uid == uid
                 && !keep.contains(&(uid, entry.owner.clone()))
                 && !entry.owner.starts_with("cond:")
+                && !entry.owner.starts_with(INTENT_OWNER_PREFIX)
+                && entry.owner != MANUAL_OWNER
         })
     }
 
@@ -4532,26 +5804,58 @@ impl DaemonCore {
         if self.journal.entries[index].owner.starts_with("wg:") {
             return self.teardown_wireguard_entry(index);
         }
-        let routes: Vec<AppliedRoute> = self.journal.entries[index]
-            .resources
-            .iter()
-            .filter_map(|resource| match resource {
-                OwnedResource::Route(route) => Some(route.clone()),
-                _ => None,
-            })
-            .collect();
-        match remove_routes_best_effort(&mut IgnoreMissing(self.routes.as_mut()), &routes) {
-            Ok(()) => {
-                self.journal.entries.remove(index);
-                Ok(())
+        // Generic owners (clients, `cond:*`, `manual`) own routes, rules
+        // and manual overrides. `Suppressed*` resources restore the
+        // foreign object instead of deleting it.
+        let resources = self.journal.entries[index].resources.clone();
+        let mut failed = Vec::new();
+        for resource in resources.iter().rev() {
+            let result = match resource {
+                OwnedResource::Route(route) => match self.routes.remove_route(route) {
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                },
+                OwnedResource::NetRoute(route) => match self.routes.remove_system_route(route) {
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                },
+                OwnedResource::NetRule(rule) => {
+                    match self.with_policy(|policy| policy.remove_system_rule(rule)) {
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                        result => result,
+                    }
+                }
+                OwnedResource::SuppressedRoute(route) => {
+                    match self.routes.add_system_route(route) {
+                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                        result => result,
+                    }
+                }
+                OwnedResource::SuppressedRule(rule) => {
+                    match self.with_policy(|policy| policy.add_system_rule(rule)) {
+                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+                        result => result,
+                    }
+                }
+                // Intent markers and resources foreign to a generic entry.
+                _ => Ok(()),
+            };
+            if let Err(err) = result {
+                eprintln!(
+                    "network-orchestrator-daemon: teardown of {} failed: {err}",
+                    self.journal.entries[index].owner
+                );
+                failed.push(resource.clone());
             }
-            Err((failed, message)) => {
-                let entry = &mut self.journal.entries[index];
-                entry.state = OwnedState::Stale;
-                // `remove_routes_best_effort` reports failures newest first.
-                entry.resources = failed.into_iter().rev().map(OwnedResource::Route).collect();
-                Err(io::Error::other(message))
-            }
+        }
+        if failed.is_empty() {
+            self.journal.entries.remove(index);
+            Ok(())
+        } else {
+            let entry = &mut self.journal.entries[index];
+            entry.state = OwnedState::Stale;
+            entry.resources = failed.into_iter().rev().collect();
+            Err(io::Error::other("owner teardown left resources behind"))
         }
     }
 
@@ -4845,6 +6149,15 @@ impl DaemonCore {
                     io::ErrorKind::InvalidData,
                     "Xray resource in WireGuard journal entry",
                 )),
+                OwnedResource::NetRoute(_)
+                | OwnedResource::NetRule(_)
+                | OwnedResource::SuppressedRoute(_)
+                | OwnedResource::SuppressedRule(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manual network override in WireGuard journal entry",
+                )),
+                // Pure intent: no kernel artifact to tear down.
+                OwnedResource::AttachSpec(_) => Ok(()),
             };
             let removed = match result {
                 Ok(()) => true,
@@ -4885,8 +6198,29 @@ fn kernel_route(route: &AppliedRoute) -> AppliedRoute {
     route
 }
 
-/// Removing a route that is already gone is success: the goal state holds.
-struct IgnoreMissing<'a>(&'a mut dyn RouteExecutor);
+/// Resolve a bypass host to addresses. Literal IPs return immediately; DNS
+/// names resolve on a helper thread so a hung resolver cannot stall the
+/// reconcile loop — a slow pass just yields no bypass this round.
+#[cfg(target_os = "linux")]
+fn resolve_endpoint_ips(host: &str) -> Vec<IpAddr> {
+    if let Ok(ip) = host.parse() {
+        return vec![ip];
+    }
+    let host = host.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            (host.as_str(), 0)
+                .to_socket_addrs()
+                .map(|addrs| addrs.map(|a| a.ip()).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+    });
+    let mut ips = rx.recv_timeout(Duration::from_secs(3)).unwrap_or_default();
+    ips.sort_unstable();
+    ips.dedup();
+    ips
+}
 
 fn full_policy_rules(full: &WireGuardFullResource) -> Vec<OwnedRuleResource> {
     let mut rules = Vec::new();
@@ -4912,19 +6246,6 @@ fn full_policy_rules(full: &WireGuardFullResource) -> Vec<OwnedRuleResource> {
         });
     }
     rules
-}
-
-impl RouteExecutor for IgnoreMissing<'_> {
-    fn add_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
-        self.0.add_route(route)
-    }
-
-    fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
-        match self.0.remove_route(route) {
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            other => other,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -4971,6 +6292,7 @@ mod xray_core_tests {
     struct GatewayRoutes {
         events: Events,
         gateways: Arc<Mutex<Vec<(std::net::IpAddr, u32)>>>,
+        on_link: Arc<Mutex<Vec<(u32, IpNet)>>>,
     }
     impl GatewayRoutes {
         fn new(events: Events) -> Self {
@@ -4980,10 +6302,14 @@ mod xray_core_tests {
                     ("192.0.2.1".parse().unwrap(), 3),
                     ("fe80::abcd".parse().unwrap(), 3),
                 ])),
+                on_link: Arc::new(Mutex::new(Vec::new())),
             }
         }
         fn shared_gateways(&self) -> Arc<Mutex<Vec<(std::net::IpAddr, u32)>>> {
             self.gateways.clone()
+        }
+        fn shared_on_link(&self) -> Arc<Mutex<Vec<(u32, IpNet)>>> {
+            self.on_link.clone()
         }
     }
     impl RouteExecutor for GatewayRoutes {
@@ -4998,6 +6324,9 @@ mod xray_core_tests {
         fn default_gateways(&self) -> io::Result<Vec<(std::net::IpAddr, u32)>> {
             Ok(self.gateways.lock().unwrap().clone())
         }
+        fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
+            Ok(self.on_link.lock().unwrap().clone())
+        }
     }
     struct Links;
     impl LinkExecutor for Links {
@@ -5009,6 +6338,9 @@ mod xray_core_tests {
         }
         fn link_kind(&mut self, _: &str) -> io::Result<ExternalLinkKind> {
             Ok(ExternalLinkKind::Missing)
+        }
+        fn link_index(&self, _: &str) -> io::Result<Option<u32>> {
+            Ok(None)
         }
     }
     struct Tun(Events);
@@ -5072,7 +6404,7 @@ mod xray_core_tests {
             config: json!({
                 "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
                 "outbounds":[
-                    {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"proxy.test","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                    {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"198.51.100.7","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
                     {"tag":"direct","protocol":"freedom"}
                 ],
                 "routing":{"domainStrategy":"AsIs","rules":[]}
@@ -5401,7 +6733,7 @@ mod xray_core_tests {
         updated.config = json!({
             "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
             "outbounds":[
-                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"proxy.test","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"198.51.100.7","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
                 {"tag":"direct","protocol":"freedom"}
             ],
             "routing":{"domainStrategy":"AsIs","rules":[{"type":"field","domain":["example.test"],"outboundTag":"direct"}]}
@@ -5418,7 +6750,7 @@ mod xray_core_tests {
         let runner = Flaky::new(events.clone());
         let mut core = DaemonCore::open_with_xray(
             JournalStore::new(dir.join("state.json")),
-            Box::new(Routes(events.clone())),
+            Box::new(GatewayRoutes::new(events.clone())),
             Box::new(Links),
             Box::new(Tun(events.clone())),
             Box::new(runner),
@@ -5446,7 +6778,11 @@ mod xray_core_tests {
             .unwrap();
         assert_eq!(process_index, 43);
         assert!(owned[0].resources.iter().all(|resource| match resource {
-            OwnedResource::Route(route) => route.interface_index == 43,
+            // TUN-scoped routes followed the respawn; the endpoint bypass
+            // stays pinned to the physical uplink it was installed on.
+            OwnedResource::Route(route) => {
+                route.interface_index == 43 || route.gateway.is_some()
+            }
             OwnedResource::Address(address) => address.interface_index == 43,
             OwnedResource::Dns(dns) => dns.interface_index == 43,
             _ => true,
@@ -5679,6 +7015,61 @@ mod xray_core_tests {
     }
 
     #[test]
+    fn xray_bypass_on_link_server_uses_dev_route() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-xray-onlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let routes = GatewayRoutes::new(events.clone());
+        // The proxy server lives inside a subnet directly connected to the
+        // uplink: pinning it `via` the default gateway would hairpin the
+        // transport through a box that never sees replies.
+        routes
+            .shared_on_link()
+            .lock()
+            .unwrap()
+            .push((3, "10.9.0.0/24".parse().unwrap()));
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(dir.join("state.json")),
+            Box::new(routes),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Process(events.clone())),
+        )
+        .unwrap();
+        core.policy = Some(Box::new(Policy(events.clone())));
+        let mut input = params();
+        input.config = json!({
+            "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":1080,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[
+                {"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"10.9.0.7","port":443,"users":[{"id":"SECRET-ID","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none"}},
+                {"tag":"direct","protocol":"freedom"}
+            ],
+            "routing":{"domainStrategy":"AsIs","rules":[]}
+        })
+        .to_string();
+        input.routes = vec![PolicyRoute {
+            destination: "0.0.0.0/0".parse().unwrap(),
+            metric: 5,
+            via: None,
+        }];
+        core.connect_xray(1000, input).unwrap();
+        let owned = core.owned(1000);
+        let bypass = owned[0]
+            .resources
+            .iter()
+            .filter_map(|resource| match resource {
+                OwnedResource::Route(route) => Some(route),
+                _ => None,
+            })
+            .find(|route| route.destination.to_string() == "10.9.0.7/32")
+            .expect("server bypass route");
+        assert_eq!(bypass.interface_index, 3);
+        assert_eq!(bypass.gateway, None);
+        core.disconnect_xray(1000, "home").unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn split_xray_bypasses_server_but_keeps_dns_inside_tunnel() {
         let events = Events::default();
         let dir =
@@ -5808,6 +7199,117 @@ mod xray_core_tests {
 
 fn invalid_input(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+/// Compile intent params into the journaled attach spec: destinations
+/// become spec routes (host bits truncated) and the path picks either a
+/// named link or the live physical uplink.
+fn intent_spec(params: &NetIntentSetParams) -> io::Result<AttachSpecParams> {
+    if params.destinations.is_empty() {
+        return Err(invalid_input(
+            "an intent needs at least one destination".into(),
+        ));
+    }
+    let metric = params.metric.unwrap_or(INTENT_DEFAULT_METRIC);
+    let mut routes = Vec::with_capacity(params.destinations.len());
+    for raw in &params.destinations {
+        let parsed: IpNet = raw
+            .trim()
+            .parse()
+            .map_err(|_| invalid_input(format!("destination {raw:?} is not a CIDR prefix")))?;
+        routes.push(PolicyRoute {
+            destination: parsed.trunc(),
+            metric,
+            via: None,
+        });
+    }
+    let spec = match params.path.kind.as_str() {
+        "interface" => AttachSpecParams {
+            interface_name: params.path.interface.clone().unwrap_or_default(),
+            routes,
+            endpoint_bypasses: Vec::new(),
+            uplink: false,
+        },
+        "direct" => AttachSpecParams {
+            interface_name: String::new(),
+            routes,
+            endpoint_bypasses: Vec::new(),
+            uplink: true,
+        },
+        other => return Err(invalid_input(format!("unknown intent path kind {other:?}"))),
+    };
+    validate_attach(&spec).map_err(invalid_input)?;
+    Ok(spec)
+}
+
+/// `intent:<id>` journal owner. Ids stay slugs — short, no whitespace or
+/// ':' (the separator other owner prefixes use), within owner limits.
+fn intent_owner(id: &str) -> io::Result<String> {
+    if id.is_empty()
+        || id.len() > 96
+        || id
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == ':')
+    {
+        return Err(invalid_input(
+            "intent id must be 1-96 characters without ':' or whitespace".into(),
+        ));
+    }
+    let owner = format!("{INTENT_OWNER_PREFIX}{id}");
+    validate_owner(&owner).map_err(invalid_input)?;
+    Ok(owner)
+}
+
+/// Aggregate one intent's desired-vs-kernel diff into an explain status.
+/// `installed` counts desired routes present in `tables` right now.
+fn intent_view_status(
+    spec: &AttachSpecParams,
+    desired: &[AppliedRoute],
+    installed: usize,
+    tables: Option<&NetTablesResult>,
+) -> (ExplainStatus, String) {
+    if desired.is_empty() {
+        return (
+            ExplainStatus::Deferred,
+            if spec.uplink {
+                "no physical uplink is available".into()
+            } else {
+                format!(
+                    "interface {} is absent; armed until it appears",
+                    spec.interface_name
+                )
+            },
+        );
+    }
+    if installed == desired.len() {
+        return (
+            ExplainStatus::Effective,
+            format!("{} route(s) enforced", desired.len()),
+        );
+    }
+    let blocked = desired.iter().any(|route| {
+        tables.is_some_and(|tables| {
+            tables.routes.iter().any(|seen| {
+                !seen.managed
+                    && seen.destination == route.destination
+                    && seen.table == RT_TABLE_MAIN
+                    && seen.kind == "unicast"
+            })
+        })
+    });
+    if blocked {
+        return (
+            ExplainStatus::Conflicted,
+            "a foreign route occupies the destination".into(),
+        );
+    }
+    (
+        ExplainStatus::Missing,
+        format!(
+            "{installed}/{} installed; the next reconcile retries",
+            desired.len()
+        ),
+    )
 }
 
 fn xray_stage(stage: &'static str, error: io::Error) -> io::Error {
@@ -5993,6 +7495,60 @@ fn trusted_ip_binary() -> io::Result<&'static str> {
     Ok(PATH)
 }
 
+/// Hard bound for short-lived helper binaries (`wg`, `ip`, `systemctl`):
+/// unbounded `.output()`/`.wait()` calls on a wedged helper pin a
+/// blocking-pool thread — and the core mutex behind it — forever.
+#[cfg(target_os = "linux")]
+const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Spawn `cmd` and wait for exit with a deadline; on timeout the child is
+/// killed and reaped. Stdout is drained by a reader thread so a verbose
+/// child cannot deadlock on a full pipe.
+#[cfg(target_os = "linux")]
+fn helper_output(mut cmd: std::process::Command) -> io::Result<std::process::Output> {
+    use std::process::{Output, Stdio};
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .map_err(|_| io::Error::other("helper launch failed"))?;
+    let reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        })
+    });
+    let deadline = Instant::now() + HELPER_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "helper command timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = reader.and_then(|r| r.join().ok()).unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
+/// `helper_output` for callers that only need the exit status.
+#[cfg(target_os = "linux")]
+fn helper_status(cmd: std::process::Command) -> io::Result<std::process::ExitStatus> {
+    helper_output(cmd).map(|output| output.status)
+}
+
 /// Stop `wg-quick@<name>` when an active unit owns the device — it removes
 /// the link along with its routes and DNS. `name` comes from
 /// `validate_iface_name`, so the unit name cannot escape the template.
@@ -6001,13 +7557,9 @@ fn stop_wg_quick_unit(name: &str) -> bool {
     use std::process::{Command, Stdio};
     let unit = format!("wg-quick@{name}");
     let quiet = |args: &[&str]| {
-        Command::new("/usr/bin/systemctl")
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+        let mut cmd = Command::new("/usr/bin/systemctl");
+        cmd.args(args).stderr(Stdio::null());
+        helper_status(cmd).is_ok_and(|status| status.success())
     };
     if !quiet(&["is-active", "--quiet", &unit]) {
         return false;
@@ -6026,13 +7578,11 @@ fn stop_wg_quick_unit(name: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn wg_dump(name: &str) -> io::Result<String> {
-    use std::process::{Command, Stdio};
-    let output = Command::new(trusted_wg_binary()?)
-        .args(["show", name, "dump"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|_| io::Error::other("WireGuard status is unavailable"))?;
+    use std::process::Command;
+    let mut cmd = Command::new(trusted_wg_binary()?);
+    cmd.args(["show", name, "dump"]);
+    let output =
+        helper_output(cmd).map_err(|_| io::Error::other("WireGuard status is unavailable"))?;
     if !output.status.success() || output.stdout.len() > 64 * 1024 {
         return Err(io::Error::other("WireGuard status is unavailable"));
     }
@@ -6042,7 +7592,7 @@ fn wg_dump(name: &str) -> io::Result<String> {
 
 #[cfg(target_os = "linux")]
 fn ip_route_device(destination: std::net::IpAddr, mark: Option<u32>) -> io::Result<String> {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     let mut args = vec![
         "-j".to_string(),
         "route".into(),
@@ -6053,12 +7603,9 @@ fn ip_route_device(destination: std::net::IpAddr, mark: Option<u32>) -> io::Resu
         args.push("mark".into());
         args.push(mark.to_string());
     }
-    let output = Command::new(trusted_ip_binary()?)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|_| io::Error::other("route lookup failed"))?;
+    let mut cmd = Command::new(trusted_ip_binary()?);
+    cmd.args(&args);
+    let output = helper_output(cmd).map_err(|_| io::Error::other("route lookup failed"))?;
     if !output.status.success() || output.stdout.len() > 64 * 1024 {
         return Err(io::Error::other("route lookup failed"));
     }
@@ -6085,9 +7632,21 @@ impl WgConfigExecutor for TrustedWgCommand {
                 )
             })?;
         let write_result = child.stdin.take().unwrap().write_all(config.as_bytes());
-        let status = child
-            .wait()
-            .map_err(|_| io::Error::other("WireGuard configuration failed"))?;
+        let deadline = Instant::now() + HELPER_TIMEOUT;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "WireGuard configuration timed out",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         if write_result.is_err() {
             return Err(io::Error::other("WireGuard config transfer failed"));
         }
@@ -6103,13 +7662,10 @@ impl WgConfigExecutor for TrustedWgCommand {
     }
 
     fn set_fwmark(&mut self, name: &str, mark: u32) -> io::Result<()> {
-        use std::process::{Command, Stdio};
-        let status = Command::new(trusted_wg_binary()?)
-            .args(["set", name, "fwmark", &mark.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+        use std::process::Command;
+        let mut cmd = Command::new(trusted_wg_binary()?);
+        cmd.args(["set", name, "fwmark", &mark.to_string()]);
+        let status = helper_status(cmd)
             .map_err(|_| io::Error::other("WireGuard fwmark configuration failed"))?;
         if status.success() {
             Ok(())
@@ -6119,13 +7675,11 @@ impl WgConfigExecutor for TrustedWgCommand {
     }
 
     fn marks_in_use(&self) -> io::Result<Vec<u32>> {
-        use std::process::{Command, Stdio};
-        let output = Command::new(trusted_wg_binary()?)
-            .args(["show", "all", "fwmark"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|_| io::Error::other("WireGuard mark inspection failed"))?;
+        use std::process::Command;
+        let mut cmd = Command::new(trusted_wg_binary()?);
+        cmd.args(["show", "all", "fwmark"]);
+        let output =
+            helper_output(cmd).map_err(|_| io::Error::other("WireGuard mark inspection failed"))?;
         if !output.status.success() || output.stdout.len() > 64 * 1024 {
             return Err(io::Error::other("WireGuard mark inspection failed"));
         }
@@ -6199,6 +7753,7 @@ impl WgConfigExecutor for TrustedWgCommand {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::{ExternalLinkKind, LinkExecutor};
+    use ipnet::IpNet;
     use net_manager_core::models::AppliedRoute;
     use net_manager_core::policy::RouteExecutor;
     use std::collections::HashMap;
@@ -6222,6 +7777,13 @@ pub(crate) mod testing {
         pub missing_on_remove: Arc<Mutex<Vec<String>>>,
         /// Foreign-link kinds probed by `FakeLinks::link_kind`; absent = Missing.
         pub link_kinds: Arc<Mutex<HashMap<String, ExternalLinkKind>>>,
+        /// Link name → ifindex for `FakeLinks::link_index`; absent = gone.
+        /// Tests mutate it between reconciles to simulate re-created tunnels.
+        pub link_indexes: Arc<Mutex<HashMap<String, u32>>>,
+        /// Physical default gateways reported by `FakeRoutes`.
+        pub gateways: Arc<Mutex<Vec<(std::net::IpAddr, u32)>>>,
+        /// Connected (gateway-less) subnets reported by `FakeRoutes`.
+        pub on_link: Arc<Mutex<Vec<(u32, IpNet)>>>,
     }
 
     impl Recorder {
@@ -6283,6 +7845,14 @@ pub(crate) mod testing {
             }
             Ok(())
         }
+
+        fn default_gateways(&self) -> io::Result<Vec<(std::net::IpAddr, u32)>> {
+            Ok(self.recorder.gateways.lock().unwrap().clone())
+        }
+
+        fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
+            Ok(self.recorder.on_link.lock().unwrap().clone())
+        }
     }
 
     pub struct FakeLinks(pub Recorder);
@@ -6305,6 +7875,9 @@ pub(crate) mod testing {
                 .get(name)
                 .copied()
                 .unwrap_or(ExternalLinkKind::Missing))
+        }
+        fn link_index(&self, name: &str) -> io::Result<Option<u32>> {
+            Ok(self.0.link_indexes.lock().unwrap().get(name).copied())
         }
     }
 }
@@ -8545,6 +10118,1093 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert!(recorder.ops().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn spec_route(dest: &str) -> net_manager_core::models::PolicyRoute {
+        net_manager_core::models::PolicyRoute {
+            destination: dest.parse().unwrap(),
+            metric: 5,
+            via: None,
+        }
+    }
+
+    fn attach_spec(iface: &str, dests: &[&str], bypasses: &[&str]) -> AttachSpecParams {
+        AttachSpecParams {
+            interface_name: iface.into(),
+            routes: dests.iter().map(|d| spec_route(d)).collect(),
+            endpoint_bypasses: bypasses.iter().map(|s| s.to_string()).collect(),
+            uplink: false,
+        }
+    }
+
+    fn route_at(dest: &str, index: u32) -> AppliedRoute {
+        AppliedRoute::on_link(dest.parse().unwrap(), index, 5)
+    }
+
+    fn set_link(recorder: &Recorder, name: &str, index: Option<u32>) {
+        let mut indexes = recorder.link_indexes.lock().unwrap();
+        match index {
+            Some(index) => indexes.insert(name.into(), index),
+            None => indexes.remove(name),
+        };
+    }
+
+    fn clear_ops(recorder: &Recorder) {
+        recorder.ops.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn attach_arms_routes_until_interface_appears() {
+        let dir = unique_dir("attach-arm");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &["10.20.0.0/16"], &[]),
+            vec![],
+        )
+        .unwrap();
+        let owned = core.owned(1000);
+        assert_eq!(owned.len(), 1);
+        assert!(matches!(
+            owned[0].resources[0],
+            OwnedResource::AttachSpec(_)
+        ));
+        // Nothing installed while the link is absent; reconcile is a no-op.
+        assert!(recorder.ops().is_empty());
+        assert!(core.reconcile_network(&[]).is_empty());
+        // The interface appears under ifindex 9: the armed route installs.
+        set_link(&recorder, "tun9", Some(9));
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(recorder.ops(), vec![add("10.20.0.0/16")]);
+        let owned = core.owned(1000);
+        let route = match &owned[0].resources[1] {
+            OwnedResource::Route(route) => route,
+            other => panic!("expected route, got {other:?}"),
+        };
+        assert_eq!(route.interface_index, 9);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attach_rebinds_when_interface_is_recreated() {
+        let dir = unique_dir("attach-rebind");
+        let recorder = Recorder::default();
+        set_link(&recorder, "tun9", Some(9));
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &["10.20.0.0/16"], &[]),
+            vec![route_at("10.20.0.0/16", 9)],
+        )
+        .unwrap();
+        clear_ops(&recorder);
+        // The client re-creates the link: old ifindex dies with its routes.
+        set_link(&recorder, "tun9", Some(10));
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(
+            recorder.ops(),
+            vec![remove("10.20.0.0/16"), add("10.20.0.0/16")]
+        );
+        let owned = core.owned(1000);
+        let route = owned[0]
+            .resources
+            .iter()
+            .find_map(|r| match r {
+                OwnedResource::Route(route) => Some(route),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(route.interface_index, 10);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attach_withdraws_routes_when_interface_disappears() {
+        let dir = unique_dir("attach-withdraw");
+        let recorder = Recorder::default();
+        set_link(&recorder, "tun9", Some(9));
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &["10.20.0.0/16"], &[]),
+            vec![route_at("10.20.0.0/16", 9)],
+        )
+        .unwrap();
+        clear_ops(&recorder);
+        set_link(&recorder, "tun9", None);
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(recorder.ops(), vec![remove("10.20.0.0/16")]);
+        // The spec stays armed: the link returning reinstalls the route.
+        set_link(&recorder, "tun9", Some(11));
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(
+            recorder.ops(),
+            vec![remove("10.20.0.0/16"), add("10.20.0.0/16")]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attach_bypass_follows_the_uplink_gateway() {
+        let dir = unique_dir("attach-bypass");
+        let recorder = Recorder::default();
+        recorder
+            .gateways
+            .lock()
+            .unwrap()
+            .push(("192.0.2.1".parse().unwrap(), 3));
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &[], &["203.0.113.7"]),
+            vec![],
+        )
+        .unwrap();
+        // The bypass derives on the first reconcile, pinned to the uplink.
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(recorder.ops(), vec![add("203.0.113.7/32")]);
+        let owned = core.owned(1000);
+        let route = owned[0]
+            .resources
+            .iter()
+            .find_map(|r| match r {
+                OwnedResource::Route(route) => Some(route),
+                _ => None,
+            })
+            .unwrap()
+            .clone();
+        assert_eq!(route.gateway, Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(route.interface_index, 3);
+        // Uplink roams: the bypass is retargeted, not re-added stale.
+        *recorder.gateways.lock().unwrap() = vec![("198.51.100.1".parse().unwrap(), 4)];
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(
+            recorder.ops(),
+            vec![
+                add("203.0.113.7/32"),
+                remove("203.0.113.7/32"),
+                add("203.0.113.7/32")
+            ]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attach_bypass_on_link_host_uses_dev_route() {
+        let dir = unique_dir("attach-bypass-onlink");
+        let recorder = Recorder::default();
+        recorder
+            .gateways
+            .lock()
+            .unwrap()
+            .push(("192.0.2.1".parse().unwrap(), 3));
+        // The uplink owns a connected subnet; a bypass host inside it is
+        // reached directly — `via` the gateway would hairpin one-sidedly.
+        recorder
+            .on_link
+            .lock()
+            .unwrap()
+            .push((3, "10.9.0.0/24".parse().unwrap()));
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &[], &["10.9.0.7", "203.0.113.7"]),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(core.reconcile_network(&[]), vec![(1000, "ext".into())]);
+        assert_eq!(
+            recorder.ops(),
+            vec![add("10.9.0.7/32"), add("203.0.113.7/32")]
+        );
+        let owned = core.owned(1000);
+        let mut routes = owned[0].resources.iter().filter_map(|r| match r {
+            OwnedResource::Route(route) => Some(route),
+            _ => None,
+        });
+        let on_link = routes.next().unwrap();
+        assert_eq!(on_link.destination.to_string(), "10.9.0.7/32");
+        assert_eq!(on_link.interface_index, 3);
+        assert_eq!(on_link.gateway, None);
+        let remote = routes.next().unwrap();
+        assert_eq!(remote.destination.to_string(), "203.0.113.7/32");
+        assert_eq!(remote.gateway, Some("192.0.2.1".parse().unwrap()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn attach_tolerates_a_foreign_duplicate_route() {
+        let dir = unique_dir("attach-foreign");
+        let recorder = Recorder::default();
+        set_link(&recorder, "tun9", Some(9));
+        let mut core = open_core(&dir, &recorder);
+        core.apply_attach(
+            1000,
+            "ext",
+            attach_spec("tun9", &["10.20.0.0/16"], &[]),
+            vec![route_at("10.20.0.0/16", 9)],
+        )
+        .unwrap();
+        clear_ops(&recorder);
+        // The kernel (or another manager) already carries the exact route:
+        // no redundant add, nothing claimed or removed.
+        let foreign = route_at("10.20.0.0/16", 9);
+        assert!(core.reconcile_network(&[foreign]).is_empty());
+        assert!(recorder.ops().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_attach_validates_spec_and_owner() {
+        let dir = unique_dir("attach-validate");
+        let recorder = Recorder::default();
+        let mut core = open_core(&dir, &recorder);
+        assert_eq!(
+            core.apply_attach(1000, "wg:internal", attach_spec("tun9", &[], &[]), vec![],)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            core.apply_attach(1000, "ext", attach_spec("bad name!", &[], &[]), vec![],)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            core.apply_attach(
+                1000,
+                "ext",
+                attach_spec("tun9", &[], &["not a host!"]),
+                vec![],
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(recorder.ops().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- Manual route/rule editing (`net.route.*`, `net.rule.*`) ---------
+
+    /// Kernel-like route/rule store for manual-edit tests: `net_tables`
+    /// reflects mutations, adds conflict on an equal key, removes are
+    /// exact-match like `RTM_DELROUTE`/`FRA` deletes.
+    #[derive(Clone, Default)]
+    struct KernelTables {
+        routes: Arc<Mutex<Vec<SystemRoute>>>,
+        rules: Arc<Mutex<Vec<SystemRule>>>,
+        gateways: Arc<Mutex<Vec<(std::net::IpAddr, u32)>>>,
+        on_link: Arc<Mutex<Vec<(u32, IpNet)>>>,
+    }
+
+    impl KernelTables {
+        fn routes(&self) -> Vec<SystemRoute> {
+            self.routes.lock().unwrap().clone()
+        }
+        fn rules(&self) -> Vec<SystemRule> {
+            self.rules.lock().unwrap().clone()
+        }
+    }
+
+    /// The kernel object an AppliedRoute install leaves behind — protocol
+    /// marks it managed, `same_route` then matches it for explain/list.
+    fn kernel_of(applied: &AppliedRoute) -> SystemRoute {
+        let applied = kernel_route(applied);
+        SystemRoute {
+            family: if applied.destination.addr().is_ipv4() {
+                IpFamily::Ipv4
+            } else {
+                IpFamily::Ipv6
+            },
+            destination: applied.destination,
+            table: applied.table.unwrap_or(RT_TABLE_MAIN),
+            kind: "unicast".into(),
+            scope: if applied.gateway.is_some() {
+                "universe"
+            } else {
+                "link"
+            }
+            .into(),
+            protocol: crate::netlink::RTPROT_NETWORK_ORCHESTRATOR,
+            managed: true,
+            gateway: applied.gateway,
+            interface_index: Some(applied.interface_index),
+            interface_name: None,
+            metric: Some(applied.metric),
+            pref_source: None,
+            nexthops: Vec::new(),
+        }
+    }
+
+    impl RouteExecutor for KernelTables {
+        fn add_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+            let mut routes = self.routes.lock().unwrap();
+            if routes.iter().any(|seen| same_route(seen, route)) {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists"));
+            }
+            routes.push(kernel_of(route));
+            Ok(())
+        }
+        fn remove_route(&mut self, route: &AppliedRoute) -> io::Result<()> {
+            let mut routes = self.routes.lock().unwrap();
+            let before = routes.len();
+            routes.retain(|seen| !same_route(seen, route));
+            if routes.len() == before {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no such route"));
+            }
+            Ok(())
+        }
+        fn default_gateways(&self) -> io::Result<Vec<(std::net::IpAddr, u32)>> {
+            Ok(self.gateways.lock().unwrap().clone())
+        }
+        fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
+            Ok(self.on_link.lock().unwrap().clone())
+        }
+        fn net_tables(&self) -> io::Result<net_manager_core::daemon_protocol::NetTablesResult> {
+            Ok(net_manager_core::daemon_protocol::NetTablesResult {
+                routes: self.routes(),
+                rules: self.rules(),
+                available: true,
+            })
+        }
+        fn add_system_route(&mut self, route: &SystemRoute) -> io::Result<()> {
+            let mut routes = self.routes.lock().unwrap();
+            if routes.iter().any(|seen| same_system_route(seen, route)) {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists"));
+            }
+            routes.push(route.clone());
+            Ok(())
+        }
+        fn remove_system_route(&mut self, route: &SystemRoute) -> io::Result<()> {
+            let mut routes = self.routes.lock().unwrap();
+            let before = routes.len();
+            routes.retain(|seen| !same_system_route(seen, route));
+            if routes.len() == before {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no such route"));
+            }
+            Ok(())
+        }
+    }
+
+    impl PolicyRuleExecutor for KernelTables {
+        fn rules_snapshot(&mut self) -> io::Result<Vec<OwnedRuleResource>> {
+            Ok(Vec::new())
+        }
+        fn table_in_use(&mut self, _: u32) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn add_rule(&mut self, _: &OwnedRuleResource) -> io::Result<()> {
+            Ok(())
+        }
+        fn remove_rule(&mut self, _: &OwnedRuleResource) -> io::Result<()> {
+            Ok(())
+        }
+        fn add_system_rule(&mut self, rule: &SystemRule) -> io::Result<()> {
+            let mut rules = self.rules.lock().unwrap();
+            if rules.iter().any(|seen| seen == rule) {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "exists"));
+            }
+            rules.push(rule.clone());
+            Ok(())
+        }
+        fn remove_system_rule(&mut self, rule: &SystemRule) -> io::Result<()> {
+            let mut rules = self.rules.lock().unwrap();
+            let before = rules.len();
+            rules.retain(|seen| seen != rule);
+            if rules.len() == before {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "no such rule"));
+            }
+            Ok(())
+        }
+    }
+
+    fn open_tables(dir: &Path, kernel: &KernelTables) -> DaemonCore {
+        let recorder = Recorder::default();
+        let mut core = DaemonCore::open(
+            JournalStore::new(dir.join(JOURNAL_FILE)),
+            Box::new(kernel.clone()),
+            Box::new(FakeLinks(recorder)),
+        )
+        .unwrap();
+        core.policy = Some(Box::new(kernel.clone()));
+        core
+    }
+
+    /// `open_tables` but the caller keeps the link recorder and intents
+    /// persist under `dir` — intent tests simulate interfaces appearing
+    /// between reconciles and daemon restarts.
+    fn open_tables_links(dir: &Path, kernel: &KernelTables, recorder: &Recorder) -> DaemonCore {
+        let mut core = DaemonCore::open(
+            JournalStore::new(dir.join(JOURNAL_FILE)),
+            Box::new(kernel.clone()),
+            Box::new(FakeLinks(recorder.clone())),
+        )
+        .unwrap();
+        core.policy = Some(Box::new(kernel.clone()));
+        core.intents = Some(crate::intents::IntentStore::new(dir.join("intents")));
+        core
+    }
+
+    fn intent_iface(id: &str, dests: &[&str], iface: &str) -> NetIntentSetParams {
+        NetIntentSetParams {
+            id: id.into(),
+            destinations: dests.iter().map(|d| d.to_string()).collect(),
+            path: NetIntentPath {
+                kind: "interface".into(),
+                interface: Some(iface.into()),
+            },
+            metric: None,
+            enabled: None,
+        }
+    }
+
+    fn intent_direct(id: &str, dests: &[&str]) -> NetIntentSetParams {
+        NetIntentSetParams {
+            id: id.into(),
+            destinations: dests.iter().map(|d| d.to_string()).collect(),
+            path: NetIntentPath {
+                kind: "direct".into(),
+                interface: None,
+            },
+            metric: None,
+            enabled: None,
+        }
+    }
+
+    #[test]
+    fn intent_arms_until_interface_appears() {
+        let dir = unique_dir("intent-arm");
+        let kernel = KernelTables::default();
+        let recorder = Recorder::default();
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        core.net_intent_set(1000, intent_iface("office", &["10.20.0.0/16"], "tun9"))
+            .unwrap();
+        let view = &core.net_intent_list(1000).unwrap().intents[0];
+        assert_eq!(view.status, ExplainStatus::Deferred);
+        assert_eq!(view.wanted, 0);
+        assert!(kernel.routes().is_empty());
+        // The link appears: reconcile installs the armed route.
+        set_link(&recorder, "tun9", Some(9));
+        assert_eq!(
+            core.reconcile_network(&[]),
+            vec![(1000, "intent:office".into())]
+        );
+        let view = &core.net_intent_list(1000).unwrap().intents[0];
+        assert_eq!(view.status, ExplainStatus::Effective);
+        assert_eq!(view.installed, 1);
+        assert_eq!(kernel.routes()[0].interface_index, Some(9));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn intent_direct_follows_the_uplink() {
+        let dir = unique_dir("intent-direct");
+        let kernel = KernelTables::default();
+        kernel
+            .gateways
+            .lock()
+            .unwrap()
+            .push(("192.0.2.1".parse().unwrap(), 3));
+        let recorder = Recorder::default();
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        core.net_intent_set(1000, intent_direct("escape", &["198.51.100.0/24"]))
+            .unwrap();
+        let routes = kernel.routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].gateway, Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(routes[0].interface_index, Some(3));
+        // The uplink roams: reconcile retargets the route, not leaves it.
+        *kernel.gateways.lock().unwrap() = vec![("203.0.113.1".parse().unwrap(), 4)];
+        assert_eq!(
+            core.reconcile_network(&[]),
+            vec![(1000, "intent:escape".into())]
+        );
+        let routes = kernel.routes();
+        assert_eq!(routes[0].gateway, Some("203.0.113.1".parse().unwrap()));
+        assert_eq!(routes[0].interface_index, Some(4));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn intent_set_replaces_and_del_removes() {
+        let dir = unique_dir("intent-upsert");
+        let kernel = KernelTables::default();
+        let recorder = Recorder::default();
+        set_link(&recorder, "tun9", Some(9));
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        core.net_intent_set(1000, intent_iface("office", &["10.20.0.0/16"], "tun9"))
+            .unwrap();
+        core.net_intent_set(
+            1000,
+            intent_iface("office", &["10.30.0.0/16", "10.40.0.0/16"], "tun9"),
+        )
+        .unwrap();
+        let routes = kernel.routes();
+        assert_eq!(
+            routes
+                .iter()
+                .map(|r| r.destination.to_string())
+                .collect::<Vec<_>>(),
+            vec!["10.30.0.0/16", "10.40.0.0/16"]
+        );
+        core.net_intent_del(1000, "office").unwrap();
+        assert!(kernel.routes().is_empty());
+        assert!(core.net_intent_list(1000).unwrap().intents.is_empty());
+        // Delete is idempotent: neither the store nor the journal holds it.
+        core.net_intent_del(1000, "office").unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn intent_disable_pauses_and_reenable_reinstalls() {
+        let dir = unique_dir("intent-toggle");
+        let kernel = KernelTables::default();
+        let recorder = Recorder::default();
+        set_link(&recorder, "tun9", Some(9));
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        core.net_intent_set(1000, intent_iface("office", &["10.20.0.0/16"], "tun9"))
+            .unwrap();
+        assert_eq!(kernel.routes().len(), 1);
+
+        // Disable: routes leave the kernel, the record stays.
+        let mut paused = intent_iface("office", &["10.20.0.0/16"], "tun9");
+        paused.enabled = Some(false);
+        core.net_intent_set(1000, paused).unwrap();
+        assert!(kernel.routes().is_empty());
+        let view = &core.net_intent_list(1000).unwrap().intents[0];
+        assert!(!view.enabled);
+        assert_eq!(view.status, ExplainStatus::Disabled);
+        // Reconcile must not resurrect a disabled intent.
+        assert!(core.reconcile_network(&[]).is_empty());
+        assert!(kernel.routes().is_empty());
+
+        // Re-enable: the spec re-arms and the route returns; the link
+        // appearing later still works because only enabled intents
+        // replay on startup.
+        core.net_intent_set(1000, intent_iface("office", &["10.20.0.0/16"], "tun9"))
+            .unwrap();
+        assert_eq!(kernel.routes().len(), 1);
+        let view = &core.net_intent_list(1000).unwrap().intents[0];
+        assert!(view.enabled);
+        assert_eq!(view.status, ExplainStatus::Effective);
+
+        // A disabled intent survives restart as a stored-but-idle record.
+        let mut paused = intent_iface("office", &["10.20.0.0/16"], "tun9");
+        paused.enabled = Some(false);
+        core.net_intent_set(1000, paused).unwrap();
+        drop(core);
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        assert_eq!(core.replay_intents(), (0, 0));
+        let view = &core.net_intent_list(1000).unwrap().intents[0];
+        assert!(!view.enabled);
+        assert!(kernel.routes().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn intent_validates_id_destinations_and_path() {
+        let dir = unique_dir("intent-validate");
+        let kernel = KernelTables::default();
+        let recorder = Recorder::default();
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        // "ns:forged" would smuggle a second ':' into the owner prefix.
+        for params in [
+            intent_iface("bad id", &["10.0.0.0/8"], "tun9"),
+            intent_iface("ns:forged", &["10.0.0.0/8"], "tun9"),
+            intent_iface("empty", &[], "tun9"),
+            intent_iface("bad-cidr", &["not a cidr"], "tun9"),
+        ] {
+            assert_eq!(
+                core.net_intent_set(1000, params).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let mut bad_path = intent_iface("x", &["10.0.0.0/8"], "tun9");
+        bad_path.path.kind = "sideways".into();
+        assert_eq!(
+            core.net_intent_set(1000, bad_path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // Client-facing apply cannot forge an intent owner either.
+        assert_eq!(
+            core.apply_routes(1000, "intent:fake", vec![])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn intent_iface_absent_stays_armed_across_reopen() {
+        let dir = unique_dir("intent-reopen");
+        let kernel = KernelTables::default();
+        let recorder = Recorder::default();
+        {
+            let mut core = open_tables_links(&dir, &kernel, &recorder);
+            core.net_intent_set(1000, intent_iface("office", &["10.20.0.0/16"], "tun9"))
+                .unwrap();
+        }
+        // Daemon restart: the journal entry is gone but the stored intent
+        // re-arms on replay and stays listed.
+        let mut core = open_tables_links(&dir, &kernel, &recorder);
+        let list = core.net_intent_list(1000).unwrap();
+        assert_eq!(list.intents.len(), 1);
+        assert_eq!(list.intents[0].status, ExplainStatus::Deferred);
+        assert_eq!(core.replay_intents(), (1, 0));
+        set_link(&recorder, "tun9", Some(9));
+        core.reconcile_network(&[]);
+        assert_eq!(kernel.routes().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn kernel_route_fixture(managed: bool) -> SystemRoute {
+        SystemRoute {
+            family: IpFamily::Ipv4,
+            destination: "198.51.100.0/24".parse().unwrap(),
+            table: RT_TABLE_MAIN,
+            kind: "unicast".into(),
+            scope: "universe".into(),
+            protocol: if managed {
+                crate::netlink::RTPROT_NETWORK_ORCHESTRATOR
+            } else {
+                3 // RTPROT_BOOT
+            },
+            managed,
+            gateway: Some("192.168.1.1".parse().unwrap()),
+            interface_index: Some(7),
+            interface_name: Some("enp0s3".into()),
+            metric: Some(100),
+            pref_source: None,
+            nexthops: Vec::new(),
+        }
+    }
+
+    fn kernel_rule_fixture(priority: u32, managed: bool) -> SystemRule {
+        SystemRule {
+            family: IpFamily::Ipv4,
+            priority,
+            action: "lookup".into(),
+            table: 100,
+            goto: None,
+            from: None,
+            to: None,
+            fwmark: Some(0x1),
+            fwmask: Some(0x1),
+            iifname: None,
+            oifname: None,
+            uid_range: None,
+            source_port_range: None,
+            destination_port_range: None,
+            ip_protocol: None,
+            suppress_prefix_length: None,
+            suppress_if_group: None,
+            tun_id: None,
+            tos: 0,
+            invert: false,
+            protocol: if managed {
+                crate::netlink::RTPROT_NETWORK_ORCHESTRATOR
+            } else {
+                0
+            },
+            managed,
+        }
+    }
+
+    #[test]
+    fn manual_route_add_installs_journaled_route() {
+        let dir = unique_dir("manual-route-add");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        let params = NetRouteAddParams {
+            destination: "203.0.113.0/24".parse().unwrap(),
+            table: None,
+            gateway: Some("192.168.1.1".parse().unwrap()),
+            interface_name: None,
+            interface_index: Some(7),
+            metric: Some(50),
+            pref_source: None,
+        };
+        core.net_route_add(1000, params).unwrap();
+        let installed = &kernel.routes()[0];
+        assert_eq!(installed.destination.to_string(), "203.0.113.0/24");
+        assert_eq!(installed.table, RT_TABLE_MAIN);
+        assert_eq!(
+            installed.protocol,
+            crate::netlink::RTPROT_NETWORK_ORCHESTRATOR
+        );
+        let journal = journal_on_disk(&dir);
+        assert_eq!(journal.entries[0].owner, MANUAL_OWNER);
+        assert_eq!(journal.entries[0].state, OwnedState::Applied);
+        assert!(matches!(
+            journal.entries[0].resources[0],
+            OwnedResource::NetRoute(_)
+        ));
+        // Deleting our own manual object is a plain delete.
+        assert_eq!(
+            core.net_route_del(1000, installed.clone()).unwrap(),
+            NetEditOutcome::Deleted
+        );
+        assert!(kernel.routes().is_empty());
+        assert!(journal_on_disk(&dir).entries.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_route_add_rejects_unsafe_input() {
+        let dir = unique_dir("manual-route-guards");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        let base = NetRouteAddParams {
+            destination: "203.0.113.0/24".parse().unwrap(),
+            table: None,
+            gateway: None,
+            interface_name: None,
+            interface_index: Some(7),
+            metric: None,
+            pref_source: None,
+        };
+        for table in [Some(RT_TABLE_UNSPEC), Some(RT_TABLE_LOCAL)] {
+            let params = NetRouteAddParams {
+                table,
+                ..base.clone()
+            };
+            assert_eq!(
+                core.net_route_add(1000, params).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        // Both or neither interface selector.
+        for (name, index) in [(Some("enp0s3".to_string()), Some(7)), (None, None)] {
+            let params = NetRouteAddParams {
+                interface_name: name,
+                interface_index: index,
+                ..base.clone()
+            };
+            assert_eq!(
+                core.net_route_add(1000, params).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        // Gateway family must match the destination family.
+        let params = NetRouteAddParams {
+            gateway: Some("fd00::1".parse().unwrap()),
+            ..base.clone()
+        };
+        assert_eq!(
+            core.net_route_add(1000, params).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(kernel.routes().is_empty());
+        assert!(journal_on_disk(&dir).entries.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_route_del_foreign_suppresses_and_restores() {
+        let dir = unique_dir("manual-route-suppress");
+        let kernel = KernelTables::default();
+        kernel
+            .routes
+            .lock()
+            .unwrap()
+            .push(kernel_route_fixture(false));
+        let mut core = open_tables(&dir, &kernel);
+        assert_eq!(
+            core.net_route_del(1000, kernel_route_fixture(false))
+                .unwrap(),
+            NetEditOutcome::Suppressed
+        );
+        assert!(kernel.routes().is_empty());
+        let journal = journal_on_disk(&dir);
+        assert!(matches!(
+            journal.entries[0].resources[0],
+            OwnedResource::SuppressedRoute(_)
+        ));
+        // Teardown (daemon stop or explicit revert) puts the foreign
+        // route back.
+        core.shutdown().unwrap();
+        assert_eq!(kernel.routes(), vec![kernel_route_fixture(false)]);
+        assert!(journal_on_disk(&dir).entries.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_route_del_refuses_tunnel_owned_route() {
+        let dir = unique_dir("manual-route-owned");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        // A tunnel owner holds the route in its journal.
+        core.journal.entries.push(JournalEntry {
+            uid: 1000,
+            owner: "wg:home".into(),
+            state: OwnedState::Applied,
+            resources: vec![OwnedResource::Route(AppliedRoute::on_link(
+                "198.51.100.0/24".parse().unwrap(),
+                7,
+                100,
+            ))],
+        });
+        // The same object visible in a dump, marked managed.
+        let mut route = kernel_route_fixture(true);
+        route.metric = Some(100);
+        route.gateway = None;
+        route.interface_index = Some(7);
+        let error = core.net_route_del(1000, route).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("wg:home"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_rule_add_and_del_roundtrip() {
+        let dir = unique_dir("manual-rule-add");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        let params = NetRuleAddParams {
+            family: IpFamily::Ipv4,
+            priority: 1000,
+            table: 100,
+            from: Some("10.0.0.0/8".parse().unwrap()),
+            to: None,
+            fwmark: Some(0x9),
+            fwmask: None,
+            iifname: Some("enp0s3".into()),
+            oifname: None,
+            invert: false,
+        };
+        core.net_rule_add(1000, params).unwrap();
+        let installed = &kernel.rules()[0];
+        assert_eq!(
+            installed.protocol,
+            crate::netlink::RTPROT_NETWORK_ORCHESTRATOR
+        );
+        assert_eq!(installed.action, "lookup");
+        // Priority 0 and local/unspec tables are refused.
+        for (priority, table) in [(0, 100), (500, RT_TABLE_LOCAL), (500, RT_TABLE_UNSPEC)] {
+            let rejected = NetRuleAddParams {
+                family: IpFamily::Ipv4,
+                priority,
+                table,
+                from: None,
+                to: None,
+                fwmark: None,
+                fwmask: None,
+                iifname: None,
+                oifname: None,
+                invert: false,
+            };
+            assert_eq!(
+                core.net_rule_add(1000, rejected).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            core.net_rule_del(1000, installed.clone()).unwrap(),
+            NetEditOutcome::Deleted
+        );
+        assert!(kernel.rules().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_rule_del_foreign_suppresses_and_restores() {
+        let dir = unique_dir("manual-rule-suppress");
+        let kernel = KernelTables::default();
+        kernel
+            .rules
+            .lock()
+            .unwrap()
+            .push(kernel_rule_fixture(300, false));
+        let mut core = open_tables(&dir, &kernel);
+        assert_eq!(
+            core.net_rule_del(1000, kernel_rule_fixture(300, false))
+                .unwrap(),
+            NetEditOutcome::Suppressed
+        );
+        assert!(kernel.rules().is_empty());
+        // The kernel local rule is untouchable.
+        let mut local = kernel_rule_fixture(0, false);
+        local.action = "lookup".into();
+        local.table = RT_TABLE_LOCAL;
+        assert_eq!(
+            core.net_rule_del(1000, local).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        core.shutdown().unwrap();
+        assert_eq!(kernel.rules(), vec![kernel_rule_fixture(300, false)]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reconcile_resuppresses_returned_foreign_route() {
+        let dir = unique_dir("manual-resuppress");
+        let kernel = KernelTables::default();
+        kernel
+            .routes
+            .lock()
+            .unwrap()
+            .push(kernel_route_fixture(false));
+        let mut core = open_tables(&dir, &kernel);
+        core.net_route_del(1000, kernel_route_fixture(false))
+            .unwrap();
+        // NM/another client re-adds the route behind our back.
+        kernel
+            .routes
+            .lock()
+            .unwrap()
+            .push(kernel_route_fixture(false));
+        let changed = core.reconcile_network(&[]);
+        assert_eq!(changed, vec![(1000, MANUAL_OWNER.to_string())]);
+        assert!(kernel.routes().is_empty());
+        // The suppression still stands in the journal; teardown restores.
+        core.shutdown().unwrap();
+        assert_eq!(kernel.routes(), vec![kernel_route_fixture(false)]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reconcile_reinstalls_missing_manual_route() {
+        let dir = unique_dir("manual-restore-missing");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        core.net_route_add(
+            1000,
+            NetRouteAddParams {
+                destination: "203.0.113.0/24".parse().unwrap(),
+                table: None,
+                gateway: Some("192.168.1.1".parse().unwrap()),
+                interface_name: None,
+                interface_index: Some(7),
+                metric: None,
+                pref_source: None,
+            },
+        )
+        .unwrap();
+        // The kernel object vanishes (link flush, `ip route flush`).
+        kernel.routes.lock().unwrap().clear();
+        let changed = core.reconcile_network(&[]);
+        assert_eq!(changed, vec![(1000, MANUAL_OWNER.to_string())]);
+        assert_eq!(kernel.routes().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn manual_owner_survives_session_cleanup() {
+        let dir = unique_dir("manual-session");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        core.net_route_add(
+            1000,
+            NetRouteAddParams {
+                destination: "203.0.113.0/24".parse().unwrap(),
+                table: None,
+                gateway: None,
+                interface_name: None,
+                interface_index: Some(7),
+                metric: None,
+                pref_source: None,
+            },
+        )
+        .unwrap();
+        // The last client of the uid disconnects — manual overrides stay.
+        let result = core
+            .cleanup_session_uid(1000, &std::collections::HashSet::new())
+            .unwrap();
+        assert!(result.removed_owners.is_empty());
+        assert_eq!(kernel.routes().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn explain_marks_effective_missing_and_conflicted() {
+        let dir = unique_dir("explain-statuses");
+        let kernel = KernelTables::default();
+        let mut core = open_tables(&dir, &kernel);
+        // Installed route → effective.
+        core.net_route_add(
+            1000,
+            NetRouteAddParams {
+                destination: "203.0.113.0/24".parse().unwrap(),
+                table: None,
+                gateway: Some("192.168.1.1".parse().unwrap()),
+                interface_name: None,
+                interface_index: Some(7),
+                metric: None,
+                pref_source: None,
+            },
+        )
+        .unwrap();
+        // A suppressed foreign route → active while absent, missing when
+        // it reappears.
+        kernel
+            .routes
+            .lock()
+            .unwrap()
+            .push(kernel_route_fixture(false));
+        core.net_route_del(1000, kernel_route_fixture(false))
+            .unwrap();
+        // A deferred attach spec: the interface does not exist.
+        core.journal.entries.push(JournalEntry {
+            uid: 1000,
+            owner: "ext".into(),
+            state: OwnedState::Applied,
+            resources: vec![OwnedResource::AttachSpec(attach_spec(
+                "tun-missing",
+                &[],
+                &[],
+            ))],
+        });
+        let result = core.net_explain(1000).unwrap();
+        assert!(result.available);
+        let by_kind: HashMap<&str, ExplainStatus> = result
+            .entries
+            .iter()
+            .map(|entry| (entry.kind.as_str(), entry.status))
+            .collect();
+        assert_eq!(by_kind["route"], ExplainStatus::Effective);
+        assert_eq!(by_kind["suppressed-route"], ExplainStatus::Active);
+        assert_eq!(by_kind["attach"], ExplainStatus::Deferred);
+        // Bring the suppressed route back — the explain turns "missing"
+        // and reconcile re-suppresses.
+        kernel
+            .routes
+            .lock()
+            .unwrap()
+            .push(kernel_route_fixture(false));
+        let result = core.net_explain(1000).unwrap();
+        let suppressed = result
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "suppressed-route")
+            .unwrap();
+        assert_eq!(suppressed.status, ExplainStatus::Missing);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn explain_reports_unavailable_without_kernel_view() {
+        let dir = unique_dir("explain-unavailable");
+        let mut core = open_core(&dir, &Recorder::default());
+        core.journal.entries.push(JournalEntry {
+            uid: 1000,
+            owner: "ext".into(),
+            state: OwnedState::Applied,
+            resources: vec![OwnedResource::AttachSpec(attach_spec("tun9", &[], &[]))],
+        });
+        // FakeRoutes has no `net_tables` — the result degrades.
+        let result = core.net_explain(1000).unwrap();
+        assert!(!result.available);
+        assert!(result.entries.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

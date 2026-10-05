@@ -1,25 +1,30 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import Page from "./Page";
+import IntentsPanel from "./IntentsPanel";
+import PanelBoundary from "./PanelBoundary";
 import RouteFlow from "./RouteFlow";
 import RouteMap from "./RouteMap";
 import RouteTable from "./RouteTable";
+import SystemTables from "./SystemTables";
 import { RouteLookupResult, RouteMap as RouteMapData } from "../types";
 import { TranslationKey, useT } from "../i18n";
 import { setRoutesPrefs, useRoutesPrefs } from "../prefs";
 
-type RouteTab = "flow" | "tree" | "table";
+type RouteTab = "intents" | "flow" | "tree" | "table" | "system";
 
 const TABS: { id: RouteTab; labelKey: TranslationKey }[] = [
+  { id: "intents", labelKey: "routes.intents" },
   { id: "flow", labelKey: "routes.flow" },
   { id: "tree", labelKey: "routes.tree" },
   { id: "table", labelKey: "routes.table" },
+  { id: "system", labelKey: "routes.system" },
 ];
 
 export default function RouteView() {
   const t = useT();
   const prefs = useRoutesPrefs();
-  const [tab, setTab] = useState<RouteTab>("flow");
+  const [tab, setTab] = useState<RouteTab>("intents");
   const [map, setMap] = useState<RouteMapData | null>(null);
   const [lookupDest, setLookupDest] = useState("");
   const [lookupResult, setLookupResult] = useState<RouteLookupResult | null>(
@@ -86,7 +91,9 @@ export default function RouteView() {
         </nav>
         {map && (
           <div className="routes-summary">
-            <span className="route-stat">{t("routes.activeCount", { n: activeCount ?? 0 })}</span>
+            <span className="route-stat">
+              {t("routes.activeCount", { n: activeCount ?? 0 })}
+            </span>
             <button
               type="button"
               className={`route-stat route-stat-btn ${conflicts ? "bad" : ""}`}
@@ -192,14 +199,18 @@ export default function RouteView() {
       )}
 
       <div className="route-tab-content">
-        {tab === "flow" && <RouteFlow hideIpv6={prefs.hideIpv6} />}
-        {tab === "tree" && (
-          <RouteMap
-            hideIpv6={prefs.hideIpv6}
-            includeInactive={prefs.includeStopped}
-          />
-        )}
-        {tab === "table" && <RouteTable hideIpv6={prefs.hideIpv6} />}
+        <PanelBoundary key={tab}>
+          {tab === "intents" && <IntentsPanel />}
+          {tab === "flow" && <RouteFlow hideIpv6={prefs.hideIpv6} />}
+          {tab === "tree" && (
+            <RouteMap
+              hideIpv6={prefs.hideIpv6}
+              includeInactive={prefs.includeStopped}
+            />
+          )}
+          {tab === "table" && <RouteTable hideIpv6={prefs.hideIpv6} />}
+          {tab === "system" && <SystemTables hideIpv6={prefs.hideIpv6} />}
+        </PanelBoundary>
       </div>
     </Page>
   );

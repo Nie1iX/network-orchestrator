@@ -135,14 +135,25 @@ async fn read_response<R: tokio::io::AsyncBufRead + Unpin, T: DeserializeOwned>(
     let frame: ResponseFrame =
         serde_json::from_slice(&line).map_err(|e| ClientError::Protocol(e.to_string()))?;
     if frame.id != id {
-        return Err(ClientError::Protocol("response id mismatch".into()));
+        // Early-error frames (busy, frameTooLarge, malformed hello) carry
+        // id 0 regardless of the request; surface their real message
+        // instead of a misleading "id mismatch".
+        return match frame.outcome {
+            Err(err) => Err(ClientError::Daemon(err)),
+            Ok(_) => Err(ClientError::Protocol("response id mismatch".into())),
+        };
     }
     let value = frame.outcome.map_err(ClientError::Daemon)?;
     daemon_protocol::from_value(value).map_err(|e| ClientError::Protocol(e.to_string()))
 }
 
 fn response_timeout(method_name: &str) -> Option<std::time::Duration> {
-    (method_name == method::HELLO).then(|| std::time::Duration::from_secs(5))
+    // Generous but finite: a wedged daemon must not pin a socket (and its
+    // server-side connection permit) forever. Polkit prompts can block a
+    // request for as long as the user takes to answer, so the bound sits
+    // just above the daemon's own 300s dispatch timeout.
+    let secs = if method_name == method::HELLO { 5 } else { 330 };
+    Some(std::time::Duration::from_secs(secs))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -346,13 +357,59 @@ mod tests {
     }
 
     #[test]
-    fn mutation_response_has_no_handshake_deadline() {
+    fn every_method_has_a_response_deadline() {
         assert_eq!(
             response_timeout(method::HELLO),
             Some(std::time::Duration::from_secs(5))
         );
-        assert_eq!(response_timeout(method::ROUTES_APPLY), None);
-        assert_eq!(response_timeout(method::LINK_SET_STATE), None);
+        assert_eq!(
+            response_timeout(method::ROUTES_APPLY),
+            Some(std::time::Duration::from_secs(330))
+        );
+        assert_eq!(
+            response_timeout(method::LINK_SET_STATE),
+            Some(std::time::Duration::from_secs(330))
+        );
+    }
+
+    /// Early-error frames carry id 0 regardless of the request id; the
+    /// client must surface their real error instead of "id mismatch".
+    #[tokio::test]
+    async fn busy_frame_surfaces_daemon_error() {
+        let dir = crate::test_support::unique_dir("daemon-client-busy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let _hello = net_manager_core::daemon_protocol::read_frame(&mut reader, 1024)
+                .await
+                .unwrap()
+                .unwrap();
+            writer
+                .write_all(
+                    &net_manager_core::daemon_protocol::encode_line(&ResponseFrame::error(
+                        0,
+                        ErrorCode::Busy,
+                        "too many connections",
+                    ))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+        let err = DaemonClient::new(path.clone()).hello().await.unwrap_err();
+        match err {
+            ClientError::Daemon(body) => {
+                assert_eq!(body.code, ErrorCode::Busy);
+                assert!(body.message.contains("too many connections"));
+            }
+            other => panic!("expected daemon error, got {other:?}"),
+        }
+        server.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

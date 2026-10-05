@@ -70,14 +70,18 @@ fn asset_dirs(
     dirs
 }
 
-/// Read and parse one dat file from the first candidate that has it; a
-/// missing/oversized/undecodable file simply yields `None` (the checker then
-/// reports those selectors as unevaluated rather than failing).
+/// Read and parse one dat file across the candidate dirs. The first dir is
+/// the highest-precedence provider overlay, the last is the managed stock
+/// file; when both exist they are merged exactly like the daemon stages
+/// them, so the checker sees the same category set as the runtime. A
+/// missing/oversized/undecodable file simply yields `None` (the checker
+/// then reports those selectors as unevaluated rather than failing).
 fn load_asset<T>(
     dirs: &[PathBuf],
     name: &str,
     parse: fn(&[u8]) -> std::io::Result<T>,
 ) -> Option<T> {
+    let mut contents = Vec::with_capacity(dirs.len());
     for dir in dirs {
         let path = dir.join(name);
         let Ok(meta) = std::fs::metadata(&path) else {
@@ -89,11 +93,16 @@ fn load_asset<T>(
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
-        if let Ok(parsed) = parse(&bytes) {
-            return Some(parsed);
+        contents.push(bytes);
+    }
+    if let [overlay, stock] = contents.as_slice() {
+        if let Ok(merged) = net_manager_core::geo_list::merge_geo_list(stock, overlay) {
+            if let Ok(parsed) = parse(&merged) {
+                return Some(parsed);
+            }
         }
     }
-    None
+    contents.iter().find_map(|bytes| parse(bytes).ok())
 }
 
 #[tauri::command]

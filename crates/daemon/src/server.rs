@@ -10,7 +10,7 @@ use crate::cond_rules::{validate_rule, CondRuleStore, NetworkObservation, NoObse
 use crate::core::DaemonCore;
 use crate::openvpn::{prepare_openvpn, OpenVpnPlan};
 use crate::settings::{DaemonSettings, SettingsStore};
-use crate::validate::{validate_apply, validate_iface_name, validate_owner};
+use crate::validate::{validate_apply, validate_attach, validate_iface_name, validate_owner};
 use crate::wireguard::parse_wireguard_config;
 use crate::xray::prepare_xray;
 use net_manager_core::daemon_protocol::{
@@ -19,13 +19,15 @@ use net_manager_core::daemon_protocol::{
     AlwaysOnSetParams, AlwaysOnSetResult, CondRulesListResult, CondRulesPutParams,
     CondRulesPutResult, CondRulesRemoveParams, CondRulesRemoveResult, ConditionalRuleEntry,
     ErrorCode, EventFrame, ExternalTunnelStopParams, HelloParams, HelloResult, LinkSetStateParams,
-    OpenVpnConnectRequest, OpenVpnConnectResult, OpenVpnDisconnectResult, OpenVpnProbeResult,
-    OpenVpnProfileParams, OwnedChanged, OwnedListResult, OwnerParams, RequestFrame, ResponseFrame,
-    RoutesApplyParams, RoutesApplyResult, RoutesRemoveResult, SettingsResult, SettingsSetParams,
-    VpnAuthMode, WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
-    WireGuardProfileParams, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
-    XrayInstallParams, XrayInstallResult, XrayProfileParams, XrayRemoveResult, HELLO_TIMEOUT_SECS,
-    MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    NetDnsProbeParams, NetEditResult, NetIntentDelParams, NetIntentResult, NetIntentSetParams,
+    NetRouteAddParams, NetRouteDelParams, NetRuleAddParams, NetRuleDelParams, NmListResult,
+    NmSetActiveParams, OpenVpnConnectRequest, OpenVpnConnectResult, OpenVpnDisconnectResult,
+    OpenVpnProbeResult, OpenVpnProfileParams, OwnedChanged, OwnedListResult, OwnerParams,
+    RequestFrame, ResponseFrame, RoutesApplyParams, RoutesApplyResult, RoutesRemoveResult,
+    SettingsResult, SettingsSetParams, VpnAuthMode, WireGuardConnectParams, WireGuardConnectResult,
+    WireGuardDisconnectResult, WireGuardProfileParams, XrayConnectParams, XrayConnectResult,
+    XrayDisconnectResult, XrayInstallParams, XrayInstallResult, XrayProfileParams,
+    XrayRemoveResult, HELLO_TIMEOUT_SECS, MAX_CONNECTIONS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -269,6 +271,10 @@ impl<A: Authorizer> ServerContext<A> {
 
 type Failure = (ErrorCode, String);
 
+/// Longest a single request may take before the client gets a `timed out`
+/// answer; covers polkit dialogs that wait on user input.
+const DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Entry point for an accepted connection: enforces the connection limit,
 /// then serves it until either side closes.
 pub async fn serve_accepted<S, A>(mut stream: S, peer: PeerIdentity, ctx: Arc<ServerContext<A>>)
@@ -347,10 +353,22 @@ where
         };
         let response = match serde_json::from_slice::<RequestFrame>(&frame) {
             Ok(request) => {
+                let id = request.id;
                 if request.method == method::SUBSCRIBE && subscription.is_none() {
                     subscription = Some(ctx.events.subscribe());
                 }
-                dispatch(request, &peer, &ctx).await
+                // A wedged handler must not hold the connection (and its
+                // semaphore permit) forever; the blocking work itself may
+                // linger, but the client is answered and released.
+                match tokio::time::timeout(DISPATCH_TIMEOUT, dispatch(request, &peer, &ctx)).await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        eprintln!(
+                            "network-orchestrator-daemon: request {id} timed out after {DISPATCH_TIMEOUT:?}"
+                        );
+                        ResponseFrame::error(id, ErrorCode::Internal, "request timed out")
+                    }
+                }
             }
             Err(_) => ResponseFrame::error(0, ErrorCode::InvalidParams, "malformed request frame"),
         };
@@ -850,10 +868,14 @@ async fn handle<A: Authorizer>(
             validate_owner(&params.owner).map_err(invalid)?;
             reject_wireguard_owner(&params.owner)?;
             validate_apply(&params.routes).map_err(invalid)?;
+            if let Some(spec) = &params.attach {
+                validate_attach(spec).map_err(invalid)?;
+            }
             authorize(ctx, peer, Action::SystemNetwork).await?;
             let owner = params.owner.clone();
-            let applied = with_core(ctx, move |core| {
-                core.apply_routes(uid, &params.owner, params.routes)
+            let applied = with_core(ctx, move |core| match params.attach {
+                Some(spec) => core.apply_attach(uid, &params.owner, spec, params.routes),
+                None => core.apply_routes(uid, &params.owner, params.routes),
             })
             .await?;
             notify(ctx, uid, owner);
@@ -914,6 +936,114 @@ async fn handle<A: Authorizer>(
             // Orphan cleanup inside evaluation withdraws the rule's routes.
             eval_conditional(ctx).await;
             to_value(&CondRulesRemoveResult { removed })
+        }
+        #[cfg(target_os = "linux")]
+        method::NM_LIST => match crate::nm::list_connections().await {
+            Ok(connections) => to_value(&NmListResult {
+                connections,
+                available: true,
+            }),
+            Err(err) if err.kind() == io::ErrorKind::NotConnected => to_value(&NmListResult {
+                connections: Vec::new(),
+                available: false,
+            }),
+            Err(err) => Err((ErrorCode::Internal, err.to_string())),
+        },
+        #[cfg(target_os = "linux")]
+        method::NM_SET_ACTIVE => {
+            let params: NmSetActiveParams = params(request.params)?;
+            authorize(ctx, peer, Action::ConnectProfile).await?;
+            crate::nm::set_active(&params.uuid, params.active)
+                .await
+                .map_err(|err| match err.kind() {
+                    io::ErrorKind::NotFound => (ErrorCode::NotFound, err.to_string()),
+                    io::ErrorKind::NotConnected => (
+                        ErrorCode::NotFound,
+                        "NetworkManager is not available".into(),
+                    ),
+                    _ => (ErrorCode::Internal, err.to_string()),
+                })?;
+            Ok(Value::Null)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_TABLES => {
+            let result = with_core(ctx, move |core| core.net_tables()).await?;
+            to_value(&result)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_ROUTE_ADD => {
+            let params: NetRouteAddParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            with_core(ctx, move |core| core.net_route_add(uid, params)).await?;
+            notify(ctx, uid, "manual".to_string());
+            Ok(Value::Null)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_ROUTE_DEL => {
+            let params: NetRouteDelParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let outcome = with_core(ctx, move |core| core.net_route_del(uid, params.route)).await?;
+            notify(ctx, uid, "manual".to_string());
+            to_value(&NetEditResult { outcome })
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_RULE_ADD => {
+            let params: NetRuleAddParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            with_core(ctx, move |core| core.net_rule_add(uid, params)).await?;
+            notify(ctx, uid, "manual".to_string());
+            Ok(Value::Null)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_RULE_DEL => {
+            let params: NetRuleDelParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let outcome = with_core(ctx, move |core| core.net_rule_del(uid, params.rule)).await?;
+            notify(ctx, uid, "manual".to_string());
+            to_value(&NetEditResult { outcome })
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_EXPLAIN => {
+            let result = with_core(ctx, move |core| core.net_explain(uid)).await?;
+            to_value(&result)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_DNS_STATUS => crate::dns_status::status()
+            .await
+            .map_err(|_| (ErrorCode::Internal, "DNS status failed".into()))
+            .and_then(|result| to_value(&result)),
+        #[cfg(target_os = "linux")]
+        method::NET_DNS_PROBE => {
+            let params: NetDnsProbeParams = params(request.params)?;
+            let observer = ctx.observer.clone();
+            let result = crate::dns_status::probe(observer, params)
+                .await
+                .map_err(|error| (error_code(&error), error.to_string()))?;
+            to_value(&result)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_INTENT_LIST => {
+            let result = with_core(ctx, move |core| core.net_intent_list(uid)).await?;
+            to_value(&result)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_INTENT_SET => {
+            let params: NetIntentSetParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let owner = format!("intent:{}", params.id);
+            let result = with_core(ctx, move |core| core.net_intent_set(uid, params)).await?;
+            notify(ctx, uid, owner);
+            to_value(&result)
+        }
+        #[cfg(target_os = "linux")]
+        method::NET_INTENT_DEL => {
+            let params: NetIntentDelParams = params(request.params)?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let owner = format!("intent:{}", params.id);
+            let id = params.id.clone();
+            with_core(ctx, move |core| core.net_intent_del(uid, &params.id)).await?;
+            notify(ctx, uid, owner);
+            to_value(&NetIntentResult { id })
         }
         method::LINK_SET_STATE => {
             let params: LinkSetStateParams = params(request.params)?;
@@ -2431,6 +2561,85 @@ mod tests {
             Err(()),
             "another uid must not see the event"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn intent_set_list_and_del_round_trip() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        harness.ctx.core.lock().unwrap().intents = Some(crate::intents::IntentStore::new(
+            harness.dir.join("intents"),
+        ));
+        let mut watcher = harness.hello(1000).await;
+        assert_eq!(
+            watcher.call(2, "subscribe", Value::Null).await["ok"],
+            json!(true)
+        );
+        let mut client = harness.hello(1000).await;
+
+        // set returns the public id, not the journal owner
+        let set = client
+            .call(
+                2,
+                method::NET_INTENT_SET,
+                json!({
+                    "id": "office",
+                    "destinations": ["10.20.0.0/16", "10.30.0.0/16"],
+                    "path": {"kind": "direct"}
+                }),
+            )
+            .await;
+        assert_eq!(set["result"]["id"], json!("office"), "{set}");
+        assert_eq!(
+            watcher.recv().await,
+            Some(json!({"event":"owned.changed","data":{"owner":"intent:office"}}))
+        );
+
+        let list = client.call(3, method::NET_INTENT_LIST, Value::Null).await;
+        let intents = &list["result"]["intents"];
+        assert_eq!(intents.as_array().unwrap().len(), 1, "{list}");
+        assert_eq!(intents[0]["id"], json!("office"));
+        assert_eq!(intents[0]["path"]["kind"], json!("direct"));
+        assert_eq!(intents[0]["metric"], json!(100));
+
+        let del = client
+            .call(4, method::NET_INTENT_DEL, json!({"id": "office"}))
+            .await;
+        assert_eq!(del["result"]["id"], json!("office"), "{del}");
+        assert_eq!(
+            watcher.recv().await,
+            Some(json!({"event":"owned.changed","data":{"owner":"intent:office"}}))
+        );
+        let list = client.call(5, method::NET_INTENT_LIST, Value::Null).await;
+        assert_eq!(list["result"]["intents"], json!([]), "{list}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn intent_mutations_require_authorization_list_does_not() {
+        let harness = Harness::new(AuthDecision::Denied);
+        let mut client = harness.hello(1000).await;
+        let denied = client
+            .call(
+                2,
+                method::NET_INTENT_SET,
+                json!({
+                    "id": "office",
+                    "destinations": ["10.20.0.0/16"],
+                    "path": {"kind": "direct"}
+                }),
+            )
+            .await;
+        assert_eq!(error_code(&denied), "notAuthorized");
+        let denied = client
+            .call(3, method::NET_INTENT_DEL, json!({"id": "office"}))
+            .await;
+        assert_eq!(error_code(&denied), "notAuthorized");
+        assert_eq!(harness.auth_calls(), 2);
+
+        let list = client.call(4, method::NET_INTENT_LIST, Value::Null).await;
+        assert_eq!(list["ok"], json!(true), "{list}");
+        assert_eq!(harness.auth_calls(), 2, "list must stay read-only");
     }
 
     #[tokio::test]

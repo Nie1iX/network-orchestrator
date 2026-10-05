@@ -16,6 +16,8 @@ interface ProfileRowProps {
   isBusy: boolean;
   /** The profile's interface is occupied by a tunnel managed elsewhere. */
   conflict: boolean;
+  /** When set, connect is locked (app-mode filter) and this explains why. */
+  connectLockedTitle?: string | null;
   selected: boolean;
   dragging: boolean;
   /** False in grouped mode — the group header already shows the backend. */
@@ -40,6 +42,7 @@ export default function ProfileRow({
   serverName,
   isBusy,
   conflict,
+  connectLockedTitle,
   selected,
   dragging,
   showBackendBadge = true,
@@ -110,6 +113,18 @@ export default function ProfileRow({
       {serverName && !profile.name.includes(serverName) && (
         <span className="profile-row-server">· {serverName}</span>
       )}
+      {status.state === "running" &&
+        (profile.waitForInterface ||
+          (profile.endpointBypasses?.length ?? 0) > 0) && (
+          <span
+            className="badge badge-armed"
+            title={t("profiles.armedHint", {
+              iface: profile.interfaceName || "tunnel",
+            })}
+          >
+            {t("profiles.armed")}
+          </span>
+        )}
       {(status.state === "failed" && status.message) || conflict ? (
         <span
           className={`profile-row-meta${conflict && status.state !== "failed" ? " warn" : ""}`}
@@ -134,9 +149,15 @@ export default function ProfileRow({
       <ToggleSwitch
         checked={status.state === "running"}
         onChange={onToggle}
-        disabled={isBusy}
+        disabled={
+          isBusy || (status.state !== "running" && !!connectLockedTitle)
+        }
         busy={isBusy}
-        title={status.state === "running" ? t("common.disconnect") : t("common.connect")}
+        title={
+          status.state === "running"
+            ? t("common.disconnect")
+            : (connectLockedTitle ?? t("common.connect"))
+        }
       />
     </div>
   );

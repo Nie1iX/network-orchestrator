@@ -31,6 +31,9 @@ fn linux_leftover_owners(
         .iter()
         .rev()
         .filter(|entry| {
+            if crate::route_runtime::daemon_managed_owner(&entry.owner) {
+                return false;
+            }
             let tunnel = crate::route_runtime::TUNNEL_OWNER_PREFIXES
                 .iter()
                 .any(|prefix| entry.owner.starts_with(prefix));
@@ -577,6 +580,39 @@ mod tests {
                 "xray:xray-failed",
             ]
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_managed_owners_are_never_leftovers() {
+        use net_manager_core::daemon_protocol::{OwnedEntry, OwnedResource, OwnedState};
+
+        let route = || {
+            OwnedResource::Route(AppliedRoute {
+                destination: "10.99.0.0/16".parse().unwrap(),
+                interface_index: 5,
+                metric: 10,
+                gateway: None,
+                table: None,
+            })
+        };
+        let entry = |owner: &str, state: OwnedState| OwnedEntry {
+            owner: owner.into(),
+            state,
+            resources: vec![route()],
+        };
+        let entries = vec![
+            // A deferred intent spec is re-armed by the daemon — it is
+            // policy, not a lost profile, whatever its journal state is.
+            entry("intent:office", OwnedState::Applying),
+            entry("intent:active", OwnedState::Applied),
+            entry("cond:lan", OwnedState::Applied),
+            entry("manual", OwnedState::Applied),
+        ];
+
+        let leftovers = linux_leftover_owners(&entries, &[], &[], &[]);
+
+        assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
     }
 
     #[cfg(target_os = "linux")]

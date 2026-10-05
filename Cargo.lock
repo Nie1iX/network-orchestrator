@@ -2623,6 +2623,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tokio",
+ "webkit2gtk",
  "windows 0.58.0",
 ]
 
@@ -2747,6 +2748,7 @@ dependencies = [
  "ipnet",
  "libc",
  "net-manager-core",
+ "netlink-packet-core",
  "netlink-packet-route",
  "netlink-sys",
  "rtnetlink",

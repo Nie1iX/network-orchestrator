@@ -1,11 +1,17 @@
 #!/bin/sh
 # Build the Network Orchestrator daemon in release mode and install it as a
-# systemd service, together with its polkit policy.
+# SECOND systemd service (network-orchestrator-dev.service) next to the
+# packaged one.
 #
-# This is a LOCAL DEV convenience, not a packaging story: a real Linux
-# package installs the same files, but the binary goes to /usr/bin
-# (the path in packaging/linux/network-orchestrator.service). Here it goes
-# to /usr/local/bin and ExecStart is rewritten to match.
+# The dev instance is fully isolated from the production daemon:
+#   socket      /run/network-orchestrator-dev/daemon.sock   (not .../daemon.sock)
+#   state dir   /var/lib/network-orchestrator-dev           (journal, always-on)
+#   runtime dir /run/network-orchestrator-dev               (staging, mgmt socks)
+#   binary      /usr/local/bin/network-orchestrator-daemon  (package uses /usr/bin)
+#
+# Point the dev app at it with `npm run dev:app` — it sets
+# NETWORK_ORCHESTRATOR_SOCKET and a dev Tauri identifier (separate
+# ~/.local/share data dir, "(Dev)" window title).
 #
 # Usage:
 #   scripts/install-linux-daemon-dev.sh              build, install, (re)start
@@ -16,17 +22,19 @@
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-UNIT_NAME="network-orchestrator.service"
-UNIT_SRC="$REPO_ROOT/packaging/linux/$UNIT_NAME"
+UNIT_NAME="network-orchestrator-dev.service"
+UNIT_SRC="$REPO_ROOT/packaging/linux/network-orchestrator.service"
 UNIT_DST="/etc/systemd/system/$UNIT_NAME"
 TMPFILES_SRC="$REPO_ROOT/packaging/linux/tmpfiles.conf"
 TMPFILES_DST="/usr/lib/tmpfiles.d/network-orchestrator.conf"
 POLICY_SRC="$REPO_ROOT/packaging/linux/com.netmanager.app.policy"
 POLICY_DST="/usr/share/polkit-1/actions/com.netmanager.app.policy"
+PROD_UNIT_DST="/etc/systemd/system/network-orchestrator.service"
 DAEMON_DIR="/usr/local/bin"
 DAEMON_PATH="$DAEMON_DIR/network-orchestrator-daemon"
 OLD_DAEMON_PATH="/usr/local/lib/network-orchestrator/network-orchestrator-daemon"
-STATE_DIR="/var/lib/network-orchestrator"
+STATE_DIR="/var/lib/network-orchestrator-dev"
+RUNTIME_DIR="/run/network-orchestrator-dev"
 PACKAGE_DIR="/usr/lib/network-orchestrator"
 OLD_HELPER_PATH="/usr/local/libexec/network-orchestrator/linux-helper"
 OLD_POLICY_PATH="/usr/share/polkit-1/actions/com.netmanager.app.linux-helper.policy"
@@ -44,14 +52,21 @@ uninstall() {
     echo "==> Stopping and disabling $UNIT_NAME (requires root)"
     sudo systemctl disable --now "$UNIT_NAME" 2>/dev/null || true
 
-    echo "==> Removing unit, binary, policy and state (requires root)"
-    sudo rm -f "$UNIT_DST" "$DAEMON_PATH" "$POLICY_DST" "$TMPFILES_DST"
+    echo "==> Removing dev unit, binary and state (requires root)"
+    sudo rm -f "$UNIT_DST" "$DAEMON_PATH"
     remove_old_helper
     sudo rmdir "$(dirname "$OLD_DAEMON_PATH")" 2>/dev/null || true
-    sudo rm -rf "$STATE_DIR" "$PACKAGE_DIR"
+    sudo rm -rf "$STATE_DIR"
+
+    # tmpfiles/polkit policy are shared with the packaged install; drop them
+    # only when the production unit is absent.
+    if [ ! -e "$PROD_UNIT_DST" ]; then
+        sudo rm -f "$POLICY_DST" "$TMPFILES_DST"
+        sudo rm -rf "$PACKAGE_DIR"
+    fi
     sudo systemctl daemon-reload
 
-    echo "Done: daemon uninstalled."
+    echo "Done: dev daemon uninstalled."
 }
 
 case "${1:-}" in
@@ -66,6 +81,21 @@ case "${1:-}" in
         ;;
 esac
 
+# Earlier revisions installed the dev build under the production unit name
+# (network-orchestrator.service, ExecStart=/usr/local/bin/...). Migrate: a
+# unit whose ExecStart points at the dev binary was dev-installed — stop it,
+# free the production slot, and keep its journal/always-on state for the
+# dev instance.
+if [ -f "$PROD_UNIT_DST" ] && grep -qx "ExecStart=$DAEMON_PATH.*" "$PROD_UNIT_DST"; then
+    echo "==> Migrating dev install out of the production unit slot"
+    sudo systemctl disable --now network-orchestrator.service 2>/dev/null || true
+    sudo rm -f "$PROD_UNIT_DST"
+    if [ -d /var/lib/network-orchestrator ] && [ ! -d "$STATE_DIR" ]; then
+        sudo mv /var/lib/network-orchestrator "$STATE_DIR"
+    fi
+    sudo systemctl daemon-reload
+fi
+
 echo "==> Building network-orchestrator-daemon (release)"
 (cd "$REPO_ROOT" && cargo build --release -p network-orchestrator-daemon)
 
@@ -79,22 +109,34 @@ echo "==> Installing daemon to $DAEMON_PATH (requires root)"
 sudo install -d -m 0755 "$DAEMON_DIR"
 sudo install -m 0755 "$BUILT_BIN" "$DAEMON_PATH"
 
-echo "==> Installing unit to $UNIT_DST (requires root)"
+echo "==> Generating dev unit from $UNIT_SRC (requires root)"
 UNIT_TMP="$(mktemp)"
 trap 'rm -f "$UNIT_TMP"' EXIT
-sed "s|^ExecStart=/usr/bin/network-orchestrator-daemon\$|ExecStart=$DAEMON_PATH|" \
+sed \
+    -e "s|^Description=.*|Description=Network Orchestrator privileged daemon (dev instance)|" \
+    -e "s|^ExecStart=.*|ExecStart=$DAEMON_PATH --socket $RUNTIME_DIR/daemon.sock --state-dir $STATE_DIR|" \
+    -e "s|^RuntimeDirectory=.*|RuntimeDirectory=network-orchestrator-dev|" \
+    -e "s|^StateDirectory=.*|StateDirectory=network-orchestrator-dev|" \
+    -e "/^UMask=0077$/a Environment=NETWORK_ORCHESTRATOR_RUNTIME_DIR=$RUNTIME_DIR" \
     "$UNIT_SRC" >"$UNIT_TMP"
-if ! grep -qx "ExecStart=$DAEMON_PATH" "$UNIT_TMP"; then
-    echo "error: failed to rewrite ExecStart in $UNIT_SRC" >&2
-    exit 1
-fi
+for needle in \
+    "ExecStart=$DAEMON_PATH --socket $RUNTIME_DIR/daemon.sock --state-dir $STATE_DIR" \
+    "RuntimeDirectory=network-orchestrator-dev" \
+    "StateDirectory=network-orchestrator-dev" \
+    "Environment=NETWORK_ORCHESTRATOR_RUNTIME_DIR=$RUNTIME_DIR"; do
+    if ! grep -qx "$needle" "$UNIT_TMP"; then
+        echo "error: failed to generate dev unit (missing: $needle)" >&2
+        exit 1
+    fi
+done
 sudo install -m 0644 "$UNIT_TMP" "$UNIT_DST"
 
 echo "==> Installing polkit policy to $POLICY_DST (requires root)"
 sudo install -m 0644 "$POLICY_SRC" "$POLICY_DST"
 
 # The managed package root must exist before the service starts:
-# ReadWritePaths is ignored for paths that do not exist yet.
+# ReadWritePaths is ignored for paths that do not exist yet. Shared with
+# the production install — both instances verify the same pinned content.
 echo "==> Installing tmpfiles config to $TMPFILES_DST (requires root)"
 sudo install -m 0644 "$TMPFILES_SRC" "$TMPFILES_DST"
 sudo systemd-tmpfiles --create "$(basename "$TMPFILES_DST")"
@@ -112,12 +154,17 @@ fi
 
 cat <<EOF
 
-Done.
+Done — dev daemon is isolated from any packaged install.
 
   Daemon:  $DAEMON_PATH
   Unit:    $UNIT_DST
-  Policy:  $POLICY_DST
+  Socket:  $RUNTIME_DIR/daemon.sock
   State:   $STATE_DIR
+  Policy:  $POLICY_DST (shared with production)
+
+Run the dev app against it with:
+
+  npm run dev:app
 
 Check status with:
   systemctl status $UNIT_NAME

@@ -3,7 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation, requiresElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
-import { useProfileListMode } from "../prefs";
+import {
+  useAppMode,
+  useProfileListMode,
+  useScanLocalProxies,
+} from "../prefs";
 import { providerPrefix } from "../subscriptions";
 import { popupNativeMenu, MenuEntry } from "../nativeMenu";
 import { useT } from "../i18n";
@@ -14,8 +18,11 @@ import {
   ChevronIcon,
   InfoIcon,
   kindIcon,
+  LoopbackIcon,
+  NetworkIcon,
   PlusIcon,
   TailscaleIcon,
+  VpnIcon,
 } from "../icons";
 
 import AddConnectionMenu from "./AddConnectionMenu";
@@ -36,6 +43,8 @@ import {
 } from "./profiles/sets";
 import Skeleton from "./ui/Skeleton";
 import ExternalTunnelPanel from "./ExternalTunnelPanel";
+import LocalProxyPanel from "./LocalProxyPanel";
+import NmConnectionPanel from "./NmConnectionPanel";
 import TailscalePanel from "./TailscalePanel";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import { useToast } from "./ui/Toast";
@@ -49,7 +58,11 @@ import {
   AlwaysOnListResult,
   AlwaysOnSetResult,
   BatchImportResult,
+  LocalProxy,
   NetworkInterface,
+  NmConnection,
+  NmConnectionKind,
+  NmListResult,
   Profile,
   ProfileDiagnostics,
   ProfileInspection,
@@ -65,6 +78,30 @@ const COLLAPSED_GROUPS_KEY = "netmanager.connections.collapsedGroups";
 const LIST_WIDTH_KEY = "netmanager.profiles.listWidth";
 const LIST_WIDTH_MIN = 220;
 const LIST_WIDTH_MAX = 720;
+
+function nmAvatarClass(kind: NmConnectionKind): string {
+  switch (kind) {
+    case "wireGuard":
+      return "backend-avatar-wireGuard";
+    case "openVpn":
+      return "backend-avatar-openVpn";
+    default:
+      return "backend-avatar-service";
+  }
+}
+
+function nmIcon(kind: NmConnectionKind): React.ReactElement {
+  switch (kind) {
+    case "wireGuard":
+      return backendIcon("wireGuard", 14);
+    case "openVpn":
+      return backendIcon("openVpn", 14);
+    case "vpn":
+      return <VpnIcon size={14} />;
+    default:
+      return <NetworkIcon size={14} />;
+  }
+}
 
 function clampListWidth(w: number): number {
   return Math.min(LIST_WIDTH_MAX, Math.max(LIST_WIDTH_MIN, Math.round(w)));
@@ -138,6 +175,9 @@ export default function ProfileManager() {
   const toast = useToast();
   const t = useT();
   const listMode = useProfileListMode();
+  const appMode = useAppMode();
+  const canManage = appMode !== "orchestrator";
+  const canOrchestrate = appMode !== "manager";
   const [profiles, setProfiles] = useState<Profile[]>(
     listCache?.profiles ?? [],
   );
@@ -192,6 +232,8 @@ export default function ProfileManager() {
   >({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [externalName, setExternalName] = useState<string | null>(null);
+  const [nmSelected, setNmSelected] = useState<string | null>(null);
+  const [proxySelected, setProxySelected] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<TunnelBackend>>(
     loadCollapsedGroups,
   );
@@ -470,6 +512,8 @@ export default function ProfileManager() {
   }, [refreshTailscale]);
 
   const [externalBusy, setExternalBusy] = useState<string | null>(null);
+  const [nm, setNm] = useState<NmListResult | null>(null);
+  const [nmBusy, setNmBusy] = useState<string | null>(null);
   // "Off" stops a foreign tunnel for real (wg-quick unit stop / netdev
   // delete / TUN admin-down via the daemon, polkit-gated). "On" only exists
   // for a foreign TUN we downed — WG devices are gone after a stop.
@@ -503,6 +547,73 @@ export default function ProfileManager() {
       toast("error", String(err));
     } finally {
       setTailscaleBusy(false);
+    }
+  };
+
+  const refreshNm = useCallback(async () => {
+    if (caps?.os !== "linux" || !canOrchestrate) {
+      setNm(null);
+      return;
+    }
+    try {
+      setNm(await invoke<NmListResult>("nm_list_connections"));
+    } catch {
+      setNm(null);
+    }
+  }, [caps?.os, canOrchestrate]);
+
+  useEffect(() => {
+    void refreshNm();
+    const onChanged = () => void refreshNm();
+    window.addEventListener("route-changed", onChanged);
+    const interval = setInterval(() => void refreshNm(), 15000);
+    return () => {
+      window.removeEventListener("route-changed", onChanged);
+      clearInterval(interval);
+    };
+  }, [refreshNm]);
+
+  // Opt-in localhost proxy discovery: real SOCKS/HTTP handshake probes,
+  // listed as suggestions only — nothing is routed through them.
+  const scanLocalProxies = useScanLocalProxies();
+  const [proxies, setProxies] = useState<LocalProxy[]>([]);
+  const refreshProxies = useCallback(async () => {
+    if (!scanLocalProxies || caps?.os !== "linux") {
+      setProxies([]);
+      return;
+    }
+    try {
+      setProxies(await invoke<LocalProxy[]>("scan_local_proxies"));
+    } catch {
+      setProxies([]);
+    }
+  }, [scanLocalProxies, caps?.os]);
+
+  useEffect(() => {
+    void refreshProxies();
+    const onChanged = () => void refreshProxies();
+    window.addEventListener("route-changed", onChanged);
+    const interval = setInterval(() => void refreshProxies(), 15000);
+    return () => {
+      window.removeEventListener("route-changed", onChanged);
+      clearInterval(interval);
+    };
+  }, [refreshProxies]);
+
+  // NM owns the profile lifecycle; we only ask it to activate/deactivate.
+  const onToggleNm = async (conn: NmConnection) => {
+    setNmBusy(conn.uuid);
+    try {
+      if (!(await ensureElevation(t("iface.elevationState")))) return;
+      await invoke("nm_set_active", {
+        uuid: conn.uuid,
+        active: conn.state === "inactive",
+      });
+      await refreshNm();
+    } catch (err) {
+      toast("error", String(err));
+    } finally {
+      setNmBusy(null);
     }
   };
 
@@ -659,7 +770,15 @@ export default function ProfileManager() {
     }
   };
 
+  /** Orchestrator mode never starts a managed backend; only route-only
+   * ("none") profiles may connect. */
+  const connectLockedTitle = (profile: Profile): string | null =>
+    !canManage && profile.backend !== "none"
+      ? t("profiles.modeManagedOnly")
+      : null;
+
   const onConnect = async (profile: Profile) => {
+    if (connectLockedTitle(profile)) return;
     if (requiresElevation(profile)) {
       try {
         if (!(await ensureElevation(t("profiles.connecting", { name: profile.name })))) return;
@@ -1184,21 +1303,29 @@ export default function ProfileManager() {
   const isTailscaleIface = (i: NetworkInterface) =>
     i.name.toLowerCase().startsWith("tailscale") ||
     (typeof i.kind === "object" && i.kind.other === "Tailscale");
-  const isTunnelIface = (i: NetworkInterface) =>
-    typeof i.kind === "string"
-      ? i.kind === "wireGuard" || i.kind === "openVpn" || i.kind === "xray"
-      : i.kind.other === "TUN";
+  const isTunnelIface = (i: NetworkInterface) => i.category === "vpn";
   const managedIfaces = new Set(
     profiles
       .filter((p) => statusFor(p.id).state === "running")
-      .flatMap((p) => [p.interfaceName]),
+      .flatMap((p) => [p.interfaceName, statusFor(p.id).interfaceName ?? ""])
+      .filter((name) => name !== ""),
+  );
+  // Interfaces already owned by a NetworkManager connection live in the NM
+  // group — showing them under "detected" too would list the same tunnel
+  // twice.
+  const nmIfaces = new Set(
+    (nm?.connections ?? [])
+      .map((c) => c.interfaceName)
+      .filter((n): n is string => n !== null),
   );
   const externalTunnels = interfaces.filter(
     (i) =>
       isTunnelIface(i) &&
       !isTailscaleIface(i) &&
       !managedIfaces.has(i.name) &&
-      !managedIfaces.has(i.friendlyName),
+      !managedIfaces.has(i.friendlyName) &&
+      !nmIfaces.has(i.name) &&
+      !nmIfaces.has(i.friendlyName),
   );
   const externalNames = new Set(
     externalTunnels.flatMap((i) => [i.name, i.friendlyName]),
@@ -1217,6 +1344,10 @@ export default function ProfileManager() {
   );
   const externalSelected =
     externalTunnels.find((i) => i.name === externalName) ?? null;
+  const nmSelectedConn =
+    nm?.connections.find((c) => c.uuid === nmSelected) ?? null;
+  const proxySelectedObj =
+    proxies.find((p) => `${p.address}:${p.port}` === proxySelected) ?? null;
 
   const tsRunning =
     tailscale !== null &&
@@ -1271,7 +1402,7 @@ export default function ProfileManager() {
         label: running ? t("common.disconnect") : t("common.connect"),
         onClick: () =>
           running ? void onDisconnect(p) : void onConnect(p),
-        disabled: busy.has(p.id),
+        disabled: busy.has(p.id) || (!running && connectLockedTitle(p) !== null),
       },
       {
         label: t("common.edit"),
@@ -1352,6 +1483,7 @@ export default function ProfileManager() {
         isBusy={isBusy}
         serverName={serverName}
         conflict={ifaceConflictIds.has(profile.id)}
+        connectLockedTitle={connectLockedTitle(profile)}
         selected={externalName === null && selected?.id === profile.id}
         dragging={dragState?.profileId === profile.id}
         showBackendBadge={group === null}
@@ -1365,6 +1497,8 @@ export default function ProfileManager() {
         onSelect={() => {
           setServiceSelected(false);
           setExternalName(null);
+          setNmSelected(null);
+          setProxySelected(null);
           setSelectedId(profile.id);
         }}
         onToggle={() =>
@@ -1376,6 +1510,8 @@ export default function ProfileManager() {
           e.preventDefault();
           setServiceSelected(false);
           setExternalName(null);
+          setNmSelected(null);
+          setProxySelected(null);
           setSelectedId(profile.id);
           const items = profileMenuItems(profile);
           void popupNativeMenu(items, e.clientX, e.clientY).then(
@@ -1520,6 +1656,8 @@ export default function ProfileManager() {
               if (!id) return;
               setServiceSelected(false);
               setExternalName(null);
+              setNmSelected(null);
+              setProxySelected(null);
               setSelectedId(id);
               document
                 .querySelector(`[data-profile-id="${id}"]`)
@@ -1595,6 +1733,8 @@ export default function ProfileManager() {
               className={`profile-row${serviceSelected ? " selected" : ""}`}
               onClick={() => {
                 setExternalName(null);
+                setNmSelected(null);
+                setProxySelected(null);
                 setServiceSelected(true);
               }}
               onKeyDown={(e) => {
@@ -1602,6 +1742,8 @@ export default function ProfileManager() {
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
                   setExternalName(null);
+                  setNmSelected(null);
+                  setProxySelected(null);
                   setServiceSelected(true);
                 }
               }}
@@ -1656,6 +1798,8 @@ export default function ProfileManager() {
                 onClick={() => {
                   setServiceSelected(false);
                   setSelectedId(null);
+                  setNmSelected(null);
+                  setProxySelected(null);
                   setExternalName(iface.name);
                 }}
                 onKeyDown={(e) => {
@@ -1664,6 +1808,8 @@ export default function ProfileManager() {
                     e.preventDefault();
                     setServiceSelected(false);
                     setSelectedId(null);
+                    setNmSelected(null);
+                    setProxySelected(null);
                     setExternalName(iface.name);
                   }
                 }}
@@ -1698,6 +1844,132 @@ export default function ProfileManager() {
           </div>
         </div>
       )}
+
+      {nm !== null && (nm.connections.length > 0 || !nm.available) && (
+        <div className="profile-group">
+          <div className="profile-group-label">{t("profiles.nmGroup")}</div>
+          {!nm.available ? (
+            <p className="external-note">{t("profiles.nmUnavailable")}</p>
+          ) : (
+            <div className="profile-rows">
+              {nm.connections.map((conn) => (
+                <div
+                  key={conn.uuid}
+                  role="button"
+                  tabIndex={0}
+                  className={`profile-row profile-row-external${
+                    nmSelected === conn.uuid ? " selected" : ""
+                  }`}
+                  onClick={() => {
+                    setServiceSelected(false);
+                    setSelectedId(null);
+                    setExternalName(null);
+                    setNmSelected(conn.uuid);
+                    setProxySelected(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setServiceSelected(false);
+                      setSelectedId(null);
+                      setExternalName(null);
+                      setNmSelected(conn.uuid);
+                      setProxySelected(null);
+                    }
+                  }}
+                >
+                  <span
+                    className={`status-dot state-${
+                      conn.state === "active" ? "running" : "stopped"
+                    }`}
+                  />
+                  <span
+                    className={`backend-avatar ${nmAvatarClass(conn.kind)}`}
+                  >
+                    {nmIcon(conn.kind)}
+                  </span>
+                  <span className="profile-row-name">{conn.id}</span>
+                  {conn.interfaceName && (
+                    <span className="profile-row-server">
+                      · {conn.interfaceName}
+                    </span>
+                  )}
+                  <span className="badge badge-external">
+                    {t("detail.external")}
+                  </span>
+                  {(conn.kind === "vpn" || conn.kind === "other") && (
+                    <span className="badge badge-managed">{conn.kind}</span>
+                  )}
+                  <ToggleSwitch
+                    checked={conn.state !== "inactive"}
+                    onChange={() => void onToggleNm(conn)}
+                    disabled={
+                      nmBusy === conn.uuid || conn.state === "activating"
+                    }
+                    busy={
+                      nmBusy === conn.uuid || conn.state === "activating"
+                    }
+                    title={
+                      conn.state === "active"
+                        ? t("common.disconnect")
+                        : t("common.connect")
+                    }
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {scanLocalProxies && proxies.length > 0 && (
+        <div className="profile-group">
+          <div className="profile-group-label">
+            {t("profiles.localProxies")}
+          </div>
+          <div className="profile-rows">
+            {proxies.map((p) => {
+              const key = `${p.address}:${p.port}`;
+              const select = () => {
+                setServiceSelected(false);
+                setSelectedId(null);
+                setExternalName(null);
+                setNmSelected(null);
+                setProxySelected(key);
+              };
+              return (
+                <div
+                  key={key}
+                  role="button"
+                  tabIndex={0}
+                  className={`profile-row profile-row-external${
+                    proxySelected === key ? " selected" : ""
+                  }`}
+                  onClick={select}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      select();
+                    }
+                  }}
+                >
+                  <span className="status-dot state-running" />
+                  <span className="backend-avatar backend-avatar-service">
+                    <LoopbackIcon size={14} />
+                  </span>
+                  <span className="profile-row-name">
+                    {p.address}:{p.port}
+                  </span>
+                  <span className="badge badge-external">{p.kind}</span>
+                </div>
+              );
+            })}
+          </div>
+          <p className="external-note">{t("profiles.localProxiesHint")}</p>
+        </div>
+      )}
         </div>
 
         <div {...splitterProps} />
@@ -1710,6 +1982,16 @@ export default function ProfileManager() {
               busy={externalBusy === externalSelected.name}
               onToggle={() => void onToggleExternal(externalSelected)}
             />
+          ) : nmSelectedConn ? (
+            <NmConnectionPanel
+              conn={nmSelectedConn}
+              busy={nmBusy === nmSelectedConn.uuid}
+              onToggle={() => void onToggleNm(nmSelectedConn)}
+              avatarClass={nmAvatarClass(nmSelectedConn.kind)}
+              icon={nmIcon(nmSelectedConn.kind)}
+            />
+          ) : proxySelectedObj ? (
+            <LocalProxyPanel proxy={proxySelectedObj} />
           ) : serviceSelected && tailscale ? (
             <TailscalePanel
               status={tailscale}
@@ -1825,6 +2107,7 @@ export default function ProfileManager() {
         onClose={() => setAddMenuOpen(false)}
         onChooseImport={handleChooseImport}
         onChooseBackend={handleChooseBackend}
+        allowManaged={canManage}
       />
 
       {ctxMenu && (

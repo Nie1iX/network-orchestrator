@@ -4,23 +4,31 @@
 
 use crate::cond_rules::{IfaceAddr, NetworkObservation};
 use crate::core::{ExternalLinkKind, LinkExecutor, PolicyRuleExecutor, WgSystem};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use ipnet::IpNet;
-use net_manager_core::daemon_protocol::{IpFamily, OwnedRuleResource};
+use net_manager_core::daemon_protocol::{
+    IpFamily, NetTablesResult, OwnedRuleResource, RouteLookup, SystemNexthop, SystemRoute,
+    SystemRule,
+};
 use net_manager_core::models::AppliedRoute;
 use net_manager_core::policy::RouteExecutor;
+use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_REQUEST};
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
 use netlink_packet_route::link::{InfoKind, LinkAttribute, LinkFlag, LinkInfo, LinkMessage};
 use netlink_packet_route::route::{
-    RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteProtocol, RouteScope, RouteType,
+    RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteNextHop, RouteProtocol,
+    RouteScope, RouteType,
 };
-use netlink_packet_route::rule::{RuleAction, RuleAttribute, RuleFlag, RuleMessage};
-use netlink_packet_route::AddressFamily;
+use netlink_packet_route::rule::{
+    RuleAction, RuleAttribute, RuleFlag, RuleMessage, RulePortRange, RuleUidRange,
+};
+use netlink_packet_route::{AddressFamily, IpProtocol, RouteNetlinkMessage};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
 use std::net::IpAddr;
 use std::sync::mpsc;
+use std::time::Duration;
 use tokio::sync::mpsc as async_mpsc;
 
 /// `RTPROT` stamped on every route the daemon installs; deletes filter on
@@ -162,6 +170,40 @@ fn owned_route_snapshot(message: &RouteMessage) -> Option<AppliedRoute> {
     })
 }
 
+/// A connected main-table subnet: unicast, carries an output interface, no
+/// gateway — i.e. an on-link network. Returns `(interface, destination)`.
+fn on_link_network(message: &RouteMessage) -> Option<(u32, IpNet)> {
+    if message.header.kind != RouteType::Unicast
+        || message.header.destination_prefix_length == 0
+        || route_table(message) != RouteHeader::RT_TABLE_MAIN as u32
+        || message
+            .attributes
+            .iter()
+            .any(|attribute| matches!(attribute, RouteAttribute::Gateway(_)))
+    {
+        return None;
+    }
+    let destination = message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Destination(RouteAddress::Inet(address)) => Some(IpAddr::V4(*address)),
+            RouteAttribute::Destination(RouteAddress::Inet6(address)) => Some(IpAddr::V6(*address)),
+            _ => None,
+        })?;
+    let interface = message
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Oif(index) => Some(*index),
+            _ => None,
+        })?;
+    let destination = IpNet::new(destination, message.header.destination_prefix_length)
+        .ok()?
+        .trunc();
+    Some((interface, destination))
+}
+
 /// A main-table default route carrying a gateway and an output interface —
 /// i.e. the physical uplink. Tunnel-carrying routes live in policy tables or
 /// lack a gateway, so they are naturally excluded.
@@ -281,6 +323,489 @@ fn route_table(message: &RouteMessage) -> u32 {
             _ => None,
         })
         .unwrap_or(message.header.table as u32)
+}
+
+fn route_kind_name(kind: RouteType) -> String {
+    match kind {
+        RouteType::Unspec => "unspec".into(),
+        RouteType::Unicast => "unicast".into(),
+        RouteType::Local => "local".into(),
+        RouteType::Broadcast => "broadcast".into(),
+        RouteType::Anycast => "anycast".into(),
+        RouteType::Multicast => "multicast".into(),
+        RouteType::BlackHole => "blackhole".into(),
+        RouteType::Unreachable => "unreachable".into(),
+        RouteType::Prohibit => "prohibit".into(),
+        RouteType::Throw => "throw".into(),
+        RouteType::Nat => "nat".into(),
+        RouteType::ExternalResolve => "xresolve".into(),
+        RouteType::Other(code) => format!("type {code}"),
+        _ => format!("{:?}", kind).to_lowercase(),
+    }
+}
+
+fn route_scope_name(scope: RouteScope) -> String {
+    match scope {
+        RouteScope::Universe => "universe".into(),
+        RouteScope::Site => "site".into(),
+        RouteScope::Link => "link".into(),
+        RouteScope::Host => "host".into(),
+        RouteScope::NoWhere => "nowhere".into(),
+        RouteScope::Other(code) => format!("scope {code}"),
+        _ => format!("{:?}", scope).to_lowercase(),
+    }
+}
+
+fn rule_action_name(action: RuleAction) -> String {
+    match action {
+        RuleAction::ToTable => "lookup".into(),
+        RuleAction::Goto => "goto".into(),
+        RuleAction::Nop => "nop".into(),
+        RuleAction::Blackhole => "blackhole".into(),
+        RuleAction::Unreachable => "unreachable".into(),
+        RuleAction::Prohibit => "prohibit".into(),
+        RuleAction::Unspec => "unspec".into(),
+        RuleAction::Other(code) => format!("type {code}"),
+        _ => format!("{:?}", action).to_lowercase(),
+    }
+}
+
+fn ip_protocol_name(protocol: IpProtocol) -> String {
+    match i32::from(protocol) {
+        1 => "icmp".into(),
+        6 => "tcp".into(),
+        17 => "udp".into(),
+        58 => "icmpv6".into(),
+        132 => "sctp".into(),
+        other => other.to_string(),
+    }
+}
+
+fn rule_selector(message: &RuleMessage, is_source: bool) -> Option<IpNet> {
+    let (address, length) = if is_source {
+        (
+            message.attributes.iter().find_map(|attr| match attr {
+                RuleAttribute::Source(address) => Some(*address),
+                _ => None,
+            }),
+            message.header.src_len,
+        )
+    } else {
+        (
+            message.attributes.iter().find_map(|attr| match attr {
+                RuleAttribute::Destination(address) => Some(*address),
+                _ => None,
+            }),
+            message.header.dst_len,
+        )
+    };
+    let address = match address {
+        Some(address) => address,
+        // `ip rule` omits the selector entirely when the prefix length is
+        // zero — a "from all" rule reports no FRA_SRC.
+        None if length == 0 => return None,
+        None => match message.header.family {
+            AddressFamily::Inet => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            AddressFamily::Inet6 => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            _ => return None,
+        },
+    };
+    IpNet::new(address, length).ok().map(|net| net.trunc())
+}
+
+/// A `RouteMessage` rendered for the net.tables view. Routes without a
+/// resolvable family are skipped.
+fn system_route(message: &RouteMessage, names: &HashMap<u32, String>) -> Option<SystemRoute> {
+    let family = match message.header.address_family {
+        AddressFamily::Inet => IpFamily::Ipv4,
+        AddressFamily::Inet6 => IpFamily::Ipv6,
+        _ => return None,
+    };
+    let address = |addr: &RouteAddress| -> Option<IpAddr> {
+        match addr {
+            RouteAddress::Inet(address) => Some(IpAddr::V4(*address)),
+            RouteAddress::Inet6(address) => Some(IpAddr::V6(*address)),
+            _ => None,
+        }
+    };
+    let find_address = |wanted: fn(&RouteAttribute) -> Option<&RouteAddress>| {
+        message
+            .attributes
+            .iter()
+            .find_map(|attr| wanted(attr).and_then(address))
+    };
+    let destination = find_address(|attr| match attr {
+        RouteAttribute::Destination(address) => Some(address),
+        _ => None,
+    })
+    .or_else(|| {
+        if message.header.destination_prefix_length != 0 {
+            return None;
+        }
+        match message.header.address_family {
+            AddressFamily::Inet => Some(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            AddressFamily::Inet6 => Some(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+            _ => None,
+        }
+    })
+    .and_then(|addr| IpNet::new(addr, message.header.destination_prefix_length).ok())
+    .map(|net| net.trunc())?;
+    let interface_index = message.attributes.iter().find_map(|attr| match attr {
+        RouteAttribute::Oif(index) => Some(*index),
+        _ => None,
+    });
+    let protocol = u8::from(message.header.protocol);
+    let nexthops = message
+        .attributes
+        .iter()
+        .find_map(|attr| match attr {
+            RouteAttribute::MultiPath(hops) => Some(hops),
+            _ => None,
+        })
+        .map(|hops| {
+            hops.iter()
+                .map(|hop| {
+                    let gateway = hop.attributes.iter().find_map(|attr| match attr {
+                        RouteAttribute::Gateway(gw) => address(gw),
+                        _ => None,
+                    });
+                    SystemNexthop {
+                        gateway,
+                        interface_index: hop.interface_index,
+                        interface_name: names.get(&hop.interface_index).cloned(),
+                        weight: hop.hops,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(SystemRoute {
+        family,
+        destination,
+        table: route_table(message),
+        kind: route_kind_name(message.header.kind),
+        scope: route_scope_name(message.header.scope),
+        protocol,
+        managed: protocol == RTPROT_NETWORK_ORCHESTRATOR,
+        gateway: find_address(|attr| match attr {
+            RouteAttribute::Gateway(address) => Some(address),
+            _ => None,
+        }),
+        interface_index,
+        interface_name: interface_index.and_then(|index| names.get(&index).cloned()),
+        metric: message.attributes.iter().find_map(|attr| match attr {
+            RouteAttribute::Priority(metric) => Some(*metric),
+            _ => None,
+        }),
+        pref_source: find_address(|attr| match attr {
+            RouteAttribute::PrefSource(address) => Some(address),
+            _ => None,
+        }),
+        nexthops,
+    })
+}
+
+/// A `RuleMessage` rendered for the net.tables view — every selector the
+/// kernel reports, not only the fields the daemon mutates itself.
+fn system_rule(message: &RuleMessage) -> SystemRule {
+    let protocol = message
+        .attributes
+        .iter()
+        .find_map(|attr| match attr {
+            RuleAttribute::Protocol(value) => Some(u8::from(*value)),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let find =
+        |wanted: fn(&RuleAttribute) -> Option<u32>| message.attributes.iter().find_map(wanted);
+    SystemRule {
+        family: if message.header.family == AddressFamily::Inet6 {
+            IpFamily::Ipv6
+        } else {
+            IpFamily::Ipv4
+        },
+        priority: rule_priority(message).unwrap_or(0),
+        action: rule_action_name(message.header.action),
+        table: rule_table(message),
+        goto: find(|attr| match attr {
+            RuleAttribute::Goto(value) => Some(*value),
+            _ => None,
+        }),
+        from: rule_selector(message, true),
+        to: rule_selector(message, false),
+        fwmark: find(|attr| match attr {
+            RuleAttribute::FwMark(value) => Some(*value),
+            _ => None,
+        }),
+        fwmask: find(|attr| match attr {
+            RuleAttribute::FwMask(value) => Some(*value),
+            _ => None,
+        }),
+        iifname: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::Iifname(name) => Some(name.clone()),
+            _ => None,
+        }),
+        oifname: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::Oifname(name) => Some(name.clone()),
+            _ => None,
+        }),
+        uid_range: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::UidRange(range) => Some([range.start, range.end]),
+            _ => None,
+        }),
+        source_port_range: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::SourcePortRange(range) => Some([range.start, range.end]),
+            _ => None,
+        }),
+        destination_port_range: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::DestinationPortRange(range) => Some([range.start, range.end]),
+            _ => None,
+        }),
+        ip_protocol: message.attributes.iter().find_map(|attr| match attr {
+            RuleAttribute::IpProtocol(protocol) => Some(ip_protocol_name(*protocol)),
+            _ => None,
+        }),
+        suppress_prefix_length: find(|attr| match attr {
+            RuleAttribute::SuppressPrefixLen(value) if *value != u32::MAX => Some(*value),
+            _ => None,
+        }),
+        suppress_if_group: find(|attr| match attr {
+            RuleAttribute::SuppressIfGroup(value) if *value != u32::MAX => Some(*value),
+            _ => None,
+        }),
+        tun_id: find(|attr| match attr {
+            RuleAttribute::TunId(value) => Some(*value),
+            _ => None,
+        }),
+        tos: message.header.tos,
+        invert: message.header.flags.contains(&RuleFlag::Invert),
+        protocol,
+        managed: protocol == RTPROT_NETWORK_ORCHESTRATOR,
+    }
+}
+
+fn route_kind_value(name: &str) -> RouteType {
+    match name {
+        "unicast" => RouteType::Unicast,
+        "local" => RouteType::Local,
+        "broadcast" => RouteType::Broadcast,
+        "anycast" => RouteType::Anycast,
+        "multicast" => RouteType::Multicast,
+        "blackhole" => RouteType::BlackHole,
+        "unreachable" => RouteType::Unreachable,
+        "prohibit" => RouteType::Prohibit,
+        "throw" => RouteType::Throw,
+        "nat" => RouteType::Nat,
+        "xresolve" => RouteType::ExternalResolve,
+        other => other
+            .strip_prefix("type ")
+            .and_then(|code| code.parse::<u8>().ok())
+            .map(RouteType::Other)
+            .unwrap_or(RouteType::Unspec),
+    }
+}
+
+fn route_scope_value(name: &str) -> RouteScope {
+    match name {
+        "universe" => RouteScope::Universe,
+        "site" => RouteScope::Site,
+        "link" => RouteScope::Link,
+        "host" => RouteScope::Host,
+        "nowhere" => RouteScope::NoWhere,
+        other => other
+            .strip_prefix("scope ")
+            .and_then(|code| code.parse::<u8>().ok())
+            .map(RouteScope::Other)
+            // `ip route del` matches on NoWhere — the wildcard scope.
+            .unwrap_or(RouteScope::NoWhere),
+    }
+}
+
+fn rule_action_value(name: &str) -> RuleAction {
+    match name {
+        "lookup" => RuleAction::ToTable,
+        "goto" => RuleAction::Goto,
+        "nop" => RuleAction::Nop,
+        "blackhole" => RuleAction::Blackhole,
+        "unreachable" => RuleAction::Unreachable,
+        "prohibit" => RuleAction::Prohibit,
+        "unspec" => RuleAction::Unspec,
+        other => other
+            .strip_prefix("type ")
+            .and_then(|code| code.parse::<u8>().ok())
+            .map(RuleAction::Other)
+            .unwrap_or(RuleAction::Unspec),
+    }
+}
+
+fn ip_protocol_value(name: &str) -> Option<IpProtocol> {
+    let code = match name {
+        "icmp" => 1,
+        "tcp" => 6,
+        "udp" => 17,
+        "icmpv6" => 58,
+        "sctp" => 132,
+        other => other.parse::<i32>().ok()?,
+    };
+    Some(IpProtocol::from(code))
+}
+
+fn route_address(ip: IpAddr) -> RouteAddress {
+    match ip {
+        IpAddr::V4(address) => RouteAddress::Inet(address),
+        IpAddr::V6(address) => RouteAddress::Inet6(address),
+    }
+}
+
+/// Rebuild the `RTM_*ROUTE` body from a dumped [`SystemRoute`]. Used for
+/// `net.route.del` (delete exactly what was reported) and for restoring a
+/// suppressed foreign route with its original protocol and attributes.
+fn system_route_message(route: &SystemRoute) -> RouteMessage {
+    let mut message = RouteMessage::default();
+    let header = &mut message.header;
+    header.address_family = match route.family {
+        IpFamily::Ipv4 => AddressFamily::Inet,
+        IpFamily::Ipv6 => AddressFamily::Inet6,
+    };
+    header.kind = route_kind_value(&route.kind);
+    header.scope = route_scope_value(&route.scope);
+    header.protocol = RouteProtocol::from(route.protocol);
+    header.destination_prefix_length = route.destination.prefix_len();
+    if route.table <= u8::MAX as u32 {
+        header.table = route.table as u8;
+    } else {
+        header.table = RouteHeader::RT_TABLE_UNSPEC;
+        message.attributes.push(RouteAttribute::Table(route.table));
+    }
+    if route.destination.prefix_len() != 0 {
+        message
+            .attributes
+            .push(RouteAttribute::Destination(route_address(
+                route.destination.addr(),
+            )));
+    }
+    if let Some(index) = route.interface_index {
+        message.attributes.push(RouteAttribute::Oif(index));
+    }
+    if let Some(metric) = route.metric {
+        message.attributes.push(RouteAttribute::Priority(metric));
+    }
+    if let Some(gateway) = route.gateway {
+        message
+            .attributes
+            .push(RouteAttribute::Gateway(route_address(gateway)));
+    }
+    if let Some(source) = route.pref_source {
+        message
+            .attributes
+            .push(RouteAttribute::PrefSource(route_address(source)));
+    }
+    if !route.nexthops.is_empty() {
+        let hops = route
+            .nexthops
+            .iter()
+            .map(|hop| {
+                let mut next = RouteNextHop::default();
+                next.interface_index = hop.interface_index;
+                next.hops = hop.weight;
+                if let Some(gateway) = hop.gateway {
+                    next.attributes
+                        .push(RouteAttribute::Gateway(route_address(gateway)));
+                }
+                next
+            })
+            .collect();
+        message.attributes.push(RouteAttribute::MultiPath(hops));
+    }
+    message
+}
+
+/// Rebuild the `RTM_*RULE` body from a dumped [`SystemRule`] — the exact
+/// inverse of [`system_rule`], including kernel sentinel defaults for
+/// suppressors. Used by `net.rule.del` and by suppression restore.
+fn system_rule_message(rule: &SystemRule) -> RuleMessage {
+    let mut message = RuleMessage::default();
+    message.header.family = rule_family(rule.family);
+    message.header.action = rule_action_value(&rule.action);
+    message.header.tos = rule.tos;
+    if rule.invert {
+        message.header.flags.push(RuleFlag::Invert);
+    }
+    message.header.src_len = rule.from.map(|net| net.prefix_len()).unwrap_or(0);
+    message.header.dst_len = rule.to.map(|net| net.prefix_len()).unwrap_or(0);
+    if rule.table <= u8::MAX as u32 {
+        message.header.table = rule.table as u8;
+    } else {
+        message.attributes.push(RuleAttribute::Table(rule.table));
+    }
+    if rule.priority != 0 {
+        message
+            .attributes
+            .push(RuleAttribute::Priority(rule.priority));
+    }
+    if let Some(net) = rule.from {
+        message.attributes.push(RuleAttribute::Source(net.addr()));
+    }
+    if let Some(net) = rule.to {
+        message
+            .attributes
+            .push(RuleAttribute::Destination(net.addr()));
+    }
+    if let Some(mark) = rule.fwmark {
+        message.attributes.push(RuleAttribute::FwMark(mark));
+    }
+    if let Some(mask) = rule.fwmask {
+        message.attributes.push(RuleAttribute::FwMask(mask));
+    }
+    if let Some(name) = &rule.iifname {
+        message
+            .attributes
+            .push(RuleAttribute::Iifname(name.clone()));
+    }
+    if let Some(name) = &rule.oifname {
+        message
+            .attributes
+            .push(RuleAttribute::Oifname(name.clone()));
+    }
+    if let Some([start, end]) = rule.uid_range {
+        message
+            .attributes
+            .push(RuleAttribute::UidRange(RuleUidRange { start, end }));
+    }
+    if let Some([start, end]) = rule.source_port_range {
+        message
+            .attributes
+            .push(RuleAttribute::SourcePortRange(RulePortRange { start, end }));
+    }
+    if let Some([start, end]) = rule.destination_port_range {
+        message
+            .attributes
+            .push(RuleAttribute::DestinationPortRange(RulePortRange {
+                start,
+                end,
+            }));
+    }
+    if let Some(protocol) = rule.ip_protocol.as_deref().and_then(ip_protocol_value) {
+        message.attributes.push(RuleAttribute::IpProtocol(protocol));
+    }
+    message.attributes.push(RuleAttribute::SuppressPrefixLen(
+        rule.suppress_prefix_length.unwrap_or(u32::MAX),
+    ));
+    message.attributes.push(RuleAttribute::SuppressIfGroup(
+        rule.suppress_if_group.unwrap_or(u32::MAX),
+    ));
+    if let Some(tun_id) = rule.tun_id {
+        message.attributes.push(RuleAttribute::TunId(tun_id));
+    }
+    if let Some(target) = rule.goto {
+        message.attributes.push(RuleAttribute::Goto(target));
+    }
+    if rule.protocol != 0 {
+        message
+            .attributes
+            .push(RuleAttribute::Protocol(RouteProtocol::from(rule.protocol)));
+    }
+    message
 }
 
 fn is_owned_rule(message: &RuleMessage, rule: &OwnedRuleResource) -> bool {
@@ -437,8 +962,35 @@ enum Command {
     OwnedRoutesSnapshot {
         reply: mpsc::Sender<io::Result<Vec<AppliedRoute>>>,
     },
+    /// Routes across every table plus all policy rules, for the
+    /// `ip route`/`ip rule` inventory view.
+    NetTablesDump {
+        reply: mpsc::Sender<io::Result<NetTablesResult>>,
+    },
+    /// Add or delete a route by full kernel spec (manual edits and
+    /// suppressed-foreign restore).
+    SystemRoute {
+        op: RouteOp,
+        route: SystemRoute,
+        reply: mpsc::Sender<io::Result<()>>,
+    },
+    /// Add or delete a policy rule by full kernel spec.
+    SystemRule {
+        add: bool,
+        rule: SystemRule,
+        reply: mpsc::Sender<io::Result<()>>,
+    },
+    /// `RTM_GETROUTE` lookup for one destination — the egress the policy
+    /// rules pick right now (used by the DNS probe to show the exit path).
+    RouteLookup {
+        to: IpAddr,
+        reply: mpsc::Sender<io::Result<RouteLookup>>,
+    },
     DefaultGateways {
         reply: mpsc::Sender<io::Result<Vec<(IpAddr, u32)>>>,
+    },
+    OnLinkNetworks {
+        reply: mpsc::Sender<io::Result<Vec<(u32, IpNet)>>>,
     },
     RulesSnapshot {
         reply: mpsc::Sender<io::Result<Vec<OwnedRuleResource>>>,
@@ -505,10 +1057,11 @@ enum Command {
 }
 
 /// Handle to the netlink actor thread. Cloneable; every call blocks the
-/// calling (non-async) thread until the kernel answers.
+/// calling (non-async) thread until the kernel answers or times out.
 #[derive(Clone)]
 pub struct NetlinkExecutor {
     tx: async_mpsc::UnboundedSender<Command>,
+    reply_timeout: Duration,
 }
 
 impl NetlinkExecutor {
@@ -521,7 +1074,7 @@ impl NetlinkExecutor {
             .name("netlink-actor".into())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_io()
+                    .enable_all()
                     .build()
                 {
                     Ok(runtime) => runtime,
@@ -544,7 +1097,10 @@ impl NetlinkExecutor {
                 });
             })?;
         ready_rx.recv().map_err(|_| actor_gone())??;
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            reply_timeout: ACTOR_REPLY_TIMEOUT,
+        })
     }
 
     fn call(
@@ -553,7 +1109,11 @@ impl NetlinkExecutor {
     ) -> io::Result<()> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx.send(command(reply_tx)).map_err(|_| actor_gone())?;
-        reply_rx.recv().map_err(|_| actor_gone())?
+        // An unbounded recv here wedges every caller forever once the actor
+        // stalls (e.g. a dead rtnetlink connection task); fail instead.
+        reply_rx
+            .recv_timeout(self.reply_timeout)
+            .map_err(|_| actor_gone())?
     }
 
     fn call_with<T>(
@@ -562,7 +1122,9 @@ impl NetlinkExecutor {
     ) -> io::Result<T> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx.send(command(reply_tx)).map_err(|_| actor_gone())?;
-        reply_rx.recv().map_err(|_| actor_gone())?
+        reply_rx
+            .recv_timeout(self.reply_timeout)
+            .map_err(|_| actor_gone())?
     }
 
     pub fn owned_routes_snapshot(&self) -> io::Result<Vec<AppliedRoute>> {
@@ -583,13 +1145,15 @@ impl NetworkObservation for NetlinkExecutor {
     fn owned_routes(&self) -> io::Result<Vec<AppliedRoute>> {
         self.owned_routes_snapshot()
     }
+
+    fn route_lookup(&self, to: IpAddr) -> io::Result<RouteLookup> {
+        RouteExecutor::route_lookup(self, to)
+    }
 }
 
-/// Dump links (index→name) and addresses (both families) in one pass.
-/// `IFA_LOCAL` is preferred over `IFA_ADDRESS`: on point-to-point links the
-/// latter is the peer's address, while the former is always ours.
-async fn get_interface_addrs(handle: &rtnetlink::Handle) -> io::Result<Vec<IfaceAddr>> {
-    let mut names: HashMap<u32, String> = HashMap::new();
+/// Interface index → name map, for resolving `Oif`/`Iif` attributes.
+async fn get_link_names(handle: &rtnetlink::Handle) -> io::Result<HashMap<u32, String>> {
+    let mut names = HashMap::new();
     let mut links = handle.link().get().execute();
     while let Some(link) = links.try_next().await.map_err(netlink_error_to_io)? {
         for attribute in &link.attributes {
@@ -598,6 +1162,14 @@ async fn get_interface_addrs(handle: &rtnetlink::Handle) -> io::Result<Vec<Iface
             }
         }
     }
+    Ok(names)
+}
+
+/// Dump links (index→name) and addresses (both families) in one pass.
+/// `IFA_LOCAL` is preferred over `IFA_ADDRESS`: on point-to-point links the
+/// latter is the peer's address, while the former is always ours.
+async fn get_interface_addrs(handle: &rtnetlink::Handle) -> io::Result<Vec<IfaceAddr>> {
+    let names = get_link_names(handle).await?;
     let mut addrs = Vec::new();
     let mut stream = handle.address().get().execute();
     while let Some(message) = stream.try_next().await.map_err(netlink_error_to_io)? {
@@ -651,6 +1223,73 @@ async fn get_link(
     }
 }
 
+/// `RTM_F_LOOKUP_TABLE` asks the kernel to resolve a destination through
+/// the policy rules, like `ip route get`, instead of dumping one table.
+const RTM_F_LOOKUP_TABLE: u16 = 0x1000;
+
+/// `ip route get <to>`: which source address, output link and gateway the
+/// policy routing picks right now.
+async fn route_lookup(handle: &rtnetlink::Handle, to: IpAddr) -> io::Result<RouteLookup> {
+    let mut message = RouteMessage::default();
+    message.header.address_family = match to {
+        IpAddr::V4(_) => AddressFamily::Inet,
+        IpAddr::V6(_) => AddressFamily::Inet6,
+    };
+    message.header.destination_prefix_length = if to.is_ipv4() { 32 } else { 128 };
+    message
+        .attributes
+        .push(RouteAttribute::Destination(route_address(to)));
+    let mut request = NetlinkMessage::from(RouteNetlinkMessage::GetRoute(message));
+    request.header.flags = NLM_F_REQUEST | RTM_F_LOOKUP_TABLE;
+    let mut stream = handle
+        .clone()
+        .request(request)
+        .map_err(netlink_error_to_io)?;
+    let reply = stream
+        .next()
+        .await
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no route"))?;
+    let route = match reply.payload {
+        NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => route,
+        NetlinkPayload::Error(err) => {
+            return Err(io::Error::new(
+                classify_errno(err.raw_code().abs()),
+                format!("route lookup failed: {}", err.to_io()),
+            ));
+        }
+        _ => return Err(io::Error::other("unexpected route lookup reply")),
+    };
+    let names = get_link_names(handle).await?;
+    let attr_addr = |wanted: fn(&RouteAttribute) -> Option<&RouteAddress>| {
+        route
+            .attributes
+            .iter()
+            .find_map(|attr| wanted(attr))
+            .and_then(|address| match address {
+                RouteAddress::Inet(address) => Some(IpAddr::V4(*address)),
+                RouteAddress::Inet6(address) => Some(IpAddr::V6(*address)),
+                _ => None,
+            })
+    };
+    let interface_index = route.attributes.iter().find_map(|attr| match attr {
+        RouteAttribute::Oif(index) => Some(*index),
+        _ => None,
+    });
+    Ok(RouteLookup {
+        source: attr_addr(|attr| match attr {
+            RouteAttribute::PrefSource(address) => Some(address),
+            _ => None,
+        }),
+        interface_index,
+        interface_name: interface_index.and_then(|index| names.get(&index).cloned()),
+        gateway: attr_addr(|attr| match attr {
+            RouteAttribute::Gateway(address) => Some(address),
+            _ => None,
+        }),
+        table: route_table(&route),
+    })
+}
+
 async fn get_rules(handle: &rtnetlink::Handle) -> io::Result<Vec<RuleMessage>> {
     let mut rules = Vec::new();
     for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
@@ -664,298 +1303,376 @@ async fn get_rules(handle: &rtnetlink::Handle) -> io::Result<Vec<RuleMessage>> {
 
 async fn run_actor(handle: rtnetlink::Handle, mut rx: async_mpsc::UnboundedReceiver<Command>) {
     while let Some(command) = rx.recv().await {
-        match command {
-            Command::Route { op, route, reply } => {
-                let message = route_request(&route, op);
-                let result = match op {
-                    RouteOp::Add => {
-                        let mut request = handle.route().add();
+        // A netlink request whose reply never arrives (e.g. the connection
+        // task died) would otherwise pin the actor and every queued caller
+        // forever; abort the stuck command — dropping the arm's `reply`
+        // makes the waiting caller fail fast instead of hanging.
+        let executed = tokio::time::timeout(ACTOR_COMMAND_TIMEOUT, async {
+            match command {
+                Command::Route { op, route, reply } => {
+                    let message = route_request(&route, op);
+                    let result = match op {
+                        RouteOp::Add => {
+                            let mut request = handle.route().add();
+                            *request.message_mut() = message;
+                            request.execute().await
+                        }
+                        RouteOp::Delete => handle.route().del(message).execute().await,
+                    };
+                    let _ = reply.send(result.map_err(netlink_error_to_io));
+                }
+                Command::DefaultGateways { reply } => {
+                    let result = async {
+                        let mut gateways = Vec::new();
+                        for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+                            let mut stream = handle.route().get(version).execute();
+                            while let Some(message) =
+                                stream.try_next().await.map_err(netlink_error_to_io)?
+                            {
+                                if let Some(gateway) = default_gateway(&message) {
+                                    gateways.push(gateway);
+                                }
+                            }
+                        }
+                        Ok(gateways)
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::OnLinkNetworks { reply } => {
+                    let result = async {
+                        let mut networks = Vec::new();
+                        for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+                            let mut stream = handle.route().get(version).execute();
+                            while let Some(message) =
+                                stream.try_next().await.map_err(netlink_error_to_io)?
+                            {
+                                if let Some(network) = on_link_network(&message) {
+                                    networks.push(network);
+                                }
+                            }
+                        }
+                        Ok(networks)
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::OwnedRoutesSnapshot { reply } => {
+                    let result = async {
+                        let mut routes = Vec::new();
+                        for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+                            let mut stream = handle.route().get(version).execute();
+                            while let Some(message) =
+                                stream.try_next().await.map_err(netlink_error_to_io)?
+                            {
+                                if let Some(route) = owned_route_snapshot(&message) {
+                                    routes.push(route);
+                                }
+                            }
+                        }
+                        Ok(routes)
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::NetTablesDump { reply } => {
+                    let result = async {
+                        let names = get_link_names(&handle).await?;
+                        let mut routes = Vec::new();
+                        for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+                            let mut stream = handle.route().get(version).execute();
+                            while let Some(message) =
+                                stream.try_next().await.map_err(netlink_error_to_io)?
+                            {
+                                if let Some(route) = system_route(&message, &names) {
+                                    routes.push(route);
+                                }
+                            }
+                        }
+                        let rules = get_rules(&handle).await?.iter().map(system_rule).collect();
+                        Ok(NetTablesResult {
+                            routes,
+                            rules,
+                            available: true,
+                        })
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::SystemRoute { op, route, reply } => {
+                    let message = system_route_message(&route);
+                    let result = match op {
+                        RouteOp::Add => {
+                            let mut request = handle.route().add();
+                            *request.message_mut() = message;
+                            request.execute().await
+                        }
+                        RouteOp::Delete => handle.route().del(message).execute().await,
+                    };
+                    let _ = reply.send(result.map_err(netlink_error_to_io));
+                }
+                Command::SystemRule { add, rule, reply } => {
+                    let message = system_rule_message(&rule);
+                    let result = if add {
+                        let mut request = handle.rule().add();
                         *request.message_mut() = message;
                         request.execute().await
-                    }
-                    RouteOp::Delete => handle.route().del(message).execute().await,
-                };
-                let _ = reply.send(result.map_err(netlink_error_to_io));
-            }
-            Command::DefaultGateways { reply } => {
-                let result = async {
-                    let mut gateways = Vec::new();
-                    for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
-                        let mut stream = handle.route().get(version).execute();
-                        while let Some(message) =
-                            stream.try_next().await.map_err(netlink_error_to_io)?
-                        {
-                            if let Some(gateway) = default_gateway(&message) {
-                                gateways.push(gateway);
-                            }
-                        }
-                    }
-                    Ok(gateways)
-                }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::OwnedRoutesSnapshot { reply } => {
-                let result = async {
-                    let mut routes = Vec::new();
-                    for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
-                        let mut stream = handle.route().get(version).execute();
-                        while let Some(message) =
-                            stream.try_next().await.map_err(netlink_error_to_io)?
-                        {
-                            if let Some(route) = owned_route_snapshot(&message) {
-                                routes.push(route);
-                            }
-                        }
-                    }
-                    Ok(routes)
-                }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::RulesSnapshot { reply } => {
-                let result = async {
-                    let messages = get_rules(&handle).await?;
-                    Ok(messages.iter().map(rule_snapshot).collect())
-                }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::Rule { rule, add, reply } => {
-                let result = async {
-                    let existing = get_rules(&handle).await?;
-                    if add {
-                        if existing.iter().any(|message| {
-                            message.header.family == rule_family(rule.family)
-                                && rule_priority(message) == Some(rule.priority)
-                        }) {
-                            return Err(io::Error::new(
-                                io::ErrorKind::AlreadyExists,
-                                "policy rule priority is occupied",
-                            ));
-                        }
-                        let mut request = handle.rule().add();
-                        *request.message_mut() = rule_request(&rule);
-                        request.execute().await.map_err(netlink_error_to_io)
                     } else {
-                        let suspicious = existing.iter().any(|message| {
-                            message.header.family == rule_family(rule.family)
-                                && rule_priority(message) == Some(rule.priority)
-                        });
-                        let Some(_message) = existing
+                        handle.rule().del(message).execute().await
+                    };
+                    let _ = reply.send(result.map_err(netlink_error_to_io));
+                }
+                Command::RouteLookup { to, reply } => {
+                    let _ = reply.send(route_lookup(&handle, to).await);
+                }
+                Command::RulesSnapshot { reply } => {
+                    let result = async {
+                        let messages = get_rules(&handle).await?;
+                        Ok(messages.iter().map(rule_snapshot).collect())
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::Rule { rule, add, reply } => {
+                    let result = async {
+                        let existing = get_rules(&handle).await?;
+                        if add {
+                            if existing.iter().any(|message| {
+                                message.header.family == rule_family(rule.family)
+                                    && rule_priority(message) == Some(rule.priority)
+                            }) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::AlreadyExists,
+                                    "policy rule priority is occupied",
+                                ));
+                            }
+                            let mut request = handle.rule().add();
+                            *request.message_mut() = rule_request(&rule);
+                            request.execute().await.map_err(netlink_error_to_io)
+                        } else {
+                            let suspicious = existing.iter().any(|message| {
+                                message.header.family == rule_family(rule.family)
+                                    && rule_priority(message) == Some(rule.priority)
+                            });
+                            let Some(_message) = existing
+                                .iter()
+                                .find(|message| is_owned_rule(message, &rule))
+                            else {
+                                return Err(io::Error::new(
+                                    if suspicious {
+                                        io::ErrorKind::Other
+                                    } else {
+                                        io::ErrorKind::NotFound
+                                    },
+                                    if suspicious {
+                                        "policy rule identity is unverified"
+                                    } else {
+                                        "owned policy rule not found"
+                                    },
+                                ));
+                            };
+                            match handle
+                                .rule()
+                                .del(rule_request(&rule))
+                                .execute()
+                                .await
+                                .map_err(netlink_error_to_io)
+                            {
+                                Ok(()) => {
+                                    if get_rules(&handle)
+                                        .await?
+                                        .iter()
+                                        .any(|message| is_owned_rule(message, &rule))
+                                    {
+                                        Err(io::Error::other("owned policy rule survived deletion"))
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
+                                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                                    Err(io::Error::other("owned policy rule could not be deleted"))
+                                }
+                                Err(err) => Err(err),
+                            }
+                        }
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::RulePresent { rule, reply } => {
+                    let result = get_rules(&handle)
+                        .await
+                        .map(|rules| rules.iter().any(|message| is_owned_rule(message, &rule)));
+                    let _ = reply.send(result);
+                }
+                Command::TableInUse { table, reply } => {
+                    let result = async {
+                        if get_rules(&handle)
+                            .await?
                             .iter()
-                            .find(|message| is_owned_rule(message, &rule))
-                        else {
+                            .any(|rule| rule_table(rule) == table)
+                        {
+                            return Ok(true);
+                        }
+                        for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+                            let mut routes = handle.route().get(version).execute();
+                            while let Some(route) =
+                                routes.try_next().await.map_err(netlink_error_to_io)?
+                            {
+                                if route_table(&route) == table {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                        Ok(false)
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::Link { index, up, reply } => {
+                    let mut request = handle.link().set(index);
+                    *request.message_mut() = link_request(index, up);
+                    let _ = reply.send(request.execute().await.map_err(netlink_error_to_io));
+                }
+                Command::LinkDel { index, reply } => {
+                    let _ = reply.send(
+                        handle
+                            .link()
+                            .del(index)
+                            .execute()
+                            .await
+                            .map_err(netlink_error_to_io),
+                    );
+                }
+                Command::InterfaceAddrs { reply } => {
+                    let _ = reply.send(get_interface_addrs(&handle).await);
+                }
+                Command::WgCreate {
+                    name,
+                    owner_marker,
+                    reply,
+                } => {
+                    let mut request = handle.link().add();
+                    *request.message_mut() = wireguard_create_request(&name, &owner_marker);
+                    let result = async {
+                        request.execute().await.map_err(netlink_error_to_io)?;
+                        let link = get_link(&handle, &name, 0).await?.ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "created interface not found")
+                        })?;
+                        if !is_wireguard_link(&link, &name, 0) {
                             return Err(io::Error::new(
-                                if suspicious {
-                                    io::ErrorKind::Other
-                                } else {
-                                    io::ErrorKind::NotFound
-                                },
-                                if suspicious {
-                                    "policy rule identity is unverified"
-                                } else {
-                                    "owned policy rule not found"
-                                },
+                                io::ErrorKind::PermissionDenied,
+                                "created interface identity changed",
                             ));
+                        }
+                        let index = link.header.index;
+                        let mut set = handle.link().set(index);
+                        set.message_mut()
+                            .attributes
+                            .push(LinkAttribute::IfAlias(owner_marker.clone()));
+                        let result = set.execute().await.map_err(netlink_error_to_io);
+                        if result.is_err() {
+                            let _ = delete_fresh_link(&handle, &name, index).await;
+                            return result.map(|()| index);
+                        }
+                        let verified = get_link(&handle, &name, index).await?;
+                        if !verified.is_some_and(|link| {
+                            is_owned_wireguard_link(&link, &name, index, &owner_marker)
+                        }) {
+                            let _ = delete_fresh_link(&handle, &name, index).await;
+                            return Err(io::Error::other(
+                                "created interface owner marker is missing",
+                            ));
+                        }
+                        Ok(index)
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
+                Command::WgDelete {
+                    name,
+                    index,
+                    owner_marker,
+                    reply,
+                } => {
+                    let result = async {
+                        let Some(link) = get_link(&handle, &name, index).await? else {
+                            return Ok(());
                         };
-                        match handle
-                            .rule()
-                            .del(rule_request(&rule))
+                        if !is_owned_wireguard_link(&link, &name, index, &owner_marker) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "interface identity does not match owner",
+                            ));
+                        }
+                        handle
+                            .link()
+                            .del(link.header.index)
                             .execute()
                             .await
                             .map_err(netlink_error_to_io)
-                        {
-                            Ok(()) => {
-                                if get_rules(&handle)
-                                    .await?
-                                    .iter()
-                                    .any(|message| is_owned_rule(message, &rule))
-                                {
-                                    Err(io::Error::other("owned policy rule survived deletion"))
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                                Err(io::Error::other("owned policy rule could not be deleted"))
-                            }
-                            Err(err) => Err(err),
-                        }
                     }
+                    .await;
+                    let _ = reply.send(result);
                 }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::RulePresent { rule, reply } => {
-                let result = get_rules(&handle)
-                    .await
-                    .map(|rules| rules.iter().any(|message| is_owned_rule(message, &rule)));
-                let _ = reply.send(result);
-            }
-            Command::TableInUse { table, reply } => {
-                let result = async {
-                    if get_rules(&handle)
-                        .await?
-                        .iter()
-                        .any(|rule| rule_table(rule) == table)
-                    {
-                        return Ok(true);
-                    }
-                    for version in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
-                        let mut routes = handle.route().get(version).execute();
-                        while let Some(route) =
-                            routes.try_next().await.map_err(netlink_error_to_io)?
-                        {
-                            if route_table(&route) == table {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    Ok(false)
+                Command::WgOwned {
+                    name,
+                    index,
+                    owner_marker,
+                    reply,
+                } => {
+                    let result = get_link(&handle, &name, index).await.map(|link| {
+                        link.is_some_and(|link| {
+                            is_owned_wireguard_link(&link, &name, index, &owner_marker)
+                        })
+                    });
+                    let _ = reply.send(result);
                 }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::Link { index, up, reply } => {
-                let mut request = handle.link().set(index);
-                *request.message_mut() = link_request(index, up);
-                let _ = reply.send(request.execute().await.map_err(netlink_error_to_io));
-            }
-            Command::LinkDel { index, reply } => {
-                let _ = reply.send(
-                    handle
-                        .link()
-                        .del(index)
-                        .execute()
-                        .await
-                        .map_err(netlink_error_to_io),
-                );
-            }
-            Command::InterfaceAddrs { reply } => {
-                let _ = reply.send(get_interface_addrs(&handle).await);
-            }
-            Command::WgCreate {
-                name,
-                owner_marker,
-                reply,
-            } => {
-                let mut request = handle.link().add();
-                *request.message_mut() = wireguard_create_request(&name, &owner_marker);
-                let result = async {
-                    request.execute().await.map_err(netlink_error_to_io)?;
-                    let link = get_link(&handle, &name, 0).await?.ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "created interface not found")
-                    })?;
-                    if !is_wireguard_link(&link, &name, 0) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "created interface identity changed",
-                        ));
-                    }
-                    let index = link.header.index;
-                    let mut set = handle.link().set(index);
-                    set.message_mut()
-                        .attributes
-                        .push(LinkAttribute::IfAlias(owner_marker.clone()));
-                    let result = set.execute().await.map_err(netlink_error_to_io);
-                    if result.is_err() {
-                        let _ = delete_fresh_link(&handle, &name, index).await;
-                        return result.map(|()| index);
-                    }
-                    let verified = get_link(&handle, &name, index).await?;
-                    if !verified.is_some_and(|link| {
-                        is_owned_wireguard_link(&link, &name, index, &owner_marker)
-                    }) {
-                        let _ = delete_fresh_link(&handle, &name, index).await;
-                        return Err(io::Error::other(
-                            "created interface owner marker is missing",
-                        ));
-                    }
-                    Ok(index)
+                Command::WgPresent { name, index, reply } => {
+                    let result = get_link(&handle, &name, index).await.map(|link| {
+                        link.is_some_and(|link| is_wireguard_link(&link, &name, index))
+                    });
+                    let _ = reply.send(result);
                 }
-                .await;
-                let _ = reply.send(result);
-            }
-            Command::WgDelete {
-                name,
-                index,
-                owner_marker,
-                reply,
-            } => {
-                let result = async {
-                    let Some(link) = get_link(&handle, &name, index).await? else {
-                        return Ok(());
+                Command::WgAddress {
+                    index,
+                    address,
+                    add,
+                    reply,
+                } => {
+                    let result = if add {
+                        handle
+                            .address()
+                            .add(index, address.addr(), address.prefix_len())
+                            .execute()
+                            .await
+                            .map_err(netlink_error_to_io)
+                    } else {
+                        handle
+                            .address()
+                            .del(address_delete_request(index, address))
+                            .execute()
+                            .await
+                            .map_err(|err| netlink_error_with(err, classify_address_delete_errno))
                     };
-                    if !is_owned_wireguard_link(&link, &name, index, &owner_marker) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "interface identity does not match owner",
-                        ));
-                    }
-                    handle
-                        .link()
-                        .del(link.header.index)
-                        .execute()
-                        .await
-                        .map_err(netlink_error_to_io)
+                    let _ = reply.send(result);
                 }
-                .await;
-                let _ = reply.send(result);
+                Command::WgMtu { index, mtu, reply } => {
+                    let _ = reply.send(
+                        handle
+                            .link()
+                            .set(index)
+                            .mtu(mtu)
+                            .execute()
+                            .await
+                            .map_err(netlink_error_to_io),
+                    );
+                }
             }
-            Command::WgOwned {
-                name,
-                index,
-                owner_marker,
-                reply,
-            } => {
-                let result = get_link(&handle, &name, index).await.map(|link| {
-                    link.is_some_and(|link| {
-                        is_owned_wireguard_link(&link, &name, index, &owner_marker)
-                    })
-                });
-                let _ = reply.send(result);
-            }
-            Command::WgPresent { name, index, reply } => {
-                let result = get_link(&handle, &name, index)
-                    .await
-                    .map(|link| link.is_some_and(|link| is_wireguard_link(&link, &name, index)));
-                let _ = reply.send(result);
-            }
-            Command::WgAddress {
-                index,
-                address,
-                add,
-                reply,
-            } => {
-                let result = if add {
-                    handle
-                        .address()
-                        .add(index, address.addr(), address.prefix_len())
-                        .execute()
-                        .await
-                        .map_err(netlink_error_to_io)
-                } else {
-                    handle
-                        .address()
-                        .del(address_delete_request(index, address))
-                        .execute()
-                        .await
-                        .map_err(|err| netlink_error_with(err, classify_address_delete_errno))
-                };
-                let _ = reply.send(result);
-            }
-            Command::WgMtu { index, mtu, reply } => {
-                let _ = reply.send(
-                    handle
-                        .link()
-                        .set(index)
-                        .mtu(mtu)
-                        .execute()
-                        .await
-                        .map_err(netlink_error_to_io),
-                );
-            }
+        })
+        .await;
+        if executed.is_err() {
+            eprintln!("network-orchestrator-daemon: netlink command timed out, skipping");
         }
     }
 }
@@ -1010,6 +1727,15 @@ pub fn watch_network_changes(
     }))
 }
 
+/// Upper bound for a single netlink round-trip; generous for kernel dumps,
+/// short enough that a stalled actor fails callers instead of wedging them.
+const ACTOR_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Upper bound per actor command; below `ACTOR_REPLY_TIMEOUT` so the actor
+/// drops a stuck request before callers report it, keeping later commands
+/// serviced.
+const ACTOR_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn actor_gone() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "netlink actor is not running")
 }
@@ -1035,6 +1761,36 @@ impl RouteExecutor for NetlinkExecutor {
 
     fn default_gateways(&self) -> io::Result<Vec<(IpAddr, u32)>> {
         self.call_with(|reply| Command::DefaultGateways { reply })
+    }
+
+    fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
+        self.call_with(|reply| Command::OnLinkNetworks { reply })
+    }
+
+    fn net_tables(&self) -> io::Result<NetTablesResult> {
+        self.call_with(|reply| Command::NetTablesDump { reply })
+    }
+
+    fn add_system_route(&mut self, route: &SystemRoute) -> io::Result<()> {
+        let route = route.clone();
+        self.call(|reply| Command::SystemRoute {
+            op: RouteOp::Add,
+            route,
+            reply,
+        })
+    }
+
+    fn remove_system_route(&mut self, route: &SystemRoute) -> io::Result<()> {
+        let route = route.clone();
+        self.call(|reply| Command::SystemRoute {
+            op: RouteOp::Delete,
+            route,
+            reply,
+        })
+    }
+
+    fn route_lookup(&self, to: IpAddr) -> io::Result<RouteLookup> {
+        self.call_with(|reply| Command::RouteLookup { to, reply })
     }
 }
 
@@ -1066,6 +1822,24 @@ impl PolicyRuleExecutor for NetlinkExecutor {
     fn rule_present(&mut self, rule: &OwnedRuleResource) -> io::Result<bool> {
         let rule = rule.clone();
         self.call_with(|reply| Command::RulePresent { rule, reply })
+    }
+
+    fn add_system_rule(&mut self, rule: &SystemRule) -> io::Result<()> {
+        let rule = rule.clone();
+        self.call(|reply| Command::SystemRule {
+            add: true,
+            rule,
+            reply,
+        })
+    }
+
+    fn remove_system_rule(&mut self, rule: &SystemRule) -> io::Result<()> {
+        let rule = rule.clone();
+        self.call(|reply| Command::SystemRule {
+            add: false,
+            rule,
+            reply,
+        })
     }
 }
 
@@ -1124,6 +1898,16 @@ impl LinkExecutor for NetlinkExecutor {
         } else {
             Ok(ExternalLinkKind::Other)
         }
+    }
+
+    /// Read-only name → ifindex probe; 0 means "no such interface".
+    fn link_index(&self, name: &str) -> io::Result<Option<u32>> {
+        let c_name = CString::new(name).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "interface name contains NUL")
+        })?;
+        // SAFETY: `c_name` is a valid NUL-terminated string for the call.
+        let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+        Ok((index != 0).then_some(index))
     }
 }
 
@@ -1647,5 +2431,216 @@ mod tests {
         let mut main_table = route_request(&route, RouteOp::Add);
         main_table.attributes.push(RouteAttribute::Table(254));
         assert_eq!(owned_route_snapshot(&main_table), Some(route));
+    }
+
+    fn names() -> HashMap<u32, String> {
+        HashMap::from([(7, "enp1s0".into()), (42, "wg0".into())])
+    }
+
+    #[test]
+    fn system_route_renders_extended_table_gateway_route() {
+        let mut message = RouteMessage::default();
+        message.header.address_family = AddressFamily::Inet;
+        message.header.kind = RouteType::Unicast;
+        message.header.scope = RouteScope::Universe;
+        message.header.protocol = RouteProtocol::Static;
+        message.header.destination_prefix_length = 24;
+        message
+            .attributes
+            .push(RouteAttribute::Destination(RouteAddress::Inet(
+                "198.51.100.0".parse().unwrap(),
+            )));
+        message
+            .attributes
+            .push(RouteAttribute::Gateway(RouteAddress::Inet(
+                "192.0.2.1".parse().unwrap(),
+            )));
+        message.attributes.push(RouteAttribute::Oif(7));
+        message.attributes.push(RouteAttribute::Priority(600));
+        message.attributes.push(RouteAttribute::Table(51820));
+
+        let route = system_route(&message, &names()).unwrap();
+        assert_eq!(route.family, IpFamily::Ipv4);
+        assert_eq!(route.destination, "198.51.100.0/24".parse().unwrap());
+        assert_eq!(route.table, 51820);
+        assert_eq!(route.kind, "unicast");
+        assert_eq!(route.scope, "universe");
+        assert_eq!(route.gateway, Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(route.interface_name.as_deref(), Some("enp1s0"));
+        assert_eq!(route.metric, Some(600));
+        assert!(!route.managed);
+    }
+
+    #[test]
+    fn system_route_marks_daemon_protocol_and_resolves_default() {
+        let mut message = RouteMessage::default();
+        message.header.address_family = AddressFamily::Inet;
+        message.header.kind = RouteType::Unicast;
+        message.header.protocol = RouteProtocol::from(RTPROT_NETWORK_ORCHESTRATOR);
+        message.header.table = RouteHeader::RT_TABLE_MAIN;
+        message.attributes.push(RouteAttribute::Oif(42));
+
+        let route = system_route(&message, &names()).unwrap();
+        assert_eq!(route.destination, "0.0.0.0/0".parse().unwrap());
+        assert_eq!(route.table, 254);
+        assert_eq!(route.interface_name.as_deref(), Some("wg0"));
+        assert!(route.managed);
+    }
+
+    #[test]
+    fn system_route_renders_multipath_nexthops() {
+        use netlink_packet_route::route::RouteNextHop;
+        let mut message = RouteMessage::default();
+        message.header.address_family = AddressFamily::Inet;
+        message.header.kind = RouteType::Unicast;
+        message.header.table = RouteHeader::RT_TABLE_MAIN;
+        let mut hop = RouteNextHop::default();
+        hop.interface_index = 7;
+        hop.hops = 1;
+        hop.attributes
+            .push(RouteAttribute::Gateway(RouteAddress::Inet(
+                "192.0.2.1".parse().unwrap(),
+            )));
+        message
+            .attributes
+            .push(RouteAttribute::MultiPath(vec![hop]));
+
+        let route = system_route(&message, &names()).unwrap();
+        assert_eq!(route.nexthops.len(), 1);
+        assert_eq!(route.nexthops[0].interface_name.as_deref(), Some("enp1s0"));
+        assert_eq!(
+            route.nexthops[0].gateway,
+            Some("192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(route.nexthops[0].weight, 1);
+    }
+
+    #[test]
+    fn system_route_skips_unknown_family() {
+        let mut message = RouteMessage::default();
+        message.header.address_family = AddressFamily::Unspec;
+        assert!(system_route(&message, &names()).is_none());
+    }
+
+    #[test]
+    fn system_rule_renders_full_selector() {
+        let mut message = RuleMessage::default();
+        message.header.family = AddressFamily::Inet;
+        message.header.action = RuleAction::ToTable;
+        message.header.src_len = 24;
+        message.header.dst_len = 8;
+        message.header.tos = 0x10;
+        message.header.flags.push(RuleFlag::Invert);
+        message.attributes.push(RuleAttribute::Priority(30100));
+        message.attributes.push(RuleAttribute::Table(51820));
+        message
+            .attributes
+            .push(RuleAttribute::Source("10.1.2.0".parse().unwrap()));
+        message
+            .attributes
+            .push(RuleAttribute::Destination("10.9.0.0".parse().unwrap()));
+        message.attributes.push(RuleAttribute::FwMark(0x1234));
+        message.attributes.push(RuleAttribute::FwMask(0xffff));
+        message
+            .attributes
+            .push(RuleAttribute::Iifname("enp1s0".into()));
+        message
+            .attributes
+            .push(RuleAttribute::Oifname("wg0".into()));
+        message.attributes.push(RuleAttribute::SuppressPrefixLen(2));
+        message
+            .attributes
+            .push(RuleAttribute::Protocol(RouteProtocol::from(
+                RTPROT_NETWORK_ORCHESTRATOR,
+            )));
+
+        let rule = system_rule(&message);
+        assert_eq!(rule.family, IpFamily::Ipv4);
+        assert_eq!(rule.priority, 30100);
+        assert_eq!(rule.action, "lookup");
+        assert_eq!(rule.table, 51820);
+        assert_eq!(rule.from, Some("10.1.2.0/24".parse().unwrap()));
+        assert_eq!(rule.to, Some("10.0.0.0/8".parse().unwrap()));
+        assert_eq!(rule.fwmark, Some(0x1234));
+        assert_eq!(rule.fwmask, Some(0xffff));
+        assert_eq!(rule.iifname.as_deref(), Some("enp1s0"));
+        assert_eq!(rule.oifname.as_deref(), Some("wg0"));
+        assert_eq!(rule.suppress_prefix_length, Some(2));
+        assert_eq!(rule.tos, 0x10);
+        assert!(rule.invert);
+        assert!(rule.managed);
+    }
+
+    #[test]
+    fn system_rule_defaults_are_ip_rule_compatible() {
+        // A bare `0: from all lookup main` rule: no selectors, no protocol.
+        let mut message = RuleMessage::default();
+        message.header.family = AddressFamily::Inet;
+        message.header.action = RuleAction::ToTable;
+        message.header.table = RouteHeader::RT_TABLE_MAIN;
+
+        let rule = system_rule(&message);
+        assert_eq!(rule.priority, 0);
+        assert_eq!(rule.table, 254);
+        assert_eq!(rule.from, None);
+        assert_eq!(rule.to, None);
+        assert!(!rule.invert);
+        assert!(!rule.managed);
+    }
+
+    #[test]
+    fn system_rule_ignores_kernel_default_suppress() {
+        let mut message = RuleMessage::default();
+        message.header.family = AddressFamily::Inet;
+        message.header.action = RuleAction::ToTable;
+        message
+            .attributes
+            .push(RuleAttribute::SuppressPrefixLen(u32::MAX));
+        message
+            .attributes
+            .push(RuleAttribute::SuppressIfGroup(u32::MAX));
+
+        let rule = system_rule(&message);
+        assert_eq!(rule.suppress_prefix_length, None);
+        assert_eq!(rule.suppress_if_group, None);
+    }
+}
+
+#[cfg(test)]
+mod executor_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc as async_mpsc;
+
+    fn executor(tx: async_mpsc::UnboundedSender<Command>) -> NetlinkExecutor {
+        NetlinkExecutor {
+            tx,
+            reply_timeout: Duration::from_millis(50),
+        }
+    }
+
+    #[test]
+    fn call_errors_fast_when_actor_channel_dropped() {
+        let (tx, rx) = async_mpsc::unbounded_channel();
+        drop(rx);
+        assert!(executor(tx).owned_routes_snapshot().is_err());
+    }
+
+    #[test]
+    fn call_times_out_when_actor_never_replies() {
+        let (tx, rx) = async_mpsc::unbounded_channel();
+        let _keep = rx; // channel alive, but no command is ever serviced
+        let start = Instant::now();
+        assert!(executor(tx).owned_routes_snapshot().is_err());
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn call_with_times_out_when_actor_never_replies() {
+        let (tx, rx) = async_mpsc::unbounded_channel();
+        let _keep = rx;
+        let start = Instant::now();
+        assert!(executor(tx).interface_addrs().is_err());
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 }

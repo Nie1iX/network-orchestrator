@@ -125,15 +125,17 @@ route or interface changes:
 
 ```bash
 scripts/install-linux-daemon-dev.sh
-systemctl status network-orchestrator.service
-npm run tauri dev
+systemctl status network-orchestrator-dev.service
+npm run dev:app
 ```
 
 The script builds the daemon, installs it under `/usr/local/bin/`, and starts
 the service. It requires `sudo`; `--uninstall` stops the service and removes
 the development installation and its state. Route changes require polkit
 authorization. The daemon's Unix socket is
-`/run/network-orchestrator/daemon.sock`.
+`/run/network-orchestrator-dev/daemon.sock`; `npm run dev:app` points the dev
+build at it through `NETWORK_ORCHESTRATOR_SOCKET` and a separate Tauri
+identifier, so a packaged install is never touched.
 
 The Linux E2E test runs in disposable Docker containers on a private network,
 each with its own network namespace. The client is Ubuntu 26.04 by default or

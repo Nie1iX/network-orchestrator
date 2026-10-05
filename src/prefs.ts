@@ -77,3 +77,65 @@ export function useRoutesPrefs(): RoutesPrefs {
   }, []);
   return prefs;
 }
+
+const SCAN_LOCAL_PROXIES_KEY = "netmanager.scan.localProxies";
+
+export function getScanLocalProxies(): boolean {
+  try {
+    return localStorage.getItem(SCAN_LOCAL_PROXIES_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function setScanLocalProxies(on: boolean): void {
+  try {
+    localStorage.setItem(SCAN_LOCAL_PROXIES_KEY, on ? "1" : "0");
+  } catch {
+    // ignore storage errors (e.g. storage disabled)
+  }
+  window.dispatchEvent(new CustomEvent(PREFS_EVENT));
+}
+
+export function useScanLocalProxies(): boolean {
+  const [on, setOn] = useState<boolean>(getScanLocalProxies);
+  useEffect(() => {
+    const handler = () => setOn(getScanLocalProxies());
+    window.addEventListener(PREFS_EVENT, handler);
+    return () => window.removeEventListener(PREFS_EVENT, handler);
+  }, []);
+  return on;
+}
+
+export type AppMode = "orchestrator" | "manager" | "combined";
+
+const APP_MODE_KEY = "netmanager.app.mode";
+
+export function getAppMode(): AppMode {
+  try {
+    const mode = localStorage.getItem(APP_MODE_KEY);
+    if (mode === "orchestrator" || mode === "manager") return mode;
+  } catch {
+    // ignore storage errors (e.g. storage disabled)
+  }
+  return "combined";
+}
+
+export function setAppMode(mode: AppMode): void {
+  try {
+    localStorage.setItem(APP_MODE_KEY, mode);
+  } catch {
+    // ignore storage errors (e.g. storage disabled)
+  }
+  window.dispatchEvent(new CustomEvent(PREFS_EVENT));
+}
+
+export function useAppMode(): AppMode {
+  const [mode, setMode] = useState<AppMode>(getAppMode);
+  useEffect(() => {
+    const handler = () => setMode(getAppMode());
+    window.addEventListener(PREFS_EVENT, handler);
+    return () => window.removeEventListener(PREFS_EVENT, handler);
+  }, []);
+  return mode;
+}

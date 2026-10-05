@@ -1,12 +1,12 @@
 import type {
   AlwaysOnListResult, BackendAvailability, ConditionalRuleEntry, ConditionalRouteRule,
-  ConfigAnalysis, DomainPolicy, NetworkInterface, Profile, ProfileInspection, RouteEntry, RouteMap,
-  TunnelStatus, VpnAuthMode,
+  ConfigAnalysis, DomainPolicy, NetIntentView, NetworkInterface, Profile, ProfileInspection,
+  RouteEntry, RouteMap, TunnelStatus, VpnAuthMode,
 } from "../types.ts";
 
 // This module intentionally has no I/O imports, fetch, or process calls.
 // It models UI transitions only; Rust tests verify actual backend behavior.
-function profile(id: string, name: string, backend: Profile["backend"], cidr?: string): Profile {
+function profile(id: string, name: string, backend: Profile["backend"], cidr?: string, endpointBypasses?: string[]): Profile {
   return {
     id, name, backend, configPath: backend === "none" ? "" : `/sandbox/${id}.${backend === "xray" ? "json" : backend === "openVpn" ? "ovpn" : "conf"}`,
     interfaceName: backend === "none" ? "qa-ethernet" : `qa-${id}`,
@@ -16,6 +16,7 @@ function profile(id: string, name: string, backend: Profile["backend"], cidr?: s
     xrayHttpPort: backend === "xray" ? 10809 : null,
     useSystemProxy: false, proxyBypass: [], subscription: null,
     xrayMode: "socks", xrayTunInterface: null, xrayTunIp: null,
+    endpointBypasses,
   };
 }
 
@@ -32,9 +33,66 @@ function iface(name: string, index: number, physical: boolean, state: NetworkInt
 }
 
 export class SandboxBackend {
+  private intents: NetIntentView[] = [
+    {
+      id: "office-via-openvpn",
+      destinations: ["10.88.0.0/24", "10.20.0.0/16"],
+      path: { kind: "interface", interface: "qa-ovpn" },
+      metric: 100,
+      enabled: true,
+      status: "deferred",
+      detail: "interface qa-ovpn is absent; armed until it appears",
+      installed: 0,
+      wanted: 2,
+    },
+    {
+      id: "everything-via-mihomo",
+      destinations: ["0.0.0.0/1", "128.0.0.0/1"],
+      path: { kind: "interface", interface: "Mihomo" },
+      metric: 100,
+      enabled: true,
+      status: "effective",
+      detail: "2 route(s) enforced",
+      installed: 2,
+      wanted: 2,
+    },
+    {
+      id: "vpn-endpoint-direct",
+      destinations: ["91.245.41.31/32"],
+      path: { kind: "direct" },
+      metric: 50,
+      enabled: true,
+      status: "effective",
+      detail: "pinned to the physical uplink",
+      installed: 1,
+      wanted: 1,
+    },
+    {
+      id: "stale-conflict",
+      destinations: ["203.0.113.0/24"],
+      path: { kind: "interface", interface: "qa-wg" },
+      metric: 100,
+      enabled: true,
+      status: "conflicted",
+      detail: "a foreign route occupies the destination",
+      installed: 0,
+      wanted: 1,
+    },
+    {
+      id: "paused-media",
+      destinations: ["192.0.2.0/24"],
+      path: { kind: "interface", interface: "qa-wg" },
+      metric: 100,
+      enabled: false,
+      status: "disabled",
+      detail: "disabled — routes are withdrawn",
+      installed: 0,
+      wanted: 1,
+    },
+  ];
   private profiles: Profile[] = [
     profile("wg", "QA WireGuard", "wireGuard", "10.77.0.0/24"),
-    profile("ovpn", "QA OpenVPN", "openVpn", "10.88.0.0/24"),
+    profile("ovpn", "QA OpenVPN", "openVpn", "10.88.0.0/24", ["203.0.113.7"]),
     profile("xray", "AcmeVPN · ⚡ Нидерланды", "xray"),
     profile("static", "QA Static routes", "none", "203.0.113.0/24"),
   ];
@@ -462,6 +520,71 @@ export class SandboxBackend {
           notes: sawUnknown ? ["geoip/geosite selectors could not be evaluated: no geo assets on disk"] : [],
         };
       }
+      case "get_net_tables": return {
+        available: true,
+        routes: [
+          { family: "ipv4", destination: "0.0.0.0/0", table: 254, routeType: "unicast", scope: "universe", protocol: 16, managed: false, gateway: "192.168.1.1", interfaceIndex: 23, interfaceName: "enp59s0u2", metric: 100, prefSource: null, nexthops: [] },
+          { family: "ipv4", destination: "0.0.0.0/1", table: 254, routeType: "unicast", scope: "universe", protocol: 3, managed: false, gateway: null, interfaceIndex: 91, interfaceName: "tun-happ", metric: 0, prefSource: null, nexthops: [] },
+          { family: "ipv4", destination: "128.0.0.0/1", table: 254, routeType: "unicast", scope: "universe", protocol: 3, managed: false, gateway: null, interfaceIndex: 91, interfaceName: "tun-happ", metric: 0, prefSource: null, nexthops: [] },
+          { family: "ipv4", destination: "198.51.100.88/32", table: 254, routeType: "unicast", scope: "universe", protocol: 79, managed: true, gateway: "192.168.1.1", interfaceIndex: 23, interfaceName: "enp59s0u2", metric: 51, prefSource: null, nexthops: [] },
+          { family: "ipv4", destination: "0.0.0.0/1", table: 2022, routeType: "unicast", scope: "universe", protocol: 3, managed: false, gateway: "198.18.0.2", interfaceIndex: 132, interfaceName: "Mihomo", metric: 0, prefSource: null, nexthops: [] },
+        ],
+        rules: [
+          { family: "ipv4", priority: 0, action: "lookup", table: 255, goto: null, from: null, to: null, fwmark: null, fwmask: null, iifname: null, oifname: null, uidRange: null, sourcePortRange: null, destinationPortRange: null, ipProtocol: null, suppressPrefixLength: null, suppressIfGroup: null, tunId: null, tos: 0, invert: false, protocol: 0, managed: false },
+          { family: "ipv4", priority: 32766, action: "lookup", table: 254, goto: null, from: null, to: null, fwmark: null, fwmask: null, iifname: null, oifname: null, uidRange: null, sourcePortRange: null, destinationPortRange: null, ipProtocol: null, suppressPrefixLength: null, suppressIfGroup: null, tunId: null, tos: 0, invert: false, protocol: 0, managed: false },
+        ],
+      };
+      case "net_explain": return {
+        available: true,
+        entries: [
+          { owner: "manual", state: "applied", kind: "route", subject: "198.51.100.88/32 dev enp59s0u2 table main", status: "effective", detail: "installed" },
+        ],
+      };
+      case "net_intent_list": return { intents: this.intents };
+      case "net_intent_set": {
+        const p = args.params as {
+          id: string; destinations: string[];
+          path: { kind: string; interface?: string };
+          metric?: number; enabled?: boolean;
+        };
+        const wanted = p.destinations.length;
+        const enabled = p.enabled !== false;
+        const effective = p.path.kind === "direct" || p.path.interface === "Mihomo";
+        const view: NetIntentView = {
+          id: p.id,
+          destinations: p.destinations,
+          path: p.path,
+          metric: p.metric ?? 100,
+          enabled,
+          status: !enabled ? "disabled" : effective ? "effective" : "deferred",
+          detail: !enabled
+            ? "disabled — routes are withdrawn"
+            : effective
+              ? `${wanted} route(s) enforced`
+              : `interface ${p.path.interface ?? ""} is absent; armed until it appears`,
+          installed: enabled && effective ? wanted : 0,
+          wanted,
+        };
+        this.intents = [...this.intents.filter((i) => i.id !== p.id), view];
+        return { id: p.id };
+      }
+      case "net_intent_del": {
+        this.intents = this.intents.filter((i) => i.id !== args.id);
+        return { id: args.id };
+      }
+      case "net_dns_status": return {
+        available: true,
+        resolvConf: ["127.0.0.53"],
+        links: [
+          { interfaceIndex: 132, interfaceName: "Mihomo", servers: ["198.18.0.2", "fdfe:dcba:9876::2"], currentServer: "198.18.0.2", defaultRoute: true, domains: [{ domain: ".", routeOnly: true }] },
+          { interfaceIndex: 5, interfaceName: "tailscale0", servers: ["100.100.100.100"], currentServer: "100.100.100.100", defaultRoute: false, domains: [{ domain: "tailfa4e85.ts.net", routeOnly: false }, { domain: "ts.net", routeOnly: true }] },
+          { interfaceIndex: 23, interfaceName: "enp59s0u2", servers: ["192.168.1.1"], currentServer: "192.168.1.1", defaultRoute: true, domains: [] },
+        ],
+      };
+      case "net_dns_probe": return {
+        server: "198.18.0.2", source: "198.18.0.1", interfaceIndex: 132, interfaceName: "Mihomo",
+        gateway: "198.18.0.2", answers: ["example.com 1 A 198.18.0.226"], status: "NOERROR", rttMs: 12,
+      };
       case "plugin:dialog|ask":
       case "plugin:dialog|confirm": return true;
       default: throw new Error(`Command is disabled in sandbox: ${command}`);

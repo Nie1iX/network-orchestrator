@@ -24,7 +24,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
-const RUNTIME_ROOT: &str = "/run/network-orchestrator";
+use crate::openvpn::runtime_root;
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const BINARY_ROOT: &str = "/usr/lib/network-orchestrator/xray";
 #[cfg(target_os = "linux")]
@@ -78,9 +79,12 @@ pub trait XrayProcessRunner: Send {
         ))
     }
     fn health(&mut self, name: &str) -> io::Result<bool>;
-    /// `(rx, tx)` bytes seen by the TUN inbound, queried over the local
-    /// StatsService dokodemo door on `api_port`. Runners without stats
-    /// support keep the default failure and the caller reports `None`.
+    /// `(rx, tx)` bytes seen by the TUN inbound. The primary source is the
+    /// link's sysfs counters (a statsquery subprocess per poll is too slow
+    /// to run while the core mutex is held); the local StatsService
+    /// dokodemo door on `api_port` is the fallback when link stats are
+    /// missing. Runners without stats support keep the default failure and
+    /// the caller reports `None`.
     fn query_stats(&mut self, name: &str, api_port: u16) -> io::Result<(u64, u64)> {
         let _ = (name, api_port);
         Err(io::Error::new(
@@ -218,12 +222,12 @@ impl XrayProcessRunner for TrustedXrayProcess {
         }
         let binary = trusted_binary()?;
         ensure_runtime_root()?;
-        let directory = stage_config_at(Path::new(RUNTIME_ROOT), uid, name, config)?;
+        let directory = stage_config_at(runtime_root().as_path(), uid, name, config)?;
         let managed_dir = binary.parent().expect("fixed managed binary");
         let asset_dir = match geo_assets {
             Some(assets) => {
                 if let Err(err) = stage_geo_assets(assets, &directory, managed_dir) {
-                    let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
+                    let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
                     return Err(err);
                 }
                 directory.as_path()
@@ -237,7 +241,7 @@ impl XrayProcessRunner for TrustedXrayProcess {
                 Ok(())
             }
             Err(error) => {
-                let _ = cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name);
+                let _ = cleanup_stage_at(runtime_root().as_path(), uid, name);
                 Err(error)
             }
         }
@@ -369,6 +373,9 @@ impl XrayProcessRunner for TrustedXrayProcess {
                 "Xray child is not tracked",
             ));
         }
+        if let Ok(stats) = tun_byte_counters(&iface_stats_dir(name)) {
+            return Ok(stats);
+        }
         let output = run_statsquery(&trusted_binary()?, api_port)?;
         let stats = parse_statsquery(&output);
         Ok(stats)
@@ -402,14 +409,14 @@ impl XrayProcessRunner for TrustedXrayProcess {
         ensure_runtime_root()?;
         // Preserve the last log lines in the daemon journal before the
         // staging directory (and its xray.log) is removed.
-        let log_path = Path::new(RUNTIME_ROOT)
+        let log_path = runtime_root()
             .join(uid.to_string())
             .join(name)
             .join("xray.log");
         for line in log_tail(&log_path).lines().take(LOG_JOURNAL_LINES) {
             eprintln!("network-orchestrator-daemon: xray[{name}] {line}");
         }
-        cleanup_stage_at(Path::new(RUNTIME_ROOT), uid, name)
+        cleanup_stage_at(runtime_root().as_path(), uid, name)
     }
 }
 
@@ -541,7 +548,7 @@ pub fn remove_managed_package_at(_root: &Path) -> io::Result<bool> {
 
 #[cfg(target_os = "linux")]
 fn ensure_runtime_root() -> io::Result<()> {
-    let root = Path::new(RUNTIME_ROOT);
+    let root = runtime_root();
     let metadata = fs::symlink_metadata(root)
         .map_err(|_| io::Error::other("Xray runtime directory unavailable"))?;
     if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
@@ -555,6 +562,32 @@ fn ensure_runtime_root() -> io::Result<()> {
 
 #[cfg(target_os = "linux")]
 const STATSQUERY_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Byte counters of the TUN link straight from sysfs. Spawning `xray api
+/// statsquery` per poll takes seconds (fresh gRPC client per call) while
+/// the daemon core mutex is held, so kernel link stats are the primary
+/// source and the stats api stays only as a fallback.
+#[cfg(target_os = "linux")]
+fn tun_byte_counters(stats_dir: &Path) -> io::Result<(u64, u64)> {
+    let counter = |file: &str| -> io::Result<u64> {
+        fs::read_to_string(stats_dir.join(file))?
+            .trim()
+            .parse()
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "interface counter is malformed")
+            })
+    };
+    // tun rx = bytes apps pushed into Xray (upload); tx = bytes Xray wrote
+    // back to apps (download). Callers count rx/tx from the client's point
+    // of view, hence the swap.
+    Ok((counter("tx_bytes")?, counter("rx_bytes")?))
+}
+
+/// `/sys/class/net/<link>/statistics` for the managed TUN link.
+#[cfg(target_os = "linux")]
+fn iface_stats_dir(name: &str) -> PathBuf {
+    Path::new("/sys/class/net").join(name).join("statistics")
+}
 
 /// `xray api statsquery -server=127.0.0.1:<port>` against the managed
 /// binary; the counter list is small enough to read after exit.
@@ -693,7 +726,7 @@ fn stage_config_at(root: &Path, uid: u32, name: &str, config: &str) -> io::Resul
 /// root-owned and private before reusing it (respawn/reload).
 #[cfg(target_os = "linux")]
 fn assert_staging_dir(uid: u32, name: &str) -> io::Result<PathBuf> {
-    let directory = Path::new(RUNTIME_ROOT).join(uid.to_string()).join(name);
+    let directory = runtime_root().join(uid.to_string()).join(name);
     for path in [
         directory.parent().expect("fixed runtime path"),
         directory.as_path(),
@@ -729,6 +762,14 @@ fn stage_geo_assets(
         ("geoip.dat", assets.geoip_dat_b64.as_deref()),
         ("geosite.dat", assets.geosite_dat_b64.as_deref()),
     ] {
+        let managed = fs::File::open(managed_dir.join(name))
+            .ok()
+            .map(|input| {
+                let mut bytes = Vec::new();
+                let _ = input.take(MAX_GEO_ASSET_BYTES + 1).read_to_end(&mut bytes);
+                bytes
+            })
+            .filter(|bytes| !bytes.is_empty() && bytes.len() as u64 <= MAX_GEO_ASSET_BYTES);
         let bytes = match encoded {
             Some(data) => {
                 let decoded = base64::engine::general_purpose::STANDARD
@@ -737,21 +778,17 @@ fn stage_geo_assets(
                 if decoded.is_empty() || decoded.len() as u64 > MAX_GEO_ASSET_BYTES {
                     return Err(invalid_input());
                 }
-                decoded
-            }
-            None => {
-                let input = fs::File::open(managed_dir.join(name))
-                    .map_err(|_| io::Error::other("geo asset file is unreadable"))?;
-                let mut bytes = Vec::new();
-                input
-                    .take(MAX_GEO_ASSET_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|_| io::Error::other("geo asset file is unreadable"))?;
-                if bytes.is_empty() || bytes.len() as u64 > MAX_GEO_ASSET_BYTES {
-                    return Err(io::Error::other("geo asset file is invalid"));
+                // Provider dats are minimal overlays (they carry only their
+                // own categories), so they are merged over the managed stock
+                // file; a missing or malformed stock file falls back to the
+                // overlay alone.
+                match managed.as_deref() {
+                    Some(stock) => net_manager_core::geo_list::merge_geo_list(stock, &decoded)
+                        .unwrap_or(decoded),
+                    None => decoded,
                 }
-                bytes
             }
+            None => managed.ok_or_else(|| io::Error::other("geo asset file is unreadable"))?,
         };
         write_private_file(&staging.join(name), &bytes)?;
     }
@@ -942,7 +979,7 @@ fn read_starttime(pid: u32) -> io::Result<u64> {
 #[cfg(target_os = "linux")]
 fn recover_child(uid: u32, name: &str) -> io::Result<()> {
     ensure_runtime_root()?;
-    let directory = Path::new(RUNTIME_ROOT).join(uid.to_string()).join(name);
+    let directory = runtime_root().join(uid.to_string()).join(name);
     for path in [
         directory.parent().expect("fixed runtime path"),
         directory.as_path(),
@@ -1066,10 +1103,25 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
         thread::sleep(Duration::from_millis(25));
     }
     signal_pidfd(&pidfd, libc::SIGKILL)?;
-    child
-        .wait()
-        .map_err(|_| io::Error::other("Xray child wait failed"))?;
-    Ok(())
+    // A child wedged in an uninterruptible syscall survives SIGKILL; keep
+    // the reaper bounded too so `stop` never blocks a core task forever.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .map_err(|_| io::Error::other("Xray child wait failed"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Xray child did not exit",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1131,6 +1183,31 @@ mod tests {
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    #[test]
+    fn tun_counters_map_iface_stats_to_client_rx_tx() {
+        let root = temp_root();
+        let stats = root.join("statistics");
+        fs::create_dir(&stats).unwrap();
+        // tun rx = bytes apps fed into Xray (upload); tx = bytes Xray handed
+        // back to apps (download). Client-facing rx/tx swaps them.
+        fs::write(stats.join("rx_bytes"), "1000\n").unwrap();
+        fs::write(stats.join("tx_bytes"), "2000\n").unwrap();
+        assert_eq!(tun_byte_counters(&stats).unwrap(), (2000, 1000));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn tun_counters_reject_missing_or_malformed_stats() {
+        let root = temp_root();
+        assert!(tun_byte_counters(&root.join("statistics")).is_err());
+        let stats = root.join("statistics");
+        fs::create_dir(&stats).unwrap();
+        fs::write(stats.join("rx_bytes"), "nope").unwrap();
+        fs::write(stats.join("tx_bytes"), "1").unwrap();
+        assert!(tun_byte_counters(&stats).is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -1304,6 +1381,32 @@ mod tests {
         assert!(stage_geo_assets(&geo_assets(Some(&empty), None), &staging, &managed).is_err());
         let oversized = encode.encode(vec![0u8; MAX_GEO_ASSET_BYTES as usize + 1]);
         assert!(stage_geo_assets(&geo_assets(Some(&oversized), None), &staging, &managed).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Provider dats carry only their own categories, so a provided file is
+    /// merged over the managed stock file instead of replacing it.
+    #[test]
+    fn stage_geo_assets_merges_overlay_over_stock() {
+        use base64::Engine;
+        let (root, staging, managed) = staged_fixture();
+        let entry = |code: &str| -> Vec<u8> {
+            let mut record = vec![0x0a, 2 + code.len() as u8, 0x0a, code.len() as u8];
+            record.extend_from_slice(code.as_bytes());
+            record
+        };
+        let mut stock = entry("GOOGLE");
+        stock.extend(entry("PRIVATE"));
+        fs::write(managed.join("geosite.dat"), &stock).unwrap();
+        let overlay = entry("TORRENT");
+        let assets = geo_assets(
+            None,
+            Some(&base64::engine::general_purpose::STANDARD.encode(overlay)),
+        );
+        stage_geo_assets(&assets, &staging, &managed).unwrap();
+        let staged = fs::read(staging.join("geosite.dat")).unwrap();
+        let codes = net_manager_core::geo_list::geo_codes(&staged).unwrap();
+        assert_eq!(codes, ["GOOGLE", "PRIVATE", "TORRENT"]);
         fs::remove_dir_all(root).unwrap();
     }
 
