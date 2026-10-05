@@ -3,6 +3,7 @@
 //! routing orchestration can target their interfaces. Linux only.
 
 use net_manager_core::daemon_protocol::NmListResult;
+#[cfg(target_os = "linux")]
 use tauri::Emitter;
 
 #[tauri::command]

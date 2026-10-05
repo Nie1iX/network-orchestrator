@@ -4,7 +4,9 @@
 //! is connected or routed automatically.
 
 use serde::Serialize;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
+#[cfg(target_os = "linux")]
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -13,6 +15,7 @@ use tokio::time::timeout;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// Loopback listeners above this count are a misconfigured/broken host; stop
 /// early instead of probing thousands of ports.
+#[cfg(target_os = "linux")]
 const MAX_CANDIDATES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -226,6 +229,8 @@ pub(crate) async fn scan_local_proxies() -> Result<Vec<LocalProxy>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "linux"))]
+    use std::net::Ipv4Addr;
     use tokio::net::TcpListener;
 
     #[cfg(target_os = "linux")]
