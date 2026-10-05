@@ -50,7 +50,7 @@ waits for the launchd helper
 | In-app updater | ✅ | — | ❌ | `appUpdates` is `windows`-only; Linux ships `.deb`/`.rpm`/AUR → package manager |
 | Per-link DNS | — | ✅ | — | `crates/daemon/src/dns.rs`, systemd-resolved; Windows relies on pushed/adapter DNS |
 | Recovery prompt (leftover resources) | ✅ | ✅ | ⚠️ | Win: orphaned adapters/routes; Linux: stale daemon owners; macOS would find nothing to recover |
-| App mode (orchestrator/manager/combined) | ✅ | ✅ | ✅ | UI capability filter in Settings → Profiles; `orchestrator` hides managed backend creation/connect, `manager` hides NM/external orchestration |
+| App mode (orchestrator/manager/combined) | ✅ | ✅ | ❌ | UI capability filter in Settings → Profiles; `orchestrator` hides managed backend creation/connect, `manager` hides NM/external orchestration; the native macOS app has no mode switch yet |
 
 ## Observability (identical on both)
 
