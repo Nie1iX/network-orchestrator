@@ -146,6 +146,11 @@ export interface ProfileFormState {
   xrayDns: XrayDnsConfig | null;
   /** Linux TUN: def1 halves (0.0.0.0/1 + 128.0.0.0/1) instead of 0.0.0.0/0. */
   xraySplitDefault: boolean;
+  /** staticRoutes: keep routes armed until the target interface appears. */
+  waitForInterface: boolean;
+  /** staticRoutes: comma-separated endpoint IPs/hostnames routed via the
+   * physical gateway so another tunnel cannot swallow the handshake. */
+  endpointBypasses: string;
 }
 
 /** Group a profile's policies into per-target text (comments preserved). */
@@ -217,6 +222,8 @@ export function newFormState(
     xrayDomainMatcher: "",
     xrayDns: null,
     xraySplitDefault: false,
+    waitForInterface: false,
+    endpointBypasses: "",
   };
 }
 
@@ -252,6 +259,8 @@ export function editFormState(profile: Profile): ProfileFormState {
     xrayDomainMatcher: profile.xrayDomainMatcher ?? "",
     xrayDns: profile.xrayDns ?? null,
     xraySplitDefault: profile.xraySplitDefault ?? false,
+    waitForInterface: profile.waitForInterface ?? false,
+    endpointBypasses: (profile.endpointBypasses ?? []).join(", "),
   };
 }
 
@@ -533,7 +542,12 @@ export default function ProfileFormModal({
       fail(tr("form.errIfaceRequired"), "routing");
       return;
     }
-    if (current.backend === "none" && current.routes.length === 0) {
+    const endpointBypasses = parseBypass(current.endpointBypasses);
+    if (
+      current.backend === "none" &&
+      current.routes.length === 0 &&
+      endpointBypasses.length === 0
+    ) {
       fail(tr("form.errStaticRoute"), "routing");
       return;
     }
@@ -630,6 +644,9 @@ export default function ProfileFormModal({
       xrayDomainMatcher: isXray && current.xrayDomainMatcher ? current.xrayDomainMatcher : null,
       xrayDns: isXray ? (current.xrayDns ?? undefined) : undefined,
       xraySplitDefault: isXray && current.xrayMode === "tun" && current.xraySplitDefault,
+      waitForInterface: current.backend === "none" && current.waitForInterface,
+      endpointBypasses:
+        current.backend === "none" ? endpointBypasses : [],
     };
     setSaving(true);
     try {
@@ -1313,6 +1330,41 @@ export default function ProfileFormModal({
           </div>
         ))}
       </div>
+      {current.backend === "none" && (
+        <div className="profile-routes">
+          <div className="profile-routes-head">
+            <span>{tr("form.externalAttach")}</span>
+          </div>
+          <label className="profile-proxy-toggle">
+            <input
+              type="checkbox"
+              checked={current.waitForInterface}
+              onChange={(e) =>
+                update({ waitForInterface: e.target.checked })
+              }
+            />
+            {tr("form.waitForInterface")}
+          </label>
+          <span className="profile-routes-hint">
+            {tr("form.waitForInterfaceHint")}
+          </span>
+          <label>
+            {tr("form.endpointBypasses")}
+            <input
+              type="text"
+              value={current.endpointBypasses}
+              onChange={(e) =>
+                update({ endpointBypasses: e.target.value })
+              }
+              placeholder={tr("form.endpointBypassesPh")}
+              spellCheck={false}
+            />
+          </label>
+          <span className="profile-routes-hint">
+            {tr("form.endpointBypassesHint")}
+          </span>
+        </div>
+      )}
       {current.backend === "xray" && (
         <div className="profile-routes">
           <div className="profile-routes-head">

@@ -285,6 +285,10 @@ export interface Profile {
   xrayDns?: XrayDnsConfig;
   /** Linux TUN: def1 halves instead of a single default route. */
   xraySplitDefault?: boolean;
+  /** Hosts pinned to the physical uplink, bypassing foreign capture tunnels. */
+  endpointBypasses?: string[];
+  /** Keep declared routes armed while the target interface is absent. */
+  waitForInterface?: boolean;
 }
 
 export type TunnelState = "stopped" | "running" | "failed";
@@ -540,6 +544,108 @@ export interface TailscaleStatusResult {
   peers: TailscalePeer[];
 }
 
+// ── NetworkManager connections (Linux daemon) ─────────────────────────
+
+export type NmConnectionKind = "wireGuard" | "openVpn" | "vpn" | "other";
+
+export type NmConnectionState = "inactive" | "activating" | "active";
+
+/** A NetworkManager VPN/WireGuard profile. The uuid is the activation
+ * handle only — never shown in the UI. */
+export interface NmConnection {
+  uuid: string;
+  id: string;
+  kind: NmConnectionKind;
+  /** Bound device interface while the connection is active. */
+  interfaceName: string | null;
+  state: NmConnectionState;
+}
+
+export interface NmListResult {
+  connections: NmConnection[];
+  /** False when NetworkManager is absent or D-Bus is unreachable. */
+  available: boolean;
+}
+
+// ── Kernel routing tables (Linux daemon, `ip route`/`ip rule`) ────────
+
+/** One nexthop of a multipath route. */
+export interface SystemNexthop {
+  gateway: string | null;
+  interfaceIndex: number;
+  interfaceName: string | null;
+  weight: number;
+}
+
+/** A kernel route from any routing table. */
+export interface SystemRoute {
+  family: "ipv4" | "ipv6";
+  /** CIDR; `0.0.0.0/0`/`::/0` render as `default`. */
+  destination: string;
+  /** Kernel table id (254 main, 253 default, 255 local). */
+  table: number;
+  /** `unicast` | `local` | `blackhole` | … as `ip route` prints it. */
+  routeType: string;
+  /** `universe` | `site` | `link` | `host` | `nowhere` | `scope N`. */
+  scope: string;
+  /** rt_proto byte. */
+  protocol: number;
+  /** Installed by this daemon (RTPROT marker). */
+  managed: boolean;
+  gateway: string | null;
+  interfaceIndex: number | null;
+  interfaceName: string | null;
+  metric: number | null;
+  prefSource: string | null;
+  nexthops: SystemNexthop[];
+}
+
+/** A policy-routing rule (`ip rule` equivalent) with every selector. */
+export interface SystemRule {
+  family: "ipv4" | "ipv6";
+  priority: number;
+  /** `lookup` | `goto` | `unreachable` | `blackhole` | `prohibit` | `nop`. */
+  action: string;
+  table: number;
+  goto: number | null;
+  from: string | null;
+  to: string | null;
+  fwmark: number | null;
+  fwmask: number | null;
+  iifname: string | null;
+  oifname: string | null;
+  uidRange: [number, number] | null;
+  sourcePortRange: [number, number] | null;
+  destinationPortRange: [number, number] | null;
+  ipProtocol: string | null;
+  suppressPrefixLength: number | null;
+  suppressIfGroup: number | null;
+  tunId: number | null;
+  tos: number;
+  /** `ip rule ... not`. */
+  invert: boolean;
+  protocol: number;
+  managed: boolean;
+}
+
+export interface NetTablesResult {
+  routes: SystemRoute[];
+  rules: SystemRule[];
+  /** False when the daemon cannot dump kernel state. */
+  available: boolean;
+}
+
+// ── Localhost proxy discovery (opt-in scan) ───────────────────────────
+
+export type LocalProxyKind = "socks5" | "socks4" | "http";
+
+/** A loopback listener that passed a real SOCKS/HTTP proxy handshake probe. */
+export interface LocalProxy {
+  address: string;
+  port: number;
+  kind: LocalProxyKind;
+}
+
 // ── Conditional rules (Linux daemon) ──────────────────────────────────
 
 /** When a conditional rule's routes may be installed. */
@@ -583,4 +689,150 @@ export interface CondRulesPutResult {
 
 export interface CondRulesRemoveResult {
   removed: boolean;
+}
+
+// ── Manual route/rule editing + reconcile explainability (Linux daemon) ──
+
+/** Payload of `net_route_add` — a daemon-owned unicast route. */
+export interface NetRouteAddParams {
+  /** CIDR destination. */
+  destination: string;
+  /** Kernel table id; absent = main (254). */
+  table?: number;
+  gateway?: string;
+  /** Exactly one of interfaceName/interfaceIndex is required. */
+  interfaceName?: string;
+  interfaceIndex?: number;
+  metric?: number;
+  /** Preferred source (`src`). */
+  prefSource?: string;
+}
+
+/** Payload of `net_rule_add` — a `lookup` policy rule. */
+export interface NetRuleAddParams {
+  family: "ipv4" | "ipv6";
+  /** Explicit priority; 0 is reserved by the kernel local rule. */
+  priority: number;
+  /** Lookup target table. */
+  table: number;
+  from?: string;
+  to?: string;
+  fwmark?: number;
+  fwmask?: number;
+  iifname?: string;
+  oifname?: string;
+  invert?: boolean;
+}
+
+/** What a `net.*.del` call did with the kernel object. */
+export type NetEditOutcome = "deleted" | "suppressed";
+
+export interface NetEditResult {
+  outcome: NetEditOutcome;
+}
+
+/** Reconciliation status of one journaled intent piece. */
+export type ExplainStatus =
+  | "effective"
+  | "deferred"
+  | "conflicted"
+  | "missing"
+  | "active"
+  | "disabled";
+
+export interface ExplainEntry {
+  /** Journal owner: `wg:…`, `manual`, `cond:…`, a client owner. */
+  owner: string;
+  state: "applying" | "applied" | "stale";
+  /** `route` | `rule` | `attach` | `suppressed-route` | `suppressed-rule` | `link` | `dns` | `process`. */
+  kind: string;
+  subject: string;
+  status: ExplainStatus;
+  /** Why it is in this status (English, daemon-composed). */
+  detail: string;
+}
+
+export interface NetExplainResult {
+  entries: ExplainEntry[];
+  /** False when the kernel dump was unavailable. */
+  available: boolean;
+}
+
+// ── Routing intents (Linux daemon) ────────────────────────────────────
+
+/** Where an intent sends its destinations: a named link or the uplink. */
+export interface NetIntentPath {
+  /** `interface` | `direct` */
+  kind: string;
+  interface?: string;
+}
+
+export interface NetIntentSetParams {
+  id: string;
+  destinations: string[];
+  path: NetIntentPath;
+  metric?: number;
+  /** false stores the intent without enforcing it; absent means on. */
+  enabled?: boolean;
+}
+
+/** One stored intent with its live reconciliation status. */
+export interface NetIntentView {
+  id: string;
+  destinations: string[];
+  path: NetIntentPath;
+  metric: number;
+  /** False when the intent is stored but not enforced. */
+  enabled: boolean;
+  status: ExplainStatus;
+  detail: string;
+  /** Desired routes currently present in the kernel. */
+  installed: number;
+  /** Routes the spec wants right now (0 while deferred). */
+  wanted: number;
+}
+
+export interface NetIntentListResult {
+  intents: NetIntentView[];
+}
+
+// ── DNS inventory + probe (Linux daemon) ─────────────────────────────
+
+export interface DnsDomain {
+  domain: string;
+  routeOnly: boolean;
+}
+
+/** Per-link resolver state as systemd-resolved reports it. */
+export interface DnsLinkStatus {
+  interfaceIndex: number;
+  interfaceName: string;
+  servers: string[];
+  currentServer: string | null;
+  domains: DnsDomain[];
+  defaultRoute: boolean;
+}
+
+export interface NetDnsStatusResult {
+  links: DnsLinkStatus[];
+  /** False when systemd-resolved is unreachable. */
+  available: boolean;
+  /** `nameserver` lines of /etc/resolv.conf — the stub view apps use. */
+  resolvConf: string[];
+}
+
+/** Result of `net_dns_probe`: one real query plus its egress path. */
+export interface NetDnsProbeResult {
+  /** Resolver that was queried. */
+  server: string;
+  /** Source address the kernel picked for the packet. */
+  source: string | null;
+  interfaceIndex: number | null;
+  interfaceName: string | null;
+  gateway: string | null;
+  /** dig-style `name TTL TYPE data` answer lines. */
+  answers: string[];
+  /** `NOERROR` | `NXDOMAIN` | `SERVFAIL` | … */
+  status: string;
+  rttMs: number;
 }

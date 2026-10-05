@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io;
+use std::net::IpAddr;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -68,6 +69,19 @@ pub mod method {
     pub const COND_RULES_PUT: &str = "condRules.put";
     pub const COND_RULES_REMOVE: &str = "condRules.remove";
     pub const EXTERNAL_TUNNEL_STOP: &str = "externalTunnel.stop";
+    pub const NM_LIST: &str = "nm.list";
+    pub const NM_SET_ACTIVE: &str = "nm.setActive";
+    pub const NET_TABLES: &str = "net.tables";
+    pub const NET_ROUTE_ADD: &str = "net.route.add";
+    pub const NET_ROUTE_DEL: &str = "net.route.del";
+    pub const NET_RULE_ADD: &str = "net.rule.add";
+    pub const NET_RULE_DEL: &str = "net.rule.del";
+    pub const NET_EXPLAIN: &str = "net.explain";
+    pub const NET_DNS_STATUS: &str = "net.dns.status";
+    pub const NET_DNS_PROBE: &str = "net.dns.probe";
+    pub const NET_INTENT_LIST: &str = "net.intent.list";
+    pub const NET_INTENT_SET: &str = "net.intent.set";
+    pub const NET_INTENT_DEL: &str = "net.intent.del";
 
     /// Methods implemented by the daemon and reported in `hello.capabilities`.
     pub const CAPABILITIES: &[&str] = &[
@@ -104,6 +118,19 @@ pub mod method {
         COND_RULES_PUT,
         COND_RULES_REMOVE,
         EXTERNAL_TUNNEL_STOP,
+        NM_LIST,
+        NM_SET_ACTIVE,
+        NET_TABLES,
+        NET_ROUTE_ADD,
+        NET_ROUTE_DEL,
+        NET_RULE_ADD,
+        NET_RULE_DEL,
+        NET_EXPLAIN,
+        NET_DNS_STATUS,
+        NET_DNS_PROBE,
+        NET_INTENT_LIST,
+        NET_INTENT_SET,
+        NET_INTENT_DEL,
     ];
 }
 
@@ -291,17 +318,482 @@ pub struct HelloResult {
     pub tools: std::collections::BTreeMap<String, bool>,
 }
 
+/// Attach intent for a routes owner: `routes` bind to `interface_name`
+/// whenever that link exists, and `endpoint_bypasses` stay pinned to the
+/// physical uplink. External tunnels re-create their links, so the daemon
+/// re-plans the spec on every reconcile instead of trusting one ifindex.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachSpecParams {
+    pub interface_name: String,
+    pub routes: Vec<PolicyRoute>,
+    pub endpoint_bypasses: Vec<String>,
+    /// `true` pins `routes` to the current physical uplink instead of a
+    /// named link — a "direct, do not tunnel" intent. The next hop is
+    /// re-derived from the live default gateway on every reconcile, so the
+    /// routes follow uplink changes and Wi-Fi/Ethernet switches.
+    #[serde(default)]
+    pub uplink: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutesApplyParams {
     pub owner: String,
     pub routes: Vec<AppliedRoute>,
+    /// Present when the owner arms an external-interface attach: the daemon
+    /// re-derives routes from the spec on every reconcile. `routes` still
+    /// carries what is installable right now (empty when the target link is
+    /// absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach: Option<AttachSpecParams>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutesApplyResult {
     pub applied: usize,
+}
+
+/// Backend family of a NetworkManager connection profile.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NmConnectionKind {
+    WireGuard,
+    OpenVpn,
+    /// Another NM VPN plugin (openconnect, l2tp, …).
+    Vpn,
+    /// Not a tunnel profile; filtered out of `nm.list` results.
+    Other,
+}
+
+/// Live activation state of an NM connection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NmConnectionState {
+    Inactive,
+    Activating,
+    Active,
+}
+
+/// One NetworkManager connection profile (VPN/WireGuard) with live state.
+/// NM owns the secrets; the app only sees metadata and may ask the daemon
+/// to activate/deactivate by UUID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NmConnection {
+    pub uuid: String,
+    pub id: String,
+    pub kind: NmConnectionKind,
+    /// Bound interface from the profile settings, or the live device while
+    /// the connection is active. `None` = NM picks the name on connect.
+    pub interface_name: Option<String>,
+    pub state: NmConnectionState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NmListResult {
+    pub connections: Vec<NmConnection>,
+    /// False when the daemon could not reach NetworkManager at all — the
+    /// UI should explain the missing backend instead of showing an empty
+    /// list.
+    #[serde(default)]
+    pub available: bool,
+}
+
+/// One kernel route as the daemon sees it — every routing table, not only
+/// `main`. Field names mirror what `ip route` prints so the UI can render
+/// a faithful line without guessing kernel conventions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemRoute {
+    pub family: IpFamily,
+    pub destination: IpNet,
+    /// Kernel routing-table id (254 main, 253 default, 255 local; the UI
+    /// renders named tables itself).
+    pub table: u32,
+    /// Route type rendered like `ip route`: `unicast`, `local`,
+    /// `blackhole`, `unreachable`, … (`"type N"` for unknown codes).
+    /// Serialized as `routeType` — `kind` is the `OwnedResource` tag key
+    /// when a route is journaled as `NetRoute`/`SuppressedRoute`.
+    #[serde(rename = "routeType")]
+    pub kind: String,
+    /// Scope rendered like `ip route`: `universe`, `site`, `link`, `host`,
+    /// `nowhere` (`"scope N"` for unknown codes).
+    pub scope: String,
+    /// `rt_proto` byte. The daemon stamps its own installs with
+    /// `RTPROT_NETWORK_ORCHESTRATOR`; the UI flags those via `managed`
+    /// rather than hardcoding the number.
+    pub protocol: u8,
+    /// Installed by this daemon (protocol marker matches).
+    pub managed: bool,
+    pub gateway: Option<IpAddr>,
+    pub interface_index: Option<u32>,
+    /// Resolved from the interface dump; `None` for detached ifindices.
+    pub interface_name: Option<String>,
+    pub metric: Option<u32>,
+    /// Preferred source (`src`) if the route carries one.
+    pub pref_source: Option<IpAddr>,
+    /// ECMP nexthops; non-empty only for multipath routes.
+    pub nexthops: Vec<SystemNexthop>,
+}
+
+/// One nexthop of a multipath (`RTA_MULTIPATH`) route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemNexthop {
+    pub gateway: Option<IpAddr>,
+    pub interface_index: u32,
+    pub interface_name: Option<String>,
+    /// Kernel weight (`hops`); `ip route` prints `weight N` when > 0.
+    pub weight: u8,
+}
+
+/// One policy-routing rule as the daemon sees it (`ip rule` equivalent):
+/// every selector the kernel reports plus its action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemRule {
+    pub family: IpFamily,
+    /// `ip rule` prints `0:` for a rule with no FRA_PRIORITY.
+    pub priority: u32,
+    /// Action rendered like `ip rule`: `lookup`, `goto`, `unreachable`,
+    /// `blackhole`, `prohibit`, `nop` (`"type N"` for unknown codes).
+    pub action: String,
+    pub table: u32,
+    /// Target priority when `action` is `goto`.
+    pub goto: Option<u32>,
+    /// `from` selector: the FRA_SRC address under `src_len`.
+    pub from: Option<IpNet>,
+    /// `to` selector: the FRA_DST address under `dst_len`.
+    pub to: Option<IpNet>,
+    pub fwmark: Option<u32>,
+    /// `None` means the kernel's implicit all-ones mask.
+    pub fwmask: Option<u32>,
+    pub iifname: Option<String>,
+    pub oifname: Option<String>,
+    /// `[start, end]` uid range.
+    pub uid_range: Option<[u32; 2]>,
+    /// `[start, end]` port ranges.
+    pub source_port_range: Option<[u16; 2]>,
+    pub destination_port_range: Option<[u16; 2]>,
+    /// IP-protocol selector rendered as a name when common (`tcp`, `udp`,
+    /// `icmp`, `icmpv6`), otherwise the protocol number.
+    pub ip_protocol: Option<String>,
+    pub suppress_prefix_length: Option<u32>,
+    pub suppress_if_group: Option<u32>,
+    pub tun_id: Option<u32>,
+    /// `dsfield`/`tos` selector; `ip rule` prints `tos 0xNN` when nonzero.
+    pub tos: u8,
+    /// `ip rule ... not` — the FIB_RULE_INVERT flag.
+    pub invert: bool,
+    /// FRA_PROTOCOL rt_proto byte; rules the kernel reports without one
+    /// carry 0.
+    pub protocol: u8,
+    /// Installed by this daemon (protocol marker matches).
+    pub managed: bool,
+}
+
+/// Full privileged view of the host routing plane (`ip route` + `ip rule`
+/// across every table), read via the daemon's rtnetlink socket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetTablesResult {
+    pub routes: Vec<SystemRoute>,
+    pub rules: Vec<SystemRule>,
+    /// False when the daemon could not dump the kernel state — the UI
+    /// should explain instead of showing empty tables.
+    #[serde(default)]
+    pub available: bool,
+}
+
+/// `net.route.add`: install a daemon-owned (`RTPROT`) unicast route.
+/// Exactly one of `interface_name`/`interface_index` must identify the
+/// output link. Tables `unspec`(0) and `local`(255) are rejected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetRouteAddParams {
+    pub destination: IpNet,
+    /// Target table; `None` means `main` (254).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_index: Option<u32>,
+    /// `None` installs metric 0 like plain `ip route add`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pref_source: Option<IpAddr>,
+}
+
+/// `net.route.del`: delete the route exactly as reported by `net.tables`.
+/// Foreign routes are journaled and re-installed when the manual owner is
+/// cleaned up — deletion is a temporary suppression, never permanent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetRouteDelParams {
+    pub route: SystemRoute,
+}
+
+/// `net.rule.add`: install a daemon-owned policy rule. `action` is
+/// implied `lookup` into `table`; wider actions are not editable yet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetRuleAddParams {
+    pub family: IpFamily,
+    /// `FRA_PRIORITY`; required so ordering is explicit.
+    pub priority: u32,
+    /// Lookup target table (`ip rule ... table N`).
+    pub table: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<IpNet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<IpNet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fwmark: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fwmask: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iifname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oifname: Option<String>,
+    #[serde(default)]
+    pub invert: bool,
+}
+
+/// `net.rule.del`: delete the rule exactly as reported by `net.tables`.
+/// Foreign rules follow the same suppress-and-restore journal contract
+/// as foreign routes. Priority 0 is never deletable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetRuleDelParams {
+    pub rule: SystemRule,
+}
+
+/// What a `net.*.del` call did with the kernel object.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NetEditOutcome {
+    /// A daemon-owned object was removed (journal updated).
+    Deleted,
+    /// A foreign object was removed and journaled for re-installation
+    /// when the manual owner is torn down.
+    Suppressed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetEditResult {
+    pub outcome: NetEditOutcome,
+}
+
+/// Reconciliation status of one intent piece, for `net.explain`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplainStatus {
+    /// Present in the kernel exactly as desired.
+    Effective,
+    /// Realization is pending — e.g. the target interface is absent.
+    Deferred,
+    /// The kernel holds an equivalent object that is not ours.
+    Conflicted,
+    /// Desired but absent from the kernel; reconcile will retry.
+    Missing,
+    /// An override (suppressed foreign object) is holding.
+    Active,
+    /// Stored but deliberately not enforced — disabled by the user.
+    Disabled,
+}
+
+/// One line of `net.explain` output: why a journaled intent looks the way
+/// it does right now.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplainEntry {
+    /// Journal owner (`wg:home`, `manual`, `cond:…`, a client owner).
+    pub owner: String,
+    pub state: OwnedState,
+    /// `route`, `rule`, `attach`, `suppressed-route`, `suppressed-rule`,
+    /// `link`, `dns`, `process`.
+    pub kind: String,
+    /// Human-readable subject, e.g. `10.0.0.0/8 via wg0 table main`.
+    pub subject: String,
+    pub status: ExplainStatus,
+    /// Why it is in this status ("interface wg1 is absent", "foreign
+    /// route occupies destination", …). English, daemon-composed.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetExplainResult {
+    pub entries: Vec<ExplainEntry>,
+    /// False when the kernel dump was unavailable; statuses are unknown.
+    #[serde(default)]
+    pub available: bool,
+}
+
+/// Where a user intent sends its destinations: `interface` binds to a
+/// link (tunnel, uplink, any netdev — armed until it appears), `direct`
+/// pins to the current physical uplink so the traffic bypasses tunnels.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentPath {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+}
+
+/// `net.intent.set`: upsert a routing intent. `id` is a stable slug that
+/// becomes journal owner `intent:<id>`; the daemon journaled attach spec
+/// re-derives and enforces the routes on every reconcile, so the intent
+/// survives interface re-creation, uplink changes and daemon restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentSetParams {
+    pub id: String,
+    /// Destination prefixes (CIDR) the intent captures.
+    pub destinations: Vec<String>,
+    pub path: NetIntentPath,
+    /// Metric for the installed routes; defaults to 100.
+    #[serde(default)]
+    pub metric: Option<u32>,
+    /// `false` stores the intent without enforcing it; absent means on.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentDelParams {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentResult {
+    pub id: String,
+}
+
+/// One intent in `net.intent.list`: the declared spec plus its live
+/// reconciliation status against the kernel inventory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentView {
+    pub id: String,
+    pub destinations: Vec<String>,
+    pub path: NetIntentPath,
+    /// Route metric the intent installs with.
+    pub metric: u32,
+    /// False when the intent is stored but not enforced.
+    pub enabled: bool,
+    pub status: ExplainStatus,
+    pub detail: String,
+    /// Desired routes currently present in the kernel.
+    pub installed: usize,
+    /// Desired routes the spec wants right now (0 while deferred).
+    pub wanted: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetIntentListResult {
+    pub intents: Vec<NetIntentView>,
+}
+
+/// DNS configuration of one link as systemd-resolved reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsLinkStatus {
+    pub interface_index: u32,
+    pub interface_name: String,
+    /// Currently configured DNS servers (`Link.DNS`).
+    pub servers: Vec<IpAddr>,
+    /// The server resolved would use next on this link
+    /// (`Link.CurrentDNSServer`).
+    pub current_server: Option<IpAddr>,
+    /// `Link.Domains` — `~.` style route domains, `true` marks route-only.
+    pub domains: Vec<DnsDomain>,
+    /// `Link.DefaultRoute` — whether general queries may use this link.
+    pub default_route: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsDomain {
+    pub domain: String,
+    pub route_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetDnsStatusResult {
+    pub links: Vec<DnsLinkStatus>,
+    /// False when systemd-resolved is unreachable (stub resolv.conf,
+    /// other resolver, …); the UI then shows the file's `nameserver`s.
+    #[serde(default)]
+    pub available: bool,
+    /// `nameserver` lines from /etc/resolv.conf — the stub view apps use.
+    #[serde(default)]
+    pub resolv_conf: Vec<IpAddr>,
+}
+
+/// `net.dns.probe`: send one real DNS query and report the path it took.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetDnsProbeParams {
+    /// A/AAAA name to resolve.
+    pub hostname: String,
+    /// Resolver to hit; `None` picks the current default-route link's
+    /// server (or the resolv.conf stub).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<IpAddr>,
+    /// Record family; `None` asks for A.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<IpFamily>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetDnsProbeResult {
+    /// Server the query was sent to.
+    pub server: IpAddr,
+    /// Route lookup for that server: source address the kernel picked.
+    pub source: Option<IpAddr>,
+    /// Output interface of the route lookup.
+    pub interface_index: Option<u32>,
+    pub interface_name: Option<String>,
+    /// Gateway the traffic would take (`None` = on-link).
+    pub gateway: Option<IpAddr>,
+    /// Answer RRs rendered like dig (`name TTL A 1.2.3.4`).
+    pub answers: Vec<String>,
+    /// DNS header status (`NOERROR`, `NXDOMAIN`, …).
+    pub status: String,
+    pub rtt_ms: u64,
+}
+
+/// Result of a kernel `RTM_GETROUTE` lookup — where a packet to `to`
+/// would egress right now (source address, output link, gateway, table).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteLookup {
+    pub source: Option<IpAddr>,
+    pub interface_index: Option<u32>,
+    pub interface_name: Option<String>,
+    pub gateway: Option<IpAddr>,
+    pub table: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NmSetActiveParams {
+    pub uuid: String,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1008,6 +1500,22 @@ pub enum OwnedResource {
     Address(WireGuardAddressResource),
     Rule(OwnedRuleResource),
     Dns(WireGuardDnsResource),
+    /// Deferred intent: routes bound to an external interface by *name*
+    /// plus uplink bypasses. Carries no kernel artifact by itself; realized
+    /// `Route` resources on the same entry are its current derivation.
+    AttachSpec(AttachSpecParams),
+    /// A route installed through `net.route.add` (full kernel spec, daemon
+    /// protocol marker). Removed on owner teardown.
+    NetRoute(SystemRoute),
+    /// A policy rule installed through `net.rule.add` (full kernel spec,
+    /// daemon protocol marker). Removed on owner teardown.
+    NetRule(SystemRule),
+    /// A foreign route the user deleted through `net.route.del`. The
+    /// kernel object is gone; teardown *re-installs* the snapshot so the
+    /// system comes back exactly as it was.
+    SuppressedRoute(SystemRoute),
+    /// A foreign rule deleted through `net.rule.del`, restored on teardown.
+    SuppressedRule(SystemRule),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1227,7 +1735,7 @@ mod tests {
 
         let (id, result): (_, HelloResult) = ok_response(
             r#"{"id":1,"ok":true,"result":{"protocol":1,"daemonVersion":"0.1.1","uid":1000,
-              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop"],"tools":{}}}"#,
+              "capabilities":["routes.apply","routes.remove","link.set_state","owned.list","recovery.cleanup","subscribe","wireguard.connect","wireguard.disconnect","wireguard.status","openvpn.connect","openvpn.disconnect","openvpn.status","openvpn.probe","openvpn.plan","xray.connect","xray.disconnect","xray.status","xray.reload","xray.install","xray.remove","tailscale.status","tailscale.up","tailscale.down","alwaysOn.set","alwaysOn.list","alwaysOn.remove","alwaysOn.resume","settings.get","settings.set","condRules.list","condRules.put","condRules.remove","externalTunnel.stop","nm.list","nm.setActive","net.tables","net.route.add","net.route.del","net.rule.add","net.rule.del","net.explain","net.dns.status","net.dns.probe","net.intent.list","net.intent.set","net.intent.del"],"tools":{}}}"#,
         );
         assert_eq!(id, 1);
         assert_eq!(result.uid, 1000);

@@ -42,11 +42,15 @@ waits for the launchd helper
 | Always-on before sign-in | — | ✅ | — | WG + static routes only; daemon journal; OVPN/Xray unsupported |
 | Start at login | — | ✅ | — | `get/set_login_autostart` |
 | Conditional routes | — | ✅ | — | `CondRules` UI; condition = interface address in prefix; applied via daemon |
+| External attach + endpoint bypass | — | ✅ | ❌ | `routes.apply` `attach` spec binds routes to an interface *name* (deferred while absent, rebinds on new ifindex); `/32`/`/128` endpoint bypasses pin to the physical default gateway, metric 50; reconcile re-asserts |
+| NetworkManager VPN inventory | — | ✅ | ❌ | `nm.list`/`nm.setActive` via the daemon over system D-Bus; NM owns credentials, lifecycle and pushed DNS |
+| Kernel route/rule inventory | — | ✅ | ❌ | `net.tables` via the daemon's rtnetlink: every table + all policy rules (`ip route`/`ip rule` equivalent); read-only, daemon-owned rows flagged by RTPROT |
 | Tailscale service row | — | ✅ | — | `tailscaled` proxied through the daemon's LocalAPI client; surfaced under Profiles → Services |
 | System proxy toggle | ✅ | — | ✅ `networksetup`, hardware services; ignored while a packet-tunnel VPN is primary | Win: registry; macOS: `system_proxy::macos::MacProxyAdapter`; `UnsupportedProxyAdapter` on Linux |
 | In-app updater | ✅ | — | ❌ | `appUpdates` is `windows`-only; Linux ships `.deb`/`.rpm`/AUR → package manager |
 | Per-link DNS | — | ✅ | — | `crates/daemon/src/dns.rs`, systemd-resolved; Windows relies on pushed/adapter DNS |
 | Recovery prompt (leftover resources) | ✅ | ✅ | ⚠️ | Win: orphaned adapters/routes; Linux: stale daemon owners; macOS would find nothing to recover |
+| App mode (orchestrator/manager/combined) | ✅ | ✅ | ✅ | UI capability filter in Settings → Profiles; `orchestrator` hides managed backend creation/connect, `manager` hides NM/external orchestration |
 
 ## Observability (identical on both)
 

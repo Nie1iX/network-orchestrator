@@ -1809,6 +1809,12 @@ a:focus-visible,
   border-color: var(--warn-border);
 }
 
+.badge-armed {
+  color: var(--info);
+  background-color: var(--info-bg);
+  border-color: var(--info-border);
+}
+
 .profile-row-meta.warn {
   color: var(--warn);
 }
@@ -2392,6 +2398,141 @@ a:focus-visible,
 
 .route-tab-content {
   min-height: 300px;
+}
+
+.system-tables-heading {
+  margin: var(--sp-5) 0 var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-strong);
+  color: var(--text-secondary);
+}
+
+.system-tables-heading:first-of-type {
+  margin-top: var(--sp-2);
+}
+
+.system-route-details {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+/* Intent status badges (explainability) — semantic state colors. */
+.state-deferred {
+  color: var(--warn);
+  background-color: var(--warn-bg);
+}
+
+.state-missing {
+  color: var(--down);
+  background-color: var(--down-bg);
+}
+
+.state-disabled {
+  color: var(--text-muted);
+  background-color: var(--bg-input);
+}
+
+.system-head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+
+.system-head-row .system-tables-heading {
+  flex: 1;
+}
+
+.system-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-1);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.system-badge-gap {
+  margin-left: var(--sp-2);
+}
+
+.system-intent-empty {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+}
+
+/* Doctor cards — detected problems with one-click fixes. */
+.intent-doctor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+.intent-doctor-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--warn);
+  border-radius: var(--r-md);
+  background: var(--warn-bg);
+}
+
+.intent-doctor-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+  font-size: var(--fs-sm);
+}
+
+.intent-doctor-text span {
+  color: var(--text-secondary);
+}
+
+.intent-doctor-actions {
+  display: flex;
+  gap: var(--sp-1);
+  flex-shrink: 0;
+}
+
+.system-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 0 var(--sp-3);
+}
+
+.system-check {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.dns-probe {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+  margin: var(--sp-3) 0;
+  flex-wrap: wrap;
+}
+
+.dns-probe input[type="text"] {
+  flex: 0 1 14rem;
+}
+
+.dns-probe .dns-probe-host {
+  flex: 1 1 16rem;
+}
+
+.dns-resolv {
+  margin: var(--sp-2) 0;
+}
+
+.dns-result {
+  margin-bottom: var(--sp-4);
 }
 
 /* ── Flow diagram ───────────────────────────────────────────────────── */

@@ -6,6 +6,7 @@ pub mod config_vault;
 pub mod daemon_protocol;
 pub mod exit_ip;
 pub mod explorer;
+pub mod geo_list;
 pub mod happ_routing;
 #[cfg(unix)]
 pub mod helper_client;

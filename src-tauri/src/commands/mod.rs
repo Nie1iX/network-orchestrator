@@ -6,7 +6,10 @@ pub(crate) mod exit_ips;
 pub(crate) mod explorer;
 pub(crate) mod happ_routing;
 pub(crate) mod logs;
+pub(crate) mod net_tables;
+pub(crate) mod nm;
 pub(crate) mod profiles;
+pub(crate) mod proxies;
 pub(crate) mod recovery;
 pub(crate) mod route_check;
 pub(crate) mod route_map;
@@ -27,12 +30,18 @@ pub(crate) use explorer::{
 };
 pub(crate) use happ_routing::parse_happ_routing;
 pub(crate) use logs::{clear_logs, daemon_log_tail, get_logs};
+pub(crate) use net_tables::{
+    get_net_tables, net_dns_probe, net_dns_status, net_explain, net_intent_del, net_intent_list,
+    net_intent_set, net_route_add, net_route_del, net_rule_add, net_rule_del,
+};
+pub(crate) use nm::{nm_list_connections, nm_set_active};
 pub(crate) use profiles::{
     delete_profile, get_profiles, get_subscription_endpoints, import_configs_batch,
     import_share_link, import_subscription, measure_subscription_endpoint_delay,
     refresh_subscription, reorder_profiles, save_profile, save_vless_profile,
     save_wireguard_profile, set_subscription_refresh_interval, switch_subscription_endpoint,
 };
+pub(crate) use proxies::scan_local_proxies;
 pub(crate) use recovery::{cleanup_recovery, get_recovery_report};
 pub(crate) use route_check::xray_test_route;
 pub(crate) use route_map::get_route_map;

@@ -60,6 +60,7 @@ trap cleanup EXIT
 
 echo "==> Starting isolated peer on $NETWORK"
 "$ENGINE" network create "$NETWORK" >/dev/null
+
 "$ENGINE" run -d --name "$SERVER" --network "$NETWORK" --network-alias wg-server \
     --cap-add NET_ADMIN --device /dev/net/tun \
     --security-opt label=disable \

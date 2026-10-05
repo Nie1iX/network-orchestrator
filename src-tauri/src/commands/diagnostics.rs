@@ -222,6 +222,68 @@ fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
         ));
     }
 
+    // Endpoint path: a remote endpoint that resolves out a tunnel interface
+    // gets its handshake swallowed (TLS timeouts). Only literal IPs are
+    // checked — DNS names are resolved by the daemon at apply time.
+    {
+        let mut endpoints: Vec<std::net::IpAddr> = profile
+            .endpoint_bypasses
+            .iter()
+            .filter_map(|e| e.trim().parse().ok())
+            .collect();
+        if let Some(inspection) = &input.inspection {
+            endpoints.extend(
+                inspection
+                    .analysis
+                    .endpoints
+                    .iter()
+                    .filter_map(|e| e.address.trim().parse::<std::net::IpAddr>().ok()),
+            );
+        }
+        endpoints.sort();
+        endpoints.dedup();
+        if !endpoints.is_empty() {
+            let routes = input.os_routes.as_deref().unwrap_or(&[]);
+            let ifaces = input.interfaces.as_deref().unwrap_or(&[]);
+            let swallowed: Vec<String> = endpoints
+                .iter()
+                .filter_map(|ip| {
+                    let route = explorer::longest_prefix_match(*ip, routes)?;
+                    let tunnel_ish = ifaces
+                        .iter()
+                        .find(|i| i.name == route.interface_name)
+                        .map(|i| {
+                            matches!(
+                                i.category,
+                                InterfaceCategory::Vpn | InterfaceCategory::Tunnel
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            let n = route.interface_name.as_str();
+                            n.starts_with("tun") || n.starts_with("wg") || n.starts_with("utun")
+                        });
+                    tunnel_ish.then(|| format!("{ip} via {}", route.interface_name))
+                })
+                .collect();
+            checks.push(if swallowed.is_empty() {
+                diag_check(
+                    "Endpoint path",
+                    DiagnosticLevel::Healthy,
+                    format!("{} endpoint(s) route via a physical uplink", endpoints.len()),
+                )
+            } else {
+                diag_check(
+                    "Endpoint path",
+                    DiagnosticLevel::Warning,
+                    format!(
+                        "endpoint(s) {} route via a tunnel interface — the handshake may never reach the server; add an endpoint bypass through the physical gateway",
+                        swallowed.join(", ")
+                    ),
+                )
+            });
+        }
+    }
+
     if profile.use_system_proxy || input.proxy_owner.is_some() {
         let check = match &input.proxy_owner {
             Some(owner) if owner == &profile.id => {
@@ -1863,6 +1925,71 @@ mod tests {
             check_named(&checks, "Applied routes").level,
             DiagnosticLevel::Error
         );
+    }
+
+    #[test]
+    fn endpoint_via_foreign_tunnel_is_warned() {
+        let mut p = profile("if0");
+        p.backend = TunnelBackend::OpenVpn;
+        let mut input = diag_input(&p);
+        let mut inspection = inspection_for(&p, true);
+        inspection.analysis.endpoints = vec![RemoteEndpoint {
+            address: "91.245.41.31".into(),
+            port: Some(2289),
+            protocol: "udp".into(),
+        }];
+        input.inspection = Some(inspection);
+        let mut tun = iface("happ-xray", "happ-xray", InterfaceState::Up);
+        tun.category = InterfaceCategory::Vpn;
+        input.interfaces = Ok(vec![tun]);
+        input.os_routes = Ok(vec![RouteEntry {
+            destination: "0.0.0.0".parse().unwrap(),
+            prefix_len: 0,
+            gateway: None,
+            interface_index: 42,
+            interface_name: "happ-xray".into(),
+            metric: 1,
+        }]);
+        let checks = build_diagnostics(&input);
+        let check = check_named(&checks, "Endpoint path");
+        assert_eq!(check.level, DiagnosticLevel::Warning);
+        assert!(check.message.contains("91.245.41.31"), "{}", check.message);
+    }
+
+    #[test]
+    fn endpoint_via_physical_uplink_is_healthy() {
+        let mut p = profile("if0");
+        p.backend = TunnelBackend::OpenVpn;
+        let mut input = diag_input(&p);
+        let mut inspection = inspection_for(&p, true);
+        inspection.analysis.endpoints = vec![RemoteEndpoint {
+            address: "91.245.41.31".into(),
+            port: Some(2289),
+            protocol: "udp".into(),
+        }];
+        input.inspection = Some(inspection);
+        input.os_routes = Ok(vec![route_entry("0.0.0.0", 0, 7, 1)]);
+        let checks = build_diagnostics(&input);
+        assert_eq!(
+            check_named(&checks, "Endpoint path").level,
+            DiagnosticLevel::Healthy
+        );
+    }
+
+    #[test]
+    fn endpoint_dns_only_skips_the_path_check() {
+        let mut p = profile("if0");
+        p.backend = TunnelBackend::OpenVpn;
+        let mut input = diag_input(&p);
+        let mut inspection = inspection_for(&p, true);
+        inspection.analysis.endpoints = vec![RemoteEndpoint {
+            address: "vpn.example.com".into(),
+            port: Some(443),
+            protocol: "udp".into(),
+        }];
+        input.inspection = Some(inspection);
+        let checks = build_diagnostics(&input);
+        assert!(checks.iter().all(|c| c.name != "Endpoint path"));
     }
 
     #[test]

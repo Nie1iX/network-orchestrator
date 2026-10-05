@@ -20,6 +20,7 @@ mod linux {
     use network_orchestrator_daemon::cond_rules::CondRuleStore;
     use network_orchestrator_daemon::core::{DaemonCore, TrustedWgCommand};
     use network_orchestrator_daemon::dns::ResolvectlDnsExecutor;
+    use network_orchestrator_daemon::intents::IntentStore;
     use network_orchestrator_daemon::netlink::{watch_network_changes, NetlinkExecutor};
     use network_orchestrator_daemon::openvpn_process::TrustedOpenVpnProcess;
     use network_orchestrator_daemon::server::{
@@ -96,6 +97,7 @@ mod linux {
         let startup_always_on = always_on.clone();
         // Recovery runs before the socket exists, so no client can observe
         // (or race with) leftovers from a previous run.
+        let intents = IntentStore::new(options.state_dir.join("intents"));
         let core = tokio::task::spawn_blocking(move || {
             let mut core = DaemonCore::open_with_all(
                 store,
@@ -108,6 +110,16 @@ mod linux {
                 Box::new(TrustedOpenVpnProcess::new()),
                 Box::new(TrustedXrayProcess::new()),
             )?;
+            core.intents = Some(intents);
+            // Routing intents re-arm the same way: the store survives the
+            // journal wipe `open` just did. Best effort either way — the
+            // socket must come up regardless.
+            let (armed, failed) = core.replay_intents();
+            if armed + failed > 0 {
+                eprintln!(
+                    "network-orchestrator-daemon: intent replay armed {armed}, failed {failed}"
+                );
+            }
             // Always-on is best effort: the socket must come up regardless.
             match always_on::replay(&mut core, &startup_always_on) {
                 Ok(report) => eprintln!(

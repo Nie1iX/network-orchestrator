@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Network Orchestrator Dev",
+  "identifier": "com.netmanager.app.dev",
+  "app": {
+    "windows": [
+      {
+        "title": "Network Orchestrator (Dev)"
+      }
+    ]
+  }
+}

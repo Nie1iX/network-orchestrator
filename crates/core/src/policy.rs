@@ -1,5 +1,5 @@
 use crate::models::{
-    AppliedProfileRoutes, AppliedRoute, InterfaceCategory, NetworkInterface, Profile,
+    AppliedProfileRoutes, AppliedRoute, InterfaceCategory, NetworkInterface, PolicyRoute, Profile,
 };
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -26,6 +26,42 @@ pub trait RouteExecutor: Send {
     /// executor that cannot inspect the host table returns an empty list.
     fn default_gateways(&self) -> io::Result<Vec<(IpAddr, u32)>> {
         Ok(Vec::new())
+    }
+    /// Connected (gateway-less) subnets in the main table, as
+    /// `(output interface, destination)`. A host covered by one on the
+    /// uplink's interface is reachable directly: a bypass must then be a
+    /// `dev` route — routing it `via` the default gateway hairpins the flow
+    /// through a box that sees only the request direction (strict conntrack
+    /// or firewalls drop the one-sided stream).
+    fn on_link_networks(&self) -> io::Result<Vec<(u32, IpNet)>> {
+        Ok(Vec::new())
+    }
+    /// Full kernel routing inventory: routes across every table plus all
+    /// policy rules (`ip route`/`ip rule` equivalent). Executors that
+    /// cannot inspect the privileged host view return `Unsupported`.
+    fn net_tables(&self) -> io::Result<crate::daemon_protocol::NetTablesResult> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Install a route described by the full kernel spec (used by manual
+    /// edits and by restoring a suppressed foreign route). Executors
+    /// without the privileged view return `Unsupported`.
+    fn add_system_route(&mut self, _route: &crate::daemon_protocol::SystemRoute) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// Delete a route by its full kernel spec (exactly as `net.tables`
+    /// reported it).
+    fn remove_system_route(
+        &mut self,
+        _route: &crate::daemon_protocol::SystemRoute,
+    ) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// `RTM_GETROUTE` for `to`: the egress the kernel picks right now.
+    fn route_lookup(
+        &self,
+        _to: std::net::IpAddr,
+    ) -> io::Result<crate::daemon_protocol::RouteLookup> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 }
 
@@ -193,12 +229,64 @@ impl Default for PolicyManager {
     }
 }
 
+/// Metric for endpoint bypass host routes. Matches NetworkManager's own
+/// VPN-server route convention so the entries coexist instead of fighting.
+pub const ENDPOINT_BYPASS_METRIC: u32 = 50;
+
+/// Full routing plan for a profile: routes installable now plus intents that
+/// cannot be expressed yet — declared routes awaiting their target interface
+/// and bypass entries still needing resolution or an uplink gateway.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutePlan {
+    /// Installable routes bound to the resolved profile interface.
+    pub routes: Vec<AppliedRoute>,
+    /// Declared policy routes deferred because the target interface is
+    /// absent (armed `wait_for_interface` profiles only).
+    pub deferred: Vec<PolicyRoute>,
+    /// Host routes pinning `endpoint_bypasses` to the physical uplink.
+    pub bypasses: Vec<AppliedRoute>,
+    /// `endpoint_bypasses` entries not yet expressible as routes: DNS names
+    /// awaiting resolution, or literals without a same-family uplink gateway.
+    pub pending_bypasses: Vec<String>,
+}
+
+pub fn plan_profile(profile: &Profile, interfaces: &[NetworkInterface]) -> io::Result<RoutePlan> {
+    // The profile interface is only needed to bind declared routes; a
+    // bypass-only profile never touches it.
+    let (routes, deferred) = if profile.routes.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        match resolve_interface(profile, interfaces) {
+            Ok(interface) => (plan_routes_on(profile, interface), Vec::new()),
+            Err(err)
+                if profile.wait_for_interface
+                    && !profile.interface_name.is_empty()
+                    && err.kind() == io::ErrorKind::NotFound =>
+            {
+                (Vec::new(), profile.routes.clone())
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    let mut plan = RoutePlan {
+        routes,
+        deferred,
+        bypasses: Vec::new(),
+        pending_bypasses: Vec::new(),
+    };
+    plan_endpoint_bypasses(profile, interfaces, &mut plan);
+    Ok(plan)
+}
+
 pub fn plan_profile_routes(
     profile: &Profile,
     interfaces: &[NetworkInterface],
 ) -> io::Result<Vec<AppliedRoute>> {
-    let interface = resolve_interface(profile, interfaces)?;
-    Ok(profile
+    Ok(plan_profile(profile, interfaces)?.routes)
+}
+
+fn plan_routes_on(profile: &Profile, interface: &NetworkInterface) -> Vec<AppliedRoute> {
+    profile
         .routes
         .iter()
         .map(|route| {
@@ -213,7 +301,59 @@ pub fn plan_profile_routes(
                 table: None,
             }
         })
-        .collect())
+        .collect()
+}
+
+/// Host routes pinning `endpoint_bypasses` to the physical uplink. Literal
+/// IPs become routes immediately; DNS names and literals without a
+/// same-family uplink gateway stay pending for the caller.
+fn plan_endpoint_bypasses(
+    profile: &Profile,
+    interfaces: &[NetworkInterface],
+    plan: &mut RoutePlan,
+) {
+    let mut seen_routes = std::collections::HashSet::new();
+    let mut seen_pending = std::collections::HashSet::new();
+    for entry in &profile.endpoint_bypasses {
+        let route = entry
+            .parse::<IpAddr>()
+            .ok()
+            .and_then(|ip| uplink_route(ip, interfaces));
+        match route {
+            Some(route) if seen_routes.insert(route.destination) => plan.bypasses.push(route),
+            Some(_) => {}
+            None if seen_pending.insert(entry.clone()) => plan.pending_bypasses.push(entry.clone()),
+            None => {}
+        }
+    }
+}
+
+/// A bypass host route goes through the physical interface carrying that
+/// family's uplink gateway — tunnels are never a valid bypass next hop.
+/// With several physical uplinks the lowest if_index wins (deterministic);
+/// the daemon retargets on uplink changes anyway.
+fn uplink_route(host: IpAddr, interfaces: &[NetworkInterface]) -> Option<AppliedRoute> {
+    interfaces
+        .iter()
+        .filter(|i| i.category == InterfaceCategory::Physical)
+        .filter_map(|i| {
+            let gateway = if host.is_ipv4() {
+                i.gateway
+            } else {
+                i.ipv6_gateway
+            };
+            gateway
+                .filter(|g| g.is_ipv4() == host.is_ipv4())
+                .map(|g| (i, g))
+        })
+        .min_by_key(|(i, _)| i.if_index)
+        .map(|(i, gateway)| AppliedRoute {
+            destination: host.into(),
+            interface_index: i.if_index,
+            metric: ENDPOINT_BYPASS_METRIC,
+            gateway: Some(gateway),
+            table: None,
+        })
 }
 
 /// The interface's default gateway is a valid next hop only on a physical
@@ -593,6 +733,126 @@ mod tests {
         let p = profile(vec![route("10.7.0.0/24", 5)]);
         let err = plan_profile_routes(&p, &interfaces).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn armed_profile_defers_routes_when_interface_is_missing() {
+        let interfaces = vec![iface("enp59s0u2", "Ethernet", 3)];
+        let mut p = profile(vec![route("10.0.0.0/8", 50)]);
+        p.interface_name = "tun0".into();
+        p.wait_for_interface = true;
+        let plan = plan_profile(&p, &interfaces).unwrap();
+        assert!(plan.routes.is_empty());
+        assert_eq!(plan.deferred, p.routes);
+        // Strict planning stays strict: the same profile without the flag
+        // still fails on the absent interface.
+        p.wait_for_interface = false;
+        assert_eq!(
+            plan_profile(&p, &interfaces).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn armed_profile_keeps_deferred_empty_when_interface_exists() {
+        let interfaces = vec![iface("tun0", "tun0", 9)];
+        let mut p = profile(vec![route("10.0.0.0/8", 50)]);
+        p.interface_name = "tun0".into();
+        p.wait_for_interface = true;
+        let plan = plan_profile(&p, &interfaces).unwrap();
+        assert_eq!(plan.routes.len(), 1);
+        assert!(plan.deferred.is_empty());
+    }
+
+    fn uplink(name: &str, if_index: u32, gateway: &str) -> NetworkInterface {
+        let mut i = iface(name, name, if_index);
+        i.category = InterfaceCategory::Physical;
+        i.gateway = Some(gateway.parse().unwrap());
+        i
+    }
+
+    #[test]
+    fn endpoint_bypass_literal_routes_via_uplink_gateway() {
+        let interfaces = vec![
+            uplink("enp59s0u2", 3, "192.168.1.1"),
+            iface("happ-xray", "happ-xray", 8),
+        ];
+        let mut p = profile(vec![]);
+        p.endpoint_bypasses = vec!["91.245.41.31".into()];
+        let plan = plan_profile(&p, &interfaces).unwrap();
+        assert_eq!(
+            plan.bypasses,
+            vec![AppliedRoute {
+                destination: "91.245.41.31/32".parse().unwrap(),
+                interface_index: 3,
+                metric: ENDPOINT_BYPASS_METRIC,
+                gateway: Some("192.168.1.1".parse().unwrap()),
+                table: None,
+            }]
+        );
+        assert!(plan.pending_bypasses.is_empty());
+    }
+
+    #[test]
+    fn endpoint_bypass_hostname_stays_pending_for_resolution() {
+        let interfaces = vec![uplink("enp59s0u2", 3, "192.168.1.1")];
+        let mut p = profile(vec![]);
+        p.endpoint_bypasses = vec!["vpn.example.com".into()];
+        let plan = plan_profile(&p, &interfaces).unwrap();
+        assert!(plan.bypasses.is_empty());
+        assert_eq!(plan.pending_bypasses, vec!["vpn.example.com".to_string()]);
+    }
+
+    #[test]
+    fn endpoint_bypass_without_matching_uplink_stays_pending() {
+        // Tunnel interfaces are never a bypass next hop, and a v4 host needs
+        // a v4 uplink gateway.
+        let mut tunnel_uplink = iface("happ-xray", "happ-xray", 8);
+        tunnel_uplink.category = InterfaceCategory::Vpn;
+        tunnel_uplink.gateway = Some("172.19.0.1".parse().unwrap());
+        let interfaces = vec![tunnel_uplink];
+        let mut p = profile(vec![]);
+        p.endpoint_bypasses = vec!["91.245.41.31".into()];
+        let plan = plan_profile(&p, &interfaces).unwrap();
+        assert!(plan.bypasses.is_empty());
+        assert_eq!(plan.pending_bypasses, vec!["91.245.41.31".to_string()]);
+    }
+
+    #[test]
+    fn endpoint_bypass_dedupes_and_pairs_ipv6_with_v6_gateway() {
+        let interfaces = vec![{
+            let mut i = uplink("enp59s0u2", 3, "192.168.1.1");
+            i.ipv6_gateway = Some("fe80::1".parse().unwrap());
+            i
+        }];
+        let mut p = profile(vec![]);
+        p.endpoint_bypasses = vec![
+            "91.245.41.31".into(),
+            "91.245.41.31".into(),
+            "2001:db8::7".into(),
+        ];
+        let plan = plan_profile(&p, &interfaces).unwrap();
+        assert_eq!(plan.bypasses.len(), 2);
+        assert_eq!(
+            plan.bypasses[1].destination,
+            "2001:db8::7/128".parse().unwrap()
+        );
+        assert_eq!(plan.bypasses[1].gateway, Some("fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn plan_profile_routes_keeps_strict_compatible_behavior() {
+        // The legacy wrapper returns only installable routes: bypasses go to
+        // the uplink, not the profile interface, so they are not part of it.
+        let interfaces = vec![
+            uplink("enp59s0u2", 3, "192.168.1.1"),
+            iface("wg-work", "wg-work", 7),
+        ];
+        let mut p = profile(vec![route("10.7.0.0/24", 5)]);
+        p.endpoint_bypasses = vec!["91.245.41.31".into()];
+        let routes = plan_profile_routes(&p, &interfaces).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].interface_index, 7);
     }
 
     #[test]
