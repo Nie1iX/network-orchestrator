@@ -8,6 +8,26 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+### Added
+
+- macOS: WireGuard and OpenVPN run through the privileged helper. WireGuard uses
+  a userspace engine (`boringtun`) inside the helper — no external binary. OpenVPN
+  is a pinned, self-contained 2.6.17 built by `scripts/build-macos-openvpn.sh`
+  and shipped in `Contents/Helpers/`; the helper verifies its SHA-256 and runs
+  only a root-owned copy, with route/DNS/script handling switched off and done by
+  the helper itself. Routes, DNS and the device are journaled and undone on any
+  exit; one tunnel runs at a time. OpenVPN credentials are requested by the app
+  and can be kept in the Keychain.
+- `openvpn_config::credential_requirements` in core: which credentials a
+  profile needs before it can connect (mirrors the Linux client's rules).
+
+### Changed
+
+- `sanitize_openvpn_config` accepts the macOS runtime root
+  (`/var/run/network-orchestrator`) as a staging location.
+- macOS: the navigation rail now stops at the title bar and is wider, so the
+  window's traffic-light buttons no longer straddle its edge.
+
 ## [0.8.0] - 2026-10-14
 
 ### Added
