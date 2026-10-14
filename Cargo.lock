@@ -2652,6 +2652,7 @@ name = "net-manager-macos-bridge"
 version = "0.7.0"
 dependencies = [
  "net-manager-core",
+ "plist",
  "serde",
  "serde_json",
  "tempfile",
@@ -2766,6 +2767,7 @@ dependencies = [
  "net-manager-core",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
 ]

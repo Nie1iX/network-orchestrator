@@ -1,7 +1,11 @@
+use network_orchestrator_macos_helper::journal::Journal;
 use network_orchestrator_macos_helper::peer::{sibling_client, AppClientPolicy};
+use network_orchestrator_macos_helper::platform::RealPlatform;
 use network_orchestrator_macos_helper::server::{bind_socket, serve, ServerContext};
 use network_orchestrator_macos_helper::service::HelperService;
-use network_orchestrator_macos_helper::SOCKET_PATH;
+use network_orchestrator_macos_helper::sysexec::SystemRunner;
+use network_orchestrator_macos_helper::xray::XrayExecutor;
+use network_orchestrator_macos_helper::{SOCKET_DIR, SOCKET_PATH, STATE_DIR};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -67,9 +71,25 @@ fn main() -> ExitCode {
 
 async fn run(options: Options) -> std::io::Result<()> {
     let listener = bind_socket(&options.socket)?;
+    let xray = Arc::new(XrayExecutor::new(
+        Box::new(RealPlatform),
+        Box::new(SystemRunner),
+        Journal::new(std::path::Path::new(STATE_DIR)),
+        std::path::Path::new(SOCKET_DIR).join("xray-tun.log"),
+    ));
+    // A tunnel a previous helper left behind must not outlive its owner.
+    if let Err(err) = xray.recover() {
+        eprintln!("network-orchestrator-helper: tunnel recovery failed: {err}");
+    }
+    // Xray dying on its own is noticed within seconds and cleaned up.
+    let watcher = xray.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        watcher.reap();
+    });
     let ctx = Arc::new(ServerContext::new(
         Box::new(AppClientPolicy::new(options.client)),
-        Arc::new(HelperService),
+        Arc::new(HelperService::new(xray.clone())),
         env!("CARGO_PKG_VERSION"),
     ));
     let mut terminate = signal(SignalKind::terminate())?;
@@ -79,6 +99,7 @@ async fn run(options: Options) -> std::io::Result<()> {
         _ = terminate.recv() => {}
         _ = interrupt.recv() => {}
     }
+    xray.shutdown();
     let _ = std::fs::remove_file(&options.socket);
     Ok(())
 }
