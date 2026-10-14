@@ -19,6 +19,10 @@ import SystemConfiguration
   var exitIPs: [String: [ExitIpEntry]] = [:]
   var checkingExitIP = Set<String>()
   var externalVPNs: [ExternalVpn] = []
+  /// The user's NetBird daemon, when one is installed.
+  var netbird: NetBirdState?
+  var netbirdBusy = false
+  var showingNetBirdSetup = false
   var switchingExternal = Set<String>()
   var snapshot: Snapshot?
   var capabilities: Capabilities?
@@ -176,6 +180,7 @@ import SystemConfiguration
     await retireOutdatedHelper()
     do { runtime = try await core.call("runtime") } catch { runtime = nil }
     if let list: [ExternalVpn] = try? await core.call("external_vpns") { externalVPNs = list }
+    netbird = try? await core.callConcurrently("netbird_status")
   }
   /// Connect or disconnect another app's VPN, as the VPN menu would.
   func setExternalVPN(_ vpn: ExternalVpn, connect: Bool) async {
@@ -548,6 +553,25 @@ import SystemConfiguration
   }
   /// Forget what Keychain holds for this profile.
   func forgetCredentials(_ profile: Profile) { CredentialStore.delete(profile.id) }
+  /// Connects NetBird (a browser sign-in opens when it is needed) or, when it
+  /// is on, disconnects it. A setup key is used once and never stored.
+  func toggleNetBird(managementUrl: String? = nil, setupKey: String? = nil) async {
+    guard !netbirdBusy, let current = netbird, current.canToggle else { return }
+    netbirdBusy = true
+    defer { netbirdBusy = false }
+    do {
+      if current.isOn && managementUrl == nil {
+        netbird = try await core.callConcurrently("netbird_down")
+      } else {
+        var args: [String: String] = [:]
+        if let managementUrl, !managementUrl.isEmpty { args["managementUrl"] = managementUrl }
+        if let setupKey, !setupKey.isEmpty { args["setupKey"] = setupKey }
+        netbird = try await core.callConcurrently("netbird_up", args: args)
+      }
+      error = nil
+    } catch { self.error = error.localizedDescription }
+    await refreshRuntime()
+  }
   /// Primary connections take all traffic; secondary ones only their networks.
   func setTunnelRole(_ profile: Profile, role: String) async {
     guard !pending.contains(profile.id) else { return }

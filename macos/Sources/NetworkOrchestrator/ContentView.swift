@@ -81,6 +81,10 @@ struct ContentView: View {
       .environment(\.locale, Locale(identifier: L10n.shared.language))
       .environment(\.layoutDirection, L10n.shared.direction)
     }
+    .sheet(isPresented: $model.showingNetBirdSetup) {
+      NetBirdSetupSheet(model: model).environment(\.palette, AppPalette(scheme: scheme))
+        .buttonStyle(TauriButtonStyle())
+    }
     .sheet(item: $model.credentialRequest) { request in
       CredentialSheet(model: model, request: request).environment(
         \.palette, AppPalette(scheme: scheme)
