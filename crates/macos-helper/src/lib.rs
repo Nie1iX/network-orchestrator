@@ -7,9 +7,18 @@
 //! added behind [`server::Handler`] and are never reachable by an
 //! unverified peer.
 
+pub mod backends;
+pub mod dns;
+pub mod journal;
 pub mod peer;
+pub mod platform;
+pub mod routes;
 pub mod server;
 pub mod service;
+pub mod sysexec;
+pub mod trusted_exec;
+pub mod tun;
+pub mod xray;
 
 /// Directory of the helper socket; created root-owned and world-searchable.
 pub const SOCKET_DIR: &str = "/var/run/network-orchestrator";
