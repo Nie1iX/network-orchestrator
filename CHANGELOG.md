@@ -14,6 +14,35 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
   System tab, DNS path probing, NetworkManager inventory, external-tunnel
   attach with endpoint bypasses, opt-in localhost proxy discovery and the
   orchestrator/manager/combined app modes.
+- macOS: Xray TUN mode. The privileged helper creates a `utun`, starts the
+  managed Xray as the console user with the device passed through
+  `XRAY_TUN_FD`, installs the capture routes (eight protected IPv4 prefixes
+  plus two IPv6 halves) with bypass routes for the machine's resolvers, and
+  points the uplink's network service at Xray's resolver. Everything is
+  journaled and undone on disconnect, when Xray dies, on helper shutdown and at
+  helper restart. The connection panel has a SOCKS/TUN switch; the app's own
+  tunnel is no longer reported as a foreign VPN.
+- macOS: Xray answers the system's DNS in TUN mode. A `dns` outbound handles
+  lookups for the tunnel resolver; names the profile routes `direct`/`block`
+  get fake-DNS answers so domain rules also match protocols without SNI (SSH);
+  the network's search domains and resolvers keep serving local names; profile
+  `dns` outbounds that forward everything to a fixed resolver are taught to
+  hijack the routed names.
+- macOS: the privileged helper is removed when the app build changes (version or
+  helper code hash) and a banner asks to install it again; starting a TUN
+  profile without the helper offers to install it.
+- macOS: a read-only "My routing settings" tab on the Network page lists
+  persistent service routes, static kernel routes with their likely source,
+  launchd jobs that run `route`, `/etc/resolver` domains, `/etc/hosts`
+  overrides and manual IP/DNS/proxy settings of network services.
+- `scripts/build-macos-native.sh` signs with `CODESIGN_IDENTITY` when set.
+  macOS does not let `SMAppService` find a daemon in an ad-hoc signed bundle,
+  so the privileged helper needs a real identity.
+
+### Changed
+
+- `xray.connect` carries an optional `macosDataRoot` so the macOS helper finds
+  the console user's managed Xray; Linux ignores it.
 
 ### Fixed
 
