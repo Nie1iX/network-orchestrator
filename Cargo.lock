@@ -2782,6 +2782,7 @@ name = "net-manager-macos-bridge"
 version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
+ "ipnet",
  "net-manager-core",
  "plist",
  "serde",

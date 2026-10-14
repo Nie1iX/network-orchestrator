@@ -75,6 +75,71 @@ fn text_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "A required field is empty".into())
 }
+/// A profile that can run next to others (every backend that makes a tunnel).
+fn tunnel_profile(
+    store: &ProfileStore,
+    id: &str,
+) -> Result<net_manager_core::models::Profile, String> {
+    let profile = store
+        .load()
+        .map_err(store_error)?
+        .profiles
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or("Profile not found")?;
+    if profile.backend == TunnelBackend::None {
+        return Err("Static routes do not create a tunnel".into());
+    }
+    Ok(profile)
+}
+
+/// Networks typed as CIDR or single addresses, separated by space, comma,
+/// semicolon or newline. Empty input clears the list.
+fn parse_networks(text: &str) -> Result<Vec<ipnet::IpNet>, String> {
+    let mut networks = Vec::new();
+    for token in text
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|token| !token.is_empty())
+    {
+        let network = token
+            .parse::<ipnet::IpNet>()
+            .or_else(|_| token.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+            .map_err(|_| format!("\"{token}\" is not a valid network"))?;
+        networks.push(network);
+    }
+    if networks.is_empty() {
+        return Ok(networks);
+    }
+    let routes: Vec<net_manager_core::models::PolicyRoute> = networks
+        .iter()
+        .map(|network| net_manager_core::models::PolicyRoute {
+            destination: *network,
+            metric: 5,
+            via: None,
+        })
+        .collect();
+    net_manager_core::models::secondary_networks(&routes).map_err(str::to_string)
+}
+
+fn parse_dns_domains(text: &str) -> Result<Vec<String>, String> {
+    let mut domains: Vec<String> = Vec::new();
+    for token in text
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|token| !token.is_empty())
+    {
+        let domain = token.trim_start_matches("*.").to_ascii_lowercase();
+        if !net_manager_core::models::valid_dns_suffix(&domain) {
+            return Err(format!("\"{token}\" is not a valid DNS domain"));
+        }
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    if domains.len() > 16 {
+        return Err("At most 16 DNS domains can be set".into());
+    }
+    Ok(domains)
+}
 fn store_error(_: std::io::Error) -> String {
     "The profile operation could not be completed. Check the input and file permissions.".into()
 }
@@ -694,6 +759,36 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
             }
             profile.xray_mode = mode;
             // A running connection is restarted in the new mode.
+            runtime::restart_around(root, &store, id, || {
+                let document = store.upsert(profile).map_err(store_error)?;
+                encode(net_manager_core::subscription::public_profiles(
+                    document.profiles,
+                ))
+            })
+        }
+        "set_tunnel_role" => {
+            let id = text_arg(args, "id")?;
+            let role = match text_arg(args, "role")? {
+                "primary" => net_manager_core::models::TunnelRole::Primary,
+                "secondary" => net_manager_core::models::TunnelRole::Secondary,
+                _ => return Err("Unknown connection role".into()),
+            };
+            let mut profile = tunnel_profile(&store, id)?;
+            profile.tunnel_role = role;
+            // A running connection restarts so the role takes effect.
+            runtime::restart_around(root, &store, id, || {
+                let document = store.upsert(profile).map_err(store_error)?;
+                encode(net_manager_core::subscription::public_profiles(
+                    document.profiles,
+                ))
+            })
+        }
+        "set_tunnel_networks" => {
+            let id = text_arg(args, "id")?;
+            let mut profile = tunnel_profile(&store, id)?;
+            profile.tunnel_networks = parse_networks(args["networks"].as_str().unwrap_or(""))?;
+            profile.tunnel_dns_domains =
+                parse_dns_domains(args["dnsDomains"].as_str().unwrap_or(""))?;
             runtime::restart_around(root, &store, id, || {
                 let document = store.upsert(profile).map_err(store_error)?;
                 encode(net_manager_core::subscription::public_profiles(
@@ -1601,5 +1696,86 @@ mod tests {
         assert!(dispatch(dir.path(), "disconnect", &json!({"id":"rt"})).is_err());
         // Shutdown with nothing running is a no-op and never touches the system proxy.
         dispatch(dir.path(), "shutdown", &json!({})).unwrap();
+    }
+
+    #[test]
+    fn typed_networks_and_domains_are_parsed_and_checked() {
+        let nets = parse_networks("10.10.4.7/16, 192.168.5.9\n fd00::/8;10.10.0.0/16").unwrap();
+        assert_eq!(
+            nets.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["10.10.0.0/16", "192.168.5.9/32", "fd00::/8"]
+        );
+        assert!(parse_networks("  \n").unwrap().is_empty());
+        for bad in [
+            "10.10.0.0/33",
+            "not-a-net",
+            "0.0.0.0/0",
+            "::/0",
+            "224.0.0.0/4",
+        ] {
+            assert!(parse_networks(bad).is_err(), "{bad}");
+        }
+        let error = parse_networks("10.0.0.0/8 oops").unwrap_err();
+        assert!(error.contains("oops"), "{error}");
+        assert_eq!(
+            parse_dns_domains("Corp.Example, *.lab.local corp.example").unwrap(),
+            ["corp.example", "lab.local"]
+        );
+        for bad in ["a/b", "../x", "-", "a b?c"] {
+            assert!(parse_dns_domains(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn role_and_networks_are_saved_on_the_profile_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "r1");
+        let profiles = dispatch(
+            dir.path(),
+            "set_tunnel_role",
+            &json!({"id":"r1", "role":"secondary"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["tunnelRole"], "secondary");
+        let profiles = dispatch(
+            dir.path(),
+            "set_tunnel_networks",
+            &json!({"id":"r1", "networks":"10.10.0.0/16\n192.168.5.0/24", "dnsDomains":"corp.example"}),
+        )
+        .unwrap();
+        assert_eq!(
+            profiles[0]["tunnelNetworks"],
+            json!(["10.10.0.0/16", "192.168.5.0/24"])
+        );
+        assert_eq!(profiles[0]["tunnelDnsDomains"], json!(["corp.example"]));
+        let profiles = dispatch(
+            dir.path(),
+            "set_tunnel_role",
+            &json!({"id":"r1", "role":"primary"}),
+        )
+        .unwrap();
+        assert!(profiles[0].get("tunnelRole").is_none());
+        for (method, args) in [
+            ("set_tunnel_role", json!({"id":"r1", "role":"boss"})),
+            ("set_tunnel_role", json!({"id":"missing", "role":"primary"})),
+            (
+                "set_tunnel_networks",
+                json!({"id":"r1", "networks":"bogus"}),
+            ),
+            (
+                "set_tunnel_networks",
+                json!({"id":"r1", "networks":"0.0.0.0/0"}),
+            ),
+            (
+                "set_tunnel_networks",
+                json!({"id":"r1", "dnsDomains":"a/b"}),
+            ),
+        ] {
+            assert!(
+                dispatch(dir.path(), method, &args).is_err(),
+                "{method} {args}"
+            );
+        }
     }
 }
