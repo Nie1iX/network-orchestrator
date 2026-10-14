@@ -9,6 +9,7 @@ use std::ffi::{c_char, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+mod netbird;
 mod routing;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
@@ -448,6 +449,17 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
         "measure_delay" => return measure_delay(root, args),
         "check_exit_ip" => return check_exit_ip(root, args),
         "helper_status" => return Ok(helper_status()),
+        // The user's own NetBird daemon, driven through its CLI; no store access.
+        "netbird_status" => return Ok(netbird::NetBird::detect().status()),
+        "netbird_up" => {
+            let url = args["managementUrl"]
+                .as_str()
+                .filter(|text| !text.is_empty());
+            let key = args["setupKey"].as_str().filter(|text| !text.is_empty());
+            return netbird::NetBird::detect().up(&root.join("runtime"), url, key);
+        }
+        "netbird_down" => return netbird::NetBird::detect().down(),
+        "netbird_log" => return Ok(json!(netbird::log_tail(&root.join("runtime")))),
         "user_network_settings" => return encode(user_network::read()),
         _ => {}
     }
