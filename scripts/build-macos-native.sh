@@ -99,11 +99,38 @@ info = {
 with open(sys.argv[1], 'wb') as output:
     plistlib.dump(info, output)
 PY
-# Default: local ad-hoc signature. macOS does not let SMAppService find a
-# daemon in an ad-hoc signed bundle (status "not found"), so the privileged
-# helper needs a real identity: CODESIGN_IDENTITY="Apple Development: ..." (or a
-# Developer ID). Notarization is a separate release step.
-SIGN_ID="${CODESIGN_IDENTITY:--}"
+# macOS does not let SMAppService find a daemon in an ad-hoc signed bundle
+# (status "not found"), so the privileged helper needs a real identity. It is
+# picked automatically from the login keychain (the certificate Xcode creates
+# for your Apple ID, "Apple Development", or a "Developer ID Application" one);
+# set CODESIGN_IDENTITY (a name or SHA-1) to choose another, or CODESIGN_IDENTITY=-
+# to force an ad-hoc signature. Notarization is a separate release step.
+pick_identity() {
+    security find-identity -v -p codesigning 2>/dev/null | python3 -c '
+import re, sys
+found = {}
+for line in sys.stdin:
+    m = re.match(r"\s*\d+\)\s+([0-9A-F]{40})\s+\"(.+)\"", line)
+    if m:
+        found.setdefault(m.group(2).split(":")[0], []).append((m.group(1), m.group(2)))
+for kind in ("Developer ID Application", "Apple Development"):
+    if found.get(kind):
+        print(found[kind][0][0], found[kind][0][1])
+        break
+'
+}
+if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
+    SIGN_ID="$CODESIGN_IDENTITY"
+else
+    PICKED="$(pick_identity)"
+    if [[ -n "$PICKED" ]]; then
+        SIGN_ID="${PICKED%% *}"
+        echo "Signing with: ${PICKED#* }" >&2
+    else
+        SIGN_ID="-"
+        echo "No signing identity in the keychain: using an ad-hoc signature, so the privileged helper will not register." >&2
+    fi
+fi
 codesign --force --sign "$SIGN_ID" "$APP_DIR/Contents/MacOS/network-orchestrator-helper"
 codesign --force --sign "$SIGN_ID" "$APP_DIR"
 codesign --verify --strict "$APP_DIR"
