@@ -122,8 +122,9 @@ mirrors this gate on Windows.
   exceptions are user-level: the managed Xray child listening on loopback and
   the per-user system proxy via `networksetup` (snapshot + rollback through
   `SystemProxyManager`), and an explicit user toggle of another app's VPN
-  service via `scutil --nc start|stop <UUID>`. Routes, interfaces and DNS
-  stay helper-only. The helper itself launches Xray TUN only as the console
+  service via `scutil --nc start|stop <UUID>`, and driving the user's own
+  NetBird daemon through its CLI (`netbird status|up|down`, no keys on the
+  command line). Routes, interfaces and DNS stay helper-only. The helper itself launches Xray TUN only as the console
   user (groups, gid and uid dropped irreversibly before exec), only from the
   user's hash-verified managed install, and never as root; tests use fake
   platforms/runners and must not create a utun or touch routes or DNS. The

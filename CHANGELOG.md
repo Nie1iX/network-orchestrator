@@ -28,6 +28,11 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
   suffixes (`/etc/resolver`). Set per connection in the connection card; one
   active connection per protocol.
 
+- macOS: NetBird. The app shows the state of your own NetBird daemon (IP,
+  peers, networks, session expiry) among the external connections and switches
+  it on and off through the NetBird CLI, signing in through the browser (SSO) or
+  with a one-time setup key that never touches a command line.
+
 ### Changed
 
 - `sanitize_openvpn_config` accepts the macOS runtime root
