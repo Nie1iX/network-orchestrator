@@ -21,6 +21,13 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 - `openvpn_config::credential_requirements` in core: which credentials a
   profile needs before it can connect (mirrors the Linux client's rules).
 
+- macOS: Xray, OpenVPN and WireGuard can run together. One is the primary
+  connection (default route and system DNS); the others are secondary and carry
+  only the networks listed for them (CIDR), which win over the primary's capture
+  because they are more specific. Secondary connections can also add split-DNS
+  suffixes (`/etc/resolver`). Set per connection in the connection card; one
+  active connection per protocol.
+
 ### Changed
 
 - `sanitize_openvpn_config` accepts the macOS runtime root

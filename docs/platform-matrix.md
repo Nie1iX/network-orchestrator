@@ -25,6 +25,7 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 
 | Feature | Windows | Linux | macOS | Notes |
 |---|---|---|---|---|
+| Several tunnels at once (primary + secondary by network) | — | — | ✅ Xray, WireGuard, OpenVPN | macOS: one primary connection, secondary ones carry only listed networks — `docs/plans/2026-10-14-18-macos-multi-tunnel.md` |
 | WireGuard profile | ✅ | ✅ | ✅ helper, arm64 | Win: embedded tunnel lib + service install; Linux: `wireguard-tools` + daemon; macOS: userspace engine (`boringtun`) inside the privileged helper — `docs/plans/2026-10-14-17-macos-wireguard-openvpn.md` |
 | OpenVPN profile | ✅ | ✅ | ✅ helper, arm64 | Win/Linux as before; macOS: pinned self-contained OpenVPN from the app bundle run by the helper, routes/DNS installed by the helper, credentials in the Keychain |
 | Xray — SOCKS mode | ✅ | ✅ | ✅ native, arm64 | macOS: native client runs managed Xray via `TunnelManager` in `crates/macos-bridge/src/runtime.rs` |
