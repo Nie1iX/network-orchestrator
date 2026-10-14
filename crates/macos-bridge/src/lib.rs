@@ -13,6 +13,8 @@ mod routing;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
 mod user_network;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod vpn_backends;
 // The proxy runtime needs the managed Xray package, pinned for Apple
 // Silicon; on other targets the bridge still builds so subscription,
 // profile and inventory commands can be exercised off-macOS.
