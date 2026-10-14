@@ -200,14 +200,82 @@ struct ConnectionsView: View {
           }
         }
       }
-      if !model.externalVPNs.isEmpty {
+      if !model.externalVPNs.isEmpty || model.netbird?.installed == true {
         Text(L10n.text("profiles.external")).font(.system(size: 11.2, weight: .semibold))
           .foregroundStyle(p.secondary).padding(.horizontal, 8).padding(.top, 14).padding(
             .bottom, 5)
         Rectangle().fill(p.border).frame(height: 1)
+        if let netbird = model.netbird, netbird.installed { netbirdRow(netbird) }
         ForEach(model.externalVPNs) { vpn in externalRow(vpn) }
       }
     }
+  }
+  /// NetBird: the user's own daemon, switched on and off like another app's VPN.
+  private func netbirdRow(_ state: NetBirdState) -> some View {
+    let busy = model.netbirdBusy
+    return HStack(spacing: 8) {
+      StateDot(state: state.state == "connected" ? "running" : state.state == "needsLogin" ? "failed" : "stopped")
+      NativeIcon(name: "VpnIcon", size: 14).foregroundStyle(p.secondary)
+      VStack(alignment: .leading, spacing: 1) {
+        Text("NetBird").font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
+        Text(netbirdSubtitle(state)).font(.system(size: 10.5))
+          .foregroundStyle(state.state == "needsLogin" ? p["warn"] : p.muted).lineLimit(2)
+      }
+      Spacer(minLength: 8)
+      Menu {
+        Button(L10n.text("native.netbird.setup")) { model.showingNetBirdSetup = true }
+      } label: {
+        NativeIcon(name: "DotsVerticalIcon", size: 14).frame(width: 22, height: 22)
+      }.menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).foregroundStyle(p.secondary)
+        .frame(width: 22)
+      if busy || state.state == "connecting" {
+        Spinner(size: 12).frame(width: 34)
+      } else {
+        Button {
+          Task { await model.toggleNetBird() }
+        } label: {
+          Capsule().fill(state.isOn ? p["up"] : p.border).frame(width: 34, height: 20).overlay(
+            alignment: state.isOn ? .trailing : .leading
+          ) {
+            Circle().fill(.white).frame(width: 16, height: 16).padding(2)
+          }
+        }.buttonStyle(.plain).disabled(!state.canToggle)
+          .help(L10n.text(state.isOn ? "common.disconnect" : "common.connect"))
+          .accessibilityLabel(L10n.text(state.isOn ? "common.disconnect" : "common.connect"))
+      }
+    }
+    .padding(.horizontal, 8).padding(.vertical, 5)
+    .overlay(alignment: .bottom) { Rectangle().fill(p.border).frame(height: 1) }
+  }
+  private func netbirdSubtitle(_ state: NetBirdState) -> String {
+    switch state.state {
+    case "connected":
+      var parts = [state.ip.map { String($0.split(separator: "/").first ?? "") } ?? ""]
+      if let connected = state.peersConnected, let total = state.peersTotal {
+        parts.append(
+          L10n.text(
+            "native.netbird.peers", ["connected": String(connected), "total": String(total)]))
+      }
+      if let until = Self.sessionEnd(state.sessionExpiresAt) {
+        parts.append(L10n.text("native.netbird.session", ["time": until]))
+      }
+      return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+    case "connecting": return L10n.text("native.netbird.connecting")
+    case "needsLogin": return L10n.text("native.netbird.needsLogin")
+    case "daemonStopped": return L10n.text("native.netbird.stopped")
+    case "unavailable": return L10n.text("native.netbird.unavailable")
+    default: return L10n.text("native.netbird.disconnected")
+    }
+  }
+  /// "09:10" for a session that ends today or tomorrow; nothing when far away.
+  private static func sessionEnd(_ iso: String?) -> String? {
+    guard let iso else { return nil }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    guard let date = formatter.date(from: iso) ?? ISO8601DateFormatter().date(from: iso),
+      date.timeIntervalSinceNow > 0, date.timeIntervalSinceNow < 48 * 3600
+    else { return nil }
+    return date.formatted(date: .omitted, time: .shortened)
   }
   private func externalRow(_ vpn: ExternalVpn) -> some View {
     let connected = vpn.state == "connected"

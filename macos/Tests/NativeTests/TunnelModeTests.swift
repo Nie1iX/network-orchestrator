@@ -155,3 +155,31 @@ private func helper(_ capabilities: [String], reachable: Bool = true) throws -> 
   #expect(secondary.tunnelDnsDomains == ["corp.example"])
   #expect(secondary.needsHelper)
 }
+
+@Test func netBirdStateDecodesAndOnlyTogglesWhenTheDaemonAnswers() throws {
+  func decode(_ json: String) throws -> NetBirdState {
+    try JSONDecoder().decode(NetBirdState.self, from: Data(json.utf8))
+  }
+  let connected = try decode(
+    #"{"installed":true,"state":"connected","ip":"10.85.18.199/16","peersConnected":2,"peersTotal":2,"networks":["10.10.40.0/24"]}"#
+  )
+  #expect(connected.isOn && connected.canToggle && connected.networks == ["10.10.40.0/24"])
+  #expect(try decode(#"{"installed":true,"state":"connecting"}"#).isOn)
+  let login = try decode(#"{"installed":true,"state":"needsLogin"}"#)
+  #expect(!login.isOn && login.canToggle)
+  for blocked in ["daemonStopped", "unavailable"] {
+    let state = try decode(#"{"installed":true,"state":"\#(blocked)"}"#)
+    #expect(!state.canToggle, "\(blocked)")
+  }
+  #expect(!(try decode(#"{"installed":false,"state":"notInstalled"}"#).canToggle))
+}
+
+@Test @MainActor func netBirdIsLeftAloneWhenItCannotBeToggled() async throws {
+  let model = try model(nil)
+  model.netbird = NetBirdState(installed: true, state: "daemonStopped")
+  await model.toggleNetBird()
+  #expect(!model.netbirdBusy && model.error == nil)
+  model.netbird = nil
+  await model.toggleNetBird()
+  #expect(model.error == nil)
+}

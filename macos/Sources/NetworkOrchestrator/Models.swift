@@ -1,5 +1,24 @@
 import Foundation
 
+/// The user's own NetBird daemon as the bridge summarises it (no keys, no events).
+struct NetBirdState: Decodable, Sendable, Equatable {
+  let installed: Bool
+  /// connected, connecting, disconnected, needsLogin, daemonStopped,
+  /// notInstalled or unavailable.
+  let state: String
+  var ip: String? = nil
+  var fqdn: String? = nil
+  var version: String? = nil
+  var managementUrl: String? = nil
+  var peersConnected: Int? = nil
+  var peersTotal: Int? = nil
+  var sessionExpiresAt: String? = nil
+  var networks: [String]? = nil
+  var isOn: Bool { state == "connected" || state == "connecting" }
+  /// The daemon can be asked to connect.
+  var canToggle: Bool { installed && state != "daemonStopped" && state != "unavailable" }
+}
+
 struct Capabilities: Decodable, Sendable {
   let os: String
   let minimumOS: String
