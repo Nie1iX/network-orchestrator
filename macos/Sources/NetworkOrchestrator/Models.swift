@@ -33,6 +33,12 @@ struct Profile: Decodable, Identifiable, Sendable {
   let xrayHttpPort: UInt16?
   let subscription: SubscriptionMeta?
   let xrayMode: String?
+  /// "primary" (default) or "secondary": a secondary connection carries only
+  /// `tunnelNetworks`, the primary owns the default route and the system DNS.
+  var tunnelRole: String? = nil
+  var tunnelNetworks: [String]? = nil
+  var tunnelDnsDomains: [String]? = nil
+  var isSecondary: Bool { tunnelRole == "secondary" }
   var domainPolicies: [DomainPolicy]? = nil
   var privateLanDirect: Bool? = nil
   var xrayDns: DnsSummary? = nil

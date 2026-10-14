@@ -429,6 +429,7 @@ struct ProfileDetailView: View {
   @Bindable var model: AppModel
   @State private var editingRules = false
   @State private var showingLog = false
+  @State private var editingNetworks = false
   let profile: Profile
   let onRename: () -> Void
   let onDelete: () -> Void
@@ -446,6 +447,9 @@ struct ProfileDetailView: View {
             Text(profile.name).font(.system(size: 14.7, weight: .semibold)).lineLimit(1)
             if profile.backend != "none" { AppBadge(text: "detail.managed") }
             if proxyOwner { AppBadge(text: "native.systemProxy", color: "up") }
+            if profile.needsHelper && profile.isSecondary {
+              AppBadge(text: "native.roleSecondary", color: "info")
+            }
           }
           Text(statusLine(status)).font(.system(size: 11.2)).foregroundStyle(
             status?.state == "failed" ? p["down"] : p.muted
@@ -497,6 +501,7 @@ struct ProfileDetailView: View {
             ? L10n.text("detail.notAssigned") : profile.interfaceName))
       }
       if profile.backend == "xray" && model.canStartConnections { modePicker }
+      if profile.needsHelper && model.canStartConnections { roleRows }
       if profile.isTun {
         row(
           "detail.interface",
@@ -559,6 +564,10 @@ struct ProfileDetailView: View {
     }
     .sheet(isPresented: $editingRules) {
       RoutingRulesEditor(model: model, profile: profile) { editingRules = false }
+        .environment(\.palette, p).buttonStyle(TauriButtonStyle())
+    }
+    .sheet(isPresented: $editingNetworks) {
+      TunnelNetworksSheet(model: model, profile: profile) { editingNetworks = false }
         .environment(\.palette, p).buttonStyle(TauriButtonStyle())
     }
   }
@@ -773,6 +782,41 @@ struct ProfileDetailView: View {
     default:
       model.canStart(profile) || profile.startsWithoutHelper || !model.canStartConnections
         ? L10n.text("detail.stopped") : L10n.text("native.helperRequired")
+    }
+  }
+  /// Primary or secondary, and for a secondary one its networks.
+  @ViewBuilder private var roleRows: some View {
+    HStack {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(L10n.text("native.role")).foregroundStyle(p.muted)
+        Text(L10n.text("native.roleHint")).font(.system(size: 10.08)).foregroundStyle(p.muted)
+      }
+      Spacer()
+      Picker(
+        "",
+        selection: Binding(
+          get: { profile.isSecondary ? "secondary" : "primary" },
+          set: { value in Task { await model.setTunnelRole(profile, role: value) } })
+      ) {
+        Text(L10n.text("native.rolePrimary")).tag("primary")
+        Text(L10n.text("native.roleSecondary")).tag("secondary")
+      }.pickerStyle(.segmented).labelsHidden().frame(width: 190)
+        .disabled(model.pending.contains(profile.id))
+    }.font(.system(size: 11.9)).padding(.vertical, 5)
+    if profile.isSecondary {
+      HStack(alignment: .top) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text(L10n.text("native.networks")).foregroundStyle(p.muted)
+          let networks = profile.tunnelNetworks ?? []
+          Text(networks.isEmpty ? L10n.text("native.networksEmpty") : networks.joined(separator: ", "))
+            .font(.system(size: 10.92, design: .monospaced))
+            .foregroundStyle(networks.isEmpty ? p["warn"] : p.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        Spacer()
+        Button(L10n.text("native.networksEdit")) { editingNetworks = true }
+          .buttonStyle(TauriButtonStyle(compact: true))
+      }.font(.system(size: 11.9)).padding(.vertical, 5)
     }
   }
   /// Loopback SOCKS proxy or a tunnel for the whole system.
