@@ -548,6 +548,24 @@ import SystemConfiguration
   }
   /// Forget what Keychain holds for this profile.
   func forgetCredentials(_ profile: Profile) { CredentialStore.delete(profile.id) }
+  /// Primary connections take all traffic; secondary ones only their networks.
+  func setTunnelRole(_ profile: Profile, role: String) async {
+    guard !pending.contains(profile.id) else { return }
+    pending.insert(profile.id)
+    defer { pending.remove(profile.id) }
+    if await change("set_tunnel_role", args: ["id": profile.id, "role": role]) {
+      await refreshRuntime()
+    }
+  }
+  /// Saves a secondary connection's networks and split-DNS domains (typed
+  /// text, validated by the core). Returns whether it was accepted.
+  func setTunnelNetworks(_ profile: Profile, networks: String, dnsDomains: String) async -> Bool {
+    let saved = await change(
+      "set_tunnel_networks",
+      args: ["id": profile.id, "networks": networks, "dnsDomains": dnsDomains])
+    if saved { await refreshRuntime() }
+    return saved
+  }
   /// TUN was requested without a helper: the window offering to install it.
   var helperPrompt = false
   /// The helper was removed because the app changed; shown until it is installed again.

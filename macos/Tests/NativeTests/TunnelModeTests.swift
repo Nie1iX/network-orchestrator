@@ -139,3 +139,19 @@ private func helper(_ capabilities: [String], reachable: Bool = true) throws -> 
     CredentialNeeds.self, from: Data(#"{"userPass":true,"keyPassphrase":false}"#.utf8))
   #expect(needs == CredentialNeeds(userPass: true, keyPassphrase: false))
 }
+
+@Test func rolesDecodeAndDefaultToPrimary() throws {
+  let plain = try profile("wireGuard", mode: nil)
+  #expect(!plain.isSecondary && plain.tunnelNetworks == nil)
+  let secondary = try JSONDecoder().decode(
+    Profile.self,
+    from: JSONSerialization.data(withJSONObject: [
+      "id": "p", "name": "P", "backend": "openVpn", "interfaceName": "", "routes": [],
+      "tunnelRole": "secondary", "tunnelNetworks": ["10.10.0.0/16"],
+      "tunnelDnsDomains": ["corp.example"],
+    ]))
+  #expect(secondary.isSecondary)
+  #expect(secondary.tunnelNetworks == ["10.10.0.0/16"])
+  #expect(secondary.tunnelDnsDomains == ["corp.example"])
+  #expect(secondary.needsHelper)
+}
