@@ -162,6 +162,23 @@ import Testing
         ]
       ],
     ]))
+  model.userNetwork = try JSONDecoder().decode(
+    UserNetworkSettings.self,
+    from: Data(
+      #"""
+      {"persistentRoutes":[{"service":"USB LAN","interface":"en7","destination":"10.10.30.0/24","gateway":"192.0.2.1","active":true},
+        {"service":"USB LAN","interface":"en7","destination":"198.51.100.0/24","gateway":"192.0.2.1","active":false}],
+       "staticRoutes":[{"destination":"10.10.30.0/24","gateway":"192.0.2.1","interface":"en7","flags":"UGSc","source":"persistent"},
+        {"destination":"10.85.0.0/16","gateway":"utun4","interface":"utun4","flags":"USc","source":"tunnel"},
+        {"destination":"203.0.113.7/32","gateway":"192.0.2.1","interface":"en7","flags":"UGHS","source":"command"}],
+       "startupJobs":[{"label":"com.example.addroute","path":"/Library/LaunchDaemons/com.example.addroute.plist","scope":"daemon",
+        "command":"/sbin/route -n add -net 198.51.100.0/24 192.0.2.1","runAtLoad":true,"intervalSeconds":null,"route":"198.51.100.0/24","active":false}],
+       "resolvers":[{"domain":"corp.example","nameservers":["10.0.0.53","10.0.1.53"],"port":null,"searchOrder":null}],
+       "hosts":[{"address":"203.0.113.7","names":["portal.example"]}],
+       "services":[{"service":"Lab","interface":"en5","enabled":true,"items":[{"kind":"ipv4Address","value":"192.0.2.10/24"},
+        {"kind":"ipv4Router","value":"192.0.2.1"},{"kind":"dnsServers","value":"1.1.1.1, 8.8.8.8"}]}],
+       "unreadable":[]}
+      """#.utf8))
   for language in ["en", "ru"] {
     L10n.shared.preference = language
     for theme in [ColorScheme.dark, .light] {

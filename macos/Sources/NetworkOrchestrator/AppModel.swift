@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import Observation
 import OSLog
@@ -35,6 +36,7 @@ import SystemConfiguration
   var inspecting: Profile?
   var inspection: Inspection?
   var lookup: Lookup?
+  var userNetwork: UserNetworkSettings?
   var lookupDestination = ""
   var runtime: RuntimeState?
   var selectedProfileID: String?
@@ -102,7 +104,7 @@ import SystemConfiguration
   }
   /// Switch to exactly the set's connections among those this client can start.
   func applySet(_ set: ConnectionSet) async {
-    for profile in snapshot?.profiles ?? [] where profile.startsWithoutHelper {
+    for profile in snapshot?.profiles ?? [] where canStart(profile) {
       let wanted = set.profileIds.contains(profile.id)
       if wanted != isRunning(profile) { await toggle(profile) }
     }
@@ -133,13 +135,38 @@ import SystemConfiguration
   func isRunning(_ profile: Profile) -> Bool { status(profile)?.state == "running" }
   var activeCount: Int { runtime?.statuses.filter { $0.state == "running" }.count ?? 0 }
   var canStartConnections: Bool { capabilities?.proxyConnections ?? false }
+  /// The helper answers and serves Xray tunnels (`xray.connect`).
+  var helperServesTunnels: Bool {
+    helperStatus?.reachable == true && helperStatus?.capabilities.contains("xray.connect") == true
+  }
+  /// Whether this client can start `profile` right now: loopback Xray always,
+  /// a full tunnel once the privileged helper serves it.
+  func canStart(_ profile: Profile) -> Bool {
+    if profile.startsWithoutHelper { return canStartConnections }
+    return profile.isTun && canStartConnections && helperServesTunnels
+  }
+  /// The switch is usable for a TUN profile even without the helper: pressing
+  /// it then offers to install the helper instead of doing nothing.
+  func canTryStart(_ profile: Profile) -> Bool {
+    canStart(profile) || (profile.isTun && canStartConnections)
+  }
+  /// Interfaces of tunnels this app runs itself.
+  var ownTunnelInterfaces: Set<String> {
+    Set(runtime?.statuses.compactMap { $0.state == "running" ? $0.interfaceName : nil } ?? [])
+  }
   /// A packet-tunnel VPN (e.g. incy) owns the primary service, so macOS takes
-  /// proxy settings from it and ignores ours on Wi-Fi/Ethernet.
-  var systemProxyOverridden: Bool { primaryInterface?.hasPrefix("utun") ?? false }
+  /// proxy settings from it and ignores ours on Wi-Fi/Ethernet. Our own
+  /// full tunnel is not "another VPN".
+  var systemProxyOverridden: Bool {
+    guard let primary = primaryInterface, primary.hasPrefix("utun") else { return false }
+    return !ownTunnelInterfaces.contains(primary)
+  }
 
   func refreshRuntime() async {
     guard !isDuplicate else { return }
     primaryInterface = Self.currentPrimaryInterface()
+    helperStatus = try? await core.callConcurrently("helper_status")
+    await retireOutdatedHelper()
     do { runtime = try await core.call("runtime") } catch { runtime = nil }
     if let list: [ExternalVpn] = try? await core.call("external_vpns") { externalVPNs = list }
   }
@@ -157,6 +184,10 @@ import SystemConfiguration
   }
   func toggle(_ profile: Profile) async {
     guard !pending.contains(profile.id) else { return }
+    if profile.isTun && !isRunning(profile) && !helperServesTunnels {
+      helperPrompt = true
+      return
+    }
     pending.insert(profile.id)
     defer { pending.remove(profile.id) }
     do {
@@ -176,6 +207,16 @@ import SystemConfiguration
         notice = "native.proxyOverridden"
       }
     } catch { self.error = error.localizedDescription }
+  }
+  /// Switches an Xray profile between loopback SOCKS and the system tunnel;
+  /// a running connection restarts in the new mode.
+  func setXrayMode(_ profile: Profile, mode: String) async {
+    guard !pending.contains(profile.id) else { return }
+    pending.insert(profile.id)
+    defer { pending.remove(profile.id) }
+    if await change("set_xray_mode", args: ["id": profile.id, "mode": mode]) {
+      await refreshRuntime()
+    }
   }
   func installXray(archive: URL? = nil) async {
     installingXray = true
@@ -430,17 +471,63 @@ import SystemConfiguration
       }
     }
   }
+  /// TUN was requested without a helper: the window offering to install it.
+  var helperPrompt = false
+  /// The helper was removed because the app changed; shown until it is installed again.
+  var helperOutdated = UserDefaults.standard.bool(forKey: "helperOutdatedNotice")
+  private var helperCheckDone = false
+  private static let helperBuildKey = "helperRegisteredBuild"
+  /// Identifies the helper this app ships: app version plus the helper's own
+  /// code hash. launchd pins a registered helper to its code hash, so any
+  /// change — a new release or just a rebuild — leaves the old registration
+  /// unable to start; it is better removed and reinstalled with the user's
+  /// knowledge than left as "not responding".
+  nonisolated static func currentHelperBuild() -> String? {
+    let url = Bundle.main.bundleURL.appendingPathComponent(
+      "Contents/MacOS/network-orchestrator-helper")
+    guard let data = try? Data(contentsOf: url) else { return nil }
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    return "\(version ?? "?")|\(hash)"
+  }
+  /// Once per launch: a registered helper that belongs to another build of the
+  /// app is unregistered and the user is told to install it again.
+  private func retireOutdatedHelper() async {
+    guard !helperCheckDone else { return }
+    helperCheckDone = true
+    guard HelperManager.registration != .notRegistered,
+      let current = Self.currentHelperBuild(),
+      UserDefaults.standard.string(forKey: Self.helperBuildKey) != current
+    else { return }
+    try? await HelperManager.unregister()
+    UserDefaults.standard.removeObject(forKey: Self.helperBuildKey)
+    UserDefaults.standard.set(true, forKey: "helperOutdatedNotice")
+    helperOutdated = true
+    await refreshHelper()
+  }
   /// Re-reads the launchd registration and asks the helper's socket who answers.
   func refreshHelper() async {
     helperRegistration = HelperManager.registration
     helperStatus = try? await core.callConcurrently("helper_status")
   }
+  /// Registers the helper; macOS may still wait for the approval in Login Items.
   func installHelper() async {
-    do { try HelperManager.register() } catch { self.error = "native.helperFailed" }
+    do {
+      try HelperManager.register()
+      if let build = Self.currentHelperBuild() {
+        UserDefaults.standard.set(build, forKey: Self.helperBuildKey)
+      }
+      UserDefaults.standard.removeObject(forKey: "helperOutdatedNotice")
+      helperOutdated = false
+    } catch { self.error = "native.helperFailed" }
     await refreshHelper()
+    if helperRegistration == .requiresApproval { HelperManager.openSystemSettings() }
   }
   func removeHelper() async {
-    do { try await HelperManager.unregister() } catch { self.error = "native.helperFailed" }
+    do {
+      try await HelperManager.unregister()
+      UserDefaults.standard.removeObject(forKey: Self.helperBuildKey)
+    } catch { self.error = "native.helperFailed" }
     await refreshHelper()
   }
   func connectionLog(_ profile: Profile) async -> String {
@@ -493,6 +580,12 @@ import SystemConfiguration
     inspecting = profile
     inspection = nil
     do { inspection = try await core.call("inspect", args: ["id": profile.id]) } catch {
+      self.error = error.localizedDescription
+    }
+  }
+  /// Reads system files and the kernel table only; no store lock is taken.
+  func loadUserNetwork() async {
+    do { userNetwork = try await core.callConcurrently("user_network_settings") } catch {
       self.error = error.localizedDescription
     }
   }

@@ -287,7 +287,7 @@ struct ConnectionsView: View {
       return true
     }
     .contextMenu {
-      if profile.startsWithoutHelper && model.canStartConnections {
+      if model.canStart(profile) {
         Button(L10n.text(model.isRunning(profile) ? "common.disconnect" : "common.connect")) {
           Task { await model.toggle(profile) }
         }
@@ -353,7 +353,7 @@ struct ConnectionSwitch: View {
     let running = model.isRunning(profile)
     let busy = model.pending.contains(profile.id)
     let enabled =
-      model.canStartConnections && profile.startsWithoutHelper
+      model.canTryStart(profile)
       && (model.runtime?.xrayInstalled ?? false) && !busy
     Button {
       Task { await model.toggle(profile) }
@@ -368,7 +368,7 @@ struct ConnectionSwitch: View {
     }.buttonStyle(.plain).disabled(!enabled)
       .help(
         L10n.text(
-          !profile.startsWithoutHelper
+          !model.canStart(profile) && model.canStartConnections
             ? "native.helperRequired"
             : running ? "common.disconnect" : "common.connect")
       )
@@ -488,9 +488,16 @@ struct ProfileDetailView: View {
           "detail.interface",
           profile.interfaceName.isEmpty ? L10n.text("detail.notAssigned") : profile.interfaceName)
       }
-      if let port = profile.xraySocksPort { row("SOCKS5", "127.0.0.1:\(port)", translate: false) }
-      if let port = profile.xrayHttpPort {
-        row("HTTP CONNECT", "127.0.0.1:\(port)", translate: false)
+      if profile.backend == "xray" && model.canStartConnections { modePicker }
+      if profile.isTun {
+        row(
+          "detail.interface",
+          model.status(profile)?.interfaceName ?? L10n.text("detail.notAssigned"))
+      } else {
+        if let port = profile.xraySocksPort { row("SOCKS5", "127.0.0.1:\(port)", translate: false) }
+        if let port = profile.xrayHttpPort {
+          row("HTTP CONNECT", "127.0.0.1:\(port)", translate: false)
+        }
       }
       if profile.startsWithoutHelper && model.canStartConnections {
         HStack {
@@ -746,13 +753,38 @@ struct ProfileDetailView: View {
   private func statusLine(_ status: TunnelStatus?) -> String {
     switch status?.state {
     case "running":
-      L10n.text("detail.runningOn", ["iface": profile.xraySocksPort.map { "127.0.0.1:\($0)" } ?? "tunnel"])
+      L10n.text(
+        "detail.runningOn",
+        ["iface": profile.isTun
+          ? (status?.interfaceName ?? "tunnel")
+          : profile.xraySocksPort.map { "127.0.0.1:\($0)" } ?? "tunnel"])
         + (model.activeServer(profile).map { " · \($0)" } ?? "")
     case "failed": status?.message.map { L10n.text($0) } ?? L10n.text("detail.failed")
     default:
-      profile.startsWithoutHelper || !model.canStartConnections
+      model.canStart(profile) || profile.startsWithoutHelper || !model.canStartConnections
         ? L10n.text("detail.stopped") : L10n.text("native.helperRequired")
     }
+  }
+  /// Loopback SOCKS proxy or a tunnel for the whole system.
+  private var modePicker: some View {
+    HStack {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(L10n.text("native.tunnelMode")).foregroundStyle(p.muted)
+        Text(L10n.text(model.helperServesTunnels ? "native.tunnelModeHint" : "native.tunnelModeNeedsHelper"))
+          .font(.system(size: 10.08)).foregroundStyle(p.muted)
+      }
+      Spacer()
+      Picker(
+        "",
+        selection: Binding(
+          get: { profile.isTun ? "tun" : "socks" },
+          set: { value in Task { await model.setXrayMode(profile, mode: value) } })
+      ) {
+        Text("SOCKS").tag("socks")
+        Text("TUN").tag("tun")
+      }.pickerStyle(.segmented).labelsHidden().frame(width: 130)
+        .disabled(model.pending.contains(profile.id))
+    }.font(.system(size: 11.9)).padding(.vertical, 5)
   }
   private func section(_ title: String, translate: Bool = true) -> some View {
     Text(translate ? L10n.text(title) : title).font(.system(size: 11.2, weight: .semibold))
