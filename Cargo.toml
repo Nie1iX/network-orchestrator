@@ -17,8 +17,12 @@ strip = true
 [profile.release.build-override]
 strip = "none"
 
-# Dependencies rarely need a debugger; dropping their DWARF keeps target/debug
-# several times smaller. Workspace crates keep full debug info.
+# Keep source lines in backtraces without full debugger metadata or incremental caches.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+# Dependencies rarely need a debugger; dropping their DWARF keeps target/debug smaller.
 [profile.dev.package."*"]
 debug = false
 
