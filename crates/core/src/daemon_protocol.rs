@@ -1123,6 +1123,11 @@ pub struct XrayConnectParams {
     /// `XRAY_LOCATION_ASSET`; absent fields fall back to managed assets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geo_assets: Option<XrayGeoAssets>,
+    /// macOS only: the console user's app data root holding the managed Xray
+    /// (`<root>/backends/xray`). The helper re-verifies the pinned hashes and
+    /// owner before executing it, always as that user, never as root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_data_root: Option<String>,
 }
 
 /// Inline geo asset overrides for [`XrayConnectParams`]; base64-encoded dat
@@ -1146,6 +1151,7 @@ impl std::fmt::Debug for XrayConnectParams {
             .field("dns_domains", &self.dns_domains)
             .field("dns_bypass", &self.dns_bypass)
             .field("interface_name", &self.interface_name)
+            .field("macos_data_root", &self.macos_data_root)
             .field(
                 "geo_assets",
                 &self.geo_assets.as_ref().map(|assets| {

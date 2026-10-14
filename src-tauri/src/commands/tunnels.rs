@@ -248,6 +248,7 @@ fn prepare_linux_xray_tun_params(
         dns_bypass,
         interface_name: link_name_hint(profile),
         geo_assets: None,
+        macos_data_root: None,
     };
     check_xray_frame_size(&params)?;
     Ok(params)
