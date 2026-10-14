@@ -11,7 +11,9 @@ use net_manager_core::daemon_protocol::{
 };
 use net_manager_core::helper_client::{HelperClient, HelperError};
 use net_manager_core::managed_xray;
-use net_manager_core::models::{Profile, TunnelBackend, TunnelState, TunnelStatus, XrayMode};
+use net_manager_core::models::{
+    Profile, TunnelBackend, TunnelRole, TunnelState, TunnelStatus, XrayMode,
+};
 use net_manager_core::profile_import;
 use net_manager_core::profiles::ProfileStore;
 use net_manager_core::system_proxy::SystemProxyManager;
@@ -257,6 +259,7 @@ fn resolver_bypass() -> Vec<String> {
 
 /// Start a full-tunnel Xray through the privileged helper.
 fn start_tun(root: &Path, profile: &Profile) -> Result<(), String> {
+    vpn_backends::check_role(profile)?;
     let client = helper();
     let hello = client.hello().map_err(helper_error)?;
     if !hello
@@ -289,13 +292,24 @@ fn request_tunnel(
         profile_id: profile.id.clone(),
         config: String::from_utf8(config)
             .map_err(|_| "The Xray configuration could not be prepared".to_string())?,
-        routes: Vec::new(),
+        // A secondary connection carries only its own networks and leaves the
+        // default route, the system DNS and the resolver bypasses to the primary.
+        routes: if profile.tunnel_role == TunnelRole::Secondary {
+            profile.secondary_routes()
+        } else {
+            Vec::new()
+        },
         dns_servers: Vec::new(),
         dns_domains: Vec::new(),
-        dns_bypass,
+        dns_bypass: if profile.tunnel_role == TunnelRole::Secondary {
+            Vec::new()
+        } else {
+            dns_bypass
+        },
         interface_name: None,
         geo_assets: None,
         macos_data_root: Some(root.to_string_lossy().into_owned()),
+        role: profile.tunnel_role,
     };
     client
         .call::<_, XrayConnectResult>(method::XRAY_CONNECT, params)

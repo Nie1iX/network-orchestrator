@@ -11,7 +11,9 @@ use net_manager_core::daemon_protocol::{
     WireGuardProfileParams, WireGuardStatusResult, WireGuardWarning,
 };
 use net_manager_core::helper_client::{HelperClient, HelperError};
-use net_manager_core::models::{Profile, TunnelBackend, TunnelState, TunnelStatus};
+use net_manager_core::models::{
+    secondary_networks, PolicyRoute, Profile, TunnelBackend, TunnelRole, TunnelState, TunnelStatus,
+};
 use net_manager_core::openvpn_config::{credential_requirements, CredentialRequirements};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -22,6 +24,24 @@ const MAX_ASSET_BYTES: u64 = 512 * 1024;
 const MAX_ASSETS: usize = 32;
 /// Shown (and translated) by the client; also what the Swift side matches.
 pub(crate) const CREDENTIALS_REQUIRED: &str = "OpenVPN credentials required";
+
+/// The routes the helper is asked to install: a secondary connection carries
+/// exactly the networks listed for it, a primary one keeps what the profile has.
+pub(crate) fn routes_for(profile: &Profile) -> Vec<PolicyRoute> {
+    if profile.tunnel_role == TunnelRole::Secondary {
+        profile.secondary_routes()
+    } else {
+        profile.routes.clone()
+    }
+}
+
+/// A secondary connection must list valid networks before anything is started.
+pub(crate) fn check_role(profile: &Profile) -> Result<(), String> {
+    if profile.tunnel_role == TunnelRole::Secondary {
+        secondary_networks(&profile.secondary_routes()).map_err(str::to_string)?;
+    }
+    Ok(())
+}
 
 pub(crate) fn is_wireguard(profile: &Profile) -> bool {
     profile.backend == TunnelBackend::WireGuard
@@ -235,6 +255,7 @@ pub(crate) fn start_wireguard(
     client: &HelperClient,
     profile: &Profile,
 ) -> Result<(), String> {
+    check_role(profile)?;
     capable(
         client,
         method::WIREGUARD_CONNECT,
@@ -257,8 +278,10 @@ pub(crate) fn request_wireguard(
             WireGuardConnectParams {
                 profile_id: profile.id.clone(),
                 config,
-                routes: profile.routes.clone(),
+                routes: routes_for(profile),
                 interface_name: None,
+                role: profile.tunnel_role,
+                dns_domains: profile.tunnel_dns_domains.clone(),
             },
         )
         .map(|_| ())
@@ -346,8 +369,10 @@ pub(crate) fn openvpn_request(
             profile_id: profile.id.clone(),
             config,
             assets,
-            routes: profile.routes.clone(),
+            routes: routes_for(profile),
             interface_name: None,
+            role: profile.tunnel_role,
+            dns_domains: profile.tunnel_dns_domains.clone(),
         },
         credentials,
     };
@@ -373,6 +398,7 @@ pub(crate) fn start_openvpn(
     profile: &Profile,
     credentials: Option<OpenVpnCredentials>,
 ) -> Result<(), String> {
+    check_role(profile)?;
     capable(
         client,
         method::OPENVPN_CONNECT,
@@ -605,5 +631,60 @@ mod tests {
             error,
             "a Xray tunnel is already active; disconnect it first"
         );
+    }
+
+    #[test]
+    fn a_secondary_connection_sends_its_own_networks_and_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = wireguard_profile(dir.path(), "[Interface]\nPrivateKey = x\n");
+        profile.tunnel_role = TunnelRole::Secondary;
+        profile.tunnel_networks = vec!["10.10.0.0/16".parse().unwrap()];
+        profile.tunnel_dns_domains = vec!["corp.example".into()];
+        // The imported routes are not what a secondary connection carries.
+        profile.routes = vec![PolicyRoute {
+            destination: "172.16.0.0/12".parse().unwrap(),
+            metric: 5,
+            via: None,
+        }];
+        let (client, seen) = fake_helper(dir.path(), method::WIREGUARD_CONNECT, |request| {
+            ResponseFrame::ok(
+                request.id,
+                json!({"status": {"profileId":"wg-1","state":"running","interfaceName":"utun11",
+                    "latestHandshake":null,"rxBytes":0,"txBytes":0,"dnsApplied":false,"warnings":[]}}),
+            )
+        });
+        start_wireguard(dir.path(), &client, &profile).unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.params["role"], "secondary");
+        assert_eq!(request.params["routes"][0]["destination"], "10.10.0.0/16");
+        assert_eq!(request.params["routes"].as_array().unwrap().len(), 1);
+        assert_eq!(request.params["dnsDomains"], json!(["corp.example"]));
+    }
+
+    #[test]
+    fn a_primary_connection_sends_no_role_and_keeps_its_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = openvpn_profile(dir.path(), "client\nremote a\nca assets/ca.crt\n");
+        profile.routes = vec![PolicyRoute {
+            destination: "172.16.0.0/12".parse().unwrap(),
+            metric: 5,
+            via: None,
+        }];
+        let request = openvpn_request(dir.path(), &profile, None).unwrap();
+        assert_eq!(request.profile.role, TunnelRole::Primary);
+        assert_eq!(request.profile.routes.len(), 1);
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json.get("role").is_none());
+    }
+
+    #[test]
+    fn a_secondary_connection_without_networks_is_refused_before_the_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = wireguard_profile(dir.path(), "x");
+        profile.tunnel_role = TunnelRole::Secondary;
+        let (client, seen) = fake_helper(dir.path(), method::WIREGUARD_CONNECT, |_| unreachable!());
+        let error = start_wireguard(dir.path(), &client, &profile).unwrap_err();
+        assert!(error.contains("at least one network"), "{error}");
+        assert!(seen.try_recv().is_err());
     }
 }
