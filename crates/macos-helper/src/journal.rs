@@ -26,9 +26,15 @@ pub struct Journal {
 }
 
 impl Journal {
+    /// The Xray TUN record.
     pub fn new(dir: &Path) -> Self {
+        Self::named(dir, "xray-tun.json")
+    }
+
+    /// One record per tunnel kind, side by side in the state directory.
+    pub fn named(dir: &Path, file: &str) -> Self {
         Self {
-            path: dir.join("xray-tun.json"),
+            path: dir.join(file),
         }
     }
 

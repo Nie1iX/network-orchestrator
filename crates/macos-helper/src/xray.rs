@@ -411,6 +411,14 @@ impl XrayExecutor {
         Ok(XrayDisconnectResult { stopped: true })
     }
 
+    /// Whether a tunnel is running right now (not just journaled).
+    pub fn active(&self) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     /// Whether a tunnel (or an unfinished one) is owned.
     pub fn owned(&self) -> Option<Record> {
         let guard = self.active.lock().unwrap_or_else(|e| e.into_inner());
