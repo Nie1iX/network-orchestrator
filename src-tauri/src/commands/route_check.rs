@@ -9,9 +9,12 @@ use net_manager_core::models::{DomainPolicy, XrayDnsConfig, XrayDomainStrategy};
 use net_manager_core::route_check::{check_route, GeoDbs, GeoIpDb, GeoSiteDb, RouteCheckResult};
 use net_manager_core::xray::ProfileRoutingOptions;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::path::Path;
+use std::path::PathBuf;
 use tauri::State;
 
+#[cfg(target_os = "linux")]
 use crate::geo_assets;
 use crate::state::AppState;
 
@@ -35,6 +38,9 @@ pub(crate) struct RouteCheckRequest {
     #[serde(default)]
     pub geosite_url: Option<String>,
 }
+
+/// Same bound the Linux geo-asset downloader enforces.
+const MAX_GEO_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Directories that may hold `geoip.dat`/`geosite.dat`, most specific first.
 fn asset_dirs(
@@ -81,8 +87,7 @@ fn load_asset<T>(
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
-        if !meta.is_file() || meta.len() == 0 || meta.len() > geo_assets::MAX_GEO_ASSET_BYTES as u64
-        {
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_GEO_ASSET_BYTES {
             continue;
         }
         let Ok(bytes) = std::fs::read(&path) else {

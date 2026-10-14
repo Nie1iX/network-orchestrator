@@ -1,9 +1,9 @@
 [workspace]
-members = ["crates/core", "crates/daemon", "crates/macos-bridge", "src-tauri"]
+members = ["crates/core", "crates/daemon", "crates/macos-bridge", "crates/macos-helper", "src-tauri"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.8.5"
 edition = "2021"
 
 [profile.release]
@@ -17,8 +17,12 @@ strip = true
 [profile.release.build-override]
 strip = "none"
 
-# Dependencies rarely need a debugger; dropping their DWARF keeps target/debug
-# several times smaller. Workspace crates keep full debug info.
+# Keep source lines in backtraces without full debugger metadata or incremental caches.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+# Dependencies rarely need a debugger; dropping their DWARF keeps target/debug smaller.
 [profile.dev.package."*"]
 debug = false
 

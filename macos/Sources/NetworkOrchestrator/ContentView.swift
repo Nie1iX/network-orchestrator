@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct ContentView: View {
@@ -19,6 +20,18 @@ struct ContentView: View {
                 Text(L10n.text(error)).foregroundStyle(AppPalette(scheme: scheme)["down"])
                 Spacer()
                 Button(L10n.text("Dismiss")) { model.error = nil }
+              }
+            }
+          }
+          if model.helperOutdated {
+            AppCard {
+              HStack {
+                Text(L10n.text("native.helperOutdated")).foregroundStyle(
+                  AppPalette(scheme: scheme)["warn"])
+                Spacer()
+                Button(L10n.text("native.helperInstall")) {
+                  Task { await model.installHelper() }
+                }
               }
             }
           }
@@ -52,9 +65,12 @@ struct ContentView: View {
       guard loadsOnAppear else { return }
       await model.refresh()
       // Xray can exit on its own (bad server, port taken); keep the UI honest.
+      var tick = 0
       while !Task.isCancelled {
         try? await Task.sleep(for: .seconds(3))
         await model.refreshRuntime()
+        tick += 1
+        if tick % 20 == 0 { await model.autoRefreshDue() }
       }
     }
     .sheet(item: $modal) { value in
@@ -65,6 +81,21 @@ struct ContentView: View {
       .environment(\.locale, Locale(identifier: L10n.shared.language))
       .environment(\.layoutDirection, L10n.shared.direction)
     }
+    .sheet(isPresented: $model.showingNetBirdSetup) {
+      NetBirdSetupSheet(model: model).environment(\.palette, AppPalette(scheme: scheme))
+        .buttonStyle(TauriButtonStyle())
+    }
+    .sheet(item: $model.credentialRequest) { request in
+      CredentialSheet(model: model, request: request).environment(
+        \.palette, AppPalette(scheme: scheme)
+      ).buttonStyle(TauriButtonStyle())
+    }
+    .alert(L10n.text("native.helperPromptTitle"), isPresented: $model.helperPrompt) {
+      Button(L10n.text("native.helperInstall")) { Task { await model.installHelper() } }
+      Button(L10n.text("common.cancel"), role: .cancel) {}
+    } message: {
+      Text(L10n.text("native.helperPromptBody"))
+    }
     .sheet(item: $model.inspecting) { profile in
       InspectionView(model: model, profile: profile).environment(
         \.palette, AppPalette(scheme: scheme)
@@ -73,6 +104,9 @@ struct ContentView: View {
   }
 }
 struct NavigationRail: View {
+  /// Wider than the shared token (64): even where the rail does reach the
+  /// title bar, all three window buttons end inside it.
+  static let width: CGFloat = 72
   @Environment(\.palette) private var p
   @Binding var selection: Section
   @State private var hovered: Section?
@@ -88,8 +122,10 @@ struct NavigationRail: View {
       railButton(.routes, muted: true)
       Spacer(minLength: 0)
       railButton(.settings)
-    }.padding(.vertical, 10.5).frame(width: DesignMetrics.railWidth).frame(maxHeight: .infinity)
-      .background(p.sidebar)
+    }.padding(.vertical, 10.5).frame(width: Self.width).frame(maxHeight: .infinity)
+      // Stops at the title bar: the window's traffic-light buttons sit above the
+      // rail, not half on it (the zoom button used to straddle its edge).
+      .background(p.sidebar, ignoresSafeAreaEdges: .bottom)
       .overlay(alignment: .trailing) { Rectangle().fill(p.border).frame(width: 1) }
   }
   private func railButton(_ section: Section, muted: Bool = false) -> some View {
@@ -151,6 +187,7 @@ struct HomeView: View {
           ForEach(running) { profile in activeRow(profile) }
         }
       }
+      ExitIPSection(model: model)
       VStack(alignment: .leading, spacing: 0) {
         AppHeading(title: "Quick actions")
         HStack(spacing: 7) {
@@ -257,5 +294,102 @@ struct StatusBar: View {
       Circle().fill(p[color]).frame(width: 6, height: 6)
       Text(text).font(.system(size: 10.5, design: .monospaced))
     }
+  }
+}
+
+/// Exit IP directly and through each running connection: the address most
+/// checkers agree on, its country and how many of the services agree.
+struct ExitIPSection: View {
+  @Environment(\.palette) private var p
+  @Bindable var model: AppModel
+  var body: some View {
+    let running = (model.snapshot?.profiles ?? []).filter { model.isRunning($0) }
+    VStack(alignment: .leading, spacing: 0) {
+      HStack {
+        AppHeading(title: "monitor.exitAddresses")
+      }
+      .overlay(alignment: .topTrailing) {
+        Button {
+          Task { await model.checkExitIPs() }
+        } label: {
+          HStack(spacing: 6) {
+            if !model.checkingExitIP.isEmpty { Spinner(size: 10) }
+            Text(
+              L10n.text(
+                !model.checkingExitIP.isEmpty
+                  ? "exitIp.checking" : model.exitIPs.isEmpty ? "exitIp.check" : "exitIp.recheck"))
+          }
+        }.buttonStyle(TauriButtonStyle(compact: true)).disabled(!model.checkingExitIP.isEmpty)
+      }
+      row("direct", L10n.text("rules.direct"))
+      ForEach(running) { profile in
+        row(
+          profile.id,
+          [profile.groupName, model.activeServer(profile)].compactMap { $0 }.joined(
+            separator: " · "))
+      }
+    }
+  }
+  @ViewBuilder private func row(_ route: String, _ label: String) -> some View {
+    let entries = model.exitIPs[route]
+    HStack(spacing: 10) {
+      Text(label).foregroundStyle(p.secondary).lineLimit(1)
+      Spacer()
+      if model.checkingExitIP.contains(route) {
+        Spinner(size: 11)
+      } else if let entries {
+        let answered = entries.compactMap(\.ip)
+        let counts = Dictionary(grouping: answered, by: { $0 }).mapValues(\.count)
+        if let (ip, agree) = counts.max(by: { $0.value < $1.value }) {
+          let country = entries.first { $0.ip == ip }?.country ?? ""
+          Text(ip).font(.system(size: 11.9, weight: .medium, design: .monospaced))
+            .textSelection(.enabled)
+          if !country.isEmpty {
+            Text(country).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(p.muted)
+          }
+          Text("\(agree)/\(entries.count)").font(.system(size: 10.5, design: .monospaced))
+            .foregroundStyle(counts.count > 1 ? p["warn"] : p.muted)
+            .help(entries.map { "\($0.name): \($0.ip ?? L10n.text("exitIp.noResponse"))" }.joined(separator: "\n"))
+        } else {
+          Text(L10n.text("exitIp.noResponse")).foregroundStyle(p["down"])
+        }
+      } else {
+        Text("—").foregroundStyle(p.muted)
+      }
+    }
+    .font(.system(size: 11.9)).padding(.horizontal, 14).padding(.vertical, 9)
+    .background(p.card, in: RoundedRectangle(cornerRadius: 8))
+    .overlay(RoundedRectangle(cornerRadius: 8).stroke(p.border, lineWidth: 1))
+    .padding(.bottom, 6)
+  }
+}
+
+/// Read-only, already-redacted log text with refresh and copy actions.
+struct LogSheet: View {
+  @Environment(\.palette) private var p
+  let title: String
+  let load: () async -> String
+  let onClose: () -> Void
+  @State private var text = ""
+  var body: some View {
+    AppModal(title: title, width: 760, onClose: onClose, translatesTitle: false) {
+      VStack(alignment: .leading, spacing: 10.5) {
+        ScrollView {
+          Text(text.isEmpty ? L10n.text("logs.empty") : text)
+            .font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+        }.frame(height: 380).background(p.input, in: RoundedRectangle(cornerRadius: 6))
+          .overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
+        HStack {
+          Button(L10n.text("common.refresh")) { Task { text = await load() } }
+          Button(L10n.text("native.copyLog")) {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+          }.disabled(text.isEmpty)
+          Spacer()
+          Button(L10n.text("common.close"), action: onClose)
+        }
+      }.padding(14)
+    }.task { text = await load() }
   }
 }

@@ -1,5 +1,6 @@
 use crate::elevation;
 use crate::state::{existing_profile_for_update, find_profile, AppState};
+#[cfg(test)]
 use net_manager_core::config_security;
 use net_manager_core::config_vault::{ConfigImport, ConfigVault};
 use net_manager_core::models::*;
@@ -29,13 +30,7 @@ fn unix_now() -> u64 {
 }
 
 pub(crate) fn subscription_refresh_due(subscription: &SubscriptionMeta, now: u64) -> bool {
-    let Some(minutes) = subscription.refresh_interval_minutes else {
-        return false;
-    };
-    matches!(minutes, 15 | 60 | 360)
-        && subscription
-            .last_refresh_at_unix
-            .is_none_or(|last| now.saturating_sub(last) >= u64::from(minutes) * 60)
+    net_manager_core::subscription::refresh_due(subscription, now)
 }
 
 fn should_auto_refresh(profile: &Profile, now: u64, active: bool) -> bool {
@@ -48,6 +43,7 @@ fn should_auto_refresh(profile: &Profile, now: u64, active: bool) -> bool {
 }
 use net_manager_core::subscription::{DELAY_PROBE_TIMEOUT, DELAY_PROBE_URL};
 
+#[cfg(test)]
 pub(crate) fn select_available_socks_port(
     used: &HashSet<u16>,
     available: impl Fn(u16) -> bool,
@@ -85,50 +81,20 @@ pub(crate) fn store_generated_xray(
     vault.store_generated_xray(profile_id, plaintext_json)
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_generated_proxy_ports(
     vault: &ConfigVault,
     profile: &mut Profile,
     new_socks_port: u16,
     new_http_port: Option<u16>,
 ) -> Result<PathBuf, String> {
-    if profile.backend != TunnelBackend::Xray
-        || profile.xray_socks_port.is_none()
-        || !vault.is_managed_profile_path(&profile.id, &profile.config_path)
-    {
-        return Err("profile does not use a managed generated Xray config".into());
-    }
-    if new_socks_port == 0
-        || new_http_port == Some(0)
-        || new_http_port == Some(new_socks_port)
-        || profile.xray_http_port.is_some() != new_http_port.is_some()
-    {
-        return Err("generated Xray listener ports are invalid".into());
-    }
-    let bytes = config_security::read_xray_config(&profile.config_path, &profile.id)
-        .map_err(|e| e.to_string())?;
-    let mut doc: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    let inbounds = doc
-        .get_mut("inbounds")
-        .and_then(|v| v.as_array_mut())
-        .ok_or_else(|| "generated config has no inbounds array".to_string())?;
-    let inbound = inbounds
-        .iter_mut()
-        .find(|i| i.get("tag").and_then(|t| t.as_str()) == Some("socks-in"))
-        .ok_or_else(|| "generated config has no 'socks-in' inbound".to_string())?;
-    inbound["port"] = serde_json::json!(new_socks_port);
-    if let Some(http_port) = new_http_port {
-        let inbound = inbounds
-            .iter_mut()
-            .find(|i| i.get("tag").and_then(|t| t.as_str()) == Some("http-in"))
-            .ok_or_else(|| "generated config has no 'http-in' inbound".to_string())?;
-        inbound["port"] = serde_json::json!(http_port);
-    }
-    let body = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
-    let import = store_generated_xray(vault, &profile.id, &body).map_err(|e| e.to_string())?;
-    profile.config_path = import.config_path.clone();
-    profile.xray_socks_port = Some(new_socks_port);
-    profile.xray_http_port = new_http_port;
-    Ok(import.config_path)
+    net_manager_core::profile_import::rewrite_generated_proxy_ports(
+        vault,
+        profile,
+        new_socks_port,
+        new_http_port,
+    )
+    .map_err(|err| err.to_string())
 }
 
 pub(crate) fn remove_managed_revision(
@@ -752,9 +718,10 @@ pub(crate) async fn import_configs_batch(
 use net_manager_core::subscription::base64_decode;
 #[cfg(test)]
 use net_manager_core::subscription::parse_subscription_body;
-#[cfg(test)]
-use net_manager_core::subscription::parse_subscription_body_schemes;
-use net_manager_core::subscription::{subscription_response_meta, SubscriptionResponseMeta};
+
+// Subscription metadata parsing lives in the core so the native client
+// shares it; these names keep the Tauri call sites and tests stable.
+use net_manager_core::subscription::ResponseMeta as SubscriptionResponseMeta;
 
 /// Fetch a subscription and import its supported share links.
 pub(crate) async fn import_subscription_into(
@@ -836,7 +803,7 @@ fn import_subscription_body_into_with_metadata(
         store,
         &request,
         body,
-        &meta,
+        meta,
         loopback_port_available,
     )
     .map_err(|error| {
@@ -927,8 +894,9 @@ async fn refresh_subscription_into_with_ports(
             response.status()
         ));
     }
-    let meta = subscription_response_meta(response.headers());
+    let headers = response.headers().clone();
     let body = read_subscription_response(response).await?;
+    let meta = net_manager_core::subscription::response_meta_from_headers(&headers, &body);
     if subscription_profile(store, id)? != profile {
         return Err("subscription changed during refresh".into());
     }
@@ -963,7 +931,7 @@ fn refresh_subscription_body_into_with_metadata(
 ) -> Result<SubscriptionRefreshResult, String> {
     subscription_profile(store, id)?;
     let outcome =
-        net_manager_core::subscription::refresh_body(vault, store, id, body, &meta, available)
+        net_manager_core::subscription::refresh_body(vault, store, id, body, meta, available)
             .map_err(|error| error.to_string())?;
     Ok(SubscriptionRefreshResult {
         endpoint_count: outcome.endpoint_count,
@@ -979,14 +947,9 @@ fn record_subscription_refresh_failure(
     id: &str,
     now: u64,
 ) -> Result<(), String> {
-    let mut profile = subscription_profile(store, id)?;
-    let subscription = profile.subscription.as_mut().unwrap();
-    subscription.last_refresh_at_unix = Some(now);
-    subscription.last_refresh_error = Some("Refresh failed".into());
-    store
-        .upsert(profile)
-        .map_err(|_| "failed to store subscription refresh state".to_string())?;
-    Ok(())
+    subscription_profile(store, id)?;
+    net_manager_core::subscription::record_refresh_failure(store, id, now)
+        .map_err(|_| "failed to store subscription refresh state".to_string())
 }
 
 fn set_subscription_refresh_interval_into(
@@ -996,13 +959,10 @@ fn set_subscription_refresh_interval_into(
     now: u64,
 ) -> Result<Vec<Profile>, String> {
     validate_refresh_interval(interval_minutes)?;
-    let mut profile = subscription_profile(store, id)?;
-    let subscription = profile.subscription.as_mut().unwrap();
-    subscription.refresh_interval_minutes = interval_minutes;
-    subscription.last_refresh_at_unix = Some(now);
-    let document = store
-        .upsert(profile)
-        .map_err(|_| "failed to store subscription refresh interval".to_string())?;
+    subscription_profile(store, id)?;
+    let document =
+        net_manager_core::subscription::set_refresh_interval(store, id, interval_minutes, now)
+            .map_err(|_| "failed to store subscription refresh interval".to_string())?;
     Ok(redact_profiles_for_ipc(document.profiles))
 }
 
@@ -1171,7 +1131,7 @@ pub(crate) async fn get_subscription_endpoints(
         .map(|(i, e)| SubscriptionEndpointInfo {
             name: e.name,
             active: i == active_index,
-            protocol: net_manager_core::subscription::endpoint_protocol(&e.url),
+            protocol: net_manager_core::xray::endpoint_protocol(&e.url),
         })
         .collect())
 }
@@ -1803,7 +1763,7 @@ mod tests {
     fn parse_subscription_body_decodes_base64_vless_urls() {
         let raw = "vless://uuid@host:443?encryption=none\ntrojan://other@host2:443\nvless://uuid2@host3:8443?encryption=none";
         let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
-        let (urls, skipped) = parse_subscription_body_schemes(&encoded);
+        let (urls, skipped) = parse_subscription_body(&encoded);
         assert_eq!(urls.len(), 2);
         assert_eq!(skipped, ["trojan"]);
         assert!(urls[0].starts_with("vless://uuid@host"));
@@ -1815,7 +1775,7 @@ mod tests {
         let raw = "vless://uuid@host:443?encryption=none\nnot-a-url\nvless://uuid2@host2:443";
         let (urls, skipped) = parse_subscription_body(raw);
         assert_eq!(urls.len(), 2);
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped.len(), 1);
         assert!(urls[0].starts_with("vless://uuid@host"));
         assert!(urls[1].starts_with("vless://uuid2@host2"));
     }
@@ -1823,7 +1783,7 @@ mod tests {
     #[test]
     fn parse_subscription_body_returns_empty_for_no_vless() {
         let raw = "trojan://other@host:443\nss://something@host:443";
-        let (urls, skipped) = parse_subscription_body_schemes(raw);
+        let (urls, skipped) = parse_subscription_body(raw);
         assert!(urls.is_empty());
         assert_eq!(skipped, ["trojan", "ss"]);
     }
@@ -1835,7 +1795,7 @@ mod tests {
         let with_whitespace = format!("  \n{}\n  ", encoded);
         let (urls, skipped) = parse_subscription_body(&with_whitespace);
         assert_eq!(urls.len(), 1);
-        assert_eq!(skipped, 0);
+        assert!(skipped.is_empty());
         assert!(urls[0].starts_with("vless://uuid@host"));
     }
 
@@ -1844,7 +1804,7 @@ mod tests {
         let raw = "vless://id@one.test:443\nhysteria2://pass@two.test:443\nhy2://pass@three.test:443\ntrojan://private@other.test:443";
         let (urls, skipped) = parse_subscription_body(raw);
         assert_eq!(urls.len(), 3);
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped.len(), 1);
         assert!(urls[1].starts_with("hysteria2://"));
         assert!(urls[2].starts_with("hy2://"));
     }
@@ -2415,36 +2375,32 @@ mod tests {
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode("AcmeVPN 🇳🇱");
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_provider_title(&format!(
-                "base64:{encoded}"
-            ))
-            .as_deref(),
+            net_manager_core::subscription::parse_provider_title(&format!("base64:{encoded}"))
+                .as_deref(),
             Some("AcmeVPN 🇳🇱")
         );
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_provider_title("Acme%20VPN")
-                .as_deref(),
+            net_manager_core::subscription::parse_provider_title("Acme%20VPN").as_deref(),
             Some("Acme VPN")
         );
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_provider_title("  AcmeVPN  ")
-                .as_deref(),
+            net_manager_core::subscription::parse_provider_title("  AcmeVPN  ").as_deref(),
             Some("AcmeVPN")
         );
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_provider_title("   "),
+            net_manager_core::subscription::parse_provider_title("   "),
             None
         );
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_provider_title("base64:%%%"),
+            net_manager_core::subscription::parse_provider_title("base64:%%%"),
             None
         );
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_provider_title("bad\nheader"),
+            net_manager_core::subscription::parse_provider_title("bad\nheader"),
             None
         );
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_provider_title(&"x".repeat(300)),
+            net_manager_core::subscription::parse_provider_title(&"x".repeat(300)),
             None
         );
     }
@@ -2600,48 +2556,35 @@ mod tests {
     #[test]
     fn subscription_url_header_accepts_only_http_links() {
         assert_eq!(
-            net_manager_core::subscription::parse_subscription_url_header(
-                "https://support.example.test"
-            )
-            .as_deref(),
+            net_manager_core::subscription::parse_url_header("https://support.example.test")
+                .as_deref(),
             Some("https://support.example.test")
         );
-        assert!(
-            net_manager_core::subscription::parse_subscription_url_header("javascript:alert(1)")
-                .is_none()
-        );
-        assert!(
-            net_manager_core::subscription::parse_subscription_url_header("ftp://host/path")
-                .is_none()
-        );
-        assert!(
-            net_manager_core::subscription::parse_subscription_url_header("not a url").is_none()
-        );
-        assert!(net_manager_core::subscription::parse_subscription_url_header("   ").is_none());
+        assert!(net_manager_core::subscription::parse_url_header("javascript:alert(1)").is_none());
+        assert!(net_manager_core::subscription::parse_url_header("ftp://host/path").is_none());
+        assert!(net_manager_core::subscription::parse_url_header("not a url").is_none());
+        assert!(net_manager_core::subscription::parse_url_header("   ").is_none());
     }
 
     #[test]
     fn endpoint_protocol_label_summarizes_scheme_security_and_transport() {
         assert_eq!(
-            net_manager_core::subscription::endpoint_protocol(
+            net_manager_core::xray::endpoint_protocol(
                 "vless://id@host.test:443?security=reality&type=grpc#Node"
             )
             .as_deref(),
             Some("VLESS · Reality · GRPC")
         );
         assert_eq!(
-            net_manager_core::subscription::endpoint_protocol(
-                "vless://id@host.test:443?security=tls#Node"
-            )
-            .as_deref(),
+            net_manager_core::xray::endpoint_protocol("vless://id@host.test:443?security=tls#Node")
+                .as_deref(),
             Some("VLESS · TLS")
         );
         assert_eq!(
-            net_manager_core::subscription::endpoint_protocol("hy2://pass@host.test:443#Node")
-                .as_deref(),
+            net_manager_core::xray::endpoint_protocol("hy2://pass@host.test:443#Node").as_deref(),
             Some("Hysteria2")
         );
-        assert!(net_manager_core::subscription::endpoint_protocol("not a url").is_none());
+        assert!(net_manager_core::xray::endpoint_protocol("not a url").is_none());
     }
 
     #[tokio::test]

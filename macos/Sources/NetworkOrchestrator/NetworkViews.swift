@@ -1,3 +1,4 @@
+import ServiceManagement
 import SwiftUI
 
 private let categoryOrder = ["physical", "vpn", "virtual", "system", "tunnel", "filter"]
@@ -92,7 +93,8 @@ struct NetworkView: View {
                 categories.contains(category) ? p.text : p.muted
               ).padding(.horizontal, 10).padding(.vertical, 4).background(p.card, in: Capsule())
               .overlay(
-                Capsule().stroke(categories.contains(category) ? p.accent : p.border, lineWidth: 1))
+                Capsule().stroke(
+                  categories.contains(category) ? p.accent : p.border, lineWidth: 1))
             }.buttonStyle(.plain)
           }
         }
@@ -233,6 +235,7 @@ enum RouteTab: String, CaseIterable {
   case tree = "Tree"
   case table = "Raw table"
   case lookup = "Lookup"
+  case user = "My routing settings"
 }
 struct RoutesView: View {
   @Environment(\.palette) private var p
@@ -259,7 +262,8 @@ struct RoutesView: View {
           AppHeading(title: "Routes")
           RouteRows(routes: model.snapshot?.routes ?? [])
         }
-      case .lookup: RouteLookupView(model: model)
+        case .lookup: RouteLookupView(model: model)
+        case .user: UserRoutingView(model: model)
       }
     }.frame(minHeight: 300, alignment: .topLeading)
   }
@@ -589,6 +593,8 @@ struct RouteLookupView: View {
 struct SettingsView: View {
   @Environment(\.palette) private var p
   @Bindable var model: AppModel
+  @State private var showingImportLog = false
+  @State private var loginItemEnabled = false
   @AppStorage("appearance") private var appearance = "system"
   @Bindable private var localizer = L10n.shared
   var body: some View {
@@ -634,6 +640,16 @@ struct SettingsView: View {
                   Button(L10n.text(model.installingXray ? "native.installing" : "native.installXray"))
                   { Task { await model.installXray() } }.disabled(model.installingXray)
                 }
+              } else if backend == "WireGuard" || backend == "OpenVPN" {
+                let serves = model.helperOffers(
+                  backend == "WireGuard" ? "wireguard.connect" : "openvpn.connect")
+                AppBadge(
+                  text: serves ? "native.installed" : "native.helperNeeded",
+                  color: serves ? "up" : "unknown")
+                Text(
+                  L10n.text(backend == "WireGuard" ? "native.wireguardEngine" : "native.openvpnEngine")
+                ).font(.system(size: 11.48)).foregroundStyle(p.secondary)
+                Spacer()
               } else {
                 AppBadge(text: "Not available")
                 Text(L10n.text("Native VPN provider pending")).font(.system(size: 11.48))
@@ -650,6 +666,42 @@ struct SettingsView: View {
             )
           ).font(.system(size: 10.92)).foregroundStyle(p.muted)
         }.padding(10.5)
+      }
+      settingsGroup("native.helper") { helperRow }
+      settingsGroup("settings.groupStartup") {
+        HStack {
+          settingText("settings.startAtLogin", "native.startAtLoginSub")
+          Spacer()
+          Toggle(
+            "",
+            isOn: Binding(
+              get: { loginItemEnabled },
+              set: { enable in
+                do {
+                  if enable {
+                    try SMAppService.mainApp.register()
+                  } else {
+                    try SMAppService.mainApp.unregister()
+                  }
+                } catch { model.error = "native.loginItemFailed" }
+                loginItemEnabled = SMAppService.mainApp.status == .enabled
+              })
+          ).toggleStyle(.switch).controlSize(.small).labelsHidden()
+        }.padding(.horizontal, 14).padding(.vertical, 10.5)
+      }
+      .onAppear { loginItemEnabled = SMAppService.mainApp.status == .enabled }
+      settingsGroup("native.diagnostics") {
+        HStack {
+          settingText("native.importLog", "native.importLogHint")
+          Spacer()
+          Button(L10n.text("native.open")) { showingImportLog = true }
+        }.padding(.horizontal, 14).padding(.vertical, 10.5)
+      }
+      .sheet(isPresented: $showingImportLog) {
+        LogSheet(
+          title: L10n.text("native.importLog"), load: { await model.importLog() },
+          onClose: { showingImportLog = false }
+        ).environment(\.palette, p).buttonStyle(TauriButtonStyle())
       }
       settingsGroup("Updates") {
         HStack {
@@ -671,6 +723,45 @@ struct SettingsView: View {
         }.padding(.horizontal, 14).padding(.vertical, 10.5)
       }
     }
+  }
+  /// Install state of the privileged helper and its install/remove controls.
+  private var helperState: (title: String, color: String) {
+    let status = model.helperStatus
+    switch model.helperRegistration {
+    case .notFound: return ("native.helperState.missing", "unknown")
+    case .requiresApproval: return ("native.helperState.approval", "warn")
+    case .notRegistered:
+      return status?.reachable == true
+        ? ("native.helperState.ready", "up") : ("native.helperState.absent", "unknown")
+    case .enabled:
+      if status?.reachable == true { return ("native.helperState.ready", "up") }
+      if status?.denied == true { return ("native.helperState.denied", "down") }
+      return ("native.helperState.stopped", "warn")
+    }
+  }
+  private var helperRow: some View {
+    let state = helperState
+    return VStack(alignment: .leading, spacing: 8) {
+      HStack(spacing: 10.5) {
+        AppBadge(text: state.title, color: state.color)
+        if let version = model.helperStatus?.version, !version.isEmpty {
+          Text("v" + version).font(.system(size: 11.48)).foregroundStyle(p.secondary)
+        }
+        Spacer()
+        switch model.helperRegistration {
+        case .notFound: EmptyView()
+        case .requiresApproval:
+          Button(L10n.text("native.helperApprove")) { HelperManager.openSystemSettings() }
+        case .notRegistered:
+          Button(L10n.text("native.helperInstall")) { Task { await model.installHelper() } }
+        case .enabled:
+          Button(L10n.text("native.helperRemove")) { Task { await model.removeHelper() } }
+        }
+      }
+      Text(L10n.text("native.helperHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+        .fixedSize(horizontal: false, vertical: true)
+    }.padding(10.5)
+      .onAppear { Task { await model.refreshHelper() } }
   }
   private func settingText(_ label: String, _ detail: String) -> some View {
     VStack(alignment: .leading, spacing: 2) {

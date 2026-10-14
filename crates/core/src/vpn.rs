@@ -491,7 +491,21 @@ fn xray_command_spec(exe: &Path, test_only: bool) -> CommandSpec {
     }
 }
 
-fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
+/// Profile config with routing policies applied, without any TUN inbound.
+/// The macOS TUN flow validates this form unprivileged (`xray run -test`
+/// with a tun inbound would create a real device), then injects the
+/// fd-mode TUN inbound before handing the config to the privileged helper.
+pub fn prepare_xray_config_base(profile: &Profile) -> io::Result<Vec<u8>> {
+    let with_policies = prepared_routing_config(profile)?;
+    serde_json::to_vec(&with_policies).map_err(|err| {
+        invalid_data(format!(
+            "failed to serialize xray config for '{}': {err}",
+            profile.config_path.display()
+        ))
+    })
+}
+
+fn prepared_routing_config(profile: &Profile) -> io::Result<serde_json::Value> {
     let raw = crate::config_security::read_xray_config(&profile.config_path, &profile.id)?;
     let base: serde_json::Value = serde_json::from_slice(&raw).map_err(|err| {
         invalid_data(format!(
@@ -499,7 +513,7 @@ fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
             profile.config_path.display()
         ))
     })?;
-    let with_policies = crate::xray::apply_profile_routing(
+    crate::xray::apply_profile_routing(
         &base,
         &profile.domain_policies,
         &crate::xray::ProfileRoutingOptions {
@@ -509,7 +523,11 @@ fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
             dns: profile.xray_dns.clone(),
         },
     )
-    .map_err(|_| invalid_data("failed to apply Xray routing policies"))?;
+    .map_err(|_| invalid_data("failed to apply Xray routing policies"))
+}
+
+fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
+    let with_policies = prepared_routing_config(profile)?;
     let merged = if profile.xray_mode == crate::models::XrayMode::Tun {
         crate::xray::apply_tun_inbound(
             &with_policies,
@@ -533,7 +551,8 @@ fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
     })
 }
 
-fn run_xray_validation(exe: &Path, config: &[u8]) -> io::Result<()> {
+/// `xray run -test` on `config` (stdin); the error carries Xray's own message.
+pub fn run_xray_validation(exe: &Path, config: &[u8]) -> io::Result<()> {
     let spec = xray_command_spec(exe, true);
     let mut command = Command::new(&spec.program);
     command
@@ -1929,6 +1948,37 @@ mod tests {
             serde_json::json!(["224.0.0.0/4", "ff00::/8"])
         );
         assert_eq!(config["routing"]["rules"][2]["ip"][0], "10.0.0.0/8");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prepare_xray_config_base_applies_policies_without_tun_inbound() {
+        let dir = unique_dir("xray-base");
+        let path = dir.join("node.json");
+        fs::write(
+            &path,
+            r#"{"inbounds":[{"tag":"socks-in","protocol":"socks","port":10808}],"outbounds":[{"tag":"proxy","protocol":"vless"}],"routing":{"rules":[]}}"#,
+        )
+        .unwrap();
+        let mut profile = xray_profile();
+        profile.config_path = path;
+        profile.xray_mode = crate::models::XrayMode::Tun;
+        profile.domain_policies = vec![DomainPolicy {
+            domains: vec!["a.com".into()],
+            target: DomainRouteTarget::Direct,
+        }];
+
+        let doc: serde_json::Value =
+            serde_json::from_slice(&prepare_xray_config_base(&profile).unwrap()).unwrap();
+        // Policies are applied but no TUN inbound: the macOS flow validates
+        // this form unprivileged, then injects the fd-mode TUN inbound.
+        assert!(!crate::xray::has_tun_inbound(&doc));
+        assert_eq!(doc["inbounds"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["inbounds"][0]["protocol"], "socks");
+        assert_eq!(
+            doc["routing"]["rules"][0]["domain"],
+            serde_json::json!(["a.com"])
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

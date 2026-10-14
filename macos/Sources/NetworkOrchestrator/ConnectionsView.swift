@@ -22,6 +22,10 @@ struct ConnectionsView: View {
   @State private var renaming: Profile?
   @State private var deleting: Profile?
   @State private var name = ""
+  @State private var savingSet = false
+  @State private var setName = ""
+  @AppStorage("connectionsListWidth") private var listWidth = 400.0
+  @State private var dragStartWidth: Double?
   var body: some View {
     VStack(alignment: .leading, spacing: 10.5) {
       HStack(spacing: 7) {
@@ -45,9 +49,10 @@ struct ConnectionsView: View {
               : L10n.text("profiles.noMatch", ["query": model.search]))
         }
       } else {
+        setsBar
         HStack(alignment: .top, spacing: 0) {
-          list.frame(width: 400)
-          Rectangle().fill(p.border).frame(width: 1).padding(.horizontal, 14)
+          list.frame(width: listWidth)
+          splitter
           if let profile = model.selectedProfile {
             ProfileDetailView(
               model: model, profile: profile,
@@ -86,6 +91,51 @@ struct ConnectionsView: View {
       }
     } message: {
       Text(L10n.text("The saved profile and its managed configuration will be removed."))
+    }
+  }
+  /// Draggable divider between the list and the detail pane.
+  private var splitter: some View {
+    Rectangle().fill(p.border).frame(width: 1).padding(.horizontal, 14)
+      .frame(maxHeight: .infinity)
+      .contentShape(Rectangle())
+      .onHover { inside in inside ? NSCursor.resizeLeftRight.push() : NSCursor.pop() }
+      .gesture(
+        DragGesture(minimumDistance: 1)
+          .onChanged { value in
+            let start = dragStartWidth ?? listWidth
+            dragStartWidth = start
+            listWidth = min(max(start + value.translation.width, 300), 640)
+          }
+          .onEnded { _ in dragStartWidth = nil })
+  }
+  /// Saved combinations of connections, applied in one click.
+  private var setsBar: some View {
+    let running = (model.snapshot?.profiles ?? []).filter { model.isRunning($0) }
+    return HStack(spacing: 7) {
+      Text(L10n.text("sets.label").uppercased()).font(.system(size: 10.08, weight: .semibold))
+        .tracking(0.7).foregroundStyle(p.muted)
+      ForEach(model.connectionSets) { set in
+        let active = Set(running.map(\.id)) == Set(set.profileIds)
+        Button(set.name) { Task { await model.applySet(set) } }
+          .buttonStyle(TauriButtonStyle(kind: active ? .accent : .chip, compact: true))
+          .help(L10n.text("sets.applyTitle", ["count": String(set.profileIds.count)]))
+          .contextMenu {
+            Button(L10n.text("sets.deleteTitle"), role: .destructive) { model.deleteSet(set) }
+          }
+      }
+      Button(L10n.text("sets.saveCurrent")) {
+        setName = ""
+        savingSet = true
+      }.buttonStyle(TauriButtonStyle(kind: .chip, compact: true)).disabled(running.isEmpty)
+        .help(L10n.text(running.isEmpty ? "sets.connectFirst" : "sets.saveTitle"))
+      Spacer()
+    }
+    .alert(L10n.text("sets.modalTitle"), isPresented: $savingSet) {
+      TextField(L10n.text("sets.namePh"), text: $setName)
+      Button(L10n.text("Cancel"), role: .cancel) {}
+      Button(L10n.text("Save")) { model.saveCurrentSet(name: setName) }
+    } message: {
+      Text(L10n.text("sets.willInclude", ["count": String(running.count)]))
     }
   }
   @ViewBuilder private var notices: some View {
@@ -136,7 +186,8 @@ struct ConnectionsView: View {
             HStack(spacing: 7) {
               NativeIcon(name: "ChevronIcon", size: 12).rotationEffect(
                 .degrees(collapsed.contains(backend) ? 0 : 180))
-              NativeIcon(name: NativeIcon.backend(backend), size: 15)
+              NativeIcon(name: NativeIcon.backend(backend), size: 15).foregroundStyle(
+                p[backendTint(backend)])
               Text(L10n.text(profiles[0].kind)).font(.system(size: 11.2, weight: .semibold))
               Text("· \(profiles.count)").font(.system(size: 10.08)).foregroundStyle(p.muted)
               Spacer()
@@ -149,7 +200,117 @@ struct ConnectionsView: View {
           }
         }
       }
+      if !model.externalVPNs.isEmpty || model.netbird?.installed == true {
+        Text(L10n.text("profiles.external")).font(.system(size: 11.2, weight: .semibold))
+          .foregroundStyle(p.secondary).padding(.horizontal, 8).padding(.top, 14).padding(
+            .bottom, 5)
+        Rectangle().fill(p.border).frame(height: 1)
+        if let netbird = model.netbird, netbird.installed { netbirdRow(netbird) }
+        ForEach(model.externalVPNs) { vpn in externalRow(vpn) }
+      }
     }
+  }
+  /// NetBird: the user's own daemon, switched on and off like another app's VPN.
+  private func netbirdRow(_ state: NetBirdState) -> some View {
+    let busy = model.netbirdBusy
+    return HStack(spacing: 8) {
+      StateDot(state: state.state == "connected" ? "running" : state.state == "needsLogin" ? "failed" : "stopped")
+      NativeIcon(name: "VpnIcon", size: 14).foregroundStyle(p.secondary)
+      VStack(alignment: .leading, spacing: 1) {
+        Text("NetBird").font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
+        Text(netbirdSubtitle(state)).font(.system(size: 10.5))
+          .foregroundStyle(state.state == "needsLogin" ? p["warn"] : p.muted).lineLimit(2)
+      }
+      Spacer(minLength: 8)
+      Menu {
+        Button(L10n.text("native.netbird.setup")) { model.showingNetBirdSetup = true }
+      } label: {
+        NativeIcon(name: "DotsVerticalIcon", size: 14).frame(width: 22, height: 22)
+      }.menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).foregroundStyle(p.secondary)
+        .frame(width: 22)
+      if busy || state.state == "connecting" {
+        Spinner(size: 12).frame(width: 34)
+      } else {
+        Button {
+          Task { await model.toggleNetBird() }
+        } label: {
+          Capsule().fill(state.isOn ? p["up"] : p.border).frame(width: 34, height: 20).overlay(
+            alignment: state.isOn ? .trailing : .leading
+          ) {
+            Circle().fill(.white).frame(width: 16, height: 16).padding(2)
+          }
+        }.buttonStyle(.plain).disabled(!state.canToggle)
+          .help(L10n.text(state.isOn ? "common.disconnect" : "common.connect"))
+          .accessibilityLabel(L10n.text(state.isOn ? "common.disconnect" : "common.connect"))
+      }
+    }
+    .padding(.horizontal, 8).padding(.vertical, 5)
+    .overlay(alignment: .bottom) { Rectangle().fill(p.border).frame(height: 1) }
+  }
+  private func netbirdSubtitle(_ state: NetBirdState) -> String {
+    switch state.state {
+    case "connected":
+      var parts = [state.ip.map { String($0.split(separator: "/").first ?? "") } ?? ""]
+      if let connected = state.peersConnected, let total = state.peersTotal {
+        parts.append(
+          L10n.text(
+            "native.netbird.peers", ["connected": String(connected), "total": String(total)]))
+      }
+      if let until = Self.sessionEnd(state.sessionExpiresAt) {
+        parts.append(L10n.text("native.netbird.session", ["time": until]))
+      }
+      return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+    case "connecting": return L10n.text("native.netbird.connecting")
+    case "needsLogin": return L10n.text("native.netbird.needsLogin")
+    case "daemonStopped": return L10n.text("native.netbird.stopped")
+    case "unavailable": return L10n.text("native.netbird.unavailable")
+    default: return L10n.text("native.netbird.disconnected")
+    }
+  }
+  /// "09:10" for a session that ends today or tomorrow; nothing when far away.
+  private static func sessionEnd(_ iso: String?) -> String? {
+    guard let iso else { return nil }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    guard let date = formatter.date(from: iso) ?? ISO8601DateFormatter().date(from: iso),
+      date.timeIntervalSinceNow > 0, date.timeIntervalSinceNow < 48 * 3600
+    else { return nil }
+    return date.formatted(date: .omitted, time: .shortened)
+  }
+  private func externalRow(_ vpn: ExternalVpn) -> some View {
+    let connected = vpn.state == "connected"
+    let busy =
+      model.switchingExternal.contains(vpn.id) || vpn.state == "connecting"
+      || vpn.state == "disconnecting"
+    return HStack(spacing: 8) {
+      StateDot(state: connected ? "running" : "stopped")
+      NativeIcon(name: "VpnIcon", size: 14).foregroundStyle(p.secondary)
+      VStack(alignment: .leading, spacing: 1) {
+        Text(vpn.name).font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
+        if let provider = vpn.provider {
+          Text(provider).font(.system(size: 10.5)).foregroundStyle(p.muted).lineLimit(1)
+        }
+      }
+      Spacer(minLength: 8)
+      AppBadge(text: "detail.external", color: "warn")
+      if busy {
+        Spinner(size: 12).frame(width: 34)
+      } else {
+        Button {
+          Task { await model.setExternalVPN(vpn, connect: !connected) }
+        } label: {
+          Capsule().fill(connected ? p["up"] : p.border).frame(width: 34, height: 20).overlay(
+            alignment: connected ? .trailing : .leading
+          ) {
+            Circle().fill(.white).frame(width: 16, height: 16).padding(2)
+          }
+        }.buttonStyle(.plain).disabled(!vpn.enabled)
+          .help(L10n.text(connected ? "common.disconnect" : "common.connect"))
+          .accessibilityLabel(L10n.text(connected ? "common.disconnect" : "common.connect"))
+      }
+    }
+    .padding(.horizontal, 8).padding(.vertical, 5)
+    .overlay(alignment: .bottom) { Rectangle().fill(p.border).frame(height: 1) }
   }
   private func row(_ profile: Profile) -> some View {
     let selected = model.selectedProfile?.id == profile.id
@@ -158,9 +319,14 @@ struct ConnectionsView: View {
       StateDot(state: state)
       NativeIcon(name: NativeIcon.backend(profile.backend), size: 14).foregroundStyle(
         p[backendTint(profile.backend)])
-      Text(profile.name).font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
-      if let server = model.activeServer(profile), server != profile.name {
-        Text(server).font(.system(size: 11.2)).foregroundStyle(p.secondary).lineLimit(1)
+      // A subscription reads as a group: its name, then the chosen server.
+      VStack(alignment: .leading, spacing: 1) {
+        Text(profile.groupName).font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
+        if let server = model.activeServer(profile), server != profile.groupName {
+          Text(profile.serverLabel(server)).font(.system(size: 10.5)).foregroundStyle(
+            p.secondary
+          ).lineLimit(1)
+        }
       }
       Spacer(minLength: 8)
       Text(rowMeta(profile)).font(.system(size: 11, design: .monospaced)).foregroundStyle(
@@ -179,8 +345,17 @@ struct ConnectionsView: View {
     .overlay(alignment: .bottom) { Rectangle().fill(p.border).frame(height: 1) }
     .contentShape(Rectangle())
     .onTapGesture { model.selectedProfileID = profile.id }
+    .draggable(profile.id)
+    .dropDestination(for: String.self) { ids, _ in
+      guard let id = ids.first, id != profile.id,
+        let dragged = model.snapshot?.profiles.first(where: { $0.id == id }),
+        dragged.backend == profile.backend
+      else { return false }
+      Task { await model.move(dragged, to: profile) }
+      return true
+    }
     .contextMenu {
-      if profile.startsWithoutHelper && model.canStartConnections {
+      if model.canStart(profile) {
         Button(L10n.text(model.isRunning(profile) ? "common.disconnect" : "common.connect")) {
           Task { await model.toggle(profile) }
         }
@@ -191,6 +366,9 @@ struct ConnectionsView: View {
         renaming = profile
       }
       Button(L10n.text("Inspect configuration")) { Task { await model.inspect(profile) } }
+      Divider()
+      Button(L10n.text("detail.moveUp")) { Task { await model.move(profile, by: -1) } }
+      Button(L10n.text("detail.moveDown")) { Task { await model.move(profile, by: 1) } }
       Divider()
       Button(L10n.text("Delete"), role: .destructive) { deleting = profile }
     }
@@ -243,7 +421,7 @@ struct ConnectionSwitch: View {
     let running = model.isRunning(profile)
     let busy = model.pending.contains(profile.id)
     let enabled =
-      model.canStartConnections && profile.startsWithoutHelper
+      model.canTryStart(profile)
       && (model.runtime?.xrayInstalled ?? false) && !busy
     Button {
       Task { await model.toggle(profile) }
@@ -258,7 +436,7 @@ struct ConnectionSwitch: View {
     }.buttonStyle(.plain).disabled(!enabled)
       .help(
         L10n.text(
-          !profile.startsWithoutHelper
+          !model.canStart(profile) && model.canStartConnections
             ? "native.helperRequired"
             : running ? "common.disconnect" : "common.connect")
       )
@@ -266,9 +444,60 @@ struct ConnectionSwitch: View {
   }
 }
 
+/// What the subscription provider says about itself: title, announcement and
+/// support / account links (https only, opened in the default browser).
+struct PanelInfoView: View {
+  @Environment(\.palette) private var p
+  let subscription: SubscriptionMeta
+  let profileName: String
+  var body: some View {
+    let links: [(String, URL)] = [
+      ("native.panelSupport", subscription.supportUrl),
+      ("native.panelAccount", subscription.webPageUrl),
+    ].compactMap { label, value in
+      guard let value, let url = URL(string: value), ["https", "http"].contains(url.scheme ?? "")
+      else { return nil }
+      return (label, url)
+    }
+    let skipped = subscription.skippedProtocols ?? []
+    if subscription.providerTitle != nil || subscription.announce != nil || !links.isEmpty
+      || !skipped.isEmpty
+    {
+      VStack(alignment: .leading, spacing: 5) {
+        if let title = subscription.providerTitle, title != profileName {
+          Text(title).font(.system(size: 11.9, weight: .semibold))
+        }
+        if let announce = subscription.announce {
+          Text(announce).font(.system(size: 11.9)).foregroundStyle(p.secondary)
+            .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        }
+        if !skipped.isEmpty {
+          Text(L10n.text("native.skippedProtocols", ["list": skipped.joined(separator: ", ")]))
+            .font(.system(size: 10.92)).foregroundStyle(p.muted)
+        }
+        if !links.isEmpty {
+          HStack(spacing: 7) {
+            ForEach(links, id: \.0) { label, url in
+              Button(L10n.text(label)) { NSWorkspace.shared.open(url) }
+                .buttonStyle(TauriButtonStyle(compact: true)).help(url.host() ?? "")
+            }
+          }.padding(.top, 2)
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.horizontal, 12).padding(.vertical, 9)
+      .background(p["info-bg"], in: RoundedRectangle(cornerRadius: 6))
+      .overlay(RoundedRectangle(cornerRadius: 6).stroke(p["info-border"], lineWidth: 1))
+    }
+  }
+}
+
 struct ProfileDetailView: View {
   @Environment(\.palette) private var p
   @Bindable var model: AppModel
+  @State private var editingRules = false
+  @State private var showingLog = false
+  @State private var editingNetworks = false
   let profile: Profile
   let onRename: () -> Void
   let onDelete: () -> Void
@@ -286,6 +515,9 @@ struct ProfileDetailView: View {
             Text(profile.name).font(.system(size: 14.7, weight: .semibold)).lineLimit(1)
             if profile.backend != "none" { AppBadge(text: "detail.managed") }
             if proxyOwner { AppBadge(text: "native.systemProxy", color: "up") }
+            if profile.needsHelper && profile.isSecondary {
+              AppBadge(text: "native.roleSecondary", color: "info")
+            }
           }
           Text(statusLine(status)).font(.system(size: 11.2)).foregroundStyle(
             status?.state == "failed" ? p["down"] : p.muted
@@ -296,11 +528,17 @@ struct ProfileDetailView: View {
         Menu {
           Button(L10n.text("Rename"), action: onRename)
           Button(L10n.text("Inspect configuration")) { Task { await model.inspect(profile) } }
+          if profile.backend == "xray" || profile.backend == "openVpn" {
+            Button(L10n.text("native.connectionLog")) { showingLog = true }
+          }
           if profile.backend == "xray" {
             Divider()
             Button(L10n.text("native.openBrowser")) { model.openBrowser(profile) }.disabled(
               !running)
             Button(L10n.text("native.copyTerminal")) { model.copyTerminalProxy(profile) }
+          }
+          if profile.backend == "openVpn" {
+            Button(L10n.text("native.credentials.forget")) { model.forgetCredentials(profile) }
           }
           Divider()
           Button(L10n.text("Delete"), role: .destructive, action: onDelete)
@@ -311,6 +549,10 @@ struct ProfileDetailView: View {
         ).frame(width: 28).help(L10n.text("detail.actions"))
       }.padding(.bottom, 10.5)
       Rectangle().fill(p.border).frame(height: 1).padding(.bottom, 7)
+      if let subscription = profile.subscription {
+        PanelInfoView(subscription: subscription, profileName: profile.groupName)
+          .padding(.bottom, 7)
+      }
       row("detail.backend", L10n.text(profile.kind), mono: false)
       if let server = model.activeServer(profile) {
         row("native.server", server, mono: false)
@@ -319,13 +561,24 @@ struct ProfileDetailView: View {
         row("detail.traffic", Self.usageText(usage), mono: false)
       }
       if profile.backend != "xray" {
+        // The live device the helper created, else what the profile declares.
+        let live = model.status(profile)?.interfaceName
         row(
           "detail.interface",
-          profile.interfaceName.isEmpty ? L10n.text("detail.notAssigned") : profile.interfaceName)
+          live ?? (profile.interfaceName.isEmpty
+            ? L10n.text("detail.notAssigned") : profile.interfaceName))
       }
-      if let port = profile.xraySocksPort { row("SOCKS5", "127.0.0.1:\(port)", translate: false) }
-      if let port = profile.xrayHttpPort {
-        row("HTTP CONNECT", "127.0.0.1:\(port)", translate: false)
+      if profile.backend == "xray" && model.canStartConnections { modePicker }
+      if profile.needsHelper && model.canStartConnections { roleRows }
+      if profile.isTun {
+        row(
+          "detail.interface",
+          model.status(profile)?.interfaceName ?? L10n.text("detail.notAssigned"))
+      } else {
+        if let port = profile.xraySocksPort { row("SOCKS5", "127.0.0.1:\(port)", translate: false) }
+        if let port = profile.xrayHttpPort {
+          row("HTTP CONNECT", "127.0.0.1:\(port)", translate: false)
+        }
       }
       if profile.startsWithoutHelper && model.canStartConnections {
         HStack {
@@ -352,6 +605,7 @@ struct ProfileDetailView: View {
           }.padding(.vertical, 5)
         }
       }
+      if profile.backend == "xray" { routingRules }
       tunnelConfig
       endpoints
       if !profile.routes.isEmpty {
@@ -370,6 +624,50 @@ struct ProfileDetailView: View {
     }
     .frame(maxWidth: .infinity, alignment: .leading)
     .task(id: profile.id) { await model.loadInspection(profile) }
+    .sheet(isPresented: $showingLog) {
+      LogSheet(
+        title: L10n.text("diag.title", ["name": profile.groupName]),
+        load: { await model.connectionLog(profile) }, onClose: { showingLog = false }
+      ).environment(\.palette, p).buttonStyle(TauriButtonStyle())
+    }
+    .sheet(isPresented: $editingRules) {
+      RoutingRulesEditor(model: model, profile: profile) { editingRules = false }
+        .environment(\.palette, p).buttonStyle(TauriButtonStyle())
+    }
+    .sheet(isPresented: $editingNetworks) {
+      TunnelNetworksSheet(model: model, profile: profile) { editingNetworks = false }
+        .environment(\.palette, p).buttonStyle(TauriButtonStyle())
+    }
+  }
+  /// Compact per-set summary; the sets are edited in a full-size sheet.
+  @ViewBuilder private var routingRules: some View {
+    HStack {
+      section("detail.domainRules")
+      Spacer()
+      Button(L10n.text("common.edit")) { editingRules = true }.buttonStyle(
+        TauriButtonStyle(compact: true)
+      ).padding(.top, 6)
+    }
+    ForEach(RoutingRulesEditor.sets, id: \.target) { set in
+      let count = profile.rules(set.target).filter { !$0.hasPrefix("#") }.count
+      HStack(spacing: 7) {
+        Circle().fill(p[set.color]).frame(width: 7, height: 7)
+        Text(L10n.text(set.title)).foregroundStyle(p.muted)
+        Spacer()
+        Text(L10n.text("rules.entryCount", ["count": String(count)]))
+          .foregroundStyle(count == 0 ? p.muted : p.text)
+      }.font(.system(size: 11.9)).padding(.vertical, 2)
+    }
+    if profile.privateLanDirect ?? false {
+      Text(L10n.text("form.privateLanDirect")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+    }
+    if let dns = profile.xrayDns, dns.serverCount + dns.hostCount > 0 {
+      Text(
+        L10n.text(
+          "rules.dnsSummary",
+          ["servers": String(dns.serverCount), "hosts": String(dns.hostCount)])
+      ).font(.system(size: 10.92)).foregroundStyle(p.muted)
+    }
   }
   @ViewBuilder private var tunnelConfig: some View {
     if let inspection = model.inspections[profile.id],
@@ -434,6 +732,7 @@ struct ProfileDetailView: View {
         }.buttonStyle(TauriButtonStyle(compact: true)).disabled(
           model.refreshing.contains(profile.id) || model.busy)
       }.padding(.top, 6)
+      autoRefreshRow(subscription)
       let busy = model.busy || model.pending.contains(profile.id)
       ForEach(Array(endpoints.enumerated()), id: \.offset) { index, endpoint in
         let active = index == subscription.activeIndex
@@ -442,8 +741,14 @@ struct ProfileDetailView: View {
         } label: {
           HStack(spacing: 7) {
             Circle().fill(active ? p.accent : .clear).frame(width: 6, height: 6)
-            Text(endpoint.name).font(.system(size: 11.9, weight: active ? .semibold : .regular))
-              .lineLimit(1)
+            Text(profile.serverLabel(endpoint.name)).font(
+              .system(size: 11.9, weight: active ? .semibold : .regular)
+            ).lineLimit(1)
+            if let proto = endpoint.protocol {
+              Text(proto).font(.system(size: 9.8, design: .monospaced)).foregroundStyle(p.muted)
+                .padding(.horizontal, 4).padding(.vertical, 1)
+                .overlay(RoundedRectangle(cornerRadius: 3).stroke(p.border, lineWidth: 1))
+            }
             Spacer()
             if model.probing[profile.id]?.contains(index) ?? false {
               Spinner(size: 10)
@@ -456,6 +761,44 @@ struct ProfileDetailView: View {
         }.buttonStyle(.plain).disabled(active || busy)
           .help(L10n.text(active ? "detail.activeEndpoint" : "detail.switchEndpoint"))
       }
+    }
+  }
+  @ViewBuilder private func autoRefreshRow(_ subscription: SubscriptionMeta) -> some View {
+    HStack(spacing: 10) {
+      Text(L10n.text("detail.autoRefresh")).foregroundStyle(p.muted)
+      Spacer()
+      Picker(
+        L10n.text("detail.autoRefresh"),
+        selection: Binding(
+          get: { subscription.refreshIntervalMinutes ?? 0 },
+          set: { value in
+            Task { await model.setRefreshInterval(profile, minutes: value == 0 ? nil : value) }
+          })
+      ) {
+        Text(L10n.text("common.off")).tag(UInt32(0))
+        Text(L10n.text("detail.every15")).tag(UInt32(15))
+        Text(L10n.text("detail.everyHour")).tag(UInt32(60))
+        Text(L10n.text("detail.every6h")).tag(UInt32(360))
+      }.labelsHidden().frame(width: 190).disabled(model.busy)
+    }.font(.system(size: 11.9)).padding(.vertical, 2)
+    let hints: [String] = [
+      subscription.lastRefreshAtUnix.map {
+        L10n.text("detail.lastChecked") + ": "
+          + Date(timeIntervalSince1970: TimeInterval($0)).formatted(
+            .dateTime.day().month().hour().minute()
+              .locale(Locale(identifier: L10n.shared.language)))
+      },
+      subscription.updateIntervalHours.map {
+        L10n.text("detail.providerInterval", ["hours": String($0)])
+      },
+    ].compactMap { $0 }
+    if !hints.isEmpty || subscription.lastRefreshError != nil {
+      HStack(spacing: 8) {
+        Text(hints.joined(separator: " · ")).foregroundStyle(p.muted)
+        if subscription.lastRefreshError != nil {
+          Text(L10n.text("native.refreshFailed")).foregroundStyle(p["down"])
+        }
+      }.font(.system(size: 10.92)).padding(.bottom, 4)
     }
   }
   /// Delay readout: green under 300 ms, amber under 800 ms, red above or
@@ -495,13 +838,75 @@ struct ProfileDetailView: View {
   private func statusLine(_ status: TunnelStatus?) -> String {
     switch status?.state {
     case "running":
-      L10n.text("detail.runningOn", ["iface": profile.xraySocksPort.map { "127.0.0.1:\($0)" } ?? "tunnel"])
+      L10n.text(
+        "detail.runningOn",
+        ["iface": profile.needsHelper
+          ? (status?.interfaceName ?? "tunnel")
+          : profile.xraySocksPort.map { "127.0.0.1:\($0)" } ?? "tunnel"])
         + (model.activeServer(profile).map { " · \($0)" } ?? "")
+        // Notices of a tunnel that works: "connecting", "IPv6 is not covered", …
+        + (status?.message.map { " · " + L10n.text($0) } ?? "")
     case "failed": status?.message.map { L10n.text($0) } ?? L10n.text("detail.failed")
     default:
-      profile.startsWithoutHelper || !model.canStartConnections
+      model.canStart(profile) || profile.startsWithoutHelper || !model.canStartConnections
         ? L10n.text("detail.stopped") : L10n.text("native.helperRequired")
     }
+  }
+  /// Primary or secondary, and for a secondary one its networks.
+  @ViewBuilder private var roleRows: some View {
+    HStack {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(L10n.text("native.role")).foregroundStyle(p.muted)
+        Text(L10n.text("native.roleHint")).font(.system(size: 10.08)).foregroundStyle(p.muted)
+      }
+      Spacer()
+      Picker(
+        "",
+        selection: Binding(
+          get: { profile.isSecondary ? "secondary" : "primary" },
+          set: { value in Task { await model.setTunnelRole(profile, role: value) } })
+      ) {
+        Text(L10n.text("native.rolePrimary")).tag("primary")
+        Text(L10n.text("native.roleSecondary")).tag("secondary")
+      }.pickerStyle(.segmented).labelsHidden().frame(width: 190)
+        .disabled(model.pending.contains(profile.id))
+    }.font(.system(size: 11.9)).padding(.vertical, 5)
+    if profile.isSecondary {
+      HStack(alignment: .top) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text(L10n.text("native.networks")).foregroundStyle(p.muted)
+          let networks = profile.tunnelNetworks ?? []
+          Text(networks.isEmpty ? L10n.text("native.networksEmpty") : networks.joined(separator: ", "))
+            .font(.system(size: 10.92, design: .monospaced))
+            .foregroundStyle(networks.isEmpty ? p["warn"] : p.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        Spacer()
+        Button(L10n.text("native.networksEdit")) { editingNetworks = true }
+          .buttonStyle(TauriButtonStyle(compact: true))
+      }.font(.system(size: 11.9)).padding(.vertical, 5)
+    }
+  }
+  /// Loopback SOCKS proxy or a tunnel for the whole system.
+  private var modePicker: some View {
+    HStack {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(L10n.text("native.tunnelMode")).foregroundStyle(p.muted)
+        Text(L10n.text(model.helperServesTunnels ? "native.tunnelModeHint" : "native.tunnelModeNeedsHelper"))
+          .font(.system(size: 10.08)).foregroundStyle(p.muted)
+      }
+      Spacer()
+      Picker(
+        "",
+        selection: Binding(
+          get: { profile.isTun ? "tun" : "socks" },
+          set: { value in Task { await model.setXrayMode(profile, mode: value) } })
+      ) {
+        Text("SOCKS").tag("socks")
+        Text("TUN").tag("tun")
+      }.pickerStyle(.segmented).labelsHidden().frame(width: 130)
+        .disabled(model.pending.contains(profile.id))
+    }.font(.system(size: 11.9)).padding(.vertical, 5)
   }
   private func section(_ title: String, translate: Bool = true) -> some View {
     Text(translate ? L10n.text(title) : title).font(.system(size: 11.2, weight: .semibold))
@@ -859,6 +1264,236 @@ struct InspectionView: View {
           }
         }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
       }.frame(height: 420)
+    }
+  }
+}
+
+/// Full-size editor for the Xray rule sets (block → proxy → direct), split
+/// DNS and domain strategy, with a Happ/Incy import and an offline checker.
+struct RoutingRulesEditor: View {
+  struct RuleSet { let target: String; let title: String; let color: String }
+  static let sets = [
+    RuleSet(target: "block", title: "rules.block", color: "down"),
+    RuleSet(target: "proxy", title: "rules.proxy", color: "accent"),
+    RuleSet(target: "direct", title: "rules.direct", color: "up"),
+  ]
+  private static let strategies = [
+    ("", "rules.strategyDefault"), ("asIs", "AsIs"), ("ipIfNonMatch", "IPIfNonMatch"),
+    ("ipOnDemand", "IPOnDemand"),
+  ]
+  private static let matchers = [
+    ("", "rules.matcherDefault"), ("mph", "mph"), ("hybrid", "hybrid"), ("linear", "linear"),
+  ]
+  private static let queryStrategies = [
+    ("", "rules.matcherDefault"), ("useIp", "UseIP"), ("useIpv4", "UseIPv4"), ("useIpv6", "UseIPv6"),
+  ]
+  @Environment(\.palette) private var p
+  @Bindable var model: AppModel
+  let profile: Profile
+  let onClose: () -> Void
+  @State private var selected = "proxy"
+  @State private var options = RoutingOptions()
+  @State private var importing = false
+  @State private var happPayload = ""
+  @State private var happWarnings: [String] = []
+  @State private var testTarget = ""
+  @State private var checking = false
+  @State private var verdict: RouteCheckResult?
+
+  private func text(_ target: String) -> Binding<String> {
+    switch target {
+    case "block": $options.block
+    case "direct": $options.direct
+    default: $options.proxy
+    }
+  }
+  private func count(_ target: String) -> Int {
+    text(target).wrappedValue.split(separator: "\n")
+      .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !$0.hasPrefix("#") }.count
+  }
+  private func tab(_ id: String, title: String, color: String?, badge: String?) -> some View {
+    Button {
+      selected = id
+    } label: {
+      HStack(spacing: 6) {
+        if let color { Circle().fill(p[color]).frame(width: 7, height: 7) }
+        Text(L10n.text(title))
+        if let badge { Text(badge).foregroundStyle(p.muted) }
+      }.font(.system(size: 11.9, weight: selected == id ? .semibold : .regular))
+        .padding(.horizontal, 10).padding(.vertical, 5)
+        .background(selected == id ? p["bg-elev"] : .clear, in: RoundedRectangle(cornerRadius: 6))
+    }.buttonStyle(.plain)
+  }
+  private func editor(_ binding: Binding<String>, height: CGFloat, label: String) -> some View {
+    TextEditor(text: binding)
+      .font(.system(size: 11.9, design: .monospaced)).scrollContentBackground(.hidden)
+      .padding(7).frame(height: height)
+      .background(p.input, in: RoundedRectangle(cornerRadius: 6))
+      .overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
+      .accessibilityLabel(L10n.text(label))
+  }
+  private func picker(_ title: String, _ value: Binding<String>, _ items: [(String, String)])
+    -> some View
+  {
+    HStack {
+      Text(L10n.text(title)).font(.system(size: 11.9))
+      Spacer()
+      Picker("", selection: value) {
+        ForEach(items, id: \.0) { Text(L10n.text($0.1)).tag($0.0) }
+      }.labelsHidden().frame(width: 190)
+    }
+  }
+  private var dnsPane: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      picker("rules.domainStrategy", $options.domainStrategy, Self.strategies)
+      picker("rules.domainMatcher", $options.domainMatcher, Self.matchers)
+      picker("native.queryStrategy", $options.queryStrategy, Self.queryStrategies)
+      Text(L10n.text("rules.outboundDns")).font(.system(size: 11.9, weight: .semibold))
+      editor($options.dnsServers, height: 110, label: "rules.outboundDns")
+      Text(L10n.text("native.dnsServersHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+        .fixedSize(horizontal: false, vertical: true)
+      Text(L10n.text("native.staticHosts")).font(.system(size: 11.9, weight: .semibold))
+      editor($options.dnsHosts, height: 70, label: "native.staticHosts")
+      Toggle(L10n.text("native.fakeDns"), isOn: $options.fakeDns).toggleStyle(.checkbox)
+        .font(.system(size: 11.9))
+    }
+  }
+  private var checker: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      HStack(spacing: 8) {
+        TextField(L10n.text("rules.testPlaceholder"), text: $testTarget)
+          .textFieldStyle(.roundedBorder).font(.system(size: 11.9, design: .monospaced))
+          .onSubmit(runCheck)
+        Button(L10n.text(checking ? "rules.testChecking" : "rules.testCheck"), action: runCheck)
+          .disabled(checking || testTarget.trimmingCharacters(in: .whitespaces).isEmpty)
+      }
+      if let verdict {
+        HStack(spacing: 6) {
+          Circle().fill(p[Self.outboundColor(verdict.outbound)]).frame(width: 7, height: 7)
+          Text(L10n.text(Self.outboundTitle(verdict.outbound))).fontWeight(.semibold)
+          Text("· " + sourceText(verdict)).foregroundStyle(p.muted)
+        }.font(.system(size: 11.9))
+        if let selector = verdict.matchedSelector {
+          Text(selector).font(.system(size: 10.92, design: .monospaced)).foregroundStyle(p.muted)
+        }
+        if verdict.certainty == "probable" {
+          Text(L10n.text("rules.testProbable")).font(.system(size: 10.92)).foregroundStyle(p["warn"])
+        }
+        ForEach(verdict.notes, id: \.self) {
+          Text($0).font(.system(size: 10.92)).foregroundStyle(p.muted)
+        }
+      }
+    }
+  }
+  private static func outboundColor(_ outbound: String) -> String {
+    switch outbound {
+    case "block": "down"
+    case "direct": "up"
+    case "dns": "info"
+    default: "accent"
+    }
+  }
+  private static func outboundTitle(_ outbound: String) -> String {
+    switch outbound {
+    case "block": "rules.block"
+    case "direct": "rules.direct"
+    case "dns": "rules.outboundDns"
+    default: "rules.proxy"
+    }
+  }
+  private func sourceText(_ verdict: RouteCheckResult) -> String {
+    switch verdict.source {
+    case "dnsCapture": L10n.text("rules.srcDnsCapture")
+    case "policy": L10n.text("rules.srcPolicy", ["index": String((verdict.policyIndex ?? 0) + 1)])
+    case "resolverPin": L10n.text("rules.srcResolverPin")
+    case "multicast": L10n.text("rules.srcMulticast")
+    case "privateLan": L10n.text("rules.srcPrivateLan")
+    default: L10n.text("rules.srcDefault")
+    }
+  }
+  private func runCheck() {
+    let target = testTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !target.isEmpty, !checking else { return }
+    model.error = nil
+    checking = true
+    Task {
+      verdict = await model.checkRoute(target, options: options)
+      checking = false
+    }
+  }
+  private var happPane: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text(L10n.text("rules.happHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+      editor($happPayload, height: 120, label: "rules.importHapp")
+      HStack {
+        Spacer()
+        Button(L10n.text("rules.back")) { importing = false }
+        Button(L10n.text("rules.happApply")) {
+          Task {
+            guard let happ = await model.parseHappRouting(happPayload) else { return }
+            options.apply(happ)
+            happWarnings = happ.warnings
+            happPayload = ""
+            importing = false
+          }
+        }.buttonStyle(TauriButtonStyle(kind: .accent))
+          .disabled(happPayload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+      }
+    }
+  }
+  var body: some View {
+    AppModal(title: "detail.domainRules", width: 720, onClose: onClose) {
+      VStack(alignment: .leading, spacing: 10.5) {
+        if importing {
+          happPane
+        } else {
+          HStack(spacing: 6) {
+            ForEach(Self.sets, id: \.target) { set in
+              tab(set.target, title: set.title, color: set.color, badge: "\(count(set.target))")
+            }
+            tab("dns", title: "DNS", color: nil, badge: nil)
+            Spacer()
+            Button(L10n.text("rules.importHapp")) {
+              model.error = nil
+              importing = true
+            }.font(.system(size: 11.9))
+          }
+          if selected == "dns" {
+            dnsPane
+          } else {
+            editor(text(selected), height: 300, label: "detail.domainRules")
+            Text(L10n.text("form.rulesHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+              .fixedSize(horizontal: false, vertical: true)
+            Toggle(L10n.text("form.privateLanDirect"), isOn: $options.privateLanDirect)
+              .toggleStyle(.checkbox).font(.system(size: 11.9))
+          }
+          Divider()
+          checker
+          ForEach(happWarnings, id: \.self) {
+            Text($0).font(.system(size: 10.92)).foregroundStyle(p["warn"])
+          }
+        }
+        if let error = model.error {
+          Text(L10n.text(error)).foregroundStyle(p["down"]).font(.system(size: 11.9))
+        }
+        if !importing {
+          HStack {
+            Spacer()
+            Button(L10n.text("Cancel"), action: onClose)
+            Button(L10n.text("Save")) {
+              Task { if await model.setRoutingRules(profile, options: options) { onClose() } }
+            }.buttonStyle(TauriButtonStyle(kind: .accent)).disabled(model.busy)
+          }
+        }
+      }.padding(14)
+    }
+    .onAppear {
+      model.error = nil
+      options.block = profile.rules("block").joined(separator: "\n")
+      options.proxy = profile.rules("proxy").joined(separator: "\n")
+      options.direct = profile.rules("direct").joined(separator: "\n")
+      options.privateLanDirect = profile.privateLanDirect ?? false
+      Task { if let loaded = await model.routingOptions(profile) { options = loaded } }
     }
   }
 }

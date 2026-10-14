@@ -1,0 +1,10 @@
+{
+  "backends": [
+    {
+      "name": "openvpn",
+      "version": "2.6.17",
+      "file": "openvpn",
+      "sha256": "07d1e223f08ce17fa39376a14924548ec740095bbc11a9b4f64c9bc9fc11d21a"
+    }
+  ]
+}
