@@ -2733,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-app"
-version = "0.8.0"
+version = "0.8.5"
 dependencies = [
  "base64 0.22.1",
  "dbus-secret-service",
@@ -2759,7 +2759,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-core"
-version = "0.8.0"
+version = "0.8.5"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -2779,7 +2779,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-macos-bridge"
-version = "0.8.0"
+version = "0.8.5"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "network-orchestrator-daemon"
-version = "0.8.0"
+version = "0.8.5"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -2893,7 +2893,7 @@ dependencies = [
 
 [[package]]
 name = "network-orchestrator-macos-helper"
-version = "0.8.0"
+version = "0.8.5"
 dependencies = [
  "base64 0.22.1",
  "boringtun",

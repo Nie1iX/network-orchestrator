@@ -8,6 +8,8 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-10-14
+
 ### Added
 
 - macOS: WireGuard and OpenVPN run through the privileged helper. WireGuard uses
