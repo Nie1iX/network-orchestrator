@@ -640,6 +640,16 @@ struct SettingsView: View {
                   Button(L10n.text(model.installingXray ? "native.installing" : "native.installXray"))
                   { Task { await model.installXray() } }.disabled(model.installingXray)
                 }
+              } else if backend == "WireGuard" || backend == "OpenVPN" {
+                let serves = model.helperOffers(
+                  backend == "WireGuard" ? "wireguard.connect" : "openvpn.connect")
+                AppBadge(
+                  text: serves ? "native.installed" : "native.helperNeeded",
+                  color: serves ? "up" : "unknown")
+                Text(
+                  L10n.text(backend == "WireGuard" ? "native.wireguardEngine" : "native.openvpnEngine")
+                ).font(.system(size: 11.48)).foregroundStyle(p.secondary)
+                Spacer()
               } else {
                 AppBadge(text: "Not available")
                 Text(L10n.text("Native VPN provider pending")).font(.system(size: 11.48))

@@ -81,6 +81,11 @@ struct ContentView: View {
       .environment(\.locale, Locale(identifier: L10n.shared.language))
       .environment(\.layoutDirection, L10n.shared.direction)
     }
+    .sheet(item: $model.credentialRequest) { request in
+      CredentialSheet(model: model, request: request).environment(
+        \.palette, AppPalette(scheme: scheme)
+      ).buttonStyle(TauriButtonStyle())
+    }
     .alert(L10n.text("native.helperPromptTitle"), isPresented: $model.helperPrompt) {
       Button(L10n.text("native.helperInstall")) { Task { await model.installHelper() } }
       Button(L10n.text("common.cancel"), role: .cancel) {}

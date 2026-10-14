@@ -139,16 +139,23 @@ import SystemConfiguration
   var helperServesTunnels: Bool {
     helperStatus?.reachable == true && helperStatus?.capabilities.contains("xray.connect") == true
   }
+  /// The helper answers and advertises `capability`.
+  func helperOffers(_ capability: String) -> Bool {
+    helperStatus?.reachable == true && helperStatus?.capabilities.contains(capability) == true
+  }
+  func helperServes(_ profile: Profile) -> Bool {
+    profile.helperCapability.map(helperOffers) ?? false
+  }
   /// Whether this client can start `profile` right now: loopback Xray always,
-  /// a full tunnel once the privileged helper serves it.
+  /// anything that needs a tunnel device once the privileged helper serves it.
   func canStart(_ profile: Profile) -> Bool {
     if profile.startsWithoutHelper { return canStartConnections }
-    return profile.isTun && canStartConnections && helperServesTunnels
+    return profile.needsHelper && canStartConnections && helperServes(profile)
   }
   /// The switch is usable for a TUN profile even without the helper: pressing
   /// it then offers to install the helper instead of doing nothing.
   func canTryStart(_ profile: Profile) -> Bool {
-    canStart(profile) || (profile.isTun && canStartConnections)
+    canStart(profile) || (profile.needsHelper && canStartConnections)
   }
   /// Interfaces of tunnels this app runs itself.
   var ownTunnelInterfaces: Set<String> {
@@ -184,18 +191,29 @@ import SystemConfiguration
   }
   func toggle(_ profile: Profile) async {
     guard !pending.contains(profile.id) else { return }
-    if profile.isTun && !isRunning(profile) && !helperServesTunnels {
+    if profile.needsHelper && !isRunning(profile) && !helperServes(profile) {
       helperPrompt = true
       return
     }
     pending.insert(profile.id)
     defer { pending.remove(profile.id) }
     do {
-      runtime = try await core.call(
-        isRunning(profile) ? "disconnect" : "connect", args: ["id": profile.id])
+      if isRunning(profile) {
+        runtime = try await core.call("disconnect", args: ["id": profile.id])
+      } else {
+        // OpenVPN may need a login; nil means the sign-in sheet is showing.
+        guard let extra = try await credentialArguments(profile) else { return }
+        runtime = try await core.call("connect", args: ["id": profile.id].merging(extra) { $1 })
+        await rememberAfterConnect(profile)
+      }
       error = nil
     } catch {
       self.error = error.localizedDescription
+      // A missing credential is answered by asking, not by an error banner.
+      if self.error == "OpenVPN credentials required" {
+        self.error = nil
+        await askForCredentials(profile, rejected: false)
+      }
       await refreshRuntime()
     }
   }
@@ -471,6 +489,65 @@ import SystemConfiguration
       }
     }
   }
+  /// OpenVPN is waiting for the user to type credentials.
+  var credentialRequest: CredentialRequest?
+  /// Typed credentials the user asked to keep, saved once the connect succeeds.
+  private var pendingRemember: [String: OpenVpnSecrets] = [:]
+  /// Extra connect arguments (credentials) for `profile`; `nil` when the
+  /// sign-in sheet was opened instead of connecting.
+  private func credentialArguments(_ profile: Profile) async throws -> [String: String]? {
+    guard profile.backend == "openVpn" else { return [:] }
+    let needs: CredentialNeeds = try await core.call(
+      "credential_requirements", args: ["id": profile.id])
+    guard needs.any else { return [:] }
+    // A refusal on the last attempt means what is saved is wrong.
+    let rejected = status(profile)?.message == "OpenVPN authentication failed"
+    if rejected { CredentialStore.delete(profile.id) }
+    if !rejected, let saved = CredentialStore.load(profile.id), saved.satisfies(needs) {
+      return saved.arguments(for: needs)
+    }
+    await askForCredentials(profile, rejected: rejected, needs: needs)
+    return nil
+  }
+  private func askForCredentials(
+    _ profile: Profile, rejected: Bool, needs: CredentialNeeds? = nil
+  ) async {
+    let needs =
+      if let needs { needs } else {
+        (try? await core.call("credential_requirements", args: ["id": profile.id]))
+          ?? CredentialNeeds(userPass: true, keyPassphrase: false)
+      }
+    credentialRequest = CredentialRequest(
+      profile: profile.id, name: profile.name, needs: needs, rejected: rejected)
+  }
+  /// Connects with what the user typed; keeps it in the Keychain on request.
+  func submitCredentials(_ request: CredentialRequest, secrets: OpenVpnSecrets, remember: Bool) async {
+    credentialRequest = nil
+    guard let profile = snapshot?.profiles.first(where: { $0.id == request.profile }),
+      !pending.contains(profile.id)
+    else { return }
+    pending.insert(profile.id)
+    defer { pending.remove(profile.id) }
+    if remember { pendingRemember[profile.id] = secrets }
+    do {
+      runtime = try await core.call(
+        "connect",
+        args: ["id": profile.id].merging(secrets.arguments(for: request.needs)) { $1 })
+      await rememberAfterConnect(profile)
+      error = nil
+    } catch {
+      pendingRemember[profile.id] = nil
+      self.error = error.localizedDescription
+      await refreshRuntime()
+    }
+  }
+  private func rememberAfterConnect(_ profile: Profile) async {
+    if let secrets = pendingRemember.removeValue(forKey: profile.id) {
+      CredentialStore.save(secrets, for: profile.id)
+    }
+  }
+  /// Forget what Keychain holds for this profile.
+  func forgetCredentials(_ profile: Profile) { CredentialStore.delete(profile.id) }
   /// TUN was requested without a helper: the window offering to install it.
   var helperPrompt = false
   /// The helper was removed because the app changed; shown until it is installed again.
