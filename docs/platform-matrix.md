@@ -25,8 +25,8 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 
 | Feature | Windows | Linux | macOS | Notes |
 |---|---|---|---|---|
-| WireGuard profile | ✅ | ✅ | ❌ | Win: embedded tunnel lib + service install; Linux: `wireguard-tools` + daemon; macOS has neither path |
-| OpenVPN profile | ✅ | ✅ | ❌ helper | Generic `Command` spawn compiles, but route/DNS plumbing and credential flow are OS-specific; never verified |
+| WireGuard profile | ✅ | ✅ | ✅ helper, arm64 | Win: embedded tunnel lib + service install; Linux: `wireguard-tools` + daemon; macOS: userspace engine (`boringtun`) inside the privileged helper — `docs/plans/2026-10-14-17-macos-wireguard-openvpn.md` |
+| OpenVPN profile | ✅ | ✅ | ✅ helper, arm64 | Win/Linux as before; macOS: pinned self-contained OpenVPN from the app bundle run by the helper, routes/DNS installed by the helper, credentials in the Keychain |
 | Xray — SOCKS mode | ✅ | ✅ | ✅ native, arm64 | macOS: native client runs managed Xray via `TunnelManager` in `crates/macos-bridge/src/runtime.rs` |
 | Xray — TUN mode | ✅ manual | ✅ managed | ✅ helper, arm64 | Win: user sets iface name/IP; Linux: daemon generates config (`xrayMode: "tun"` default); macOS: the launchd helper creates the `utun`, hands its fd to Xray (`XRAY_TUN_FD`, Xray runs as the console user) and owns routes + DNS — `docs/plans/2026-10-14-16-macos-xray-tun.md`; one tunnel at a time |
 | Static routes (`none`) | ✅ | ✅ | ❌ helper | Policy routes only, no tunnel; route mutation is IP Helper / netlink |
@@ -37,7 +37,7 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 
 | Feature | Windows | Linux | macOS | Notes |
 |---|---|---|---|---|
-| Privileged ops | ✅ elevated relaunch | ✅ daemon | ⚠️ Xray TUN only | Win: `elevationRelaunch` respawn; Linux: `net-manager-daemon` (systemd + polkit + Unix socket); macOS: launchd helper (`SMAppService.daemon`) verifies the app and runs the Xray TUN executor (utun, routes, DNS, journal); WireGuard/OpenVPN/static-route executors are not written yet — see the helper plan |
+| Privileged ops | ✅ elevated relaunch | ✅ daemon | ✅ Xray TUN, WireGuard, OpenVPN | Win: `elevationRelaunch` respawn; Linux: `net-manager-daemon` (systemd + polkit + Unix socket); macOS: launchd helper (`SMAppService.daemon`) verifies the app and runs the Xray TUN, WireGuard and OpenVPN executors (utun, routes, DNS, journal); a static-route executor is not written yet — see the helper plans |
 | Ask for admin password (polkit policy) | — | ✅ | — | `get/set_vpn_auth_mode`; Settings → System |
 | Always-on before sign-in | — | ✅ | — | WG + static routes only; daemon journal; OVPN/Xray unsupported |
 | Start at login | — | ✅ | — | `get/set_login_autostart` |

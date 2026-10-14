@@ -126,7 +126,11 @@ mirrors this gate on Windows.
   stay helper-only. The helper itself launches Xray TUN only as the console
   user (groups, gid and uid dropped irreversibly before exec), only from the
   user's hash-verified managed install, and never as root; tests use fake
-  platforms/runners and must not create a utun or touch routes or DNS.
+  platforms/runners and must not create a utun or touch routes or DNS. The
+  helper runs OpenVPN as root only from the pinned, self-contained copy of the
+  bundled binary (SHA-256 compiled into the helper, no script hooks, config
+  through `sanitize_openvpn_config`), and runs WireGuard in-process; tests use
+  fake platforms and a fake management server, never a real tunnel.
 - Do not commit unless explicitly asked; do not push to `main`/`master`.
 
 ## Conventions
