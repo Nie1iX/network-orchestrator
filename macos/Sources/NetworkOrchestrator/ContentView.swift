@@ -95,6 +95,9 @@ struct ContentView: View {
   }
 }
 struct NavigationRail: View {
+  /// Wider than the shared token (64): even where the rail does reach the
+  /// title bar, all three window buttons end inside it.
+  static let width: CGFloat = 72
   @Environment(\.palette) private var p
   @Binding var selection: Section
   @State private var hovered: Section?
@@ -110,8 +113,10 @@ struct NavigationRail: View {
       railButton(.routes, muted: true)
       Spacer(minLength: 0)
       railButton(.settings)
-    }.padding(.vertical, 10.5).frame(width: DesignMetrics.railWidth).frame(maxHeight: .infinity)
-      .background(p.sidebar)
+    }.padding(.vertical, 10.5).frame(width: Self.width).frame(maxHeight: .infinity)
+      // Stops at the title bar: the window's traffic-light buttons sit above the
+      // rail, not half on it (the zoom button used to straddle its edge).
+      .background(p.sidebar, ignoresSafeAreaEdges: .bottom)
       .overlay(alignment: .trailing) { Rectangle().fill(p.border).frame(width: 1) }
   }
   private func railButton(_ section: Section, muted: Bool = false) -> some View {
