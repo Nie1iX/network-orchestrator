@@ -3,7 +3,7 @@ members = ["crates/core", "crates/daemon", "crates/macos-bridge", "crates/macos-
 resolver = "2"
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.5"
 edition = "2021"
 
 [profile.release]
