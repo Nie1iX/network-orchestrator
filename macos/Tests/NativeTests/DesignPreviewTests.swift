@@ -33,11 +33,24 @@ import Testing
     [
       "id": "design-xray", "name": "Personal proxy", "backend": "xray", "interfaceName": "",
       "routes": [], "xraySocksPort": 10808, "xrayHttpPort": 10809,
+      "domainPolicies": [
+        ["domains": ["geosite:category-ads-all"], "target": "block"],
+        ["domains": ["domain:youtube.com", "geosite:google", "# video"], "target": "proxy"],
+        ["domains": ["geoip:ru", "domain:example.ru"], "target": "direct"],
+      ],
+      "privateLanDirect": true,
       "subscription": [
         "endpointCount": 2, "activeIndex": 0,
         "userInfo": [
           "uploadBytes": 0, "downloadBytes": 8_151_449_629, "expiresAtUnix": 1_802_708_026,
         ],
+        "providerTitle": "QA Panel",
+        "announce": "Servers in Europe were updated. Use the Asia server if Europe is slow.",
+        "supportUrl": "https://support.example.test/",
+        "webPageUrl": "https://account.example.test/",
+        "skippedProtocols": ["trojan"],
+        "refreshIntervalMinutes": 60, "lastRefreshAtUnix": 1_790_850_000,
+        "updateIntervalHours": 12,
       ],
     ],
     [
@@ -101,8 +114,8 @@ import Testing
     ]))
   model.subscriptionEndpoints = [
     "design-xray": [
-      SubscriptionEndpoint(name: "QA Europe", active: true),
-      SubscriptionEndpoint(name: "QA Asia", active: false),
+      SubscriptionEndpoint(name: "QA Panel - QA Europe", active: true, protocol: "VLESS · Reality"),
+      SubscriptionEndpoint(name: "QA Panel - QA Asia", active: false, protocol: "Hysteria2"),
     ]
   ]
   model.runtime = RuntimeState(
@@ -112,8 +125,28 @@ import Testing
       TunnelStatus(profileId: "design-wg", state: "stopped", message: nil),
     ], systemProxyOwner: "design-xray")
   model.primaryInterface = "en0"
+  model.connectionSets = [
+    ConnectionSet(id: "work", name: "Work", profileIds: ["design-xray"]),
+    ConnectionSet(id: "home", name: "Home", profileIds: ["design-wg"]),
+  ]
+  model.externalVPNs = [
+    ExternalVpn(
+      id: "392D9AF2-DA71-4726-B590-5EDE32714C7C", name: "Corporate VPN", state: "connected",
+      provider: "com.example.vpn", enabled: true)
+  ]
   model.delays["design-xray"] = [0: UInt64?.some(142)]
   model.probing["design-xray"] = [1]
+  model.exitIPs = [
+    "direct": [
+      ExitIpEntry(name: "ipify", ip: "198.51.100.20", country: "RU", error: nil),
+      ExitIpEntry(name: "icanhazip", ip: "198.51.100.20", country: "RU", error: nil),
+    ],
+    "design-xray": [
+      ExitIpEntry(name: "ipify", ip: "203.0.113.7", country: "NL", error: nil),
+      ExitIpEntry(name: "icanhazip", ip: "203.0.113.7", country: "NL", error: nil),
+      ExitIpEntry(name: "2ip.io", ip: nil, country: nil, error: "unreachable"),
+    ],
+  ]
   model.inspections["design-wg"] = try JSONDecoder().decode(
     Inspection.self,
     from: JSONSerialization.data(withJSONObject: [
@@ -129,6 +162,23 @@ import Testing
         ]
       ],
     ]))
+  model.userNetwork = try JSONDecoder().decode(
+    UserNetworkSettings.self,
+    from: Data(
+      #"""
+      {"persistentRoutes":[{"service":"USB LAN","interface":"en7","destination":"10.10.30.0/24","gateway":"192.0.2.1","active":true},
+        {"service":"USB LAN","interface":"en7","destination":"198.51.100.0/24","gateway":"192.0.2.1","active":false}],
+       "staticRoutes":[{"destination":"10.10.30.0/24","gateway":"192.0.2.1","interface":"en7","flags":"UGSc","source":"persistent"},
+        {"destination":"10.85.0.0/16","gateway":"utun4","interface":"utun4","flags":"USc","source":"tunnel"},
+        {"destination":"203.0.113.7/32","gateway":"192.0.2.1","interface":"en7","flags":"UGHS","source":"command"}],
+       "startupJobs":[{"label":"com.example.addroute","path":"/Library/LaunchDaemons/com.example.addroute.plist","scope":"daemon",
+        "command":"/sbin/route -n add -net 198.51.100.0/24 192.0.2.1","runAtLoad":true,"intervalSeconds":null,"route":"198.51.100.0/24","active":false}],
+       "resolvers":[{"domain":"corp.example","nameservers":["10.0.0.53","10.0.1.53"],"port":null,"searchOrder":null}],
+       "hosts":[{"address":"203.0.113.7","names":["portal.example"]}],
+       "services":[{"service":"Lab","interface":"en5","enabled":true,"items":[{"kind":"ipv4Address","value":"192.0.2.10/24"},
+        {"kind":"ipv4Router","value":"192.0.2.1"},{"kind":"dnsServers","value":"1.1.1.1, 8.8.8.8"}]}],
+       "unreadable":[]}
+      """#.utf8))
   for language in ["en", "ru"] {
     L10n.shared.preference = language
     for theme in [ColorScheme.dark, .light] {
@@ -172,6 +222,12 @@ import Testing
           .environment(\.colorScheme, theme).buttonStyle(TauriButtonStyle())
         try render(view, to: directory.appendingPathComponent("dialog-" + filename + ".png"))
       }
+      let xrayProfile = try #require(model.snapshot?.profiles.first { $0.id == "design-xray" })
+      let rulesView = RoutingRulesEditor(model: model, profile: xrayProfile, onClose: {})
+        .frame(maxWidth: .infinity, maxHeight: .infinity).background(palette.app)
+        .foregroundStyle(palette.text).environment(\.palette, palette)
+        .environment(\.colorScheme, theme).buttonStyle(TauriButtonStyle())
+      try render(rulesView, to: directory.appendingPathComponent("dialog-rules.png"))
       let linkView = ImportConfigurationView(
         model: model, preferredBackend: "xray", onClose: {}, initialTab: "Link"
       )

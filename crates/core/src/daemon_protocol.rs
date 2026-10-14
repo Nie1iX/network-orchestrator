@@ -7,7 +7,7 @@
 //! so an unknown method still parses and can be answered with
 //! `unsupportedMethod`.
 
-use crate::models::{AnalyzedRoute, AppliedRoute, PolicyRoute, TunnelState};
+use crate::models::{AnalyzedRoute, AppliedRoute, PolicyRoute, TunnelRole, TunnelState};
 use ipnet::IpNet;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_SOCKET_PATH: &str = "/run/network-orchestrator/daemon.sock";
 pub const SOCKET_ENV: &str = "NETWORK_ORCHESTRATOR_SOCKET";
+/// Socket of the macOS launchd helper.
+pub const MACOS_SOCKET_PATH: &str = "/var/run/network-orchestrator/helper.sock";
 /// Hard cap for one frame; read buffers grow with actual bytes, the cap is
 /// only an abort threshold. `xray.connect` may carry inline base64 geo
 /// assets (two ~10 MiB dat files → ~27 MiB frame); `xray.install` carries a
@@ -820,6 +822,14 @@ pub struct WireGuardConnectParams {
     /// unusable, or (in a shortened form) already taken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_name: Option<String>,
+    /// macOS: a secondary tunnel carries only `routes`; the primary owns the
+    /// default route and system DNS. Other platforms ignore it.
+    #[serde(default, skip_serializing_if = "TunnelRole::is_primary")]
+    pub role: TunnelRole,
+    /// macOS secondary tunnels: names under these suffixes resolve through the
+    /// tunnel's DNS servers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_domains: Vec<String>,
 }
 
 impl std::fmt::Debug for WireGuardConnectParams {
@@ -829,6 +839,7 @@ impl std::fmt::Debug for WireGuardConnectParams {
             .field("config", &"[REDACTED]")
             .field("routes", &self.routes)
             .field("interface_name", &self.interface_name)
+            .field("role", &self.role)
             .finish()
     }
 }
@@ -887,6 +898,14 @@ pub struct OpenVpnConnectParams {
     /// The daemon sanitizes it and falls back to the deterministic name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_name: Option<String>,
+    /// macOS: a secondary tunnel carries only `routes` (pushed routes are
+    /// ignored); the primary owns the default route and system DNS.
+    #[serde(default, skip_serializing_if = "TunnelRole::is_primary")]
+    pub role: TunnelRole,
+    /// macOS secondary tunnels: names under these suffixes resolve through the
+    /// pushed DNS servers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_domains: Vec<String>,
 }
 
 impl std::fmt::Debug for OpenVpnConnectParams {
@@ -897,6 +916,7 @@ impl std::fmt::Debug for OpenVpnConnectParams {
             .field("assets", &"[REDACTED]")
             .field("routes", &self.routes)
             .field("interface_name", &self.interface_name)
+            .field("role", &self.role)
             .finish()
     }
 }
@@ -1121,6 +1141,16 @@ pub struct XrayConnectParams {
     /// `XRAY_LOCATION_ASSET`; absent fields fall back to managed assets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geo_assets: Option<XrayGeoAssets>,
+    /// macOS only: the console user's app data root holding the managed Xray
+    /// (`<root>/backends/xray`). The helper re-verifies the pinned hashes and
+    /// owner before executing it, always as that user, never as root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_data_root: Option<String>,
+    /// macOS: with several tunnels running, a secondary one carries only
+    /// `routes` and leaves the default route and system DNS to the primary.
+    /// Other platforms ignore it.
+    #[serde(default, skip_serializing_if = "TunnelRole::is_primary")]
+    pub role: TunnelRole,
 }
 
 /// Inline geo asset overrides for [`XrayConnectParams`]; base64-encoded dat
@@ -1144,6 +1174,8 @@ impl std::fmt::Debug for XrayConnectParams {
             .field("dns_domains", &self.dns_domains)
             .field("dns_bypass", &self.dns_bypass)
             .field("interface_name", &self.interface_name)
+            .field("macos_data_root", &self.macos_data_root)
+            .field("role", &self.role)
             .field(
                 "geo_assets",
                 &self.geo_assets.as_ref().map(|assets| {

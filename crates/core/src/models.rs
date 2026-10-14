@@ -175,6 +175,65 @@ pub struct DomainPolicy {
     pub target: DomainRouteTarget,
 }
 
+/// How a tunnel takes part when several run together (macOS). The primary
+/// tunnel owns the default route and the system DNS; a secondary tunnel only
+/// carries the networks the user lists for it, which win over the primary's
+/// capture because they are more specific.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TunnelRole {
+    #[default]
+    Primary,
+    Secondary,
+}
+
+impl TunnelRole {
+    pub fn is_primary(&self) -> bool {
+        matches!(self, Self::Primary)
+    }
+}
+
+/// Most networks one secondary tunnel may carry.
+pub const MAX_SECONDARY_NETWORKS: usize = 512;
+
+/// The networks a secondary tunnel carries, checked: at least one, no default
+/// route (that is the primary's job), a bounded count. Host bits are cleared.
+pub fn secondary_networks(routes: &[PolicyRoute]) -> Result<Vec<IpNet>, &'static str> {
+    if routes.is_empty() {
+        return Err("Add at least one network to this secondary connection");
+    }
+    if routes.len() > MAX_SECONDARY_NETWORKS {
+        return Err("A secondary connection can carry at most 512 networks");
+    }
+    let mut networks: Vec<IpNet> = Vec::new();
+    for route in routes {
+        let network = route.destination.trunc();
+        if network.prefix_len() == 0 {
+            return Err("A secondary connection cannot take all traffic; make it the primary");
+        }
+        if network.addr().is_multicast() || network.addr().is_loopback() {
+            return Err("A secondary connection cannot take multicast or loopback addresses");
+        }
+        if !networks.contains(&network) {
+            networks.push(network);
+        }
+    }
+    Ok(networks)
+}
+
+/// Domain names acceptable as a split-DNS suffix (`corp.example`).
+pub fn valid_dns_suffix(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        && name.contains(|c: char| c.is_ascii_alphabetic())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyRoute {
@@ -380,6 +439,32 @@ pub struct Profile {
     /// (external tunnels come and go). Ignored while the interface exists.
     #[serde(default)]
     pub wait_for_interface: bool,
+    /// Primary (default route + system DNS) or secondary (only `routes`).
+    /// Used by the macOS client when several tunnels run at once.
+    #[serde(default, skip_serializing_if = "TunnelRole::is_primary")]
+    pub tunnel_role: TunnelRole,
+    /// For a secondary tunnel: names under these suffixes resolve through the
+    /// tunnel's own DNS servers (split DNS) instead of the system's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tunnel_dns_domains: Vec<String>,
+    /// For a secondary tunnel: the networks it carries. Kept apart from
+    /// `routes` (which an OpenVPN import fills from the config).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tunnel_networks: Vec<IpNet>,
+}
+
+impl Profile {
+    /// `tunnel_networks` as policy routes, the form the helper protocol uses.
+    pub fn secondary_routes(&self) -> Vec<PolicyRoute> {
+        self.tunnel_networks
+            .iter()
+            .map(|network| PolicyRoute {
+                destination: *network,
+                metric: 5,
+                via: None,
+            })
+            .collect()
+    }
 }
 
 impl Default for Profile {
@@ -410,6 +495,9 @@ impl Default for Profile {
             xray_split_default: false,
             endpoint_bypasses: Vec::new(),
             wait_for_interface: false,
+            tunnel_role: TunnelRole::Primary,
+            tunnel_dns_domains: Vec::new(),
+            tunnel_networks: Vec::new(),
         }
     }
 }
@@ -885,5 +973,72 @@ mod tests {
         assert_eq!(restored.last_refresh_at_unix, None);
         assert!(restored.last_refresh_error.is_none());
         assert!(restored.user_info.is_none());
+    }
+
+    fn route(cidr: &str) -> PolicyRoute {
+        PolicyRoute {
+            destination: cidr.parse().unwrap(),
+            metric: 5,
+            via: None,
+        }
+    }
+
+    #[test]
+    fn old_profiles_are_primary_and_the_role_is_stored_only_when_secondary() {
+        let json = serde_json::to_value(Profile::default()).unwrap();
+        assert!(json.get("tunnelRole").is_none());
+        let restored: Profile = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.tunnel_role, TunnelRole::Primary);
+        let secondary = Profile {
+            tunnel_role: TunnelRole::Secondary,
+            tunnel_dns_domains: vec!["corp.example".into()],
+            tunnel_networks: vec!["10.10.0.0/16".parse().unwrap()],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&secondary).unwrap();
+        assert_eq!(json["tunnelRole"], "secondary");
+        assert_eq!(
+            secondary.secondary_routes()[0].destination.to_string(),
+            "10.10.0.0/16"
+        );
+        assert_eq!(serde_json::from_value::<Profile>(json).unwrap(), secondary);
+    }
+
+    #[test]
+    fn secondary_networks_are_checked_and_normalised() {
+        let ok = secondary_networks(&[
+            route("10.10.4.7/16"),
+            route("10.10.0.0/16"),
+            route("192.168.5.0/24"),
+            route("fd00::/8"),
+        ])
+        .unwrap();
+        assert_eq!(
+            ok.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["10.10.0.0/16", "192.168.5.0/24", "fd00::/8"]
+        );
+        for bad in [
+            vec![],
+            vec![route("0.0.0.0/0")],
+            vec![route("::/0")],
+            vec![route("224.0.0.0/4")],
+            vec![route("127.0.0.0/8")],
+        ] {
+            assert!(secondary_networks(&bad).is_err(), "{bad:?}");
+        }
+        let many: Vec<PolicyRoute> = (0..=MAX_SECONDARY_NETWORKS)
+            .map(|n| route(&format!("10.{}.{}.0/24", n / 256, n % 256)))
+            .collect();
+        assert!(secondary_networks(&many).is_err());
+    }
+
+    #[test]
+    fn dns_suffixes_are_plain_domain_names() {
+        for ok in ["corp.example", "corp", "a-b.c_d.example", "10.in-addr.arpa"] {
+            assert!(valid_dns_suffix(ok), "{ok}");
+        }
+        for bad in ["", ".corp", "corp.", "a..b", "a/b", "a b", "123", "ex*.com"] {
+            assert!(!valid_dns_suffix(bad), "{bad}");
+        }
     }
 }

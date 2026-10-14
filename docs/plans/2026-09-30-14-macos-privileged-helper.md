@@ -1,7 +1,66 @@
 # macOS: привилегированные мутации через launchd-хелпер, а не через bridge (2026-09-30)
 
-**Статус:** решение принято, реализация не начата. Сейчас на macOS нет
-ни одной сетевой мутации (`capabilities.networkMutations = false`).
+**Статус:** этап 1 реализован (каркас helper'а, установка, проверка клиента).
+Сетевых мутаций на macOS по-прежнему нет (`capabilities.networkMutations =
+false`): исполнители WireGuard/OpenVPN/TUN ещё не написаны.
+
+## Этап 1 — сделано (0.7.0)
+
+- `crates/macos-helper` (`network-orchestrator-helper`): launchd-демон с общим
+  `daemon_protocol` по Unix-сокету `/var/run/network-orchestrator/helper.sock`
+  (0666, доступ решает политика пира). Обязательный `hello`, ограниченные
+  кадры, лимит соединений. Исполняет только `owned.list` и
+  `recovery.cleanup` (пустые), остальное — `unsupportedMethod`; список
+  `capabilities` в `hello` честный.
+- Политика пира: uid владельца `/dev/console` **и** путь процесса
+  (`proc_pidpath`) равен исполняемому файлу приложения в том же бандле.
+  Проверка подписи кода (SecRequirement) — следующий шаг; путь не защищает от
+  подмены самого бандла, поэтому до неё helper не получает мутаций.
+- Установка: бандл содержит `Contents/MacOS/network-orchestrator-helper` и
+  `Contents/Library/LaunchDaemons/com.netmanager.app.helper.plist`; приложение
+  регистрирует его через `SMAppService.daemon` (подтверждение в Настройки →
+  Объекты входа). Пароль администратора приложение не запрашивает и не хранит.
+- `core::helper_client` — блокирующий клиент протокола; мост даёт
+  `helper_status` (достижим ли сокет, версия, capabilities). Мост по-прежнему
+  не обслуживает методы `daemon_protocol`.
+- Настройки → «Привилегированный помощник»: состояние, установка, удаление.
+
+## Этап 2 — выбран вариант 1 (бинарники в подписанном бандле), в работе
+
+Решение (2026-10-05): `openvpn` и `wireguard-go` едут в бандле, NetworkExtension
+не используется. Сделано: `trusted_exec::stage_backend` — helper читает файл
+бандла (без симлинков, ограниченный размер), сверяет SHA-256, зашитый в
+подписанный helper, и копирует его в root-owned stage-каталог; запускается
+только копия (закрывает гонку check-then-exec). Бэкенды обязаны быть
+самодостаточными (статические или с dylib внутри бандла).
+Каталог `crates/macos-helper/backends.json` (вшит в helper через
+`include_str!`, схема в `backends.rs`: имя, версия, файл в
+`Contents/Helpers/`, SHA-256) пока пуст — запись появляется вместе с
+воспроизводимой сборкой бинарника; `Catalog::stage` уже проверяет и
+копирует по каталогу.
+Дальше (сделано 2026-10-14, см. `2026-10-14-17-macos-wireguard-openvpn.md`):
+OpenVPN собирается из закреплённого архива (`scripts/build-macos-openvpn.sh`) и
+пинится в `backends.json`; WireGuard работает без внешнего бинарника
+(`wireguard-go` не нужен — userspace-движок на `boringtun` внутри helper'а);
+исполнители, журнал и подключение UI добавлены.
+
+Исходная постановка:
+
+Root-демон нельзя заставлять запускать пользовательски-записываемый файл или
+файл с пользовательски-записываемыми dylib. Homebrew `openvpn`
+(`/opt/homebrew/sbin`, линкуется с `/opt/homebrew/opt/openssl`) именно такой, как
+и `wg-quick` (bash + `wireguard-go`). Допустимые варианты:
+
+1. **Бинарники в подписанном бандле.** `openvpn` и `wireguard-go`, собранные из
+   закреплённых тегов (хеш исходников в репозитории), статически или с
+   dylib внутри бандла; helper запускает только их и проверяет путь/владельца.
+2. **NetworkExtension** (packet tunnel provider, как WireGuard.app): нужны
+   entitlement и подпись Developer ID; helper отвечает только за маршруты/DNS.
+
+После выбора: исполнители маршрутов (`/sbin/route`/`ifconfig` или PF_ROUTE),
+DNS (SCDynamicStore), журнал владения, очистка при смерти клиента и
+восстановление после перезагрузки, затем подключение Swift-UI к connect.
+
 
 ## Контекст
 

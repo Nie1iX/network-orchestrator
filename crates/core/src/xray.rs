@@ -373,6 +373,51 @@ pub fn generate_share_link_config_with_http(
     Ok(config)
 }
 
+/// Short protocol label for an endpoint, e.g. `VLESS · Reality` or
+/// `Hysteria2`; for full Xray JSON entries it is read from the first outbound.
+pub fn endpoint_protocol(uri: &str) -> Option<String> {
+    let name = |scheme: &str| match scheme {
+        "vless" => "VLESS".to_string(),
+        "hy2" | "hysteria2" => "Hysteria2".to_string(),
+        "trojan" => "Trojan".to_string(),
+        "vmess" => "VMess".to_string(),
+        "ss" | "shadowsocks" => "Shadowsocks".to_string(),
+        other => other.to_uppercase(),
+    };
+    let mut label;
+    let (security, transport) = if uri.trim().starts_with(XRAY_JSON_PREFIX) {
+        let entry = decode_xray_json_entry(uri).ok()?;
+        let outbound = entry.get("outbounds")?.as_array()?.first()?.clone();
+        label = name(outbound.get("protocol")?.as_str()?);
+        let stream = outbound
+            .get("streamSettings")
+            .cloned()
+            .unwrap_or(Value::Null);
+        (
+            stream["security"].as_str().map(str::to_string),
+            stream["network"].as_str().map(str::to_string),
+        )
+    } else {
+        let url = reqwest::Url::parse(uri.trim()).ok()?;
+        label = name(url.scheme());
+        let query = |key: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        };
+        (query("security"), query("type"))
+    };
+    match security.as_deref() {
+        Some("reality") => label.push_str(" · Reality"),
+        Some("tls") => label.push_str(" · TLS"),
+        _ => {}
+    }
+    if let Some(transport) = transport.filter(|t| t != "tcp" && t != "none" && t != "raw") {
+        label.push_str(&format!(" · {}", transport.to_uppercase()));
+    }
+    Some(label)
+}
+
 pub fn share_link_name(uri: &str) -> Option<String> {
     if uri.trim().starts_with(XRAY_JSON_PREFIX) {
         return decode_xray_json_entry(uri)
@@ -635,7 +680,7 @@ pub(crate) fn classify_routing_selector(
 
 const DNS_SCHEMES: &[&str] = &["udp", "tcp", "tls", "https", "https+local", "quic+local"];
 
-fn validate_dns_config(dns: &XrayDnsConfig) -> io::Result<()> {
+pub fn validate_dns_config(dns: &XrayDnsConfig) -> io::Result<()> {
     for server in &dns.servers {
         let address = server.address.trim();
         if address.is_empty()
@@ -1166,6 +1211,423 @@ pub fn apply_tun_inbound(
     Ok(doc)
 }
 
+/// Replace the SOCKS inbound in an Xray config with the TUN inbound used for
+/// macOS full-tunnel operation. The privileged helper creates the `utun`
+/// device and hands its fd to Xray through `XRAY_TUN_FD`, so the settings
+/// carry only what Xray consumes in that mode: the stack `mtu` and
+/// `autoOutboundsInterface`. The latter binds every outbound dial Xray makes
+/// itself (proxy endpoint, direct/freedom, resolvers) to the physical
+/// uplink via `IP_BOUND_IF` — loop prevention, since a full tunnel would
+/// otherwise feed `direct` traffic straight back into the utun.
+pub fn apply_macos_tun_inbound(base: &Value, mtu: u32, uplink: &str) -> io::Result<Value> {
+    let uplink = uplink.trim();
+    if uplink.is_empty()
+        || uplink.len() > 15
+        || !uplink
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    {
+        return Err(invalid_input("invalid uplink interface name"));
+    }
+    if !(512..=9000).contains(&mtu) {
+        return Err(invalid_input("invalid TUN MTU"));
+    }
+    let mut doc = base.clone();
+    let root = doc
+        .as_object_mut()
+        .ok_or_else(|| invalid_data("xray config root must be an object"))?;
+    let inbounds = root
+        .entry("inbounds")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| invalid_data("xray config inbounds must be an array"))?;
+
+    inbounds.retain(|inbound| inbound["protocol"].as_str() != Some("socks"));
+
+    // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
+    // SNI / HTTP Host so domain and geosite routing rules can match. With
+    // fake-DNS enabled it also translates pool answers back to real names.
+    let mut dest_override = vec!["http", "tls", "quic"];
+    if base["fakedns"]
+        .as_array()
+        .is_some_and(|fakedns| !fakedns.is_empty())
+    {
+        dest_override.push("fakedns");
+    }
+
+    let tun_inbound = json!({
+        "tag": "tun-in",
+        "protocol": "tun",
+        "settings": {
+            "mtu": mtu,
+            "autoOutboundsInterface": uplink,
+        },
+        "sniffing": {
+            "enabled": true,
+            "destOverride": dest_override,
+        },
+    });
+    inbounds.insert(0, tun_inbound);
+    Ok(doc)
+}
+
+/// Resolver the tunnel's own lookups use for everything that is not pinned to
+/// the local network; plain TCP-over-HTTPS so it works through any proxy.
+const MACOS_REMOTE_DNS: &str = "https://1.1.1.1/dns-query";
+/// Gateway of the helper-created utun; the system DNS is pointed here.
+const MACOS_TUNNEL_RESOLVER: &str = "169.254.10.1";
+const MACOS_REMOTE_DNS_IP: &str = "1.1.1.1";
+
+fn outbound_tag(outbound: &Value) -> Option<&str> {
+    outbound["tag"]
+        .as_str()
+        .filter(|tag| !tag.trim().is_empty())
+}
+
+/// Make Xray answer the system's DNS on macOS and keep domain rules working.
+///
+/// The helper points the uplink's service at the tunnel gateway, so every
+/// lookup arrives on `tun-in` as a packet for `169.254.10.1:53`. Unless a
+/// `dns` outbound answers it, routing sends it `direct` to a gateway that does
+/// not exist: no name resolves and every domain rule goes quiet.
+///
+/// Added, never replacing what the profile defines:
+/// - when the profile does not route DNS itself: a `dns` outbound, a first rule
+///   sending `tun-in` traffic for the tunnel resolver to it, and `dns.servers`
+///   (a remote resolver through the proxy);
+/// - a `direct` rule for `local_domains` (the network's search domains), and
+///   `dns.servers` entries sending those names plus the profile's direct names
+///   to the local network's resolvers, which are pinned `direct`;
+/// - `domainStrategy: UseIP` on `freedom`, so a direct connection to a name is
+///   resolved by Xray (the OS resolver points back at this tunnel);
+/// - fake-DNS for every name the profile routes `direct`/`block`, so protocols
+///   without SNI (SSH) still match their rule, see
+///   [`add_fake_dns_for_routed_domains`];
+/// - those names in the `hijack` rules of a profile `dns` outbound that
+///   forwards everything else to a fixed resolver, otherwise they would never
+///   reach the fake-DNS engine.
+pub fn apply_macos_dns_capture(
+    base: &Value,
+    local_resolvers: &[IpAddr],
+    local_domains: &[String],
+) -> io::Result<Value> {
+    let mut doc = base.clone();
+    let root = doc
+        .as_object_mut()
+        .ok_or_else(|| invalid_data("xray config root must be an object"))?;
+    let existing_rules = root
+        .get("routing")
+        .and_then(|routing| routing.get("rules"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let outbounds = root
+        .entry("outbounds")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| invalid_data("xray config outbounds must be an array"))?;
+
+    let dns_outbound_tags: HashSet<String> = outbounds
+        .iter()
+        .filter(|outbound| outbound["protocol"].as_str() == Some("dns"))
+        .filter_map(|outbound| outbound_tag(outbound).map(str::to_string))
+        .collect();
+    let already_captured = existing_rules.iter().any(|rule| {
+        rule["port"]
+            .as_str()
+            .or_else(|| rule["port"].as_u64().map(|_| "53"))
+            == Some("53")
+            && rule["outboundTag"]
+                .as_str()
+                .is_some_and(|tag| dns_outbound_tags.contains(tag))
+    });
+
+    let mut taken: HashSet<String> = outbounds
+        .iter()
+        .filter_map(|outbound| outbound_tag(outbound).map(str::to_string))
+        .collect();
+    let mut fresh_tag = |wanted: &str| {
+        let mut tag = wanted.to_string();
+        let mut n = 2;
+        while taken.contains(&tag) {
+            tag = format!("{wanted}-{n}");
+            n += 1;
+        }
+        taken.insert(tag.clone());
+        tag
+    };
+
+    // Outbounds: reuse what exists (naming it when it has no tag), add what is missing.
+    let dns_tag = if already_captured {
+        None
+    } else {
+        Some(
+            match outbounds
+                .iter()
+                .position(|outbound| outbound["protocol"].as_str() == Some("dns"))
+            {
+                Some(index) => match outbound_tag(&outbounds[index]) {
+                    Some(tag) => tag.to_string(),
+                    None => {
+                        let tag = fresh_tag("dns-out");
+                        outbounds[index]["tag"] = json!(tag);
+                        tag
+                    }
+                },
+                None => {
+                    let tag = fresh_tag("dns-out");
+                    outbounds.push(json!({"protocol": "dns", "tag": tag}));
+                    tag
+                }
+            },
+        )
+    };
+    let direct_index = match outbounds
+        .iter()
+        .position(|outbound| outbound["protocol"].as_str() == Some("freedom"))
+    {
+        Some(index) => index,
+        None => {
+            let tag = fresh_tag("direct");
+            outbounds.push(json!({"protocol": "freedom", "tag": tag}));
+            outbounds.len() - 1
+        }
+    };
+    let direct_tag = match outbound_tag(&outbounds[direct_index]) {
+        Some(tag) => tag.to_string(),
+        None => {
+            let tag = fresh_tag("direct");
+            outbounds[direct_index]["tag"] = json!(tag);
+            tag
+        }
+    };
+    let proxy_tag = if dns_tag.is_some() {
+        outbounds
+            .iter()
+            .position(|outbound| {
+                outbound["protocol"]
+                    .as_str()
+                    .is_some_and(|protocol| !matches!(protocol, "freedom" | "blackhole" | "dns"))
+            })
+            .map(|index| match outbound_tag(&outbounds[index]) {
+                Some(tag) => tag.to_string(),
+                None => {
+                    let tag = fresh_tag("proxy");
+                    outbounds[index]["tag"] = json!(tag);
+                    tag
+                }
+            })
+    } else {
+        None
+    };
+
+    // The names that live on the local network: what the profile routes
+    // direct, plus the network's own search domains.
+    let search: Vec<Value> = local_domains
+        .iter()
+        .map(|domain| json!(format!("domain:{}", domain.trim_start_matches('.'))))
+        .collect();
+    let mut local_names: Vec<Value> = existing_rules
+        .iter()
+        .filter(|rule| rule["outboundTag"].as_str() == Some(direct_tag.as_str()))
+        .filter_map(|rule| rule["domain"].as_array())
+        .flatten()
+        .cloned()
+        .collect();
+    for name in &search {
+        if !local_names.contains(name) {
+            local_names.push(name.clone());
+        }
+    }
+
+    let mut rules: Vec<Value> = Vec::new();
+    if let Some(tag) = &dns_tag {
+        // Only lookups addressed to the tunnel's own resolver (the address the
+        // system DNS points at) are answered here; an app asking some other
+        // resolver keeps its normal routing.
+        rules.push(json!({
+            "type": "field",
+            "inboundTag": ["tun-in"],
+            "ip": [MACOS_TUNNEL_RESOLVER],
+            "port": "53",
+            "outboundTag": tag,
+        }));
+    }
+    for resolver in local_resolvers {
+        rules.push(
+            json!({"type": "field", "ip": [resolver.to_string()], "outboundTag": direct_tag}),
+        );
+    }
+    if !search.is_empty() {
+        rules.push(json!({"type": "field", "domain": search, "outboundTag": direct_tag}));
+    }
+    if let (Some(tag), true) = (&proxy_tag, dns_tag.is_some()) {
+        rules.push(json!({"type": "field", "ip": [MACOS_REMOTE_DNS_IP], "outboundTag": tag}));
+    }
+
+    let routing = root
+        .entry("routing")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| invalid_data("xray config routing must be an object"))?;
+    let existing = routing
+        .entry("rules")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| invalid_data("xray config routing.rules must be an array"))?;
+    rules.append(existing);
+    *existing = rules;
+
+    // DNS servers, in front of whatever the profile has: local resolvers for
+    // the local names; the remote default only when the profile has no servers.
+    let mut servers: Vec<Value> = Vec::new();
+    if !local_names.is_empty() {
+        for resolver in local_resolvers {
+            servers.push(json!({
+                "address": resolver.to_string(),
+                "domains": local_names,
+                "skipFallback": true,
+            }));
+        }
+    }
+    let dns = root.entry("dns").or_insert_with(|| json!({}));
+    let dns = dns
+        .as_object_mut()
+        .ok_or_else(|| invalid_data("xray config dns must be an object"))?;
+    match dns.get_mut("servers").and_then(Value::as_array_mut) {
+        Some(own) => {
+            let mut merged = servers;
+            merged.append(own);
+            *own = merged;
+        }
+        None => {
+            servers.push(json!(MACOS_REMOTE_DNS));
+            dns.insert("servers".into(), Value::Array(servers));
+        }
+    }
+
+    // `freedom` resolves names through Xray's resolvers (the OS one points back
+    // at this tunnel).
+    if let Some(outbounds) = root.get_mut("outbounds").and_then(Value::as_array_mut) {
+        for outbound in outbounds
+            .iter_mut()
+            .filter(|outbound| outbound["protocol"].as_str() == Some("freedom"))
+        {
+            if outbound["settings"]["domainStrategy"].is_null() {
+                outbound["settings"]["domainStrategy"] = json!("UseIP");
+            }
+        }
+    }
+    let fake_domains = add_fake_dns_for_routed_domains(root);
+    hijack_routed_domains(root, &fake_domains);
+    Ok(doc)
+}
+
+/// Domain rules only see a name when the traffic carries one (TLS SNI, HTTP
+/// Host, QUIC); SSH, databases and other plain protocols arrive as a bare IP
+/// and fall through to the default outbound. Names the profile routes `direct`
+/// or `block` therefore get fake-DNS answers: the tunnel hands out a pool
+/// address for them and sniffing (`fakedns`) turns the connection back into the
+/// name, whatever the protocol. Returns those names.
+///
+/// Xray applies the fake server to every lookup its DNS engine answers, not
+/// just the listed names; the listed names are what matters for routing.
+fn add_fake_dns_for_routed_domains(root: &mut Map<String, Value>) -> Vec<Value> {
+    let routed: HashSet<String> = root
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|outbound| {
+            matches!(
+                outbound["protocol"].as_str(),
+                Some("freedom") | Some("blackhole")
+            )
+        })
+        .filter_map(|outbound| outbound_tag(outbound).map(str::to_string))
+        .collect();
+    let mut domains: Vec<Value> = Vec::new();
+    for rule in root
+        .get("routing")
+        .and_then(|routing| routing.get("rules"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let routed_here = rule["outboundTag"]
+            .as_str()
+            .is_some_and(|tag| routed.contains(tag));
+        if let (true, Some(list)) = (routed_here, rule["domain"].as_array()) {
+            for domain in list {
+                if !domains.contains(domain) {
+                    domains.push(domain.clone());
+                }
+            }
+        }
+    }
+    if domains.is_empty() || root.contains_key("fakedns") {
+        return domains;
+    }
+    root.insert(
+        "fakedns".into(),
+        json!([{ "ipPool": "198.18.0.0/16", "poolSize": 65535 }]),
+    );
+    let dns = root.entry("dns").or_insert_with(|| json!({}));
+    if let Some(dns) = dns.as_object_mut() {
+        let fake = json!({"address": "fakedns", "domains": domains});
+        match dns.get_mut("servers").and_then(Value::as_array_mut) {
+            Some(servers) => servers.insert(0, fake),
+            None => {
+                dns.insert("servers".into(), json!([fake, MACOS_REMOTE_DNS]));
+            }
+        }
+    }
+    domains
+}
+
+/// A `dns` outbound with `rules` (newer Xray) can answer only some names
+/// itself (`hijack`) and forward the rest verbatim to a fixed resolver
+/// (`direct`). Those forwarded answers are real addresses, so a name that
+/// needs a fake one must be hijacked: a `hijack` rule for it goes in front of
+/// the first catch-all `direct` rule (after any `return` rules, which keep
+/// refusing e.g. AAAA).
+fn hijack_routed_domains(root: &mut Map<String, Value>, domains: &[Value]) {
+    if domains.is_empty() {
+        return;
+    }
+    let Some(outbounds) = root.get_mut("outbounds").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for outbound in outbounds
+        .iter_mut()
+        .filter(|outbound| outbound["protocol"].as_str() == Some("dns"))
+    {
+        let Some(rules) = outbound["settings"]["rules"].as_array_mut() else {
+            continue;
+        };
+        let Some(at) = rules
+            .iter()
+            .position(|rule| rule["action"].as_str() == Some("direct"))
+        else {
+            continue;
+        };
+        rules.insert(
+            at,
+            json!({"action": "hijack", "domain": domains, "qType": "1"}),
+        );
+    }
+}
+
+/// Drop every TUN inbound. `xray run -test` with a tun inbound would create a
+/// real device (and needs privileges), so validation must run on this form.
+pub fn strip_tun_inbound(base: &Value) -> Value {
+    let mut doc = base.clone();
+    if let Some(inbounds) = doc.get_mut("inbounds").and_then(Value::as_array_mut) {
+        inbounds.retain(|inbound| inbound["protocol"].as_str() != Some("tun"));
+    }
+    doc
+}
+
 /// Check whether an Xray config has a TUN inbound.
 pub fn has_tun_inbound(config: &Value) -> bool {
     config["inbounds"]
@@ -1234,6 +1696,27 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn endpoint_protocol_labels_links_and_json_entries() {
+        assert_eq!(
+            endpoint_protocol("vless://id@h:443?security=reality&type=grpc#A").as_deref(),
+            Some("VLESS · Reality · GRPC")
+        );
+        assert_eq!(
+            endpoint_protocol("hy2://p@h:443#B").as_deref(),
+            Some("Hysteria2")
+        );
+        let entry = xray_json_entry(&json!({
+            "remarks": "NL",
+            "outbounds": [{"protocol": "vless", "streamSettings": {"network": "xhttp", "security": "reality"}}]
+        }))
+        .unwrap();
+        assert_eq!(
+            endpoint_protocol(&entry).as_deref(),
+            Some("VLESS · Reality · XHTTP")
+        );
+    }
+
     /// Opt-in pipeline probe: XRAY_PANEL_CONFIG=<managed config>,
     /// XRAY_PROFILES=<profiles.json>, XRAY_PROFILE_ID=<id>, XRAY_PROC_OUT=<out>
     /// applies `apply_profile_routing` exactly like the TUN connect path and
@@ -2169,6 +2652,302 @@ mod tests {
         assert!(!has_tun_inbound(&with_socks));
         let no_inbounds = json!({"outbounds": []});
         assert!(!has_tun_inbound(&no_inbounds));
+    }
+
+    #[test]
+    fn apply_macos_tun_inbound_replaces_socks_with_fd_mode_tun() {
+        let base = json!({
+            "inbounds": [{"tag": "socks-in", "protocol": "socks", "port": 10808}],
+            "outbounds": [{"tag": "proxy", "protocol": "vless"}],
+        });
+        let result = apply_macos_tun_inbound(&base, 1500, "en0").unwrap();
+        let inbounds = result["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds[0]["protocol"], "tun");
+        assert_eq!(inbounds[0]["tag"], "tun-in");
+        // fd-mode schema: the helper owns the device (name, address, MTU on
+        // the interface itself), so Xray only needs the stack MTU and the
+        // loop-prevention uplink binding.
+        assert_eq!(
+            inbounds[0]["settings"],
+            json!({"mtu": 1500, "autoOutboundsInterface": "en0"})
+        );
+        assert_eq!(result["outbounds"][0]["tag"], "proxy");
+    }
+
+    #[test]
+    fn apply_macos_tun_inbound_sniffs_with_fakedns_override() {
+        let base = json!({
+            "outbounds": [{"tag": "proxy", "protocol": "vless"}],
+            "fakedns": [{"ipPool": "198.18.0.0/16", "poolSize": 65535}]
+        });
+        let result = apply_macos_tun_inbound(&base, 1400, "en0").unwrap();
+        assert_eq!(result["inbounds"][0]["sniffing"]["enabled"], true);
+        assert_eq!(
+            result["inbounds"][0]["sniffing"]["destOverride"],
+            json!(["http", "tls", "quic", "fakedns"])
+        );
+        assert_eq!(result["inbounds"][0]["settings"]["mtu"], 1400);
+    }
+
+    #[test]
+    fn apply_macos_tun_inbound_rejects_bad_uplink_or_mtu() {
+        let base = json!({"outbounds": [{"tag": "p", "protocol": "vless"}]});
+        for uplink in ["", "   ", "en0123456789012345", "en 0"] {
+            assert_eq!(
+                apply_macos_tun_inbound(&base, 1500, uplink)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput,
+                "{uplink:?}"
+            );
+        }
+        for mtu in [0, 9001] {
+            assert_eq!(
+                apply_macos_tun_inbound(&base, mtu, "en0")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput,
+                "{mtu}"
+            );
+        }
+    }
+
+    fn macos_dns_base() -> Value {
+        json!({
+            "inbounds": [{"tag": "tun-in", "protocol": "tun"}],
+            "outbounds": [
+                {"tag": "proxy", "protocol": "vless"},
+                {"tag": "network-orchestrator-direct", "protocol": "freedom"},
+                {"tag": "network-orchestrator-block", "protocol": "blackhole"},
+            ],
+            "routing": {"rules": [
+                {"type": "field", "domain": ["ds-mind-lab.ru", "domain:corp.example"], "outboundTag": "network-orchestrator-direct"},
+                {"type": "field", "domain": ["ads.example"], "outboundTag": "network-orchestrator-block"},
+            ]},
+        })
+    }
+
+    #[test]
+    fn macos_dns_capture_answers_port_53_and_resolves_direct_names_locally() {
+        let local: Vec<IpAddr> = vec!["10.228.32.2".parse().unwrap()];
+        let out = apply_macos_dns_capture(&macos_dns_base(), &local, &[]).unwrap();
+        // A dns outbound exists and tun-in port-53 traffic goes to it.
+        let dns_tag = out["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["protocol"] == "dns")
+            .and_then(|o| o["tag"].as_str())
+            .unwrap();
+        let rules = out["routing"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["port"] == "53"
+            && r["inboundTag"] == json!(["tun-in"])
+            && r["ip"] == json!(["169.254.10.1"])
+            && r["outboundTag"] == dns_tag));
+        // It is the first rule, so nothing can pre-empt the system's lookups.
+        assert_eq!(rules[0]["port"], "53");
+        // Local resolver: pinned direct and answers only the direct domains.
+        assert!(rules.iter().any(|r| r["ip"] == json!(["10.228.32.2"])
+            && r["outboundTag"] == "network-orchestrator-direct"));
+        assert_eq!(
+            out["dns"]["servers"][1],
+            json!({"address": "10.228.32.2", "domains": ["ds-mind-lab.ru", "domain:corp.example"], "skipFallback": true})
+        );
+        // Everything else resolves remotely, through the proxy.
+        assert_eq!(out["dns"]["servers"][2], json!("https://1.1.1.1/dns-query"));
+        assert!(rules
+            .iter()
+            .any(|r| r["ip"] == json!(["1.1.1.1"]) && r["outboundTag"] == "proxy"));
+        // The profile's own rules survive, after ours.
+        assert!(rules
+            .iter()
+            .any(|r| r["outboundTag"] == "network-orchestrator-block"));
+        // Names routed direct/block get fake answers, so SSH and other
+        // protocols without SNI still match their domain rule.
+        assert_eq!(
+            out["dns"]["servers"][0],
+            json!({"address": "fakedns", "domains": ["ds-mind-lab.ru", "domain:corp.example", "ads.example"]})
+        );
+        assert_eq!(out["fakedns"][0]["ipPool"], "198.18.0.0/16");
+        // Direct connections to a name resolve through Xray's resolvers.
+        let freedom = out["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["protocol"] == "freedom")
+            .unwrap();
+        assert_eq!(freedom["settings"]["domainStrategy"], "UseIP");
+    }
+
+    #[test]
+    fn macos_dns_capture_without_direct_domains_or_resolvers_still_resolves() {
+        let base = json!({"outbounds": [{"tag": "proxy", "protocol": "vless"}]});
+        let out = apply_macos_dns_capture(&base, &[], &[]).unwrap();
+        assert_eq!(out["dns"]["servers"], json!(["https://1.1.1.1/dns-query"]));
+        let rules = out["routing"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["port"] == "53"));
+        // A freedom outbound was added for the direct side.
+        assert!(out["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["protocol"] == "freedom"));
+    }
+
+    #[test]
+    fn macos_dns_capture_keeps_a_profile_that_already_routes_dns() {
+        let mut base = macos_dns_base();
+        base["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"tag": "dns-out", "protocol": "dns"}));
+        base["routing"]["rules"].as_array_mut().unwrap().insert(
+            0,
+            json!({"type": "field", "port": "53", "outboundTag": "dns-out"}),
+        );
+        let out = apply_macos_dns_capture(&base, &["10.0.0.1".parse().unwrap()], &[]).unwrap();
+        // Its own DNS routing stays: no second dns outbound, no second port-53 rule.
+        let dns_outbounds = out["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["protocol"] == "dns")
+            .count();
+        assert_eq!(dns_outbounds, 1);
+        let capture_rules = out["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["port"] == "53")
+            .count();
+        assert_eq!(capture_rules, 1);
+        // Direct names still resolve on the local network and get fake answers.
+        let servers = out["dns"]["servers"].as_array().unwrap();
+        assert_eq!(servers[0]["address"], "fakedns");
+        assert_eq!(servers[1]["address"], "10.0.0.1");
+        assert_eq!(servers[1]["skipFallback"], true);
+    }
+
+    #[test]
+    fn macos_dns_capture_merges_with_a_profile_dns_section_and_unique_tags() {
+        let mut base = macos_dns_base();
+        base["dns"] = json!({"servers": ["9.9.9.9"], "hosts": {"a.test": "1.2.3.4"}});
+        base["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"tag": "dns-out", "protocol": "vless"}));
+        let out = apply_macos_dns_capture(&base, &["10.0.0.1".parse().unwrap()], &[]).unwrap();
+        assert_eq!(out["dns"]["hosts"]["a.test"], "1.2.3.4");
+        assert!(out["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("9.9.9.9")));
+        let tags: Vec<&str> = out["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["tag"].as_str())
+            .collect();
+        let unique: HashSet<&&str> = tags.iter().collect();
+        assert_eq!(tags.len(), unique.len(), "{tags:?}");
+    }
+
+    /// The shape provider configs ship: a `dns` outbound that answers a few
+    /// domains itself and forwards everything else to a fixed resolver.
+    fn provider_dns_base() -> Value {
+        json!({
+            "outbounds": [
+                {"tag": "proxy", "protocol": "vless"},
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "dns", "protocol": "dns", "settings": {
+                    "rewriteAddress": "8.8.8.8", "rewriteNetwork": "udp", "rewritePort": 53,
+                    "rules": [
+                        {"action": "return", "qType": "65,28", "rCode": 5},
+                        {"action": "hijack", "domain": ["geosite:yandex"], "qType": "1"},
+                        {"action": "direct"}
+                    ]}},
+            ],
+            "dns": {"servers": ["77.88.8.8"]},
+            "routing": {"rules": [
+                {"type": "field", "network": "tcp,udp", "port": "53", "outboundTag": "dns"},
+                {"type": "field", "domain": ["ds-mind-lab.ru"], "outboundTag": "direct"},
+            ]},
+        })
+    }
+
+    #[test]
+    fn macos_dns_capture_hijacks_routed_names_in_a_forwarding_dns_outbound() {
+        let out = apply_macos_dns_capture(&provider_dns_base(), &[], &[]).unwrap();
+        let rules = out["outbounds"][2]["settings"]["rules"].as_array().unwrap();
+        // `return` rules stay first, ours sits before the catch-all forward.
+        assert_eq!(rules[0]["action"], "return");
+        assert_eq!(rules[1]["action"], "hijack");
+        assert_eq!(rules[2]["action"], "hijack");
+        assert_eq!(rules[2]["domain"], json!(["ds-mind-lab.ru"]));
+        assert_eq!(rules[2]["qType"], "1");
+        assert_eq!(rules[3]["action"], "direct");
+        // The profile's own resolvers remain behind the fake server.
+        assert_eq!(
+            out["dns"]["servers"],
+            json!([
+                {"address": "fakedns", "domains": ["ds-mind-lab.ru"]},
+                "77.88.8.8"
+            ])
+        );
+    }
+
+    #[test]
+    fn macos_dns_capture_sends_search_domains_to_the_local_resolvers_direct() {
+        let local: Vec<IpAddr> = vec!["10.228.32.2".parse().unwrap()];
+        let out = apply_macos_dns_capture(
+            &provider_dns_base(),
+            &local,
+            &["agtuvsn.local".to_string(), ".agni.loc".to_string()],
+        )
+        .unwrap();
+        let servers = out["dns"]["servers"].as_array().unwrap();
+        // fake first, then the local resolver for direct names + search domains.
+        assert_eq!(servers[1]["address"], "10.228.32.2");
+        assert_eq!(
+            servers[1]["domains"],
+            json!(["ds-mind-lab.ru", "domain:agtuvsn.local", "domain:agni.loc"])
+        );
+        let rules = out["routing"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["domain"]
+            == json!(["domain:agtuvsn.local", "domain:agni.loc"])
+            && r["outboundTag"] == "direct"));
+        assert!(rules
+            .iter()
+            .any(|r| r["ip"] == json!(["10.228.32.2"]) && r["outboundTag"] == "direct"));
+        // Search domains are hijacked too, so they never leave as real forwards.
+        let hijack = &out["outbounds"][2]["settings"]["rules"][2];
+        assert!(hijack["domain"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("domain:agtuvsn.local")));
+    }
+
+    #[test]
+    fn macos_dns_capture_rejects_non_object_configs() {
+        assert!(apply_macos_dns_capture(&json!([]), &[], &[]).is_err());
+    }
+
+    #[test]
+    fn strip_tun_inbound_leaves_socks_and_outbounds() {
+        let base = json!({
+            "inbounds": [
+                {"tag": "tun-in", "protocol": "tun"},
+                {"tag": "socks-in", "protocol": "socks", "port": 10808},
+            ],
+            "outbounds": [{"tag": "proxy", "protocol": "vless"}],
+        });
+        let stripped = strip_tun_inbound(&base);
+        assert_eq!(stripped["inbounds"].as_array().unwrap().len(), 1);
+        assert_eq!(stripped["inbounds"][0]["protocol"], "socks");
+        assert!(!has_tun_inbound(&stripped));
+        let untouched = strip_tun_inbound(&json!({"outbounds": []}));
+        assert!(!has_tun_inbound(&untouched));
     }
 
     #[test]

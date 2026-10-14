@@ -6,18 +6,32 @@ Guidance for agents/contributors working in this repository.
 
 - `crates/core` — pure Rust library: models, static analysis, config vault,
   DPAPI, policy routes, tunnel manager, route plan, system proxy, explorer,
-  backend executable settings, managed Xray verification.
+  backend executable settings, managed Xray verification. Also hosts the
+  opt-in `windows_e2e` integration tests (see Safety rules).
 - `crates/daemon` — Linux privileged system service: Unix socket protocol,
   polkit authorization, netlink mutations, ownership journal and recovery.
-- `src-tauri` — Tauri 2 shell: commands in `src-tauri/src/commands/`,
-  `state.rs` (AppState + runtime mutex), `lifecycle.rs` (shutdown cleanup),
-  `test_support.rs` fixtures.
-- `src` — React/TypeScript frontend; `src/types.ts` mirrors Rust models
-  (camelCase).
+  Hard-learned netlink quirks live in `MEMORY.md`.
+- `crates/macos-bridge` — unprivileged JSON C ABI staticlib the Swift client
+  links; every macOS core operation goes through it.
+- `crates/macos-helper` — privileged launchd helper daemon for root macOS
+  network mutations; design in
+  `docs/plans/2026-09-30-14-macos-privileged-helper.md`.
+- `macos/` — native SwiftUI/AppKit client for macOS 27 (no WebView); Swift
+  tests in `macos/Tests/NativeTests`, capabilities and test isolation in
+  `macos/README.md`. Links the bridge from `target/macos-bridge`, which
+  `scripts/stage-macos-bridge.sh <profile>` fills.
+- `src-tauri` — Tauri 2 shell for Windows/Linux: commands in
+  `src-tauri/src/commands/`, `state.rs` (AppState + runtime mutex),
+  `lifecycle.rs` (shutdown cleanup), `test_support.rs` fixtures.
+- `src` — React/TypeScript frontend (Tauri client + browser sandbox);
+  `src/types.ts` mirrors the Rust models (camelCase).
+- `tests/` — frontend Node unit tests (`npm run test`).
 - `e2e/linux` — disposable Docker test harness for the Linux daemon.
-- `docs/plans` — per-stage implementation plans; `docs/testing.md` — Linux
-  Docker and Windows VM E2E contracts; `docs/platform-matrix.md` — per-OS
-  feature support matrix (keep in sync with `PlatformCapabilities`).
+- `packaging/` — deb/rpm/Arch package scripts used by the build scripts.
+- `docs/plans` — per-stage implementation plans; `docs/testing.md` — browser
+  sandbox, Linux Docker and Windows VM E2E contracts;
+  `docs/platform-matrix.md` — per-OS feature matrix (keep in sync with
+  `PlatformCapabilities` in `src-tauri/src/commands/system.rs`).
 
 ## Setup
 
@@ -31,6 +45,8 @@ Windows + MSVC + WebView2 are required for Windows tunnel functionality.
 On Linux, the daemon requires systemd and polkit for network mutations;
 WireGuard also needs `wireguard-tools`, OpenVPN needs `openvpn`, and DNS needs
 `systemd-resolved`.
+The native macOS client requires macOS 27, Xcode 27 and Python 3; the build
+script aborts without SDK 27.
 
 ## Quality gate (run before reporting done)
 
@@ -42,10 +58,18 @@ cargo test --workspace
 npm run build
 ```
 
+CI (`.github/workflows/ci.yml`) is manual-only (`workflow_dispatch`) and
+mirrors this gate on Windows.
+
 ## Commands
 
 - `cargo test -p net-manager-core <filter>` / `-p net-manager-app <filter>` —
-  focused tests.
+  focused Rust tests; `swift test --package-path macos --scratch-path
+  target/macos-swift --filter <name>` — focused Swift tests.
+- `npm run test` — frontend Node unit tests (format, i18n, sandbox,
+  subscriptions, intent doctor).
+- `npm run dev:sandbox` — browser-only frontend on :1422 with an in-memory
+  synthetic backend (no VPN, no native calls); contract in `docs/testing.md`.
 - **Production binary:** never install a `cargo build --release` artifact as
   the prod app. Without the `tauri/custom-protocol` feature the release binary
   compiles with `cfg(dev)` and loads `devUrl` (`http://127.0.0.1:1420`) — the
@@ -54,7 +78,10 @@ npm run build
   feature), or pass `--features tauri/custom-protocol` to cargo explicitly.
 - `scripts/macos-dev.sh build|run|test|preview|check|du|clean` — native
   macOS loop: `release-fast` bridge (no LTO, incremental) + Swift debug,
-  isolated QA data for `run`, offscreen renders for `preview`.
+  isolated QA data for `run` (`NETORCH_MACOS_DATA_DIR`), offscreen renders
+  for `preview`; `check` covers only core + macos-bridge, not the workspace.
+  `npm run build:macos` builds the distributable release bundle (LTO +
+  Swift release, ad-hoc signed).
 - `npm run dev:app` — Linux dev run against the dev daemon
   (`network-orchestrator-dev.service`, socket `/run/network-orchestrator-dev/`,
   data dir `~/.local/share/com.netmanager.app.dev/`, "(Dev)" window title);
@@ -94,7 +121,17 @@ npm run build
   (`docs/plans/2026-09-30-14-macos-privileged-helper.md`). The only
   exceptions are user-level: the managed Xray child listening on loopback and
   the per-user system proxy via `networksetup` (snapshot + rollback through
-  `SystemProxyManager`). Routes, interfaces and DNS stay helper-only.
+  `SystemProxyManager`), and an explicit user toggle of another app's VPN
+  service via `scutil --nc start|stop <UUID>`, and driving the user's own
+  NetBird daemon through its CLI (`netbird status|up|down`, no keys on the
+  command line). Routes, interfaces and DNS stay helper-only. The helper itself launches Xray TUN only as the console
+  user (groups, gid and uid dropped irreversibly before exec), only from the
+  user's hash-verified managed install, and never as root; tests use fake
+  platforms/runners and must not create a utun or touch routes or DNS. The
+  helper runs OpenVPN as root only from the pinned, self-contained copy of the
+  bundled binary (SHA-256 compiled into the helper, no script hooks, config
+  through `sanitize_openvpn_config`), and runs WireGuard in-process; tests use
+  fake platforms and a fake management server, never a real tunnel.
 - Do not commit unless explicitly asked; do not push to `main`/`master`.
 
 ## Conventions
@@ -104,12 +141,14 @@ npm run build
   report RED/GREEN.
 - Frontend: components subscribe to `route-changed` window events for
   refresh; types stay in `src/types.ts`.
-- i18n: the web UI uses dotted keys (`t("profiles.title")`); the macOS app
-  uses English text as the key (`L10n.text("Add a connection")`). Both share
-  `locales/*.json` — never delete an English-text key that only appears in
-  Swift sources.
+- i18n: both clients share `locales/*.json` — canonical keys are English
+  source text used as the key (`tr("Connecting {name}")` in TSX,
+  `L10n.text("Add a connection")` in Swift); `t("dotted.key")` is the legacy
+  compat path still used across the web UI. Never delete an English-text key
+  that only appears in Swift sources; add new messages to `en.json` first.
 - App version has one source of truth: `[workspace.package].version` in the
-  root `Cargo.toml`; do not duplicate it in `package.json` or `tauri.conf.json`.
+  root `Cargo.toml`; do not duplicate it in `package.json` or
+  `tauri.conf.json` (neither has a version field).
 - Versioning, commit messages and releases follow `docs/versioning.md`
   (SemVer, Conventional Commits in English, `CHANGELOG.md`); bump the version
   in a separate `chore(release): X.Y.Z` commit after each group of changes.
@@ -125,14 +164,18 @@ npm run build
   outputs (`src/theme.generated.css`, `src/palette.ts`,
   `macos/Sources/NetworkOrchestrator/Theme.generated.swift`). No hardcoded
   hex/`rgba()` colors in CSS or TSX — JS-rendered visuals import from
-  `src/palette.ts`. User-facing copy lives in `locales/*.json`; run
-  `python3 scripts/generate-localizations.py` instead of editing
+  `src/palette.ts`.
+- User-facing copy lives in `locales/*.json`; run `npm run i18n:generate`
+  (or `python3 scripts/generate-localizations.py`) instead of editing
   `src/i18n/catalog.generated.ts` or the macOS `Localizations.json`.
+- Editing `src/icons.tsx` (24×24 stroke-based) changes the hash that
+  `generate-ui-theme.py --check` validates against the checked-in native PDF
+  icons; regenerate with `python3 scripts/generate-native-icons.py`
+  (needs ReportLab) or the build fails. No Unicode glyphs as UI icons; `…`
+  is allowed only in placeholders/loading labels.
 - One primary CTA per screen: `btn-primary`. Default `<button>` is the
   secondary style; `btn-danger`, `btn-ghost`, `btn-sm`, `btn-with-icon` are
   the other sanctioned variants.
-- Icons live in `src/icons.tsx` (24×24, stroke-based). No Unicode glyphs as
-  UI icons; `…` is allowed only in placeholders/loading labels.
 - Right-align numeric table cells with `.num`; use `formatBytes`/`formatRate`
   from `src/format.ts` and `<RateText>` for rx/tx readouts.
 - Transient feedback uses `useToast()` (`ToastProvider` wraps the app in

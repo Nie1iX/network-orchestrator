@@ -63,22 +63,18 @@ pub fn is_unsupported_client_placeholder(urls: &[String]) -> bool {
         })
 }
 
-fn share_link_scheme(line: &str) -> &str {
-    line.split_once("://").map(|(s, _)| s).unwrap_or("unknown")
-}
-
-fn push_skipped_scheme(skipped: &mut Vec<String>, scheme: &str) {
-    if !skipped.iter().any(|s| s == scheme) {
-        skipped.push(scheme.to_string());
-    }
-}
-
-/// Decode a v2ray-style subscription body: the supported entries plus the
-/// distinct schemes of lines skipped as unsupported.
-pub fn parse_subscription_body_schemes(body: &str) -> (Vec<String>, Vec<String>) {
+/// Supported entries of a subscription body (share links or full Xray JSON
+/// configs), the number of unsupported entries, and their distinct schemes.
+pub fn parse_subscription_body_detailed(body: &str) -> (Vec<String>, usize, Vec<String>) {
     let decoded = base64_decode(body.trim()).unwrap_or_else(|| body.to_string());
     let mut urls = Vec::new();
-    let mut skipped = Vec::new();
+    let mut skipped = 0;
+    let mut schemes: Vec<String> = Vec::new();
+    let mut note = |scheme: &str| {
+        if !schemes.iter().any(|known| known == scheme) {
+            schemes.push(scheme.to_string());
+        }
+    };
     let trimmed = decoded.trim();
     if trimmed.starts_with('[') || trimmed.starts_with('{') {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -89,16 +85,19 @@ pub fn parse_subscription_body_schemes(body: &str) -> (Vec<String>, Vec<String>)
             for config in &configs {
                 match crate::xray::xray_json_entry(config) {
                     Ok(entry) => urls.push(entry),
-                    Err(_) => push_skipped_scheme(&mut skipped, "json"),
+                    Err(_) => {
+                        skipped += 1;
+                        note("json");
+                    }
                 }
             }
-            return (urls, skipped);
+            return (urls, skipped, schemes);
         }
     }
     for line in decoded
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
     {
         if line.starts_with("vless://")
             || line.starts_with("hysteria2://")
@@ -106,16 +105,21 @@ pub fn parse_subscription_body_schemes(body: &str) -> (Vec<String>, Vec<String>)
         {
             urls.push(line.to_string());
         } else {
-            push_skipped_scheme(&mut skipped, share_link_scheme(line));
+            skipped += 1;
+            note(
+                line.split_once("://")
+                    .map(|(scheme, _)| scheme)
+                    .unwrap_or("unknown"),
+            );
         }
     }
-    (urls, skipped)
+    (urls, skipped, schemes)
 }
 
-/// Decode a v2ray-style subscription body and count unsupported nonblank lines.
-pub fn parse_subscription_body(body: &str) -> (Vec<String>, usize) {
-    let (urls, skipped) = parse_subscription_body_schemes(body);
-    (urls, skipped.len())
+/// Supported entries and the distinct schemes of skipped lines.
+pub fn parse_subscription_body(body: &str) -> (Vec<String>, Vec<String>) {
+    let (urls, _, schemes) = parse_subscription_body_detailed(body);
+    (urls, schemes)
 }
 
 pub fn parse_subscription_userinfo(value: &str) -> Option<SubscriptionUserInfo> {
@@ -153,15 +157,68 @@ pub fn parse_subscription_userinfo(value: &str) -> Option<SubscriptionUserInfo> 
     })
 }
 
-/// Decode a textual subscription header (`Profile-Title`, `Announce`). Panels
-/// emit values either plain/percent-encoded or as `base64:<data>`. Returns
-/// `None` for empty, overlong, or control-character payloads; `Announce` may
-/// legitimately contain newlines, which `allow_newlines` permits.
-fn parse_subscription_text_header(
-    value: &str,
-    max_chars: usize,
-    allow_newlines: bool,
-) -> Option<String> {
+/// Best-effort standard base64 decoder that tolerates missing padding and
+/// whitespace. Returns `None` if the input is not valid base64.
+pub fn base64_decode(input: &str) -> Option<String> {
+    use base64::Engine;
+    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+        .iter()
+        .find_map(|engine| {
+            engine
+                .decode(&cleaned)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+        })
+}
+
+pub fn http_client() -> io::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(SUBSCRIPTION_USER_AGENT)
+        .build()
+        .map_err(|_| failure("Could not create the subscription HTTP client"))
+}
+pub fn validate_url(value: &str) -> io::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value.trim())
+        .map_err(|_| invalid("Enter a valid HTTP or HTTPS subscription URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(invalid("Enter a valid HTTP or HTTPS subscription URL"));
+    }
+    Ok(url)
+}
+pub struct FetchedSubscription {
+    pub body: String,
+    pub content_type: Option<String>,
+    /// Response header names only (never values), for diagnostics.
+    pub header_names: Vec<String>,
+    pub meta: ResponseMeta,
+}
+
+/// Optional metadata a subscription response announces alongside the body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResponseMeta {
+    pub user_info: Option<SubscriptionUserInfo>,
+    pub provider_title: Option<String>,
+    pub announce: Option<String>,
+    pub support_url: Option<String>,
+    pub web_page_url: Option<String>,
+    pub update_interval_hours: Option<u32>,
+}
+
+/// Decode a textual subscription header (`Profile-Title`, `Announce`): plain,
+/// percent-encoded or `base64:`-prefixed. Rejects oversized values and control
+/// characters; only announcements may contain newlines.
+pub fn parse_text_header(value: &str, max_chars: usize, allow_newlines: bool) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.len() > max_chars * 2 {
         return None;
@@ -184,13 +241,13 @@ fn parse_subscription_text_header(
     Some(text.to_string())
 }
 
-pub fn parse_subscription_provider_title(value: &str) -> Option<String> {
-    parse_subscription_text_header(value, 200, false)
+pub fn parse_provider_title(value: &str) -> Option<String> {
+    parse_text_header(value, 200, false)
 }
 
 /// Accept only http(s) links for `Support-Url` / `Profile-Web-Page-Url`;
-/// these end up behind clickable links in the UI.
-pub fn parse_subscription_url_header(value: &str) -> Option<String> {
+/// they end up behind clickable links in the UI.
+pub fn parse_url_header(value: &str) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.len() > 300 {
         return None;
@@ -199,33 +256,57 @@ pub fn parse_subscription_url_header(value: &str) -> Option<String> {
     matches!(url.scheme(), "https" | "http").then(|| trimmed.to_string())
 }
 
-/// Optional metadata a subscription response announces alongside the body.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct SubscriptionResponseMeta {
-    pub user_info: Option<SubscriptionUserInfo>,
-    pub provider_title: Option<String>,
-    pub announce: Option<String>,
-    pub support_url: Option<String>,
-    pub web_page_url: Option<String>,
-    pub update_interval_hours: Option<u32>,
-}
-
-/// Collect every supported metadata header a subscription response announces.
-pub fn subscription_response_meta(
-    headers: &reqwest::header::HeaderMap,
-) -> SubscriptionResponseMeta {
-    let get = |name: &str| headers.get(name).and_then(|h| h.to_str().ok());
-    SubscriptionResponseMeta {
-        user_info: get("subscription-userinfo").and_then(parse_subscription_userinfo),
-        provider_title: get("profile-title").and_then(parse_subscription_provider_title),
+/// Collect every supported metadata header, falling back to `#key: value`
+/// comment lines in the body for panels that announce metadata there.
+pub fn response_meta(headers: &[(String, String)], body: &str) -> ResponseMeta {
+    let decoded = base64_decode(body.trim()).unwrap_or_else(|| body.to_string());
+    let get = |name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+            .or_else(|| {
+                decoded.lines().find_map(|line| {
+                    let rest = line.trim().strip_prefix('#')?.trim_start();
+                    let (key, value) = rest.split_once(':')?;
+                    key.trim()
+                        .eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_string())
+                })
+            })
+    };
+    ResponseMeta {
+        user_info: get("subscription-userinfo")
+            .as_deref()
+            .and_then(parse_subscription_userinfo),
+        provider_title: get("profile-title")
+            .as_deref()
+            .and_then(parse_provider_title),
         announce: get("announce")
-            .and_then(|value| parse_subscription_text_header(value, 2000, true)),
-        support_url: get("support-url").and_then(parse_subscription_url_header),
-        web_page_url: get("profile-web-page-url").and_then(parse_subscription_url_header),
+            .as_deref()
+            .and_then(|value| parse_text_header(value, 2000, true)),
+        support_url: get("support-url").as_deref().and_then(parse_url_header),
+        web_page_url: get("profile-web-page-url")
+            .as_deref()
+            .and_then(parse_url_header),
         update_interval_hours: get("profile-update-interval")
             .and_then(|value| value.trim().parse::<u32>().ok())
             .filter(|hours| (1..=24 * 365).contains(hours)),
     }
+}
+
+/// [`response_meta`] for a reqwest header map.
+pub fn response_meta_from_headers(
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> ResponseMeta {
+    let pairs: Vec<(String, String)> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+        })
+        .collect();
+    response_meta(&pairs, body)
 }
 
 /// Compose the profile display name as `{provider} · {endpoint}`. When the
@@ -273,8 +354,9 @@ fn endpoint_tail(endpoint_name: &str) -> &str {
 }
 
 /// True when `profile_name` is the auto-generated name of `endpoint_name` —
-/// bare, provider-prefixed, or the provider-less tail of a prefixed name
-/// (a profile imported before the panel started advertising its title).
+/// bare, provider-prefixed, or the provider-less tail of a prefixed name.
+/// Separator-insensitive, so names from older releases still follow the
+/// selected server.
 fn auto_profile_name_matches(
     provider_title: Option<&str>,
     endpoint_name: &str,
@@ -283,55 +365,21 @@ fn auto_profile_name_matches(
     endpoint_name == profile_name
         || subscription_profile_name(provider_title, endpoint_name) == profile_name
         || endpoint_tail(endpoint_name) == profile_name
-        // Separator-insensitive: "AcmeVPN - NL" (older release) still counts
-        // as the auto name of "AcmeVPN · NL".
         || subscription_profile_name(provider_title, profile_name)
             == subscription_profile_name(provider_title, endpoint_name)
 }
 
-/// Best-effort standard base64 decoder that tolerates missing padding and
-/// whitespace. Returns `None` if the input is not valid base64.
-pub fn base64_decode(input: &str) -> Option<String> {
-    use base64::Engine;
-    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.is_empty() {
-        return None;
-    }
-    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-    [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+/// A profile name the app generated from one of its servers (optionally with
+/// the provider prefix); such names follow the selected server, a name the
+/// user typed is kept.
+fn is_generated_name(
+    name: &str,
+    provider_title: Option<&str>,
+    endpoints: &[SubscriptionEndpoint],
+) -> bool {
+    endpoints
         .iter()
-        .find_map(|engine| {
-            engine
-                .decode(&cleaned)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-        })
-}
-
-pub fn http_client() -> io::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(SUBSCRIPTION_USER_AGENT)
-        .build()
-        .map_err(|_| failure("Could not create the subscription HTTP client"))
-}
-pub fn validate_url(value: &str) -> io::Result<reqwest::Url> {
-    let url = reqwest::Url::parse(value.trim())
-        .map_err(|_| invalid("Enter a valid HTTP or HTTPS subscription URL"))?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return Err(invalid("Enter a valid HTTP or HTTPS subscription URL"));
-    }
-    Ok(url)
-}
-pub struct FetchedSubscription {
-    pub body: String,
-    pub meta: SubscriptionResponseMeta,
-    pub content_type: Option<String>,
+        .any(|endpoint| auto_profile_name_matches(provider_title, &endpoint.name, name))
 }
 
 /// Secret-free description of a subscription response for diagnostics:
@@ -444,12 +492,17 @@ async fn fetch_inner(
                 response.status().as_u16()
             )));
         }
-        let meta = subscription_response_meta(response.headers());
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|h| h.to_str().ok())
             .map(str::to_string);
+        let header_names: Vec<String> = response
+            .headers()
+            .keys()
+            .map(|name| name.as_str().to_string())
+            .collect();
+        let headers = response.headers().clone();
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -463,10 +516,12 @@ async fn fetch_inner(
         }
         let body =
             String::from_utf8(bytes).map_err(|_| invalid("Subscription response is not UTF-8"))?;
+        let meta = response_meta_from_headers(&headers, &body);
         return Ok(FetchedSubscription {
             body,
-            meta,
             content_type,
+            header_names,
+            meta,
         });
     }
     Err(failure("Subscription redirected too many times"))
@@ -484,7 +539,7 @@ pub fn import_body(
     store: &ProfileStore,
     request: &SubscriptionImport<'_>,
     body: &str,
-    meta: &SubscriptionResponseMeta,
+    meta: ResponseMeta,
     available: impl Fn(u16) -> bool,
 ) -> io::Result<BatchImportResult> {
     crate::config_vault::sanitize_profile_id(request.id)?;
@@ -502,7 +557,7 @@ pub fn import_body(
     if document.profiles.iter().any(|p| p.id == request.id) {
         return Err(invalid("A profile with this identifier already exists"));
     }
-    let (urls, skipped_protocols) = parse_subscription_body_schemes(body);
+    let (urls, unsupported, skipped_protocols) = parse_subscription_body_detailed(body);
     if urls.is_empty() {
         return Err(invalid("Subscription contained no supported share links"));
     }
@@ -512,13 +567,10 @@ pub fn import_body(
     let used = profile_listener_ports(&document.profiles, "");
     let (socks, http) = select_generated_ports(None, None, &used, available)?;
     let mut errors = Vec::new();
-    if !skipped_protocols.is_empty() {
+    if unsupported != 0 {
         errors.push(BatchImportError {
             path: "Subscription".into(),
-            error: format!(
-                "{} unsupported share link(s) skipped",
-                skipped_protocols.len()
-            ),
+            error: format!("{unsupported} unsupported share link(s) skipped"),
         });
     }
     let mut endpoints = Vec::new();
@@ -570,11 +622,11 @@ pub fn import_body(
                         .as_secs(),
                 ),
                 last_refresh_error: None,
-                user_info: meta.user_info.clone(),
-                provider_title: meta.provider_title.clone(),
-                announce: meta.announce.clone(),
-                support_url: meta.support_url.clone(),
-                web_page_url: meta.web_page_url.clone(),
+                user_info: meta.user_info,
+                provider_title: meta.provider_title,
+                announce: meta.announce,
+                support_url: meta.support_url,
+                web_page_url: meta.web_page_url,
                 update_interval_hours: meta.update_interval_hours,
                 skipped_protocols,
             }),
@@ -630,14 +682,10 @@ pub fn switch_endpoint(
     profile.config_path = imported.config_path.clone();
     profile.xray_socks_port = Some(socks);
     profile.xray_http_port = Some(http);
-    // A profile named after one of its servers was auto-named and follows the
-    // selection; a user-chosen name is kept.
-    let provider_title = subscription.provider_title.as_deref();
-    if endpoints
-        .iter()
-        .any(|known| auto_profile_name_matches(provider_title, &known.name, &profile.name))
-    {
-        profile.name = subscription_profile_name(provider_title, &endpoint.name);
+    // Generated names follow the selection; a user-chosen name is kept.
+    let title = subscription.provider_title.clone();
+    if is_generated_name(&profile.name, title.as_deref(), &endpoints) {
+        profile.name = subscription_profile_name(title.as_deref(), &endpoint.name);
     }
     subscription.active_index = index;
     subscription.endpoint_count = endpoints.len();
@@ -655,29 +703,54 @@ pub fn switch_endpoint(
     }
 }
 
-/// Human-readable protocol/transport badge for a share link, e.g.
-/// `VLESS · Reality` or `Hysteria2`.
-pub fn endpoint_protocol(uri: &str) -> Option<String> {
-    let url = reqwest::Url::parse(uri.trim()).ok()?;
-    let mut label = match url.scheme() {
-        "vless" => "VLESS".to_string(),
-        "hy2" | "hysteria2" => "Hysteria2".to_string(),
-        "trojan" => "Trojan".to_string(),
-        "vmess" => "VMess".to_string(),
-        "ss" => "Shadowsocks".to_string(),
-        other => other.to_uppercase(),
+/// Auto-refresh cadences the clients offer, in minutes.
+pub const REFRESH_INTERVALS: [u32; 3] = [15, 60, 360];
+
+/// Whether an auto-refreshing subscription is due (its interval elapsed since
+/// the last attempt, successful or not).
+pub fn refresh_due(subscription: &SubscriptionMeta, now: u64) -> bool {
+    let Some(minutes) = subscription.refresh_interval_minutes else {
+        return false;
     };
-    for (key, value) in url.query_pairs() {
-        match (key.as_ref(), value.as_ref()) {
-            ("security", "reality") => label.push_str(" · Reality"),
-            ("security", "tls") => label.push_str(" · TLS"),
-            ("type", transport) if transport != "tcp" && transport != "none" => {
-                label.push_str(&format!(" · {}", transport.to_uppercase()));
-            }
-            _ => {}
-        }
+    REFRESH_INTERVALS.contains(&minutes)
+        && subscription
+            .last_refresh_at_unix
+            .is_none_or(|last| now.saturating_sub(last) >= u64::from(minutes) * 60)
+}
+
+fn subscription_profile(store: &ProfileStore, id: &str) -> io::Result<Profile> {
+    store
+        .load()?
+        .profiles
+        .into_iter()
+        .find(|p| p.id == id && p.subscription.is_some())
+        .ok_or_else(|| invalid("Profile is not a subscription"))
+}
+
+/// Set (or clear) the auto-refresh interval; the clock restarts now.
+pub fn set_refresh_interval(
+    store: &ProfileStore,
+    id: &str,
+    minutes: Option<u32>,
+    now: u64,
+) -> io::Result<ProfileDocument> {
+    if minutes.is_some_and(|m| !REFRESH_INTERVALS.contains(&m)) {
+        return Err(invalid("unsupported subscription refresh interval"));
     }
-    Some(label)
+    let mut profile = subscription_profile(store, id)?;
+    let subscription = profile.subscription.as_mut().expect("checked above");
+    subscription.refresh_interval_minutes = minutes;
+    subscription.last_refresh_at_unix = Some(now);
+    store.upsert(profile)
+}
+
+/// Remember a failed refresh so auto-refresh waits a full interval.
+pub fn record_refresh_failure(store: &ProfileStore, id: &str, now: u64) -> io::Result<()> {
+    let mut profile = subscription_profile(store, id)?;
+    let subscription = profile.subscription.as_mut().expect("checked above");
+    subscription.last_refresh_at_unix = Some(now);
+    subscription.last_refresh_error = Some("Refresh failed".into());
+    store.upsert(profile).map(|_| ())
 }
 
 /// Identity of an endpoint across refreshes: the share link without its
@@ -715,7 +788,7 @@ pub fn refresh_body(
     store: &ProfileStore,
     id: &str,
     body: &str,
-    meta: &SubscriptionResponseMeta,
+    meta: ResponseMeta,
     available: impl Fn(u16) -> bool,
 ) -> io::Result<RefreshOutcome> {
     if body.len() > MAX_SUBSCRIPTION_BODY_BYTES {
@@ -754,8 +827,7 @@ pub fn refresh_body(
         })
         .unwrap_or(0);
 
-    let (urls, skipped_protocols) = parse_subscription_body_schemes(body);
-    let mut skipped_count = skipped_protocols.len();
+    let (urls, mut skipped_count, skipped_protocols) = parse_subscription_body_detailed(body);
     if is_unsupported_client_placeholder(&urls) {
         return Err(invalid(UNSUPPORTED_CLIENT_MESSAGE));
     }
@@ -813,15 +885,14 @@ pub fn refresh_body(
         return Err(failure_message("failed to store refreshed endpoints"));
     }
     let old_path = profile.config_path.clone();
-    let provider_title = meta.provider_title.as_deref().or(profile
+    // Missing headers keep the stored provider metadata.
+    let stored_title = profile
         .subscription
         .as_ref()
-        .and_then(|s| s.provider_title.as_deref()));
-    if previous
-        .iter()
-        .any(|known| auto_profile_name_matches(provider_title, &known.name, &profile.name))
-    {
-        profile.name = subscription_profile_name(provider_title, &endpoints[active_index].name);
+        .and_then(|s| s.provider_title.clone());
+    let title = meta.provider_title.clone().or(stored_title.clone());
+    if is_generated_name(&profile.name, stored_title.as_deref(), &previous) {
+        profile.name = subscription_profile_name(title.as_deref(), &endpoints[active_index].name);
     }
     profile.config_path = new_path.clone();
     profile.xray_socks_port = Some(socks);
@@ -836,18 +907,20 @@ pub fn refresh_body(
             .as_secs(),
     );
     subscription.last_refresh_error = None;
-    subscription.user_info = meta.user_info.clone();
+    if meta.user_info.is_some() {
+        subscription.user_info = meta.user_info;
+    }
     if meta.provider_title.is_some() {
-        subscription.provider_title = meta.provider_title.clone();
+        subscription.provider_title = meta.provider_title;
     }
     if meta.announce.is_some() {
-        subscription.announce = meta.announce.clone();
+        subscription.announce = meta.announce;
     }
     if meta.support_url.is_some() {
-        subscription.support_url = meta.support_url.clone();
+        subscription.support_url = meta.support_url;
     }
     if meta.web_page_url.is_some() {
-        subscription.web_page_url = meta.web_page_url.clone();
+        subscription.web_page_url = meta.web_page_url;
     }
     if meta.update_interval_hours.is_some() {
         subscription.update_interval_hours = meta.update_interval_hours;
@@ -988,6 +1061,108 @@ pub fn public_profiles(mut profiles: Vec<Profile>) -> Vec<Profile> {
 
 #[cfg(test)]
 mod tests {
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn response_meta_reads_headers_and_decodes_base64_values() {
+        use base64::Engine;
+        let announce =
+            base64::engine::general_purpose::STANDARD.encode("Привет!\nСерверы обновлены.");
+        let meta = response_meta(
+            &headers(&[
+                ("Profile-Title", "My%20panel"),
+                ("announce", &format!("base64:{announce}")),
+                ("support-url", "https://t.me/support"),
+                ("profile-web-page-url", "javascript:alert(1)"),
+                ("profile-update-interval", "12"),
+            ]),
+            "vless://id@h:1#A",
+        );
+        assert_eq!(meta.provider_title.as_deref(), Some("My panel"));
+        assert_eq!(
+            meta.announce.as_deref(),
+            Some("Привет!\nСерверы обновлены.")
+        );
+        assert_eq!(meta.support_url.as_deref(), Some("https://t.me/support"));
+        assert_eq!(meta.web_page_url, None);
+        assert_eq!(meta.update_interval_hours, Some(12));
+    }
+
+    #[test]
+    fn response_meta_falls_back_to_body_comments_and_rejects_bad_text() {
+        let body = "#profile-title: Body title\n#announce: bad\u{7}text\nvless://id@h:1#A\n";
+        let meta = response_meta(&[], body);
+        assert_eq!(meta.provider_title.as_deref(), Some("Body title"));
+        assert_eq!(meta.announce, None);
+        assert_eq!(
+            response_meta(&[], "vless://id@h:1#A"),
+            ResponseMeta::default()
+        );
+    }
+
+    #[test]
+    fn comment_lines_are_not_counted_as_skipped_links() {
+        let (urls, skipped) =
+            parse_subscription_body("#announce: hi\nvless://id@h:1#A\ntrojan://x@h:1\nss://y@h:1");
+        assert_eq!(urls.len(), 1);
+        assert_eq!(skipped, vec!["trojan", "ss"]);
+    }
+
+    #[test]
+    fn provider_metadata_is_stored_and_kept_when_refresh_omits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let store = ProfileStore::new(dir.path().join("profiles.json"));
+        let request = SubscriptionImport {
+            id: "panel",
+            url: "https://sub.example.test/token",
+            hwid: "",
+            name: "",
+            refresh_interval_minutes: None,
+        };
+        let meta = ResponseMeta {
+            provider_title: Some("Panel".into()),
+            announce: Some("News".into()),
+            ..Default::default()
+        };
+        import_body(
+            &vault,
+            &store,
+            &request,
+            &panel_body(&["NL", "DE"]),
+            meta,
+            |_| true,
+        )
+        .unwrap();
+        let profile = store.load().unwrap().profiles.remove(0);
+        assert_eq!(profile.name, "Panel · NL");
+        let subscription = profile.subscription.unwrap();
+        assert_eq!(subscription.provider_title.as_deref(), Some("Panel"));
+        assert_eq!(subscription.announce.as_deref(), Some("News"));
+        switch_endpoint(&vault, &store, "panel", 1, |_| true).unwrap();
+        assert_eq!(store.load().unwrap().profiles[0].name, "Panel · DE");
+        refresh_body(
+            &vault,
+            &store,
+            "panel",
+            &panel_body(&["NL", "DE"]),
+            ResponseMeta::default(),
+            |_| true,
+        )
+        .unwrap();
+        let profile = store.load().unwrap().profiles.remove(0);
+        assert_eq!(profile.name, "Panel · DE");
+        assert_eq!(
+            profile.subscription.unwrap().announce.as_deref(),
+            Some("News")
+        );
+    }
+
     fn panel_body(names: &[&str]) -> String {
         serde_json::Value::Array(
             names
@@ -1018,7 +1193,7 @@ mod tests {
             &store,
             &request,
             &panel_body(names),
-            &SubscriptionResponseMeta::default(),
+            ResponseMeta::default(),
             |_| true,
         )
         .unwrap();
@@ -1040,27 +1215,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_name_match_accepts_bare_names_after_provider_appears() {
-        // Profile imported as "⚡ NL" before the panel started sending
-        // Profile-Title: today's endpoint is "AcmeVPN - ⚡ NL" and the old
-        // bare name still counts as auto-generated, so it may be re-prefixed.
-        assert!(auto_profile_name_matches(
-            Some("AcmeVPN"),
-            "AcmeVPN - ⚡ NL",
-            "⚡ NL"
-        ));
-        // Same without a header: a name matching the last "- "-delimited
-        // endpoint segment is still auto-generated.
-        assert!(auto_profile_name_matches(None, "Geodema - ⚡ NL", "⚡ NL"));
-        // A hand-picked name stays custom.
-        assert!(!auto_profile_name_matches(
-            Some("AcmeVPN"),
-            "AcmeVPN - ⚡ NL",
-            "My VPN"
-        ));
-    }
-
-    #[test]
     fn refresh_keeps_selected_server_and_profile_name() {
         let dir = tempfile::tempdir().unwrap();
         let (vault, store) = import_panel(dir.path(), &["NL", "DE", "FI"]);
@@ -1070,7 +1224,7 @@ mod tests {
             &store,
             "panel",
             &panel_body(&["FI", "US", "DE", "NL"]),
-            &SubscriptionResponseMeta::default(),
+            ResponseMeta::default(),
             |_| true,
         )
         .unwrap();
@@ -1092,7 +1246,7 @@ mod tests {
             &store,
             "panel",
             stub,
-            &SubscriptionResponseMeta::default(),
+            ResponseMeta::default(),
             |_| true,
         )
         .unwrap_err();
@@ -1113,7 +1267,7 @@ mod tests {
     fn json_subscription_body_yields_one_entry_per_config() {
         let (urls, skipped) = parse_subscription_body(&panel_json_body());
         assert_eq!(urls.len(), 2);
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped, vec!["json"]);
         assert_eq!(
             crate::xray::share_link_name(&urls[1]).as_deref(),
             Some("🇩🇪 Germany")
@@ -1137,7 +1291,7 @@ mod tests {
             &store,
             &request,
             &panel_json_body(),
-            &SubscriptionResponseMeta::default(),
+            ResponseMeta::default(),
             |_| true,
         )
         .unwrap();
@@ -1233,7 +1387,7 @@ mod tests {
             &store,
             &request,
             body,
-            &SubscriptionResponseMeta::default(),
+            ResponseMeta::default(),
             |_| true,
         )
         .unwrap_err();
@@ -1267,7 +1421,7 @@ mod tests {
                 &store,
                 &request,
                 &body,
-                &SubscriptionResponseMeta::default(),
+                ResponseMeta::default(),
                 |_| true,
             )
             .unwrap();
@@ -1332,7 +1486,7 @@ mod tests {
                 &store,
                 &request,
                 body,
-                &SubscriptionResponseMeta::default(),
+                ResponseMeta::default(),
                 |_| true
             )
             .is_err());
@@ -1344,7 +1498,7 @@ mod tests {
             &store,
             &request,
             BODY,
-            &SubscriptionResponseMeta::default(),
+            ResponseMeta::default(),
             |_| true
         )
         .is_err());

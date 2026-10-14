@@ -372,3 +372,23 @@ cargo test -p net-manager-core --test windows_e2e -- --ignored --test-threads=1
 The `wireguard_killswitch_is_rejected_by_fixture_guard` test is not ignored —
 it only verifies that the `/0` fixture guard refuses to connect, using a
 temporary synthetic config.
+
+## macOS privileged helper — manual QA (stage 1)
+
+Automated: `cargo test -p network-orchestrator-macos-helper` (framing, hello,
+peer policy, socket binding) and `cargo test -p net-manager-core helper_client`.
+These never touch routes, interfaces or DNS and never install anything.
+
+Manual, on a dev Mac (installs a launchd daemon; remove it afterwards):
+
+1. `scripts/macos-dev.sh build`, open `target/macos/Network Orchestrator.app`.
+2. Settings → Privileged helper → Install. Approve in System Settings → Login
+   Items. The badge changes to Running with the helper version.
+3. `sudo launchctl print system/com.netmanager.app.helper` shows the job;
+   `/var/run/network-orchestrator/helper.sock` exists with mode 0666.
+4. A foreign process is refused: `python3` connecting to the socket and sending
+   `hello` receives `notAuthorized`.
+5. Remove in Settings. The job and the socket disappear.
+
+Local ad-hoc builds may need the app run from `/Applications` for launchd to
+accept the bundle; that is expected until Developer ID signing is in place.

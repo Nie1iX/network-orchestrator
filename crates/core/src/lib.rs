@@ -4,13 +4,17 @@ pub mod cidr_bulk;
 pub mod config_security;
 pub mod config_vault;
 pub mod daemon_protocol;
+pub mod exit_ip;
 pub mod explorer;
 pub mod geo_list;
 pub mod happ_routing;
+#[cfg(unix)]
+pub mod helper_client;
 pub mod journal;
 pub mod log_sanitize;
 #[cfg(target_os = "macos")]
 mod macos_inventory;
+pub mod macos_vpn;
 pub mod managed_xray;
 pub mod models;
 pub mod openvpn_config;

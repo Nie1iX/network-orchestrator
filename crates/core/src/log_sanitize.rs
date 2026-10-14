@@ -58,9 +58,9 @@ fn is_domain_shaped(token: &str) -> bool {
     }
     let last = labels.last().unwrap();
     // TLD must be alpha (or punycode); rejects version strings like "1.2.3".
-    if !(2..=63).contains(&last.len())
-        || !(last.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
-            && last.bytes().any(|b| b.is_ascii_alphabetic()))
+    if !((2..=63).contains(&last.len())
+        && last.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
+        && last.bytes().any(|b| b.is_ascii_alphabetic()))
     {
         return false;
     }

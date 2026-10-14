@@ -79,6 +79,8 @@ fn build_definition(
                 config,
                 routes: profile.routes.clone(),
                 interface_name: super::tunnels::link_name_hint(profile),
+                role: Default::default(),
+                dns_domains: Vec::new(),
             }))
         }
         TunnelBackend::None => {

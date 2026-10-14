@@ -9,8 +9,13 @@ use std::ffi::{c_char, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+mod netbird;
+mod routing;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
+mod user_network;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod vpn_backends;
 // The proxy runtime needs the managed Xray package, pinned for Apple
 // Silicon; on other targets the bridge still builds so subscription,
 // profile and inventory commands can be exercised off-macOS.
@@ -71,11 +76,102 @@ fn text_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "A required field is empty".into())
 }
+/// A profile that can run next to others (every backend that makes a tunnel).
+fn tunnel_profile(
+    store: &ProfileStore,
+    id: &str,
+) -> Result<net_manager_core::models::Profile, String> {
+    let profile = store
+        .load()
+        .map_err(store_error)?
+        .profiles
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or("Profile not found")?;
+    if profile.backend == TunnelBackend::None {
+        return Err("Static routes do not create a tunnel".into());
+    }
+    Ok(profile)
+}
+
+/// Networks typed as CIDR or single addresses, separated by space, comma,
+/// semicolon or newline. Empty input clears the list.
+fn parse_networks(text: &str) -> Result<Vec<ipnet::IpNet>, String> {
+    let mut networks = Vec::new();
+    for token in text
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|token| !token.is_empty())
+    {
+        let network = token
+            .parse::<ipnet::IpNet>()
+            .or_else(|_| token.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+            .map_err(|_| format!("\"{token}\" is not a valid network"))?;
+        networks.push(network);
+    }
+    if networks.is_empty() {
+        return Ok(networks);
+    }
+    let routes: Vec<net_manager_core::models::PolicyRoute> = networks
+        .iter()
+        .map(|network| net_manager_core::models::PolicyRoute {
+            destination: *network,
+            metric: 5,
+            via: None,
+        })
+        .collect();
+    net_manager_core::models::secondary_networks(&routes).map_err(str::to_string)
+}
+
+fn parse_dns_domains(text: &str) -> Result<Vec<String>, String> {
+    let mut domains: Vec<String> = Vec::new();
+    for token in text
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|token| !token.is_empty())
+    {
+        let domain = token.trim_start_matches("*.").to_ascii_lowercase();
+        if !net_manager_core::models::valid_dns_suffix(&domain) {
+            return Err(format!("\"{token}\" is not a valid DNS domain"));
+        }
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    if domains.len() > 16 {
+        return Err("At most 16 DNS domains can be set".into());
+    }
+    Ok(domains)
+}
 fn store_error(_: std::io::Error) -> String {
     "The profile operation could not be completed. Check the input and file permissions.".into()
 }
 fn local_port_available(port: u16) -> bool {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+}
+/// Socket of the privileged helper; QA runs may point it elsewhere.
+pub(crate) fn helper_socket() -> PathBuf {
+    std::env::var_os("NETORCH_HELPER_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| net_manager_core::daemon_protocol::MACOS_SOCKET_PATH.into())
+}
+/// Whether the privileged helper answers on its socket and accepts this app.
+/// The Swift side adds the launchd registration state (`SMAppService`).
+fn helper_status() -> Value {
+    use net_manager_core::helper_client::{is_denied, HelperClient, HelperError};
+    match HelperClient::new(helper_socket())
+        .with_timeout(std::time::Duration::from_secs(3))
+        .hello()
+    {
+        Ok(hello) => json!({
+            "reachable": true, "denied": false, "version": hello.daemon_version,
+            "capabilities": hello.capabilities,
+        }),
+        Err(error) => json!({
+            "reachable": false,
+            "denied": is_denied(&error),
+            "protocolError": matches!(error, HelperError::Protocol(_)),
+            "version": "", "capabilities": [],
+        }),
+    }
 }
 fn subscription_error(error: std::io::Error) -> String {
     if matches!(
@@ -125,6 +221,102 @@ fn delay_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
 }
 
 const DELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Fetch outside the store lock (it can take seconds), then apply the body
+/// under the lock; a failed attempt is recorded so auto-refresh backs off.
+fn refresh_subscription(root: &Path, args: &Value) -> Result<Value, String> {
+    let id = text_arg(args, "id")?;
+    let store = ProfileStore::new(root.join("profiles.json"));
+    let meta = store
+        .load()
+        .map_err(store_error)?
+        .profiles
+        .into_iter()
+        .find(|p| p.id == id)
+        .and_then(|p| p.subscription)
+        .ok_or("Profile is not a subscription")?;
+    let record_failure = |message: String| {
+        let _lock = TRANSACTION.lock();
+        let _ = net_manager_core::subscription::record_refresh_failure(&store, id, unix_now());
+        message
+    };
+    let client = net_manager_core::subscription::http_client().map_err(subscription_error)?;
+    let fetched = runtime_executor()?
+        .block_on(net_manager_core::subscription::fetch(
+            &client, &meta.url, &meta.hwid,
+        ))
+        .map_err(|error| record_failure(subscription_error(error)))?;
+    let summary = format!(
+        "{} headers: {}",
+        net_manager_core::subscription::summarize_subscription_body(
+            &fetched.body,
+            fetched.content_type.as_deref(),
+        ),
+        fetched.header_names.join(",")
+    );
+    let _lock = TRANSACTION
+        .lock()
+        .map_err(|_| "Profile service is unavailable".to_string())?;
+    let vault = ConfigVault::new(root.join("configs"));
+    let result = runtime::restart_around(root, &store, id, || {
+        let outcome = net_manager_core::subscription::refresh_body(
+            &vault,
+            &store,
+            id,
+            &fetched.body,
+            fetched.meta.clone(),
+            local_port_available,
+        );
+        log_subscription_import(
+            root,
+            &summary,
+            !meta.hwid.is_empty(),
+            outcome.as_ref().err().map(|e| e.to_string()),
+        );
+        encode(outcome.map_err(subscription_error)?)
+    });
+    if result.is_err() {
+        let _ = net_manager_core::subscription::record_refresh_failure(&store, id, unix_now());
+    }
+    result
+}
+
+/// Exit IP as seen by IP-echo services, directly or through a running
+/// connection's SOCKS port; never holds the store lock.
+fn check_exit_ip(root: &Path, args: &Value) -> Result<Value, String> {
+    let via = args["via"].as_str().unwrap_or("direct");
+    let socks = if via == "direct" {
+        None
+    } else {
+        let store = ProfileStore::new(root.join("profiles.json"));
+        let profile = store
+            .load()
+            .map_err(store_error)?
+            .profiles
+            .into_iter()
+            .find(|p| p.id == via)
+            .ok_or("Profile not found")?;
+        if !runtime::is_running(root, &profile)? {
+            return Err("Start the connection first".into());
+        }
+        Some(
+            profile
+                .xray_socks_port
+                .ok_or("This connection has no local proxy port")?,
+        )
+    };
+    let client = net_manager_core::exit_ip::client(socks)
+        .map_err(|_| "Exit IP check could not start".to_string())?;
+    let entries = delay_runtime()?.block_on(net_manager_core::exit_ip::check_all(client));
+    encode(entries)
+}
 
 /// One endpoint, so the UI can show each result as soon as it lands.
 fn measure_delay(root: &Path, args: &Value) -> Result<Value, String> {
@@ -249,11 +441,26 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
     if !root.is_absolute() {
         return Err("App data location must be absolute".into());
     }
-    // Delay probes take seconds; they only read the store, so they run
-    // outside the transaction lock and never stall other calls.
+    // Delay probes take seconds and system reads never touch the store, so
+    // they run outside the transaction lock and never stall other calls.
     match method {
+        "refresh_subscription" => return refresh_subscription(root, args),
         "measure_delays" => return measure_delays(root, args),
         "measure_delay" => return measure_delay(root, args),
+        "check_exit_ip" => return check_exit_ip(root, args),
+        "helper_status" => return Ok(helper_status()),
+        // The user's own NetBird daemon, driven through its CLI; no store access.
+        "netbird_status" => return Ok(netbird::NetBird::detect().status()),
+        "netbird_up" => {
+            let url = args["managementUrl"]
+                .as_str()
+                .filter(|text| !text.is_empty());
+            let key = args["setupKey"].as_str().filter(|text| !text.is_empty());
+            return netbird::NetBird::detect().up(&root.join("runtime"), url, key);
+        }
+        "netbird_down" => return netbird::NetBird::detect().down(),
+        "netbird_log" => return Ok(json!(netbird::log_tail(&root.join("runtime")))),
+        "user_network_settings" => return encode(user_network::read()),
         _ => {}
     }
     let _lock = TRANSACTION
@@ -262,6 +469,19 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
     let store = ProfileStore::new(root.join("profiles.json"));
     let vault = ConfigVault::new(root.join("configs"));
     if let Some(result) = runtime::handle(root, &store, method, args) {
+        return result;
+    }
+    let find_profile = || {
+        let id = text_arg(args, "id")?;
+        store
+            .load()
+            .map_err(store_error)?
+            .profiles
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| "Profile not found".to_string())
+    };
+    if let Some(result) = routing::handle(root, find_profile, method, args) {
         return result;
     }
     match method {
@@ -377,16 +597,20 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 name,
                 refresh_interval_minutes: None,
             };
-            let summary = net_manager_core::subscription::summarize_subscription_body(
-                &fetched.body,
-                fetched.content_type.as_deref(),
+            let summary = format!(
+                "{} headers: {}",
+                net_manager_core::subscription::summarize_subscription_body(
+                    &fetched.body,
+                    fetched.content_type.as_deref(),
+                ),
+                fetched.header_names.join(",")
             );
             let imported = net_manager_core::subscription::import_body(
                 &vault,
                 &store,
                 &request,
                 &fetched.body,
-                &fetched.meta,
+                fetched.meta.clone(),
                 local_port_available,
             );
             log_subscription_import(
@@ -441,14 +665,10 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 endpoints
                     .into_iter()
                     .enumerate()
-                    .map(|(index, endpoint)| {
-                        let protocol =
-                            net_manager_core::subscription::endpoint_protocol(&endpoint.url);
-                        SubscriptionEndpointInfo {
-                            name: endpoint.name,
-                            active: index == active,
-                            protocol,
-                        }
+                    .map(|(index, endpoint)| SubscriptionEndpointInfo {
+                        protocol: net_manager_core::xray::endpoint_protocol(&endpoint.url),
+                        name: endpoint.name,
+                        active: index == active,
                     })
                     .collect::<Vec<_>>(),
             )
@@ -472,44 +692,142 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 ))
             })
         }
-        "refresh_subscription" => {
+        "external_vpns" => encode(
+            net_manager_core::macos_vpn::list(&mut net_manager_core::macos_vpn::SystemScutil)
+                .map_err(|_| "VPN services could not be listed".to_string())?,
+        ),
+        "set_external_vpn" => {
+            let id = args["id"].as_str().unwrap_or_default();
+            let connect = args["connect"].as_str() == Some("true");
+            net_manager_core::macos_vpn::nc_command(id, connect)
+                .map_err(|_| "Unknown VPN service".to_string())?;
+            net_manager_core::macos_vpn::set_connected(
+                &mut net_manager_core::macos_vpn::SystemScutil,
+                id,
+                connect,
+            )
+            .map_err(|_| "The VPN service could not be switched".to_string())?;
+            encode(
+                net_manager_core::macos_vpn::list(&mut net_manager_core::macos_vpn::SystemScutil)
+                    .map_err(|_| "VPN services could not be listed".to_string())?,
+            )
+        }
+        "reorder" => {
+            let backend: TunnelBackend = serde_json::from_value(args["backend"].clone())
+                .map_err(|_| "Unknown connection type".to_string())?;
+            let ids: Vec<String> = text_arg(args, "ids")?
+                .split(',')
+                .map(str::to_string)
+                .collect();
+            let document = store
+                .reorder(backend, &ids)
+                .map_err(|_| "The order could not be saved".to_string())?;
+            encode(net_manager_core::subscription::public_profiles(
+                document.profiles,
+            ))
+        }
+        "import_log" => {
+            let text = std::fs::read_to_string(root.join("runtime/logs/subscription-import.log"))
+                .unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            Ok(json!(lines[lines.len().saturating_sub(64)..].join("\n")))
+        }
+        "set_routing_rules" => {
             let id = text_arg(args, "id")?;
-            let meta = store
+            let mut profile = store
                 .load()
                 .map_err(store_error)?
                 .profiles
                 .into_iter()
                 .find(|p| p.id == id)
-                .and_then(|p| p.subscription)
-                .ok_or("Profile is not a subscription")?;
-            let client =
-                net_manager_core::subscription::http_client().map_err(subscription_error)?;
-            let fetched = runtime_executor()?
-                .block_on(net_manager_core::subscription::fetch(
-                    &client, &meta.url, &meta.hwid,
-                ))
-                .map_err(subscription_error)?;
-            let summary = net_manager_core::subscription::summarize_subscription_body(
-                &fetched.body,
-                fetched.content_type.as_deref(),
-            );
+                .ok_or("Profile not found")?;
+            if profile.backend != TunnelBackend::Xray {
+                return Err("Routing rules are available for Xray connections".into());
+            }
+            routing::apply_draft(&mut profile, args)?;
             runtime::restart_around(root, &store, id, || {
-                let outcome = net_manager_core::subscription::refresh_body(
-                    &vault,
-                    &store,
-                    id,
-                    &fetched.body,
-                    &fetched.meta,
-                    local_port_available,
-                );
-                log_subscription_import(
-                    root,
-                    &summary,
-                    !meta.hwid.is_empty(),
-                    outcome.as_ref().err().map(|e| e.to_string()),
-                );
-                encode(outcome.map_err(subscription_error)?)
+                let document = store.upsert(profile).map_err(store_error)?;
+                encode(net_manager_core::subscription::public_profiles(
+                    document.profiles,
+                ))
             })
+        }
+        "set_xray_mode" => {
+            let id = text_arg(args, "id")?;
+            let mode = match text_arg(args, "mode")? {
+                "socks" => net_manager_core::models::XrayMode::Socks,
+                "tun" => net_manager_core::models::XrayMode::Tun,
+                _ => return Err("Unknown connection mode".into()),
+            };
+            let mut profile = store
+                .load()
+                .map_err(store_error)?
+                .profiles
+                .into_iter()
+                .find(|p| p.id == id)
+                .ok_or("Profile not found")?;
+            if profile.backend != TunnelBackend::Xray {
+                return Err("The mode can be changed for Xray connections".into());
+            }
+            profile.xray_mode = mode;
+            // A running connection is restarted in the new mode.
+            runtime::restart_around(root, &store, id, || {
+                let document = store.upsert(profile).map_err(store_error)?;
+                encode(net_manager_core::subscription::public_profiles(
+                    document.profiles,
+                ))
+            })
+        }
+        "set_tunnel_role" => {
+            let id = text_arg(args, "id")?;
+            let role = match text_arg(args, "role")? {
+                "primary" => net_manager_core::models::TunnelRole::Primary,
+                "secondary" => net_manager_core::models::TunnelRole::Secondary,
+                _ => return Err("Unknown connection role".into()),
+            };
+            let mut profile = tunnel_profile(&store, id)?;
+            profile.tunnel_role = role;
+            // A running connection restarts so the role takes effect.
+            runtime::restart_around(root, &store, id, || {
+                let document = store.upsert(profile).map_err(store_error)?;
+                encode(net_manager_core::subscription::public_profiles(
+                    document.profiles,
+                ))
+            })
+        }
+        "set_tunnel_networks" => {
+            let id = text_arg(args, "id")?;
+            let mut profile = tunnel_profile(&store, id)?;
+            profile.tunnel_networks = parse_networks(args["networks"].as_str().unwrap_or(""))?;
+            profile.tunnel_dns_domains =
+                parse_dns_domains(args["dnsDomains"].as_str().unwrap_or(""))?;
+            runtime::restart_around(root, &store, id, || {
+                let document = store.upsert(profile).map_err(store_error)?;
+                encode(net_manager_core::subscription::public_profiles(
+                    document.profiles,
+                ))
+            })
+        }
+        "set_refresh_interval" => {
+            let id = text_arg(args, "id")?;
+            let minutes = match args["minutes"].as_str().unwrap_or_default() {
+                "" => None,
+                value => Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| "unsupported subscription refresh interval".to_string())?,
+                ),
+            };
+            let document = net_manager_core::subscription::set_refresh_interval(
+                &store,
+                id,
+                minutes,
+                unix_now(),
+            )
+            .map_err(subscription_error)?;
+            encode(net_manager_core::subscription::public_profiles(
+                document.profiles,
+            ))
         }
         "import_share_link" => {
             let id = text_arg(args, "id")?;
@@ -638,6 +956,171 @@ pub unsafe extern "C" fn netorch_free(value: *mut c_char) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reorder_changes_the_order_within_a_backend_group() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "a");
+        import_link(dir.path(), "b");
+        let profiles = dispatch(
+            dir.path(),
+            "reorder",
+            &json!({"backend": "xray", "ids": "b,a"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["id"], "b");
+        assert_eq!(profiles[1]["id"], "a");
+        assert!(dispatch(
+            dir.path(),
+            "reorder",
+            &json!({"backend": "xray", "ids": "b"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn external_vpn_toggle_rejects_malformed_service_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = dispatch(
+            dir.path(),
+            "set_external_vpn",
+            &json!({"id": "incy; rm -rf /", "connect": "true"}),
+        )
+        .unwrap_err();
+        assert_eq!(error, "Unknown VPN service");
+    }
+
+    #[test]
+    fn refresh_interval_is_validated_and_failures_are_recorded() {
+        let (url, server) =
+            serve_bodies(vec!["vless://synthetic@nl.test:443?security=tls#NL".into()]);
+        let dir = tempfile::tempdir().unwrap();
+        dispatch(
+            dir.path(),
+            "import_subscription",
+            &json!({"id":"sub", "url":url, "hwid":"", "name":""}),
+        )
+        .unwrap();
+        server.join().unwrap();
+        let profiles = dispatch(
+            dir.path(),
+            "set_refresh_interval",
+            &json!({"id":"sub", "minutes":"60"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["subscription"]["refreshIntervalMinutes"], 60);
+        assert!(dispatch(
+            dir.path(),
+            "set_refresh_interval",
+            &json!({"id":"sub", "minutes":"5"}),
+        )
+        .is_err());
+        let off = dispatch(
+            dir.path(),
+            "set_refresh_interval",
+            &json!({"id":"sub", "minutes":""}),
+        )
+        .unwrap();
+        assert!(off[0]["subscription"]["refreshIntervalMinutes"].is_null());
+        // The serving thread is gone, so the refresh fetch fails and is recorded.
+        assert!(dispatch(dir.path(), "refresh_subscription", &json!({"id":"sub"})).is_err());
+        let profiles = dispatch(dir.path(), "profiles", &json!({})).unwrap();
+        assert_eq!(
+            profiles[0]["subscription"]["lastRefreshError"],
+            "Refresh failed"
+        );
+    }
+
+    #[test]
+    fn exit_ip_through_a_connection_requires_it_to_run() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "rt");
+        let error = dispatch(dir.path(), "check_exit_ip", &json!({"via":"rt"})).unwrap_err();
+        assert_eq!(error, "Start the connection first");
+        let error = dispatch(dir.path(), "check_exit_ip", &json!({"via":"missing"})).unwrap_err();
+        assert_eq!(error, "Profile not found");
+    }
+
+    #[test]
+    fn routing_rules_are_validated_ordered_and_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "rt");
+        let profiles = dispatch(
+            dir.path(),
+            "set_routing_rules",
+            &json!({
+                "id": "rt",
+                "proxy": "domain:youtube.com\ngeosite:google\n# comment",
+                "direct": "geoip:ru\n10.0.0.0/8",
+                "block": "geosite:category-ads-all",
+                "privateLanDirect": "true",
+            }),
+        )
+        .unwrap();
+        let policies = &profiles[0]["domainPolicies"];
+        assert_eq!(policies[0]["target"], "block");
+        assert_eq!(policies[1]["target"], "proxy");
+        assert_eq!(policies[1]["domains"][2], "# comment");
+        assert_eq!(policies[2]["target"], "direct");
+        assert_eq!(profiles[0]["privateLanDirect"], true);
+        let error = dispatch(
+            dir.path(),
+            "set_routing_rules",
+            &json!({"id": "rt", "proxy": "geosite:bad category!", "direct": "", "block": ""}),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("Invalid routing rule"), "{error}");
+        dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"st", "name":"Static", "interfaceName":"en0", "cidrs":"192.0.2.0/24"}),
+        )
+        .unwrap();
+        assert!(dispatch(
+            dir.path(),
+            "set_routing_rules",
+            &json!({"id": "st", "proxy": "domain:a.test", "direct": "", "block": ""}),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn subscription_panel_title_and_announce_are_stored_and_logged_by_name_only() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            let body = "vless://synthetic@nl.test:443?security=tls#NL";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nprofile-title: Synthetic Panel\r\nannounce: base64:U2VjcmV0LWZyZWUgbmV3cw==\r\nsupport-url: https://support.example.test/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        dispatch(
+            dir.path(),
+            "import_subscription",
+            &json!({"id":"sub", "url":url, "hwid":"", "name":"Mine"}),
+        )
+        .unwrap();
+        server.join().unwrap();
+        let profiles = dispatch(dir.path(), "profiles", &json!({})).unwrap();
+        let subscription = &profiles[0]["subscription"];
+        assert_eq!(subscription["providerTitle"], "Synthetic Panel");
+        assert_eq!(subscription["announce"], "Secret-free news");
+        assert_eq!(subscription["supportUrl"], "https://support.example.test/");
+        assert_eq!(profiles[0]["name"], "Mine");
+        let log = std::fs::read_to_string(dir.path().join("runtime/logs/subscription-import.log"))
+            .unwrap();
+        assert!(log.contains("announce") && log.contains("profile-title"));
+        assert!(!log.contains("Synthetic Panel") && !log.contains("news"));
+    }
+
     #[test]
     fn single_delay_probe_validates_index_and_requires_xray() {
         let first = "vless://synthetic@nl.test:443?security=tls#NL".to_string();
@@ -1116,6 +1599,61 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
+    #[test]
+    fn helper_status_reports_a_missing_helper_without_touching_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dispatch(dir.path(), "helper_status", &json!({})).unwrap();
+        assert_eq!(status["reachable"], false);
+        assert_eq!(status["capabilities"], json!([]));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn xray_mode_can_be_switched_and_is_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "m1");
+        let profiles = dispatch(
+            dir.path(),
+            "set_xray_mode",
+            &json!({"id":"m1", "mode":"tun"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["xrayMode"], "tun");
+        let profiles = dispatch(
+            dir.path(),
+            "set_xray_mode",
+            &json!({"id":"m1", "mode":"socks"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["xrayMode"], "socks");
+        for args in [
+            json!({"id":"m1", "mode":"bridge"}),
+            json!({"id":"missing", "mode":"tun"}),
+            json!({"mode":"tun"}),
+        ] {
+            assert!(dispatch(dir.path(), "set_xray_mode", &args).is_err());
+        }
+    }
+
+    #[test]
+    fn user_network_settings_are_read_without_touching_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dispatch(dir.path(), "user_network_settings", &json!({})).unwrap();
+        for key in [
+            "persistentRoutes",
+            "staticRoutes",
+            "startupJobs",
+            "resolvers",
+            "hosts",
+            "services",
+            "unreadable",
+        ] {
+            assert!(settings[key].is_array(), "{key}");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn import_link(root: &Path, id: &str) {
         dispatch(
@@ -1170,5 +1708,86 @@ mod tests {
         assert!(dispatch(dir.path(), "disconnect", &json!({"id":"rt"})).is_err());
         // Shutdown with nothing running is a no-op and never touches the system proxy.
         dispatch(dir.path(), "shutdown", &json!({})).unwrap();
+    }
+
+    #[test]
+    fn typed_networks_and_domains_are_parsed_and_checked() {
+        let nets = parse_networks("10.10.4.7/16, 192.168.5.9\n fd00::/8;10.10.0.0/16").unwrap();
+        assert_eq!(
+            nets.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["10.10.0.0/16", "192.168.5.9/32", "fd00::/8"]
+        );
+        assert!(parse_networks("  \n").unwrap().is_empty());
+        for bad in [
+            "10.10.0.0/33",
+            "not-a-net",
+            "0.0.0.0/0",
+            "::/0",
+            "224.0.0.0/4",
+        ] {
+            assert!(parse_networks(bad).is_err(), "{bad}");
+        }
+        let error = parse_networks("10.0.0.0/8 oops").unwrap_err();
+        assert!(error.contains("oops"), "{error}");
+        assert_eq!(
+            parse_dns_domains("Corp.Example, *.lab.local corp.example").unwrap(),
+            ["corp.example", "lab.local"]
+        );
+        for bad in ["a/b", "../x", "-", "a b?c"] {
+            assert!(parse_dns_domains(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn role_and_networks_are_saved_on_the_profile_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "r1");
+        let profiles = dispatch(
+            dir.path(),
+            "set_tunnel_role",
+            &json!({"id":"r1", "role":"secondary"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["tunnelRole"], "secondary");
+        let profiles = dispatch(
+            dir.path(),
+            "set_tunnel_networks",
+            &json!({"id":"r1", "networks":"10.10.0.0/16\n192.168.5.0/24", "dnsDomains":"corp.example"}),
+        )
+        .unwrap();
+        assert_eq!(
+            profiles[0]["tunnelNetworks"],
+            json!(["10.10.0.0/16", "192.168.5.0/24"])
+        );
+        assert_eq!(profiles[0]["tunnelDnsDomains"], json!(["corp.example"]));
+        let profiles = dispatch(
+            dir.path(),
+            "set_tunnel_role",
+            &json!({"id":"r1", "role":"primary"}),
+        )
+        .unwrap();
+        assert!(profiles[0].get("tunnelRole").is_none());
+        for (method, args) in [
+            ("set_tunnel_role", json!({"id":"r1", "role":"boss"})),
+            ("set_tunnel_role", json!({"id":"missing", "role":"primary"})),
+            (
+                "set_tunnel_networks",
+                json!({"id":"r1", "networks":"bogus"}),
+            ),
+            (
+                "set_tunnel_networks",
+                json!({"id":"r1", "networks":"0.0.0.0/0"}),
+            ),
+            (
+                "set_tunnel_networks",
+                json!({"id":"r1", "dnsDomains":"a/b"}),
+            ),
+        ] {
+            assert!(
+                dispatch(dir.path(), method, &args).is_err(),
+                "{method} {args}"
+            );
+        }
     }
 }

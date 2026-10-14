@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import Observation
 import OSLog
@@ -14,6 +15,15 @@ import SystemConfiguration
   /// Endpoint indices still being measured, per profile.
   var probing: [String: Set<Int>] = [:]
   var refreshing = Set<String>()
+  /// Exit-IP results per route: "direct" or a running profile id.
+  var exitIPs: [String: [ExitIpEntry]] = [:]
+  var checkingExitIP = Set<String>()
+  var externalVPNs: [ExternalVpn] = []
+  /// The user's NetBird daemon, when one is installed.
+  var netbird: NetBirdState?
+  var netbirdBusy = false
+  var showingNetBirdSetup = false
+  var switchingExternal = Set<String>()
   var snapshot: Snapshot?
   var capabilities: Capabilities?
   var section: Section = .home
@@ -30,6 +40,7 @@ import SystemConfiguration
   var inspecting: Profile?
   var inspection: Inspection?
   var lookup: Lookup?
+  var userNetwork: UserNetworkSettings?
   var lookupDestination = ""
   var runtime: RuntimeState?
   var selectedProfileID: String?
@@ -39,6 +50,8 @@ import SystemConfiguration
   /// Interface carrying the system default route, e.g. `en0` or a VPN `utun9`.
   var primaryInterface: String?
   var notice: String?
+  var helperRegistration: HelperRegistration = .notRegistered
+  var helperStatus: HelperStatus?
 
   init(dataDirectory: URL? = nil) {
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -50,6 +63,65 @@ import SystemConfiguration
       ?? base.appendingPathComponent("com.netmanager.app.macos", isDirectory: true)
     core = CoreBridge(root: root)
     probeCore = CoreBridge(root: root)
+    isDuplicate = !Self.acquireInstanceLock(root: root)
+    connectionSets = Self.loadSets()
+  }
+  /// Another process already serves this data directory; this one must not
+  /// touch the bridge (startup recovery would stop the other's connections).
+  let isDuplicate: Bool
+  private static var instanceLock: Int32 = -1
+  private static func acquireInstanceLock(root: URL) -> Bool {
+    try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let descriptor = open(root.appendingPathComponent(".instance.lock").path, O_CREAT | O_RDWR, 0o600)
+    guard descriptor >= 0 else { return true }
+    if flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+      close(descriptor)
+      return false
+    }
+    instanceLock = descriptor
+    return true
+  }
+
+  var connectionSets: [ConnectionSet] = []
+  private static let setsKey = "connectionSets"
+  private static func loadSets() -> [ConnectionSet] {
+    guard let data = UserDefaults.standard.data(forKey: setsKey) else { return [] }
+    return (try? JSONDecoder().decode([ConnectionSet].self, from: data)) ?? []
+  }
+  private func saveSets() {
+    if let data = try? JSONEncoder().encode(connectionSets) {
+      UserDefaults.standard.set(data, forKey: Self.setsKey)
+    }
+  }
+  /// Saves the running connections as a set; an identical set is not duplicated.
+  func saveCurrentSet(name: String) {
+    let ids = (snapshot?.profiles ?? []).filter { isRunning($0) }.map(\.id)
+    guard !ids.isEmpty else { return }
+    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    connectionSets.append(
+      ConnectionSet(id: UUID().uuidString, name: trimmed.isEmpty ? L10n.text("sets.label") : trimmed, profileIds: ids))
+    saveSets()
+  }
+  func deleteSet(_ set: ConnectionSet) {
+    connectionSets.removeAll { $0.id == set.id }
+    saveSets()
+  }
+  /// Switch to exactly the set's connections among those this client can start.
+  func applySet(_ set: ConnectionSet) async {
+    for profile in snapshot?.profiles ?? [] where canStart(profile) {
+      let wanted = set.profileIds.contains(profile.id)
+      if wanted != isRunning(profile) { await toggle(profile) }
+    }
+  }
+  /// Moves a profile within its backend group (drag and drop or Move up/down).
+  func move(_ profile: Profile, to target: Profile? = nil, by offset: Int = 0) async {
+    var group = (snapshot?.profiles ?? []).filter { $0.backend == profile.backend }.map(\.id)
+    guard let from = group.firstIndex(of: profile.id) else { return }
+    group.remove(at: from)
+    var to = from + offset
+    if let target, let index = group.firstIndex(of: target.id) { to = index }
+    group.insert(profile.id, at: max(0, min(group.count, to)))
+    _ = await change("reorder", args: ["backend": profile.backend, "ids": group.joined(separator: ",")])
   }
   var profiles: [Profile] {
     (snapshot?.profiles ?? []).filter {
@@ -67,24 +139,86 @@ import SystemConfiguration
   func isRunning(_ profile: Profile) -> Bool { status(profile)?.state == "running" }
   var activeCount: Int { runtime?.statuses.filter { $0.state == "running" }.count ?? 0 }
   var canStartConnections: Bool { capabilities?.proxyConnections ?? false }
+  /// The helper answers and serves Xray tunnels (`xray.connect`).
+  var helperServesTunnels: Bool {
+    helperStatus?.reachable == true && helperStatus?.capabilities.contains("xray.connect") == true
+  }
+  /// The helper answers and advertises `capability`.
+  func helperOffers(_ capability: String) -> Bool {
+    helperStatus?.reachable == true && helperStatus?.capabilities.contains(capability) == true
+  }
+  func helperServes(_ profile: Profile) -> Bool {
+    profile.helperCapability.map(helperOffers) ?? false
+  }
+  /// Whether this client can start `profile` right now: loopback Xray always,
+  /// anything that needs a tunnel device once the privileged helper serves it.
+  func canStart(_ profile: Profile) -> Bool {
+    if profile.startsWithoutHelper { return canStartConnections }
+    return profile.needsHelper && canStartConnections && helperServes(profile)
+  }
+  /// The switch is usable for a TUN profile even without the helper: pressing
+  /// it then offers to install the helper instead of doing nothing.
+  func canTryStart(_ profile: Profile) -> Bool {
+    canStart(profile) || (profile.needsHelper && canStartConnections)
+  }
+  /// Interfaces of tunnels this app runs itself.
+  var ownTunnelInterfaces: Set<String> {
+    Set(runtime?.statuses.compactMap { $0.state == "running" ? $0.interfaceName : nil } ?? [])
+  }
   /// A packet-tunnel VPN (e.g. incy) owns the primary service, so macOS takes
-  /// proxy settings from it and ignores ours on Wi-Fi/Ethernet.
-  var systemProxyOverridden: Bool { primaryInterface?.hasPrefix("utun") ?? false }
+  /// proxy settings from it and ignores ours on Wi-Fi/Ethernet. Our own
+  /// full tunnel is not "another VPN".
+  var systemProxyOverridden: Bool {
+    guard let primary = primaryInterface, primary.hasPrefix("utun") else { return false }
+    return !ownTunnelInterfaces.contains(primary)
+  }
 
   func refreshRuntime() async {
+    guard !isDuplicate else { return }
     primaryInterface = Self.currentPrimaryInterface()
+    helperStatus = try? await core.callConcurrently("helper_status")
+    await retireOutdatedHelper()
     do { runtime = try await core.call("runtime") } catch { runtime = nil }
+    if let list: [ExternalVpn] = try? await core.call("external_vpns") { externalVPNs = list }
+    netbird = try? await core.callConcurrently("netbird_status")
+  }
+  /// Connect or disconnect another app's VPN, as the VPN menu would.
+  func setExternalVPN(_ vpn: ExternalVpn, connect: Bool) async {
+    switchingExternal.insert(vpn.id)
+    defer { switchingExternal.remove(vpn.id) }
+    do {
+      externalVPNs = try await core.call(
+        "set_external_vpn", args: ["id": vpn.id, "connect": connect ? "true" : "false"])
+      // Connecting takes a moment; pick up the settled state.
+      try? await Task.sleep(for: .seconds(2))
+      await refreshRuntime()
+    } catch { self.error = error.localizedDescription }
   }
   func toggle(_ profile: Profile) async {
     guard !pending.contains(profile.id) else { return }
+    if profile.needsHelper && !isRunning(profile) && !helperServes(profile) {
+      helperPrompt = true
+      return
+    }
     pending.insert(profile.id)
     defer { pending.remove(profile.id) }
     do {
-      runtime = try await core.call(
-        isRunning(profile) ? "disconnect" : "connect", args: ["id": profile.id])
+      if isRunning(profile) {
+        runtime = try await core.call("disconnect", args: ["id": profile.id])
+      } else {
+        // OpenVPN may need a login; nil means the sign-in sheet is showing.
+        guard let extra = try await credentialArguments(profile) else { return }
+        runtime = try await core.call("connect", args: ["id": profile.id].merging(extra) { $1 })
+        await rememberAfterConnect(profile)
+      }
       error = nil
     } catch {
       self.error = error.localizedDescription
+      // A missing credential is answered by asking, not by an error banner.
+      if self.error == "OpenVPN credentials required" {
+        self.error = nil
+        await askForCredentials(profile, rejected: false)
+      }
       await refreshRuntime()
     }
   }
@@ -96,6 +230,16 @@ import SystemConfiguration
         notice = "native.proxyOverridden"
       }
     } catch { self.error = error.localizedDescription }
+  }
+  /// Switches an Xray profile between loopback SOCKS and the system tunnel;
+  /// a running connection restarts in the new mode.
+  func setXrayMode(_ profile: Profile, mode: String) async {
+    guard !pending.contains(profile.id) else { return }
+    pending.insert(profile.id)
+    defer { pending.remove(profile.id) }
+    if await change("set_xray_mode", args: ["id": profile.id, "mode": mode]) {
+      await refreshRuntime()
+    }
   }
   func installXray(archive: URL? = nil) async {
     installingXray = true
@@ -142,7 +286,9 @@ import SystemConfiguration
   }
   /// Stops our Xray processes and rolls back the system proxy. Blocking: runs
   /// from applicationWillTerminate.
-  nonisolated func shutdown() { core.callSync("shutdown") }
+  nonisolated func shutdown() {
+    if !isDuplicate { core.callSync("shutdown") }
+  }
 
   nonisolated static func currentPrimaryInterface() -> String? {
     guard let store = SCDynamicStoreCreate(nil, "NetworkOrchestrator" as CFString, nil, nil),
@@ -153,7 +299,7 @@ import SystemConfiguration
   }
 
   func refresh() async {
-    guard !busy else { return }
+    guard !busy, !isDuplicate else { return }
     busy = true
     defer { busy = false }
     do {
@@ -233,7 +379,7 @@ import SystemConfiguration
       let endpoints = subscriptionEndpoints[profile.id],
       endpoints.indices.contains(subscription.activeIndex)
     else { return nil }
-    return endpoints[subscription.activeIndex].name
+    return profile.serverLabel(endpoints[subscription.activeIndex].name)
   }
   /// Probes every server, up to eight at once, publishing each result the
   /// moment it arrives so the list fills in live.
@@ -283,17 +429,42 @@ import SystemConfiguration
       }
     }
   }
-  func refreshSubscription(_ profile: Profile) async {
+  /// Re-fetches a subscription. The download runs off the core actor (the
+  /// bridge only locks the store to apply it), so the UI keeps polling.
+  func refreshSubscription(_ profile: Profile, quiet: Bool = false) async {
     guard !refreshing.contains(profile.id) else { return }
     refreshing.insert(profile.id)
     defer { refreshing.remove(profile.id) }
     do {
-      let outcome: RefreshOutcome = try await core.call(
+      let outcome: RefreshOutcome = try await probeCore.callConcurrently(
         "refresh_subscription", args: ["id": profile.id])
       delays[profile.id] = nil
-      notice = L10n.text("native.refreshed", ["count": String(outcome.endpointCount)])
-      await refresh()
-    } catch { self.error = error.localizedDescription }
+      if !quiet {
+        notice = L10n.text("native.refreshed", ["count": String(outcome.endpointCount)])
+      }
+    } catch {
+      if !quiet { self.error = error.localizedDescription }
+    }
+    await refresh()
+  }
+  func setRefreshInterval(_ profile: Profile, minutes: UInt32?) async {
+    _ = await change(
+      "set_refresh_interval",
+      args: ["id": profile.id, "minutes": minutes.map(String.init) ?? ""])
+  }
+  /// Refreshes subscriptions whose interval elapsed. Running connections are
+  /// left alone so a background refresh never drops traffic.
+  func autoRefreshDue() async {
+    let now = UInt64(Date().timeIntervalSince1970)
+    for profile in snapshot?.profiles ?? [] where !isRunning(profile) {
+      guard let subscription = profile.subscription,
+        let minutes = subscription.refreshIntervalMinutes
+      else { continue }
+      let last = subscription.lastRefreshAtUnix ?? 0
+      if now >= last + UInt64(minutes) * 60 {
+        await refreshSubscription(profile, quiet: true)
+      }
+    }
   }
   /// Toolbar refresh: re-fetch every subscription, then reload everything.
   func refreshAll() async {
@@ -301,6 +472,213 @@ import SystemConfiguration
       await refreshSubscription(profile)
     }
     await refresh()
+  }
+  /// Checks the exit IP directly and through every running connection at
+  /// once; each route's result appears as soon as its checkers finish.
+  func checkExitIPs() async {
+    let routes = ["direct"] + (snapshot?.profiles ?? []).filter { isRunning($0) }.map(\.id)
+    exitIPs = exitIPs.filter { routes.contains($0.key) }
+    let core = probeCore
+    await withTaskGroup(of: (String, [ExitIpEntry]?).self) { group in
+      for route in routes where !checkingExitIP.contains(route) {
+        checkingExitIP.insert(route)
+        group.addTask {
+          let entries: [ExitIpEntry]? = try? await core.callConcurrently(
+            "check_exit_ip", args: ["via": route])
+          return (route, entries)
+        }
+      }
+      for await (route, entries) in group {
+        exitIPs[route] = entries ?? []
+        checkingExitIP.remove(route)
+      }
+    }
+  }
+  /// OpenVPN is waiting for the user to type credentials.
+  var credentialRequest: CredentialRequest?
+  /// Typed credentials the user asked to keep, saved once the connect succeeds.
+  private var pendingRemember: [String: OpenVpnSecrets] = [:]
+  /// Extra connect arguments (credentials) for `profile`; `nil` when the
+  /// sign-in sheet was opened instead of connecting.
+  private func credentialArguments(_ profile: Profile) async throws -> [String: String]? {
+    guard profile.backend == "openVpn" else { return [:] }
+    let needs: CredentialNeeds = try await core.call(
+      "credential_requirements", args: ["id": profile.id])
+    guard needs.any else { return [:] }
+    // A refusal on the last attempt means what is saved is wrong.
+    let rejected = status(profile)?.message == "OpenVPN authentication failed"
+    if rejected { CredentialStore.delete(profile.id) }
+    if !rejected, let saved = CredentialStore.load(profile.id), saved.satisfies(needs) {
+      return saved.arguments(for: needs)
+    }
+    await askForCredentials(profile, rejected: rejected, needs: needs)
+    return nil
+  }
+  private func askForCredentials(
+    _ profile: Profile, rejected: Bool, needs: CredentialNeeds? = nil
+  ) async {
+    let needs =
+      if let needs { needs } else {
+        (try? await core.call("credential_requirements", args: ["id": profile.id]))
+          ?? CredentialNeeds(userPass: true, keyPassphrase: false)
+      }
+    credentialRequest = CredentialRequest(
+      profile: profile.id, name: profile.name, needs: needs, rejected: rejected)
+  }
+  /// Connects with what the user typed; keeps it in the Keychain on request.
+  func submitCredentials(_ request: CredentialRequest, secrets: OpenVpnSecrets, remember: Bool) async {
+    credentialRequest = nil
+    guard let profile = snapshot?.profiles.first(where: { $0.id == request.profile }),
+      !pending.contains(profile.id)
+    else { return }
+    pending.insert(profile.id)
+    defer { pending.remove(profile.id) }
+    if remember { pendingRemember[profile.id] = secrets }
+    do {
+      runtime = try await core.call(
+        "connect",
+        args: ["id": profile.id].merging(secrets.arguments(for: request.needs)) { $1 })
+      await rememberAfterConnect(profile)
+      error = nil
+    } catch {
+      pendingRemember[profile.id] = nil
+      self.error = error.localizedDescription
+      await refreshRuntime()
+    }
+  }
+  private func rememberAfterConnect(_ profile: Profile) async {
+    if let secrets = pendingRemember.removeValue(forKey: profile.id) {
+      CredentialStore.save(secrets, for: profile.id)
+    }
+  }
+  /// Forget what Keychain holds for this profile.
+  func forgetCredentials(_ profile: Profile) { CredentialStore.delete(profile.id) }
+  /// Connects NetBird (a browser sign-in opens when it is needed) or, when it
+  /// is on, disconnects it. A setup key is used once and never stored.
+  func toggleNetBird(managementUrl: String? = nil, setupKey: String? = nil) async {
+    guard !netbirdBusy, let current = netbird, current.canToggle else { return }
+    netbirdBusy = true
+    defer { netbirdBusy = false }
+    do {
+      if current.isOn && managementUrl == nil {
+        netbird = try await core.callConcurrently("netbird_down")
+      } else {
+        var args: [String: String] = [:]
+        if let managementUrl, !managementUrl.isEmpty { args["managementUrl"] = managementUrl }
+        if let setupKey, !setupKey.isEmpty { args["setupKey"] = setupKey }
+        netbird = try await core.callConcurrently("netbird_up", args: args)
+      }
+      error = nil
+    } catch { self.error = error.localizedDescription }
+    await refreshRuntime()
+  }
+  /// Primary connections take all traffic; secondary ones only their networks.
+  func setTunnelRole(_ profile: Profile, role: String) async {
+    guard !pending.contains(profile.id) else { return }
+    pending.insert(profile.id)
+    defer { pending.remove(profile.id) }
+    if await change("set_tunnel_role", args: ["id": profile.id, "role": role]) {
+      await refreshRuntime()
+    }
+  }
+  /// Saves a secondary connection's networks and split-DNS domains (typed
+  /// text, validated by the core). Returns whether it was accepted.
+  func setTunnelNetworks(_ profile: Profile, networks: String, dnsDomains: String) async -> Bool {
+    let saved = await change(
+      "set_tunnel_networks",
+      args: ["id": profile.id, "networks": networks, "dnsDomains": dnsDomains])
+    if saved { await refreshRuntime() }
+    return saved
+  }
+  /// TUN was requested without a helper: the window offering to install it.
+  var helperPrompt = false
+  /// The helper was removed because the app changed; shown until it is installed again.
+  var helperOutdated = UserDefaults.standard.bool(forKey: "helperOutdatedNotice")
+  private var helperCheckDone = false
+  private static let helperBuildKey = "helperRegisteredBuild"
+  /// Identifies the helper this app ships: app version plus the helper's own
+  /// code hash. launchd pins a registered helper to its code hash, so any
+  /// change — a new release or just a rebuild — leaves the old registration
+  /// unable to start; it is better removed and reinstalled with the user's
+  /// knowledge than left as "not responding".
+  nonisolated static func currentHelperBuild() -> String? {
+    let url = Bundle.main.bundleURL.appendingPathComponent(
+      "Contents/MacOS/network-orchestrator-helper")
+    guard let data = try? Data(contentsOf: url) else { return nil }
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    return "\(version ?? "?")|\(hash)"
+  }
+  /// Once per launch: a registered helper that belongs to another build of the
+  /// app is unregistered and the user is told to install it again.
+  private func retireOutdatedHelper() async {
+    guard !helperCheckDone else { return }
+    helperCheckDone = true
+    guard HelperManager.registration != .notRegistered,
+      let current = Self.currentHelperBuild(),
+      UserDefaults.standard.string(forKey: Self.helperBuildKey) != current
+    else { return }
+    try? await HelperManager.unregister()
+    UserDefaults.standard.removeObject(forKey: Self.helperBuildKey)
+    UserDefaults.standard.set(true, forKey: "helperOutdatedNotice")
+    helperOutdated = true
+    await refreshHelper()
+  }
+  /// Re-reads the launchd registration and asks the helper's socket who answers.
+  func refreshHelper() async {
+    helperRegistration = HelperManager.registration
+    helperStatus = try? await core.callConcurrently("helper_status")
+  }
+  /// Registers the helper; macOS may still wait for the approval in Login Items.
+  func installHelper() async {
+    do {
+      try HelperManager.register()
+      if let build = Self.currentHelperBuild() {
+        UserDefaults.standard.set(build, forKey: Self.helperBuildKey)
+      }
+      UserDefaults.standard.removeObject(forKey: "helperOutdatedNotice")
+      helperOutdated = false
+    } catch { self.error = "native.helperFailed" }
+    await refreshHelper()
+    if helperRegistration == .requiresApproval { HelperManager.openSystemSettings() }
+  }
+  func removeHelper() async {
+    do {
+      try await HelperManager.unregister()
+      UserDefaults.standard.removeObject(forKey: Self.helperBuildKey)
+    } catch { self.error = "native.helperFailed" }
+    await refreshHelper()
+  }
+  func connectionLog(_ profile: Profile) async -> String {
+    (try? await core.call("log", args: ["id": profile.id]) as String) ?? ""
+  }
+  func importLog() async -> String {
+    (try? await core.call("import_log") as String) ?? ""
+  }
+  /// Saves the rule sets and DNS options; a running connection restarts to apply them.
+  func setRoutingRules(_ profile: Profile, options: RoutingOptions) async -> Bool {
+    var args = options.bridgeArgs
+    args["id"] = profile.id
+    return await change("set_routing_rules", args: args)
+  }
+  func routingOptions(_ profile: Profile) async -> RoutingOptions? {
+    try? await core.call("routing_options", args: ["id": profile.id])
+  }
+  /// Parses a Happ/Incy export without touching the profile.
+  func parseHappRouting(_ payload: String) async -> HappRouting? {
+    do { return try await core.call("parse_happ_routing", args: ["payload": payload]) } catch {
+      self.error = error.localizedDescription
+      return nil
+    }
+  }
+  /// Replays the draft rules for one host or IP, offline.
+  func checkRoute(_ target: String, options: RoutingOptions) async -> RouteCheckResult? {
+    var args = options.bridgeArgs
+    args["target"] = target
+    do { return try await core.call("check_route", args: args) } catch {
+      self.error = error.localizedDescription
+      return nil
+    }
   }
   func remove(_ profile: Profile) async { _ = await change("delete", args: ["id": profile.id]) }
   private func change(_ method: String, args: [String: String]) async -> Bool {
@@ -321,6 +699,12 @@ import SystemConfiguration
     inspecting = profile
     inspection = nil
     do { inspection = try await core.call("inspect", args: ["id": profile.id]) } catch {
+      self.error = error.localizedDescription
+    }
+  }
+  /// Reads system files and the kernel table only; no store lock is taken.
+  func loadUserNetwork() async {
+    do { userNetwork = try await core.callConcurrently("user_network_settings") } catch {
       self.error = error.localizedDescription
     }
   }

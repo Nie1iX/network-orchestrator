@@ -1,5 +1,24 @@
 import Foundation
 
+/// The user's own NetBird daemon as the bridge summarises it (no keys, no events).
+struct NetBirdState: Decodable, Sendable, Equatable {
+  let installed: Bool
+  /// connected, connecting, disconnected, needsLogin, daemonStopped,
+  /// notInstalled or unavailable.
+  let state: String
+  var ip: String? = nil
+  var fqdn: String? = nil
+  var version: String? = nil
+  var managementUrl: String? = nil
+  var peersConnected: Int? = nil
+  var peersTotal: Int? = nil
+  var sessionExpiresAt: String? = nil
+  var networks: [String]? = nil
+  var isOn: Bool { state == "connected" || state == "connecting" }
+  /// The daemon can be asked to connect.
+  var canToggle: Bool { installed && state != "daemonStopped" && state != "unavailable" }
+}
+
 struct Capabilities: Decodable, Sendable {
   let os: String
   let minimumOS: String
@@ -13,6 +32,8 @@ struct TunnelStatus: Decodable, Sendable {
   let profileId: String
   let state: String
   let message: String?
+  /// `utunN` of a running full tunnel; nil for loopback proxies.
+  var interfaceName: String? = nil
 }
 struct RuntimeState: Decodable, Sendable {
   let xrayInstalled: Bool
@@ -31,9 +52,52 @@ struct Profile: Decodable, Identifiable, Sendable {
   let xrayHttpPort: UInt16?
   let subscription: SubscriptionMeta?
   let xrayMode: String?
+  /// "primary" (default) or "secondary": a secondary connection carries only
+  /// `tunnelNetworks`, the primary owns the default route and the system DNS.
+  var tunnelRole: String? = nil
+  var tunnelNetworks: [String]? = nil
+  var tunnelDnsDomains: [String]? = nil
+  var isSecondary: Bool { tunnelRole == "secondary" }
+  var domainPolicies: [DomainPolicy]? = nil
+  var privateLanDirect: Bool? = nil
+  var xrayDns: DnsSummary? = nil
+  /// Rule lines of one target (block / proxy / direct), comments included.
+  func rules(_ target: String) -> [String] {
+    (domainPolicies ?? []).filter { $0.target == target }.flatMap(\.domains)
+  }
+  /// Name shown for the profile: a generated "{provider} - {server}" name
+  /// reads as the provider group, a user-chosen name is shown as typed.
+  var groupName: String {
+    guard let title = subscription?.providerTitle, !title.isEmpty,
+      name == title || [" · ", " - "].contains(where: { name.hasPrefix(title + $0) })
+    else { return name }
+    return title
+  }
+  /// A server name without the provider prefix the panel repeats on each.
+  func serverLabel(_ server: String) -> String {
+    guard let title = subscription?.providerTitle, !title.isEmpty else { return server }
+    for separator in [" · ", " - ", " – ", " — ", " | "] where server.hasPrefix(title + separator) {
+      return String(server.dropFirst(title.count + separator.count))
+    }
+    return server
+  }
   /// Xray in loopback SOCKS/HTTP mode is the only kind this client can start
   /// without the privileged helper.
   var startsWithoutHelper: Bool { backend == "xray" && (xrayMode ?? "socks") == "socks" }
+  /// Xray as a system-wide tunnel; the privileged helper owns it.
+  var isTun: Bool { backend == "xray" && xrayMode == "tun" }
+  /// Everything that creates a tunnel device runs in the privileged helper:
+  /// Xray TUN, WireGuard and OpenVPN.
+  var needsHelper: Bool { isTun || backend == "wireGuard" || backend == "openVpn" }
+  /// The helper capability that serves this profile.
+  var helperCapability: String? {
+    switch backend {
+    case "wireGuard": "wireguard.connect"
+    case "openVpn": "openvpn.connect"
+    case "xray": isTun ? "xray.connect" : nil
+    default: nil
+    }
+  }
   var kind: String {
     switch backend {
     case "wireGuard": "WireGuard"
@@ -56,6 +120,20 @@ struct SubscriptionMeta: Decodable, Sendable {
   let endpointCount: Int
   let activeIndex: Int
   let userInfo: SubscriptionUsage?
+  var refreshIntervalMinutes: UInt32? = nil
+  var lastRefreshAtUnix: UInt64? = nil
+  var lastRefreshError: String? = nil
+  /// What the provider announces about the subscription (response headers).
+  let providerTitle: String?
+  let announce: String?
+  let supportUrl: String?
+  let webPageUrl: String?
+  let updateIntervalHours: UInt32?
+  let skippedProtocols: [String]?
+}
+struct DomainPolicy: Decodable, Sendable {
+  let domains: [String]
+  let target: String
 }
 struct SubscriptionUsage: Decodable, Sendable {
   let uploadBytes: UInt64
@@ -76,6 +154,7 @@ struct RefreshOutcome: Decodable, Sendable {
 struct SubscriptionEndpoint: Decodable, Sendable {
   let name: String
   let active: Bool
+  var `protocol`: String? = nil
 }
 struct SubscriptionImportResult: Decodable, Sendable {
   let profiles: [Profile]
@@ -142,6 +221,60 @@ struct Route: Decodable, Identifiable, Sendable {
   let metric: UInt32
   var cidr: String { "\(destination)/\(prefixLen)" }
   var id: String { "\(cidr)|\(interfaceIndex)|\(gateway ?? "")|\(metric)" }
+}
+/// Routing settings a person made on this Mac (`user_network_settings`).
+struct UserNetworkSettings: Decodable, Sendable {
+  struct PersistentRoute: Decodable, Sendable {
+    let service: String
+    let interface: String?
+    let destination: String
+    let gateway: String?
+    let active: Bool
+  }
+  struct StaticRoute: Decodable, Sendable {
+    let destination: String
+    let gateway: String
+    let interface: String
+    let flags: String
+    let source: String
+  }
+  struct StartupJob: Decodable, Sendable {
+    let label: String
+    let path: String
+    let scope: String
+    let command: String
+    let runAtLoad: Bool
+    let intervalSeconds: UInt64?
+    let route: String?
+    let active: Bool?
+  }
+  struct Resolver: Decodable, Sendable {
+    let domain: String
+    let nameservers: [String]
+    let port: UInt16?
+    let searchOrder: UInt32?
+  }
+  struct HostEntry: Decodable, Sendable {
+    let address: String
+    let names: [String]
+  }
+  struct Setting: Decodable, Sendable {
+    let kind: String
+    let value: String
+  }
+  struct Service: Decodable, Sendable {
+    let service: String
+    let interface: String?
+    let enabled: Bool
+    let items: [Setting]
+  }
+  let persistentRoutes: [PersistentRoute]
+  let staticRoutes: [StaticRoute]
+  let startupJobs: [StartupJob]
+  let resolvers: [Resolver]
+  let hosts: [HostEntry]
+  let services: [Service]
+  let unreadable: [String]
 }
 struct PlannedRoute: Decodable, Sendable {
   let destination: String
@@ -231,5 +364,101 @@ enum Section: String, CaseIterable, Identifiable {
     case .routes: "arrow.triangle.branch"
     case .settings: "gearshape"
     }
+  }
+}
+
+struct ExitIpEntry: Decodable, Sendable {
+  let name: String
+  let ip: String?
+  let country: String?
+  let error: String?
+}
+
+/// A VPN configured by another app (e.g. incy), toggled with `scutil --nc`.
+struct ExternalVpn: Decodable, Identifiable, Sendable {
+  let id: String
+  let name: String
+  let state: String
+  let provider: String?
+  let enabled: Bool
+}
+
+/// A saved combination of connections restored in one click (kept in
+/// UserDefaults, like the web client's localStorage sets).
+struct ConnectionSet: Codable, Identifiable, Sendable, Equatable {
+  var id: String
+  var name: String
+  var profileIds: [String]
+}
+
+/// Counts of a profile's custom DNS policy, for the detail summary.
+struct DnsSummary: Decodable, Sendable {
+  let servers: [DnsServerStub]?
+  let hosts: [String: [String]]?
+  var serverCount: Int { servers?.count ?? 0 }
+  var hostCount: Int { hosts?.count ?? 0 }
+}
+struct DnsServerStub: Decodable, Sendable {}
+/// Editor state of a profile's Xray routing options, as plain text fields.
+struct RoutingOptions: Decodable, Sendable {
+  var block = ""
+  var proxy = ""
+  var direct = ""
+  var privateLanDirect = false
+  var domainStrategy = ""
+  var domainMatcher = ""
+  var dnsServers = ""
+  var dnsHosts = ""
+  var fakeDns = false
+  var queryStrategy = ""
+}
+/// Fields recovered from a pasted Happ/Incy routing export; absent fields
+/// were not mentioned and keep their current value in the editor.
+struct HappRouting: Decodable, Sendable {
+  let name: String?
+  let block: String
+  let proxy: String
+  let direct: String
+  let privateLanDirect: Bool?
+  let domainStrategy: String?
+  let domainMatcher: String?
+  let dnsServers: String?
+  let dnsHosts: String?
+  let fakeDns: Bool?
+  let queryStrategy: String?
+  let warnings: [String]
+}
+struct RouteCheckResult: Decodable, Sendable {
+  let target: String
+  let outbound: String
+  let source: String
+  let policyIndex: Int?
+  let matchedSelector: String?
+  let certainty: String
+  let notes: [String]
+}
+
+extension RoutingOptions {
+  var bridgeArgs: [String: String] {
+    [
+      "block": block, "proxy": proxy, "direct": direct,
+      "privateLanDirect": privateLanDirect ? "true" : "false",
+      "domainStrategy": domainStrategy, "domainMatcher": domainMatcher,
+      "dnsServers": dnsServers, "dnsHosts": dnsHosts,
+      "fakeDns": fakeDns ? "true" : "false", "queryStrategy": queryStrategy,
+    ]
+  }
+  /// Applies the fields a Happ export mentions and keeps the rest.
+  mutating func apply(_ happ: HappRouting) {
+    block = happ.block
+    proxy = happ.proxy
+    direct = happ.direct
+    if let value = happ.privateLanDirect { privateLanDirect = value }
+    if let value = happ.domainStrategy { domainStrategy = value }
+    if let value = happ.domainMatcher { domainMatcher = value }
+    if let value = happ.dnsServers { dnsServers = value }
+    if let value = happ.dnsHosts { dnsHosts = value }
+    if let value = happ.fakeDns { fakeDns = value }
+    if let value = happ.queryStrategy { queryStrategy = value }
   }
 }

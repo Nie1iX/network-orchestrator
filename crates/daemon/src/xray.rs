@@ -1135,6 +1135,8 @@ mod tests {
             dns_bypass: vec![],
             interface_name: None,
             geo_assets: None,
+            macos_data_root: None,
+            role: Default::default(),
         }
     }
 
