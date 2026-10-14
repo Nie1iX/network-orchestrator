@@ -3,10 +3,11 @@
 //! out of this crate; they belong to the privileged launchd helper (plan 14).
 //! Xray TUN profiles are delegated to that helper over `daemon_protocol`
 //! (`docs/plans/2026-10-14-16-macos-xray-tun.md`); this crate only asks.
+use crate::vpn_backends;
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::daemon_protocol::{
-    method, XrayConnectParams, XrayConnectResult, XrayDisconnectResult, XrayProfileParams,
-    XrayStatusResult,
+    method, OpenVpnCredentials, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
+    XrayProfileParams, XrayStatusResult,
 };
 use net_manager_core::helper_client::{HelperClient, HelperError};
 use net_manager_core::managed_xray;
@@ -116,7 +117,7 @@ fn helper() -> HelperClient {
     HelperClient::new(crate::helper_socket()).with_timeout(Duration::from_secs(20))
 }
 
-fn helper_error(error: HelperError) -> String {
+pub(crate) fn helper_error(error: HelperError) -> String {
     match error {
         HelperError::Unreachable(_) => {
             "The privileged helper is not running. Install it in Settings.".into()
@@ -132,8 +133,17 @@ fn tun_log_path() -> PathBuf {
 }
 
 fn tun_log_tail() -> Option<String> {
+    tail_of(&tun_log_path())
+}
+
+/// OpenVPN (run by the helper) logs next to the helper's socket.
+fn openvpn_log_tail() -> Option<String> {
+    tail_of(&crate::helper_socket().with_file_name("openvpn.log"))
+}
+
+fn tail_of(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(tun_log_path()).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     file.seek(SeekFrom::Start(len.saturating_sub(LOG_TAIL_BYTES as u64)))
         .ok()?;
@@ -184,6 +194,10 @@ fn tun_status_via(client: &HelperClient, profile: &Profile) -> TunnelStatus {
 fn status_of(session: &mut Session, profile: &Profile) -> TunnelStatus {
     if is_tun(profile) {
         tun_status(profile)
+    } else if vpn_backends::is_wireguard(profile) {
+        vpn_backends::wireguard_status(&helper(), profile)
+    } else if vpn_backends::is_openvpn(profile) {
+        vpn_backends::openvpn_status(&helper(), profile)
     } else {
         session.tunnels.status(profile)
     }
@@ -194,6 +208,9 @@ fn running(session: &mut Session, profile: &Profile) -> bool {
 }
 
 fn stop(session: &mut Session, profile: &Profile) -> Result<(), String> {
+    if vpn_backends::is_wireguard(profile) || vpn_backends::is_openvpn(profile) {
+        return vpn_backends::stop(&helper(), profile, helper_error);
+    }
     if is_tun(profile) {
         let result: XrayDisconnectResult = helper()
             .call(
@@ -346,8 +363,27 @@ fn free_listener_ports(root: &Path, store: &ProfileStore, profile: &mut Profile)
 }
 
 /// Start a loopback Xray connection and confirm it survived startup.
-fn start(root: &Path, store: &ProfileStore, profile: &Profile) -> Result<(), String> {
+fn start(
+    root: &Path,
+    store: &ProfileStore,
+    profile: &Profile,
+    credentials: Option<OpenVpnCredentials>,
+) -> Result<(), String> {
     let mut profile = profile.clone();
+    if vpn_backends::is_wireguard(&profile) || vpn_backends::is_openvpn(&profile) {
+        let profile = &profile;
+        return with_session(root, |session| {
+            if running(session, profile) {
+                return Err("The connection is already running".into());
+            }
+            let client = helper();
+            if vpn_backends::is_wireguard(profile) {
+                vpn_backends::start_wireguard(root, &client, profile)
+            } else {
+                vpn_backends::start_openvpn(root, &client, profile, credentials)
+            }
+        });
+    }
     if is_tun(&profile) {
         let profile = &profile;
         return with_session(root, |session| {
@@ -421,7 +457,7 @@ pub(crate) fn restart_around(
     let result = change();
     if was_running {
         let after = find(&load()?, &id_arg)?;
-        start(root, store, &after)?;
+        start(root, store, &after, None)?;
     }
     result
 }
@@ -443,9 +479,19 @@ pub(crate) fn handle(
             with_session(root, |session| Ok(snapshot(root, session, &profiles)))
         }),
         "install_xray" => install_xray(root, args["archivePath"].as_str()),
+        "credential_requirements" => load().and_then(|profiles| {
+            let profile = find(&profiles, args)?;
+            let needs = vpn_backends::requirements(root, &profile)?;
+            Ok(json!({"userPass": needs.user_pass, "keyPassphrase": needs.key_passphrase}))
+        }),
         "connect" => load().and_then(|profiles| {
             let profile = find(&profiles, args)?;
-            start(root, store, &profile)?;
+            start(
+                root,
+                store,
+                &profile,
+                vpn_backends::credentials_from_args(args),
+            )?;
             let profiles = load()?;
             with_session(root, |session| Ok(snapshot(root, session, &profiles)))
         }),
@@ -519,6 +565,13 @@ pub(crate) fn handle(
             let profile = find(&profiles, args)?;
             if is_tun(&profile) {
                 return Ok(json!(tun_log_tail().unwrap_or_default()));
+            }
+            if vpn_backends::is_openvpn(&profile) {
+                return Ok(json!(openvpn_log_tail().unwrap_or_default()));
+            }
+            if vpn_backends::is_wireguard(&profile) {
+                // The engine keeps no text log; the status carries its notices.
+                return Ok(json!(""));
             }
             with_session(root, |session| {
                 Ok(json!(session
