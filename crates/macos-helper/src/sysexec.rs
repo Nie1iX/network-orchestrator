@@ -8,6 +8,8 @@ pub const ROUTE: &str = "/sbin/route";
 pub const NETWORKSETUP: &str = "/usr/sbin/networksetup";
 pub const IPCONFIG: &str = "/usr/sbin/ipconfig";
 pub const IFCONFIG: &str = "/sbin/ifconfig";
+pub const DSCACHEUTIL: &str = "/usr/bin/dscacheutil";
+pub const KILLALL: &str = "/usr/bin/killall";
 
 pub trait Runner: Send + Sync {
     /// Run `program` with `args`; stdout on success, `Err` on a non-zero exit.

@@ -84,6 +84,7 @@ async fn run(options: Options) -> std::io::Result<()> {
         Box::new(RealWgPlatform),
         Box::new(SystemRunner),
         Journal::named(state_dir, "wireguard.json"),
+        std::path::PathBuf::from(network_orchestrator_macos_helper::resolver::DIR),
     ));
     let openvpn = Arc::new(OpenVpnExecutor::new(
         Box::new(RealOvpnPlatform {
@@ -93,6 +94,7 @@ async fn run(options: Options) -> std::io::Result<()> {
         Box::new(SystemRunner),
         Journal::named(state_dir, "openvpn.json"),
         std::path::PathBuf::from(network_orchestrator_macos_helper::openvpn::RUNTIME_ROOT),
+        std::path::PathBuf::from(network_orchestrator_macos_helper::resolver::DIR),
     ));
     // A tunnel a previous helper left behind must not outlive its owner.
     for (name, result) in [

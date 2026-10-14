@@ -197,6 +197,34 @@ impl RouteOp {
     }
 }
 
+/// Routes for a secondary Xray tunnel: only `networks`, through the tunnel
+/// gateway (IPv6 through the interface). All of them are best effort; the
+/// caller decides whether having none installed is an error.
+pub fn gateway_routes(gateway: Ipv4Addr, tun: &str, networks: &[ipnet::IpNet]) -> Vec<RouteOp> {
+    let mut ops: Vec<RouteOp> = Vec::new();
+    for net in networks {
+        let target = match net.addr() {
+            IpAddr::V4(_) => Target::Gateway {
+                address: IpAddr::V4(gateway),
+            },
+            IpAddr::V6(_) => Target::Interface { name: tun.into() },
+        };
+        let op = RouteOp {
+            network: net.network(),
+            prefix: net.prefix_len(),
+            target,
+            optional: true,
+        };
+        if !ops
+            .iter()
+            .any(|have| have.network == op.network && have.prefix == op.prefix)
+        {
+            ops.push(op);
+        }
+    }
+    ops
+}
+
 /// Capture routes for a tunnel that is addressed by interface (WireGuard,
 /// OpenVPN): `0.0.0.0/0` and `::/0` become two halves each, which win over the
 /// uplink's default without replacing it; every other network is routed as is.

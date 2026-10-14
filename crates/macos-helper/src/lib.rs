@@ -13,6 +13,7 @@ pub mod journal;
 pub mod openvpn;
 pub mod peer;
 pub mod platform;
+pub mod resolver;
 pub mod routes;
 pub mod server;
 pub mod service;

@@ -19,6 +19,9 @@ pub struct Record {
     pub pid: u32,
     pub routes: Vec<RouteOp>,
     pub dns: Option<Snapshot>,
+    /// Split-DNS suffixes this tunnel wrote to `/etc/resolver`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolver_domains: Vec<String>,
 }
 
 pub struct Journal {
@@ -88,6 +91,7 @@ mod tests {
                 service: "Wi-Fi".into(),
                 servers: vec![],
             }),
+            resolver_domains: Vec::new(),
         }
     }
 

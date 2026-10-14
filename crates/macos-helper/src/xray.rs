@@ -13,7 +13,7 @@ use crate::tun;
 use net_manager_core::daemon_protocol::{
     XrayConnectParams, XrayConnectResult, XrayDisconnectResult, XrayStatusResult,
 };
-use net_manager_core::models::TunnelState;
+use net_manager_core::models::{secondary_networks, TunnelRole, TunnelState};
 use net_manager_core::xray::{apply_macos_dns_capture, apply_macos_tun_inbound, strip_tun_inbound};
 use std::fmt;
 use std::io;
@@ -96,6 +96,7 @@ pub trait Platform: Send + Sync {
 struct Active {
     profile_id: String,
     owner_uid: u32,
+    role: TunnelRole,
     record: Record,
     tun: Box<dyn TunDevice>,
     process: Box<dyn Process>,
@@ -202,6 +203,13 @@ impl XrayExecutor {
                 "the Xray configuration must be an object".into(),
             ));
         }
+        // A secondary tunnel carries only the networks listed for it.
+        let secondary = params.role == TunnelRole::Secondary;
+        let networks = if secondary {
+            secondary_networks(&params.routes).map_err(|message| Error::Invalid(message.into()))?
+        } else {
+            Vec::new()
+        };
         self.reap();
         let mut guard = self.active.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(active) = guard.as_mut() {
@@ -225,7 +233,8 @@ impl XrayExecutor {
             }
         })?;
         let mut bypass: Vec<Ipv4Addr> = Vec::new();
-        for host in &params.dns_bypass {
+        // Resolver bypasses belong to the primary's DNS capture.
+        for host in params.dns_bypass.iter().filter(|_| !secondary) {
             match is_ip(host) {
                 Some(IpAddr::V4(ip)) => bypass.push(ip),
                 Some(IpAddr::V6(_)) => {}
@@ -237,14 +246,24 @@ impl XrayExecutor {
 
         // Read before anything is changed: the original DNS is both what the
         // direct names keep resolving through and what teardown restores.
-        let snapshot = dns::snapshot(&*self.runner, &uplink.interface).ok();
-        let local_resolvers =
-            dns::local_resolvers(&*self.runner, &uplink.interface, snapshot.as_ref());
-        let local_domains = dns::search_domains(
-            &*self.runner,
-            &uplink.interface,
-            snapshot.as_ref().map(|s| s.service.as_str()),
-        );
+        // A secondary tunnel never touches the system DNS.
+        let snapshot = if secondary {
+            None
+        } else {
+            dns::snapshot(&*self.runner, &uplink.interface).ok()
+        };
+        let (local_resolvers, local_domains) = if secondary {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                dns::local_resolvers(&*self.runner, &uplink.interface, snapshot.as_ref()),
+                dns::search_domains(
+                    &*self.runner,
+                    &uplink.interface,
+                    snapshot.as_ref().map(|s| s.service.as_str()),
+                ),
+            )
+        };
         let config =
             apply_macos_dns_capture(&strip_tun_inbound(&base), &local_resolvers, &local_domains)
                 .and_then(|doc| apply_macos_tun_inbound(&doc, tun::DEFAULT_MTU, &uplink.interface))
@@ -260,6 +279,7 @@ impl XrayExecutor {
             pid: 0,
             routes: Vec::new(),
             dns: None,
+            resolver_domains: Vec::new(),
         };
         self.journal
             .save(&record)
@@ -286,7 +306,11 @@ impl XrayExecutor {
             }
         })?;
         record.interface = tun.name().to_string();
-        let planned = routes::plan(&uplink, tun.name(), &bypass);
+        let planned = if secondary {
+            routes::gateway_routes(tun::GATEWAY, tun.name(), &networks)
+        } else {
+            routes::plan(&uplink, tun.name(), &bypass)
+        };
         // Write-ahead holds only the routes the tunnel cannot do without; the
         // optional bypasses are recorded once they exist, so teardown never
         // deletes a route that was already there.
@@ -339,6 +363,16 @@ impl XrayExecutor {
             ));
         }
         match routes::apply(&*self.runner, &planned) {
+            Ok(installed) if secondary && installed.is_empty() => {
+                record.routes.clear();
+                return Err(fail(
+                    self,
+                    &mut process,
+                    &record,
+                    false,
+                    "None of this connection's networks could be routed",
+                ));
+            }
             Ok(installed) => {
                 record.routes = installed;
                 if self.journal.save(&record).is_err() {
@@ -378,6 +412,7 @@ impl XrayExecutor {
         let mut active = Active {
             profile_id: params.profile_id,
             owner_uid: uid,
+            role: params.role,
             record,
             tun,
             process,
@@ -409,6 +444,15 @@ impl XrayExecutor {
             "The previous DNS settings could not be restored",
         ))?;
         Ok(XrayDisconnectResult { stopped: true })
+    }
+
+    /// Whether the running tunnel is the primary one (default route and DNS).
+    pub fn holds_primary(&self) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|active| active.role == TunnelRole::Primary)
     }
 
     /// Whether a tunnel is running right now (not just journaled).
@@ -612,6 +656,7 @@ mod tests {
             interface_name: None,
             geo_assets: None,
             macos_data_root: None,
+            role: Default::default(),
         }
     }
 
@@ -771,6 +816,7 @@ mod tests {
                 service: "Wi-Fi".into(),
                 servers: vec![],
             }),
+            resolver_domains: Vec::new(),
         };
         Journal::new(f.dir.path()).save(&record).unwrap();
         assert!(f.executor.recover().unwrap());
@@ -804,5 +850,103 @@ mod tests {
     fn debug_of_params_never_prints_the_config() {
         let text = format!("{:?}", params("p"));
         assert!(!text.contains("vless"));
+    }
+
+    fn secondary(id: &str, networks: &[&str]) -> XrayConnectParams {
+        use net_manager_core::models::PolicyRoute;
+        let mut p = params(id);
+        p.role = TunnelRole::Secondary;
+        p.routes = networks
+            .iter()
+            .map(|n| PolicyRoute {
+                destination: n.parse().unwrap(),
+                metric: 5,
+                via: None,
+            })
+            .collect();
+        p
+    }
+
+    #[test]
+    fn a_secondary_tunnel_routes_only_its_networks_and_leaves_dns_alone() {
+        let f = fixture();
+        let result = f
+            .executor
+            .connect(
+                501,
+                secondary("corp", &["10.10.4.0/16", "192.168.77.0/24", "fd00::/8"]),
+            )
+            .unwrap();
+        assert_eq!(result.status.state, TunnelState::Running);
+        assert!(!result.status.dns_applied);
+        let calls = f.runner.calls();
+        assert!(calls.contains(
+            &"route -n add -net 10.10.0.0 -netmask 255.255.0.0 -gateway 169.254.10.1".to_string()
+        ));
+        assert!(calls.contains(
+            &"route -n add -net 192.168.77.0 -netmask 255.255.255.0 -gateway 169.254.10.1"
+                .to_string()
+        ));
+        assert!(calls.contains(
+            &"route -n add -inet6 -net fd00:: -prefixlen 8 -interface utun10".to_string()
+        ));
+        // No default capture, no resolver bypass, no DNS change.
+        assert!(!calls
+            .iter()
+            .any(|c| c.starts_with("route -n add -net 128.0.0.0")));
+        assert!(!calls.iter().any(|c| c.contains("-host")));
+        assert!(!calls
+            .iter()
+            .any(|c| c.contains("-setdnsservers") || c.contains("getdnsservers")));
+        assert!(!f.executor.holds_primary());
+        assert!(f.executor.active());
+
+        f.executor.disconnect(501, "corp").unwrap();
+        assert!(f
+            .runner
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("route -n delete -net 10.10.0.0")));
+        assert!(!f
+            .runner
+            .calls()
+            .iter()
+            .any(|c| c.contains("-setdnsservers")));
+        assert!(f.executor.owned().is_none());
+    }
+
+    #[test]
+    fn a_primary_tunnel_reports_itself_as_primary() {
+        let f = fixture();
+        f.executor.connect(501, params("p")).unwrap();
+        assert!(f.executor.holds_primary());
+    }
+
+    #[test]
+    fn secondary_tunnels_need_valid_networks() {
+        let f = fixture();
+        for bad in [vec![], vec!["0.0.0.0/0"], vec!["::/0"], vec!["224.0.0.0/4"]] {
+            assert!(
+                matches!(
+                    f.executor.connect(501, secondary("corp", &bad)),
+                    Err(Error::Invalid(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(f.runner.calls().is_empty());
+    }
+
+    #[test]
+    fn a_secondary_tunnel_with_no_routable_network_is_rolled_back() {
+        let f = fixture();
+        f.runner.fail("route -n add -net 10.10.0.0");
+        let error = f
+            .executor
+            .connect(501, secondary("corp", &["10.10.0.0/16"]))
+            .expect_err("nothing could be routed");
+        assert!(matches!(error, Error::Unavailable(_)));
+        assert!(f.flags.stopped.load(Ordering::SeqCst));
+        assert!(f.executor.owned().is_none());
     }
 }

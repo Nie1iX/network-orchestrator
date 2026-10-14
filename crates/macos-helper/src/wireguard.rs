@@ -5,6 +5,7 @@
 
 use crate::dns;
 use crate::journal::{Journal, Record};
+use crate::resolver;
 use crate::routes;
 use crate::sysexec::{Runner, IFCONFIG};
 use crate::wg_engine::{Engine, EngineConfig, PacketIo, PeerSetup};
@@ -15,9 +16,10 @@ use net_manager_core::daemon_protocol::{
     WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
     WireGuardStatusResult, WireGuardWarning,
 };
-use net_manager_core::models::TunnelState;
+use net_manager_core::models::{secondary_networks, TunnelRole, TunnelState};
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// Standard WireGuard MTU when the config does not set one.
@@ -34,6 +36,7 @@ pub trait WgPlatform: Send + Sync {
 struct Active {
     profile_id: String,
     owner_uid: u32,
+    role: TunnelRole,
     record: Record,
     tun: Box<dyn TunDevice>,
     engine: Engine,
@@ -45,6 +48,8 @@ pub struct WireGuardExecutor {
     platform: Box<dyn WgPlatform>,
     runner: Box<dyn Runner>,
     journal: Journal,
+    /// Where split-DNS files go (`/etc/resolver`).
+    resolver_dir: PathBuf,
     active: Mutex<Option<Active>>,
 }
 
@@ -82,11 +87,17 @@ fn covers(networks: &[IpNet], v6: bool) -> bool {
 }
 
 impl WireGuardExecutor {
-    pub fn new(platform: Box<dyn WgPlatform>, runner: Box<dyn Runner>, journal: Journal) -> Self {
+    pub fn new(
+        platform: Box<dyn WgPlatform>,
+        runner: Box<dyn Runner>,
+        journal: Journal,
+        resolver_dir: PathBuf,
+    ) -> Self {
         Self {
             platform,
             runner,
             journal,
+            resolver_dir,
             active: Mutex::new(None),
         }
     }
@@ -136,6 +147,7 @@ impl WireGuardExecutor {
             None => true,
         };
         routes::remove(&*self.runner, &record.routes);
+        resolver::remove(&*self.runner, &self.resolver_dir, &record.resolver_domains);
         drop(tun);
         if dns_ok {
             self.journal.clear()
@@ -164,6 +176,12 @@ impl WireGuardExecutor {
         }
         let config = wireguard_config::parse(&params.config)
             .map_err(|error| Error::Invalid(error.to_string()))?;
+        let secondary = params.role == TunnelRole::Secondary;
+        let networks = if secondary {
+            secondary_networks(&params.routes).map_err(|message| Error::Invalid(message.into()))?
+        } else {
+            Vec::new()
+        };
         self.reap();
         let mut guard = self.active.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(active) = guard.as_ref() {
@@ -190,11 +208,21 @@ impl WireGuardExecutor {
                 })?),
                 None => None,
             };
+            let mut allowed_ips = peer.allowed_ips.clone();
+            if secondary && config.peers.len() == 1 {
+                // The user's networks must reach the only peer even when the
+                // config's AllowedIPs name something narrower.
+                for net in &networks {
+                    if !allowed_ips.contains(net) {
+                        allowed_ips.push(*net);
+                    }
+                }
+            }
             peers.push(PeerSetup {
                 public_key: peer.public_key,
                 preshared_key: peer.preshared_key,
                 endpoint,
-                allowed_ips: peer.allowed_ips.clone(),
+                allowed_ips,
                 keepalive: peer.keepalive,
             });
         }
@@ -204,6 +232,7 @@ impl WireGuardExecutor {
             pid: 0,
             routes: Vec::new(),
             dns: None,
+            resolver_domains: Vec::new(),
         };
         self.journal
             .save(&record)
@@ -247,17 +276,31 @@ impl WireGuardExecutor {
             .iter()
             .flat_map(|peer| peer.allowed_ips.iter().copied())
             .collect();
-        let planned = if config.table_off {
+        let planned = if secondary {
+            routes::interface_routes(tun.name(), &networks)
+        } else if config.table_off {
             Vec::new()
         } else {
             routes::interface_routes(tun.name(), &all_allowed)
         };
         record.routes = planned.iter().filter(|op| !op.optional).cloned().collect();
-        let snapshot = if config.dns_servers.is_empty() {
+        // The primary replaces its service's DNS; a secondary only adds
+        // per-domain resolvers and never touches the system DNS.
+        let snapshot = if config.dns_servers.is_empty() || secondary {
             None
         } else {
             dns::snapshot(&*self.runner, &uplink.interface).ok()
         };
+        let split_dns: Vec<String> = if secondary && !config.dns_servers.is_empty() {
+            params.dns_domains.clone()
+        } else {
+            Vec::new()
+        };
+        record.resolver_domains = split_dns
+            .iter()
+            .map(|domain| domain.to_ascii_lowercase())
+            .filter(|domain| net_manager_core::models::valid_dns_suffix(domain))
+            .collect();
         record.dns = snapshot.clone();
         record.pid = std::process::id();
         if self.journal.save(&record).is_err() {
@@ -283,6 +326,14 @@ impl WireGuardExecutor {
         })?;
 
         match routes::apply(&*self.runner, &planned) {
+            Ok(installed) if secondary && installed.is_empty() => {
+                engine.stop();
+                record.routes.clear();
+                rollback(self, &record, false);
+                return Err(Error::Unavailable(
+                    "None of this connection's networks could be routed".into(),
+                ));
+            }
             Ok(installed) => {
                 record.routes = installed;
                 let _ = self.journal.save(&record);
@@ -315,13 +366,30 @@ impl WireGuardExecutor {
         } else if !config.dns_servers.is_empty() {
             warnings.push(WireGuardWarning::DnsNotApplied);
         }
-        if !config.table_off && covers(&all_allowed, false) && !covers(&all_allowed, true) {
+        if !record.resolver_domains.is_empty() {
+            match resolver::apply(
+                &*self.runner,
+                &self.resolver_dir,
+                &record.resolver_domains,
+                &config.dns_servers,
+            ) {
+                Ok(written) => dns_applied = !written.is_empty(),
+                Err(_) => warnings.push(WireGuardWarning::DnsNotApplied),
+            }
+            let _ = self.journal.save(&record);
+        }
+        if !secondary
+            && !config.table_off
+            && covers(&all_allowed, false)
+            && !covers(&all_allowed, true)
+        {
             // IPv4 is captured but IPv6 keeps using the uplink.
             warnings.push(WireGuardWarning::Ipv6NotCovered);
         }
         let active = Active {
             profile_id: params.profile_id,
             owner_uid: uid,
+            role: params.role,
             record,
             tun,
             engine,
@@ -361,6 +429,14 @@ impl WireGuardExecutor {
         Ok(WireGuardDisconnectResult { stopped: true })
     }
 
+    pub fn holds_primary(&self) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|active| active.role == TunnelRole::Primary)
+    }
+
     pub fn active(&self) -> bool {
         self.active
             .lock()
@@ -397,6 +473,7 @@ impl WireGuardExecutor {
             None => true,
         };
         routes::remove(&*self.runner, &record.routes);
+        resolver::remove(&*self.runner, &self.resolver_dir, &record.resolver_domains);
         if dns_ok {
             self.journal.clear()?;
             Ok(true)
@@ -499,6 +576,8 @@ mod tests {
             config,
             routes: vec![],
             interface_name: None,
+            role: Default::default(),
+            dns_domains: Vec::new(),
         }
     }
 
@@ -507,6 +586,12 @@ mod tests {
         flags: Arc<Flags>,
         runner: Arc<FakeRunner>,
         dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn runner_box(&self) -> Box<dyn Runner> {
+            Box::new(Shared(self.runner.clone()))
+        }
     }
 
     struct Shared(Arc<FakeRunner>);
@@ -533,6 +618,7 @@ mod tests {
             Box::new(FakePlatform(flags.clone())),
             Box::new(Shared(runner.clone())),
             Journal::named(dir.path(), "wireguard.json"),
+            dir.path().join("resolver"),
         );
         Fixture {
             executor,
@@ -717,6 +803,7 @@ mod tests {
                 service: "Wi-Fi".into(),
                 servers: vec![],
             }),
+            resolver_domains: Vec::new(),
         };
         Journal::named(f.dir.path(), "wireguard.json")
             .save(&record)
@@ -726,5 +813,137 @@ mod tests {
         assert!(calls.contains(&"networksetup -setdnsservers Wi-Fi Empty".to_string()));
         assert!(calls.iter().any(|c| c.starts_with("route -n delete")));
         assert!(!f.executor.recover().unwrap());
+    }
+
+    fn secondary(
+        id: &str,
+        text: String,
+        networks: &[&str],
+        domains: &[&str],
+    ) -> WireGuardConnectParams {
+        use net_manager_core::models::PolicyRoute;
+        let mut p = params(id, text);
+        p.role = TunnelRole::Secondary;
+        p.routes = networks
+            .iter()
+            .map(|n| PolicyRoute {
+                destination: n.parse().unwrap(),
+                metric: 5,
+                via: None,
+            })
+            .collect();
+        p.dns_domains = domains.iter().map(|d| d.to_string()).collect();
+        p
+    }
+
+    #[test]
+    fn a_secondary_tunnel_routes_only_its_networks_and_adds_split_dns() {
+        let f = fixture();
+        let result = f
+            .executor
+            .connect(
+                501,
+                secondary(
+                    "corp",
+                    config("0.0.0.0/0, ::/0", "DNS = 10.20.0.53"),
+                    &["10.20.0.0/16"],
+                    &["corp.example"],
+                ),
+            )
+            .unwrap();
+        assert!(result.status.dns_applied);
+        let calls = f.runner.calls();
+        // Only the listed network — the config's default route is ignored.
+        assert!(calls.contains(
+            &"route -n add -net 10.20.0.0 -netmask 255.255.0.0 -interface utun11".to_string()
+        ));
+        assert!(!calls
+            .iter()
+            .any(|c| c.starts_with("route -n add -net 0.0.0.0")));
+        assert!(!calls
+            .iter()
+            .any(|c| c.contains("-setdnsservers") || c.contains("getdnsservers")));
+        // Split DNS instead of the system DNS.
+        let file = f.dir.path().join("resolver/corp.example");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("nameserver 10.20.0.53"));
+        assert!(!f.executor.holds_primary());
+        assert_eq!(
+            f.executor.owned().unwrap().resolver_domains,
+            ["corp.example"]
+        );
+
+        f.executor.disconnect(501, "corp").unwrap();
+        assert!(!file.exists());
+        assert!(f.executor.owned().is_none());
+    }
+
+    #[test]
+    fn a_secondary_tunnel_without_domains_leaves_dns_completely_alone() {
+        let f = fixture();
+        f.executor
+            .connect(
+                501,
+                secondary(
+                    "corp",
+                    config("10.20.0.0/16", "DNS = 10.20.0.53"),
+                    &["10.20.0.0/16"],
+                    &[],
+                ),
+            )
+            .unwrap();
+        assert!(!f.dir.path().join("resolver").exists());
+        assert!(!f.runner.calls().iter().any(|c| c.contains("dnsservers")));
+    }
+
+    #[test]
+    fn secondary_networks_are_validated_and_must_be_routable() {
+        let f = fixture();
+        for bad in [vec![], vec!["0.0.0.0/0"]] {
+            assert!(matches!(
+                f.executor.connect(
+                    501,
+                    secondary("corp", config("10.20.0.0/16", ""), &bad, &[])
+                ),
+                Err(Error::Invalid(_))
+            ));
+        }
+        f.runner.fail("route -n add -net 10.20.0.0");
+        assert!(matches!(
+            f.executor.connect(
+                501,
+                secondary("corp", config("10.20.0.0/16", ""), &["10.20.0.0/16"], &[])
+            ),
+            Err(Error::Unavailable(_))
+        ));
+        assert!(f.executor.owned().is_none());
+    }
+
+    #[test]
+    fn recovery_removes_split_dns_files_a_dead_helper_left() {
+        let f = fixture();
+        let dir = f.dir.path().join("resolver");
+        std::fs::create_dir_all(&dir).unwrap();
+        let domains = vec!["corp.example".to_string()];
+        crate::resolver::apply(
+            &*f.runner_box(),
+            &dir,
+            &domains,
+            &["10.20.0.53".parse().unwrap()],
+        )
+        .unwrap();
+        let record = Record {
+            profile_id: "wg".into(),
+            interface: "utun11".into(),
+            pid: 4,
+            routes: vec![],
+            dns: None,
+            resolver_domains: domains,
+        };
+        Journal::named(f.dir.path(), "wireguard.json")
+            .save(&record)
+            .unwrap();
+        assert!(f.executor.recover().unwrap());
+        assert!(!dir.join("corp.example").exists());
     }
 }
