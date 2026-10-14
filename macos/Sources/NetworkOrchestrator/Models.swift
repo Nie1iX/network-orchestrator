@@ -61,6 +61,18 @@ struct Profile: Decodable, Identifiable, Sendable {
   var startsWithoutHelper: Bool { backend == "xray" && (xrayMode ?? "socks") == "socks" }
   /// Xray as a system-wide tunnel; the privileged helper owns it.
   var isTun: Bool { backend == "xray" && xrayMode == "tun" }
+  /// Everything that creates a tunnel device runs in the privileged helper:
+  /// Xray TUN, WireGuard and OpenVPN.
+  var needsHelper: Bool { isTun || backend == "wireGuard" || backend == "openVpn" }
+  /// The helper capability that serves this profile.
+  var helperCapability: String? {
+    switch backend {
+    case "wireGuard": "wireguard.connect"
+    case "openVpn": "openvpn.connect"
+    case "xray": isTun ? "xray.connect" : nil
+    default: nil
+    }
+  }
   var kind: String {
     switch backend {
     case "wireGuard": "WireGuard"

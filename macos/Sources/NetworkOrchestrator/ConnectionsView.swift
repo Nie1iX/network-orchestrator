@@ -456,12 +456,17 @@ struct ProfileDetailView: View {
         Menu {
           Button(L10n.text("Rename"), action: onRename)
           Button(L10n.text("Inspect configuration")) { Task { await model.inspect(profile) } }
-          if profile.backend == "xray" {
+          if profile.backend == "xray" || profile.backend == "openVpn" {
             Button(L10n.text("native.connectionLog")) { showingLog = true }
+          }
+          if profile.backend == "xray" {
             Divider()
             Button(L10n.text("native.openBrowser")) { model.openBrowser(profile) }.disabled(
               !running)
             Button(L10n.text("native.copyTerminal")) { model.copyTerminalProxy(profile) }
+          }
+          if profile.backend == "openVpn" {
+            Button(L10n.text("native.credentials.forget")) { model.forgetCredentials(profile) }
           }
           Divider()
           Button(L10n.text("Delete"), role: .destructive, action: onDelete)
@@ -484,9 +489,12 @@ struct ProfileDetailView: View {
         row("detail.traffic", Self.usageText(usage), mono: false)
       }
       if profile.backend != "xray" {
+        // The live device the helper created, else what the profile declares.
+        let live = model.status(profile)?.interfaceName
         row(
           "detail.interface",
-          profile.interfaceName.isEmpty ? L10n.text("detail.notAssigned") : profile.interfaceName)
+          live ?? (profile.interfaceName.isEmpty
+            ? L10n.text("detail.notAssigned") : profile.interfaceName))
       }
       if profile.backend == "xray" && model.canStartConnections { modePicker }
       if profile.isTun {
@@ -755,10 +763,12 @@ struct ProfileDetailView: View {
     case "running":
       L10n.text(
         "detail.runningOn",
-        ["iface": profile.isTun
+        ["iface": profile.needsHelper
           ? (status?.interfaceName ?? "tunnel")
           : profile.xraySocksPort.map { "127.0.0.1:\($0)" } ?? "tunnel"])
         + (model.activeServer(profile).map { " · \($0)" } ?? "")
+        // Notices of a tunnel that works: "connecting", "IPv6 is not covered", …
+        + (status?.message.map { " · " + L10n.text($0) } ?? "")
     case "failed": status?.message.map { L10n.text($0) } ?? L10n.text("detail.failed")
     default:
       model.canStart(profile) || profile.startsWithoutHelper || !model.canStartConnections
