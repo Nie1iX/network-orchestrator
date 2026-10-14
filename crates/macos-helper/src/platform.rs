@@ -1,7 +1,11 @@
 //! The real machine behind [`crate::xray::Platform`]: utun creation, the
 //! hash-verified managed Xray, and launching it as the console user.
 
+use crate::backends::{bundle_contents, Catalog};
+use crate::openvpn::{OvpnPlatform, SpawnSpec as OvpnSpawn};
 use crate::tun;
+use crate::wg_engine::{PacketIo, UtunIo};
+use crate::wireguard::WgPlatform;
 use crate::xray::{Error, Platform, Process, SpawnSpec, TunDevice, CHILD_TUN_FD};
 use std::ffi::{CStr, OsStr};
 use std::fs::{self, File, OpenOptions};
@@ -90,7 +94,7 @@ fn verified_executable(_: &Path, _: u32) -> Result<PathBuf, Error> {
     Err(denied("Xray tunnels are supported on Apple Silicon only"))
 }
 
-fn open_log(path: &Path, uid: u32, gid: u32) -> io::Result<File> {
+pub(crate) fn open_log(path: &Path, uid: u32, gid: u32) -> io::Result<File> {
     let file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -105,11 +109,12 @@ fn open_log(path: &Path, uid: u32, gid: u32) -> io::Result<File> {
     Ok(file)
 }
 
-struct Child_ {
+/// A spawned child as the executors see it.
+pub(crate) struct ChildProcess {
     child: Child,
 }
 
-impl Process for Child_ {
+impl Process for ChildProcess {
     fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -212,7 +217,7 @@ impl Platform for RealPlatform {
                 let _ = stdin.write_all(&config);
             });
         }
-        Ok(Box::new(Child_ { child }))
+        Ok(Box::new(ChildProcess { child }))
     }
 
     fn resolve(&self, host: &str) -> Vec<Ipv4Addr> {
@@ -249,6 +254,96 @@ impl Platform for RealPlatform {
 
     fn settle(&self) {
         std::thread::sleep(SETTLE);
+    }
+}
+
+/// WireGuard on the real machine: a utun plus a second descriptor for the engine.
+pub struct RealWgPlatform;
+
+impl WgPlatform for RealWgPlatform {
+    fn create_tun(&self, mtu: u32) -> io::Result<(Box<dyn TunDevice>, Box<dyn PacketIo>)> {
+        let utun = tun::create(mtu)?;
+        let io = UtunIo::new(utun.try_clone_fd()?)?;
+        Ok((Box::new(utun), Box::new(io)))
+    }
+
+    fn resolve(&self, endpoint: &str) -> Option<std::net::SocketAddr> {
+        let mut found: Vec<std::net::SocketAddr> = endpoint.to_socket_addrs().ok()?.collect();
+        found.sort_by_key(|addr| addr.is_ipv6());
+        found.into_iter().next()
+    }
+}
+
+/// OpenVPN on the real machine: the pinned binary from the bundle, run as root.
+pub struct RealOvpnPlatform {
+    /// Root-owned directory the verified copy of the binary is staged in.
+    pub stage_dir: PathBuf,
+    /// Log file next to the helper's socket, owned by the console user.
+    pub log: PathBuf,
+}
+
+impl OvpnPlatform for RealOvpnPlatform {
+    fn stage_binary(&self) -> io::Result<PathBuf> {
+        let helper = std::env::current_exe()?;
+        let contents = bundle_contents(&helper)
+            .ok_or_else(|| io::Error::other("the app bundle could not be located"))?;
+        if !self.stage_dir.exists() {
+            fs::create_dir_all(&self.stage_dir)?;
+            fs::set_permissions(
+                &self.stage_dir,
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )?;
+        }
+        // SAFETY: geteuid never fails.
+        let owner = unsafe { libc::geteuid() };
+        Catalog::embedded()?.stage("openvpn", &contents, &self.stage_dir, owner)
+    }
+
+    fn free_unit(&self) -> io::Result<String> {
+        let unit = tun::pick_free_unit(&tun::used_units()?)
+            .ok_or_else(|| io::Error::other("no free utun unit"))?;
+        Ok(format!("utun{unit}"))
+    }
+
+    fn spawn(&self, spec: &OvpnSpawn) -> io::Result<Box<dyn Process>> {
+        let account = account(spec.uid)?;
+        let log = open_log(&self.log, spec.uid, account.gid)?;
+        let child = Command::new(spec.binary)
+            .args(spec.args)
+            .current_dir(spec.cwd)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .spawn()?;
+        Ok(Box::new(ChildProcess { child }))
+    }
+
+    fn resolve(&self, host: &str) -> Vec<std::net::IpAddr> {
+        if host.is_empty() || host.len() > 253 {
+            return Vec::new();
+        }
+        (host, 0)
+            .to_socket_addrs()
+            .map(|addrs| {
+                addrs
+                    .map(|addr| addr.ip())
+                    .take(MAX_RESOLVED_BYPASS)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn is_our_openvpn(&self, pid: u32) -> bool {
+        crate::peer::process_path(pid)
+            .map(|path| path.starts_with(&self.stage_dir))
+            .unwrap_or(false)
+    }
+
+    fn kill(&self, pid: u32) {
+        // SAFETY: plain signal; the pid was just checked to be our OpenVPN.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     }
 }
 

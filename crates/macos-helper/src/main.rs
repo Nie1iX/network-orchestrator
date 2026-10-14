@@ -1,9 +1,11 @@
 use network_orchestrator_macos_helper::journal::Journal;
+use network_orchestrator_macos_helper::openvpn::OpenVpnExecutor;
 use network_orchestrator_macos_helper::peer::{sibling_client, AppClientPolicy};
-use network_orchestrator_macos_helper::platform::RealPlatform;
+use network_orchestrator_macos_helper::platform::{RealOvpnPlatform, RealPlatform, RealWgPlatform};
 use network_orchestrator_macos_helper::server::{bind_socket, serve, ServerContext};
 use network_orchestrator_macos_helper::service::HelperService;
 use network_orchestrator_macos_helper::sysexec::SystemRunner;
+use network_orchestrator_macos_helper::wireguard::WireGuardExecutor;
 use network_orchestrator_macos_helper::xray::XrayExecutor;
 use network_orchestrator_macos_helper::{SOCKET_DIR, SOCKET_PATH, STATE_DIR};
 use std::path::PathBuf;
@@ -77,19 +79,46 @@ async fn run(options: Options) -> std::io::Result<()> {
         Journal::new(std::path::Path::new(STATE_DIR)),
         std::path::Path::new(SOCKET_DIR).join("xray-tun.log"),
     ));
+    let state_dir = std::path::Path::new(STATE_DIR);
+    let wireguard = Arc::new(WireGuardExecutor::new(
+        Box::new(RealWgPlatform),
+        Box::new(SystemRunner),
+        Journal::named(state_dir, "wireguard.json"),
+    ));
+    let openvpn = Arc::new(OpenVpnExecutor::new(
+        Box::new(RealOvpnPlatform {
+            stage_dir: state_dir.join("backends"),
+            log: std::path::Path::new(SOCKET_DIR).join("openvpn.log"),
+        }),
+        Box::new(SystemRunner),
+        Journal::named(state_dir, "openvpn.json"),
+        std::path::PathBuf::from(network_orchestrator_macos_helper::openvpn::RUNTIME_ROOT),
+    ));
     // A tunnel a previous helper left behind must not outlive its owner.
-    if let Err(err) = xray.recover() {
-        eprintln!("network-orchestrator-helper: tunnel recovery failed: {err}");
+    for (name, result) in [
+        ("xray", xray.recover()),
+        ("wireguard", wireguard.recover()),
+        ("openvpn", openvpn.recover()),
+    ] {
+        if let Err(err) = result {
+            eprintln!("network-orchestrator-helper: {name} recovery failed: {err}");
+        }
     }
-    // Xray dying on its own is noticed within seconds and cleaned up.
-    let watcher = xray.clone();
+    // A tunnel dying on its own is noticed within seconds and cleaned up.
+    let (watch_xray, watch_wg, watch_ovpn) = (xray.clone(), wireguard.clone(), openvpn.clone());
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
-        watcher.reap();
+        watch_xray.reap();
+        watch_wg.reap();
+        watch_ovpn.reap();
     });
     let ctx = Arc::new(ServerContext::new(
         Box::new(AppClientPolicy::new(options.client)),
-        Arc::new(HelperService::new(xray.clone())),
+        Arc::new(HelperService::new(
+            xray.clone(),
+            wireguard.clone(),
+            openvpn.clone(),
+        )),
         env!("CARGO_PKG_VERSION"),
     ));
     let mut terminate = signal(SignalKind::terminate())?;
@@ -100,6 +129,8 @@ async fn run(options: Options) -> std::io::Result<()> {
         _ = interrupt.recv() => {}
     }
     xray.shutdown();
+    wireguard.shutdown();
+    openvpn.shutdown();
     let _ = std::fs::remove_file(&options.socket);
     Ok(())
 }

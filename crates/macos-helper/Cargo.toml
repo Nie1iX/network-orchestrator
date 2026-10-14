@@ -12,6 +12,9 @@ name = "network_orchestrator_macos_helper"
 path = "src/lib.rs"
 
 [dependencies]
+base64 = "0.22"
+boringtun = { version = "0.6", default-features = false }
+ipnet = "2"
 libc = "0.2"
 net-manager-core = { path = "../core" }
 serde = { version = "1", features = ["derive"] }

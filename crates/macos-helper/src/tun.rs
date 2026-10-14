@@ -55,6 +55,11 @@ impl Utun {
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
+
+    /// An independent descriptor for the same device (read/write by another owner).
+    pub fn try_clone_fd(&self) -> io::Result<OwnedFd> {
+        self.fd.try_clone()
+    }
 }
 
 /// Keeps the error kind and adds which step failed; the OS error text
@@ -98,10 +103,10 @@ pub fn used_units() -> io::Result<BTreeSet<u32>> {
     Ok(used)
 }
 
-/// Create `utunN` (smallest free N >= 10), set MTU and the point-to-point
-/// address, and keep the interface alive for the lifetime of the returned
-/// value.
-pub fn open(mtu: u32) -> io::Result<Utun> {
+/// Create `utunN` (smallest free N >= 10) with the given MTU and no address:
+/// the caller assigns what its protocol needs. The interface lives as long as
+/// the returned value.
+pub fn create(mtu: u32) -> io::Result<Utun> {
     if !(512..=9000).contains(&mtu) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -112,17 +117,25 @@ pub fn open(mtu: u32) -> io::Result<Utun> {
         pick_free_unit(&used_units()?).ok_or_else(|| io::Error::other("no free utun unit"))?;
     let fd = open_control_socket(unit).map_err(|err| stage("connect", err))?;
     let name = interface_name(&fd).unwrap_or_else(|_| format!("utun{unit}"));
-    set_mtu(&name, mtu).map_err(|err| stage("set MTU", err))?;
-    set_ipv4_pair(&name).map_err(|err| stage("set IPv4 address", err))?;
-    set_ipv6_link_local(&name).map_err(|err| stage("set IPv6 address", err))?;
     // SAFETY: `fd` is owned by this process from the socket() above.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    Ok(Utun {
+    let tun = Utun {
         name,
         gateway: GATEWAY,
         local: LOCAL,
         fd,
-    })
+    };
+    set_mtu(&tun.name, mtu).map_err(|err| stage("set MTU", err))?;
+    Ok(tun)
+}
+
+/// [`create`], plus the point-to-point address pair and link-local v6 address
+/// the Xray fd mode needs (Darwin routing requires them).
+pub fn open(mtu: u32) -> io::Result<Utun> {
+    let tun = create(mtu)?;
+    set_ipv4_pair(&tun.name).map_err(|err| stage("set IPv4 address", err))?;
+    set_ipv6_link_local(&tun.name).map_err(|err| stage("set IPv6 address", err))?;
+    Ok(tun)
 }
 
 /// Connect the `com.apple.net.utun_control` system socket at `unit`.

@@ -197,6 +197,49 @@ impl RouteOp {
     }
 }
 
+/// Capture routes for a tunnel that is addressed by interface (WireGuard,
+/// OpenVPN): `0.0.0.0/0` and `::/0` become two halves each, which win over the
+/// uplink's default without replacing it; every other network is routed as is.
+/// Default-capture routes are required, the rest is best effort.
+pub fn interface_routes(tun: &str, networks: &[ipnet::IpNet]) -> Vec<RouteOp> {
+    let target = |name: &str| Target::Interface { name: name.into() };
+    let mut ops: Vec<RouteOp> = Vec::new();
+    let push = |ops: &mut Vec<RouteOp>, network: IpAddr, prefix: u8, optional: bool| {
+        let op = RouteOp {
+            network,
+            prefix,
+            target: target(tun),
+            optional,
+        };
+        if !ops
+            .iter()
+            .any(|have| have.network == op.network && have.prefix == op.prefix)
+        {
+            ops.push(op);
+        }
+    };
+    for net in networks {
+        match (net.addr(), net.prefix_len()) {
+            (IpAddr::V4(_), 0) => {
+                push(&mut ops, IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1, false);
+                push(&mut ops, IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1, false);
+            }
+            (IpAddr::V6(_), 0) => {
+                push(&mut ops, IpAddr::V6(Ipv6Addr::UNSPECIFIED), 1, false);
+                push(
+                    &mut ops,
+                    IpAddr::V6(Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0)),
+                    1,
+                    false,
+                );
+            }
+            // The /1 halves of a redirect are as required as a default route.
+            (_, prefix) => push(&mut ops, net.network(), prefix, prefix > 1),
+        }
+    }
+    ops
+}
+
 /// Install `ops` and return the ones that are really in place. A required
 /// route that fails removes everything added so far and reports which one;
 /// an optional one is skipped.

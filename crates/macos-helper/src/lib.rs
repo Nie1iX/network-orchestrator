@@ -10,6 +10,7 @@
 pub mod backends;
 pub mod dns;
 pub mod journal;
+pub mod openvpn;
 pub mod peer;
 pub mod platform;
 pub mod routes;
@@ -18,6 +19,9 @@ pub mod service;
 pub mod sysexec;
 pub mod trusted_exec;
 pub mod tun;
+pub mod wg_engine;
+pub mod wireguard;
+pub mod wireguard_config;
 pub mod xray;
 
 /// Directory of the helper socket; created root-owned and world-searchable.
