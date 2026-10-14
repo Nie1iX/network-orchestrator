@@ -9,6 +9,7 @@
 
 use crate::dns;
 use crate::journal::{Journal, Record};
+use crate::resolver;
 use crate::routes::{self, RouteOp, Target, Uplink};
 use crate::sysexec::Runner;
 use crate::xray::{Error, Process};
@@ -18,6 +19,7 @@ use net_manager_core::daemon_protocol::{
     OpenVpnConnectRequest, OpenVpnConnectResult, OpenVpnConnectionState, OpenVpnCredentials,
     OpenVpnDisconnectResult, OpenVpnFailure, OpenVpnStatusResult, OpenVpnWarning,
 };
+use net_manager_core::models::{secondary_networks, valid_dns_suffix, TunnelRole};
 use net_manager_core::openvpn_config::{
     sanitize_openvpn_config, SanitizedOpenVpnConfig, MAX_ASSET_BYTES, MAX_CONFIG_BYTES,
 };
@@ -70,6 +72,9 @@ pub trait OvpnPlatform: Send + Sync {
 struct Active {
     profile_id: String,
     owner_uid: u32,
+    role: TunnelRole,
+    /// Secondary only: split-DNS suffixes for the pushed DNS servers.
+    dns_domains: Vec<String>,
     tun: String,
     uplink: Uplink,
     record: Record,
@@ -100,6 +105,8 @@ struct Inner {
     runner: Box<dyn Runner>,
     journal: Journal,
     staging_root: PathBuf,
+    /// Where split-DNS files go (`/etc/resolver`).
+    resolver_dir: PathBuf,
     active: Mutex<Option<Active>>,
     finished: Mutex<Option<Finished>>,
 }
@@ -320,6 +327,11 @@ impl Inner {
             None => true,
         };
         routes::remove(&*self.runner, &active.record.routes);
+        resolver::remove(
+            &*self.runner,
+            &self.resolver_dir,
+            &active.record.resolver_domains,
+        );
         let _ = fs::remove_dir_all(&active.stage);
         if dns_ok {
             let _ = self.journal.clear();
@@ -343,7 +355,14 @@ impl Inner {
         let Some(push) = active.snapshot.active_push.as_ref() else {
             return Ok(());
         };
-        let mut networks: Vec<IpNet> = push.routes.clone();
+        let secondary = active.role == TunnelRole::Secondary;
+        // A secondary tunnel carries only the networks listed for it; what
+        // the server pushes (including a redirect) is ignored.
+        let mut networks: Vec<IpNet> = if secondary {
+            Vec::new()
+        } else {
+            push.routes.clone()
+        };
         networks.extend(active.policy_networks.iter().copied());
         let mut dns_servers: Vec<IpAddr> = push.legacy_dns_servers.clone();
         for server in &push.dns_servers {
@@ -400,7 +419,32 @@ impl Inner {
         active
             .warnings
             .retain(|w| *w != OpenVpnWarning::DnsNotApplied);
-        if !dns_servers.is_empty() {
+        if secondary {
+            // Split DNS: the pushed servers answer only the listed suffixes.
+            resolver::remove(
+                &*self.runner,
+                &self.resolver_dir,
+                &active.record.resolver_domains,
+            );
+            active.record.resolver_domains = active
+                .dns_domains
+                .iter()
+                .map(|domain| domain.to_ascii_lowercase())
+                .filter(|domain| valid_dns_suffix(domain))
+                .collect();
+            let _ = self.journal.save(&active.record);
+            if !dns_servers.is_empty() && !active.record.resolver_domains.is_empty() {
+                match resolver::apply(
+                    &*self.runner,
+                    &self.resolver_dir,
+                    &active.record.resolver_domains,
+                    &dns_servers,
+                ) {
+                    Ok(written) if !written.is_empty() => {}
+                    _ => active.warnings.push(OpenVpnWarning::DnsNotApplied),
+                }
+            }
+        } else if !dns_servers.is_empty() {
             let snapshot = match &active.record.dns {
                 Some(existing) => Some(existing.clone()),
                 None => dns::snapshot(&*self.runner, &active.uplink.interface).ok(),
@@ -430,7 +474,7 @@ impl Inner {
             .applied_nets
             .iter()
             .any(|n| n.prefix_len() == 1 && n.addr().is_ipv6());
-        if v4_default && !v6_default {
+        if !secondary && v4_default && !v6_default {
             active.warnings.push(OpenVpnWarning::Ipv6NotCovered);
         }
         active.applied = Some(signature);
@@ -577,12 +621,14 @@ impl OpenVpnExecutor {
         runner: Box<dyn Runner>,
         journal: Journal,
         staging_root: PathBuf,
+        resolver_dir: PathBuf,
     ) -> Self {
         Self(Arc::new(Inner {
             platform,
             runner,
             journal,
             staging_root,
+            resolver_dir,
             active: Mutex::new(None),
             finished: Mutex::new(None),
         }))
@@ -623,6 +669,12 @@ impl OpenVpnExecutor {
             assets.insert(name.clone(), bytes);
         }
 
+        let secondary = params.role == TunnelRole::Secondary;
+        let secondary_nets = if secondary {
+            secondary_networks(&params.routes).map_err(|message| Error::Invalid(message.into()))?
+        } else {
+            Vec::new()
+        };
         self.reap();
         let mut guard = inner.lock_active();
         if let Some(active) = guard.as_ref() {
@@ -672,6 +724,7 @@ impl OpenVpnExecutor {
             pid: 0,
             routes: Vec::new(),
             dns: None,
+            resolver_domains: Vec::new(),
         };
         inner
             .journal
@@ -748,11 +801,17 @@ impl OpenVpnExecutor {
             credentials: request.credentials,
             management: writer,
             remotes,
-            policy_networks: params
-                .routes
-                .iter()
-                .map(|route| route.destination)
-                .collect(),
+            role: params.role,
+            dns_domains: params.dns_domains.clone(),
+            policy_networks: if secondary {
+                secondary_nets
+            } else {
+                params
+                    .routes
+                    .iter()
+                    .map(|route| route.destination)
+                    .collect()
+            },
             applied: None,
             applied_nets: Vec::new(),
             warnings: Vec::new(),
@@ -839,6 +898,13 @@ impl OpenVpnExecutor {
         }
     }
 
+    pub fn holds_primary(&self) -> bool {
+        self.0
+            .lock_active()
+            .as_ref()
+            .is_some_and(|active| active.role == TunnelRole::Primary)
+    }
+
     pub fn active(&self) -> bool {
         self.0.lock_active().is_some()
     }
@@ -874,6 +940,11 @@ impl OpenVpnExecutor {
             None => true,
         };
         routes::remove(&*self.0.runner, &record.routes);
+        resolver::remove(
+            &*self.0.runner,
+            &self.0.resolver_dir,
+            &record.resolver_domains,
+        );
         // Only one session exists at a time; every staged secret is stale.
         if let Ok(entries) = fs::read_dir(&self.0.staging_root) {
             for entry in entries.flatten() {
@@ -1097,6 +1168,7 @@ mod tests {
             Box::new(SharedRunner(runner.clone())),
             Journal::named(dir.path(), "openvpn.json"),
             dir.path().join("run"),
+            dir.path().join("resolver"),
         );
         Fixture {
             executor,
@@ -1114,6 +1186,8 @@ mod tests {
                 assets: BTreeMap::new(),
                 routes: vec![],
                 interface_name: None,
+                role: Default::default(),
+                dns_domains: Vec::new(),
             },
             credentials: creds.then(|| OpenVpnCredentials {
                 auth_user_pass: Some(OpenVpnUserPass {
@@ -1318,6 +1392,7 @@ mod tests {
                 service: "Wi-Fi".into(),
                 servers: vec![],
             }),
+            resolver_domains: Vec::new(),
         };
         Journal::named(f.dir.path(), "openvpn.json")
             .save(&record)
@@ -1364,5 +1439,76 @@ mod tests {
         let mode = fs::metadata(staged.join("config.ovpn")).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(fs::metadata(&staged).unwrap().mode() & 0o777, 0o700);
+    }
+
+    fn secondary_request(networks: &[&str], domains: &[&str]) -> OpenVpnConnectRequest {
+        use net_manager_core::models::PolicyRoute;
+        let mut r = request(true);
+        r.profile.role = TunnelRole::Secondary;
+        r.profile.routes = networks
+            .iter()
+            .map(|n| PolicyRoute {
+                destination: n.parse().unwrap(),
+                metric: 5,
+                via: None,
+            })
+            .collect();
+        r.profile.dns_domains = domains.iter().map(|d| d.to_string()).collect();
+        r
+    }
+
+    #[test]
+    fn a_secondary_openvpn_ignores_the_push_and_carries_only_its_networks() {
+        let f = fixture(Behavior::Connects);
+        f.executor
+            .connect(501, secondary_request(&["10.10.0.0/16"], &["corp.example"]))
+            .unwrap();
+        wait_for("routes", || {
+            f.runner
+                .calls()
+                .iter()
+                .any(|c| c.contains("-netmask 255.255.0.0 -interface utun12"))
+        });
+        wait_for("split dns", || {
+            f.dir.path().join("resolver/corp.example").exists()
+        });
+        let calls = f.runner.calls();
+        // The server pushed a redirect and a route; neither is installed.
+        assert!(calls.contains(
+            &"route -n add -net 10.10.0.0 -netmask 255.255.0.0 -interface utun12".to_string()
+        ));
+        assert!(!calls
+            .iter()
+            .any(|c| c.contains("0.0.0.0 -netmask 128.0.0.0")));
+        assert!(!calls.iter().any(|c| c.contains("10.9.0.0")));
+        // The server itself stays reachable around any primary tunnel.
+        assert!(calls.contains(&"route -n add -host 203.0.113.5 -gateway 192.168.1.1".to_string()));
+        // DNS: split only, the system DNS is untouched.
+        let text = std::fs::read_to_string(f.dir.path().join("resolver/corp.example")).unwrap();
+        assert!(text.contains("nameserver 10.8.0.1"));
+        assert!(!calls.iter().any(|c| c.contains("-setdnsservers")));
+        let status = f.executor.status(501, "office");
+        assert!(!status.warnings.contains(&OpenVpnWarning::Ipv6NotCovered));
+        assert!(!f.executor.holds_primary());
+
+        f.executor.disconnect(501, "office").unwrap();
+        assert!(!f.dir.path().join("resolver/corp.example").exists());
+        assert!(f.executor.owned().is_none());
+    }
+
+    #[test]
+    fn a_secondary_openvpn_needs_valid_networks() {
+        let f = fixture(Behavior::Connects);
+        for bad in [vec![], vec!["0.0.0.0/0"]] {
+            assert!(matches!(
+                f.executor.connect(501, secondary_request(&bad, &[])),
+                Err(Error::Invalid(_))
+            ));
+        }
+        assert_eq!(f.platform.spawned.load(Ordering::SeqCst), 0);
+        // The same profile as a primary still takes the pushed default route.
+        let primary = fixture(Behavior::Connects);
+        primary.executor.connect(501, request(true)).unwrap();
+        assert!(primary.executor.holds_primary());
     }
 }

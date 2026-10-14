@@ -14,6 +14,7 @@ use net_manager_core::daemon_protocol::{
     ResponseFrame, WireGuardConnectParams, WireGuardLinkResource, WireGuardProfileParams,
     XrayConnectParams, XrayProcessResource, XrayProfileParams,
 };
+use net_manager_core::models::TunnelRole;
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 
@@ -53,16 +54,20 @@ impl HelperService {
         }
     }
 
-    /// One tunnel at a time: a second kind would fight over the default route
-    /// and the system DNS.
-    fn busy_with_another(&self, kind: Kind) -> Option<Kind> {
+    /// Tunnels of different kinds run together, but only one of them may be
+    /// the primary: two would fight over the default route and the system DNS.
+    /// Secondary tunnels carry only their own networks and never conflict.
+    fn primary_held_by_another(&self, kind: Kind, role: TunnelRole) -> Option<Kind> {
+        if role != TunnelRole::Primary {
+            return None;
+        }
         [
-            (Kind::Xray, self.xray.active()),
-            (Kind::WireGuard, self.wireguard.active()),
-            (Kind::OpenVpn, self.openvpn.active()),
+            (Kind::Xray, self.xray.holds_primary()),
+            (Kind::WireGuard, self.wireguard.holds_primary()),
+            (Kind::OpenVpn, self.openvpn.holds_primary()),
         ]
         .into_iter()
-        .find(|(other, active)| *other != kind && *active)
+        .find(|(other, holds)| *other != kind && *holds)
         .map(|(other, _)| other)
     }
 }
@@ -171,10 +176,10 @@ impl Handler for HelperService {
     fn handle(&self, peer: &Peer, request: RequestFrame) -> ResponseFrame {
         let id = request.id;
         let uid = peer.uid;
-        let conflict = |kind: Kind| {
-            self.busy_with_another(kind).map(|other| {
+        let conflict = |kind: Kind, role: TunnelRole| {
+            self.primary_held_by_another(kind, role).map(|other| {
                 Error::Conflict(format!(
-                    "a {} tunnel is already active; disconnect it first",
+                    "the {} connection is already the primary one; make one of them secondary or disconnect it",
                     other.label()
                 ))
             })
@@ -216,7 +221,7 @@ impl Handler for HelperService {
                 ok(id, &result)
             }
             method::XRAY_CONNECT => call(request, |params: XrayConnectParams| {
-                if let Some(error) = conflict(Kind::Xray) {
+                if let Some(error) = conflict(Kind::Xray, params.role) {
                     return Err(error);
                 }
                 self.xray.connect(uid, params)
@@ -228,7 +233,7 @@ impl Handler for HelperService {
                 self.xray.disconnect(uid, &params.profile_id)
             }),
             method::WIREGUARD_CONNECT => call(request, |params: WireGuardConnectParams| {
-                if let Some(error) = conflict(Kind::WireGuard) {
+                if let Some(error) = conflict(Kind::WireGuard, params.role) {
                     return Err(error);
                 }
                 self.wireguard.connect(uid, params)
@@ -240,7 +245,7 @@ impl Handler for HelperService {
                 self.wireguard.disconnect(uid, &params.profile_id)
             }),
             method::OPENVPN_CONNECT => call(request, |params: OpenVpnConnectRequest| {
-                if let Some(error) = conflict(Kind::OpenVpn) {
+                if let Some(error) = conflict(Kind::OpenVpn, params.profile.role) {
                     return Err(error);
                 }
                 self.openvpn.connect(uid, params)
@@ -374,12 +379,14 @@ mod tests {
             wg,
             Box::new(runner),
             Journal::named(dir.path(), "wireguard.json"),
+            dir.path().join("resolver"),
         );
         let openvpn = OpenVpnExecutor::new(
             Box::new(DeniedOvpn),
             Box::new(FakeRunner::default()),
             Journal::named(dir.path(), "openvpn.json"),
             dir.path().join("openvpn"),
+            dir.path().join("resolver"),
         );
         (
             HelperService::new(Arc::new(xray), Arc::new(wireguard), Arc::new(openvpn)),
@@ -537,6 +544,7 @@ mod tests {
             let error = call(&service, name, params).outcome.unwrap_err();
             assert_eq!(error.code, ErrorCode::Conflict, "{name}");
             assert!(error.message.contains("WireGuard"), "{}", error.message);
+            assert!(error.message.contains("primary"), "{}", error.message);
         }
         let owners = call(&service, method::OWNED_LIST, Value::Null)
             .outcome
@@ -557,6 +565,69 @@ mod tests {
             &service,
             method::XRAY_CONNECT,
             json!({"profileId": "x", "config": "{}"}),
+        )
+        .outcome
+        .unwrap_err();
+        assert_ne!(error.code, ErrorCode::Conflict);
+    }
+
+    #[test]
+    fn secondary_tunnels_never_conflict_and_only_one_primary_may_exist() {
+        let runner = FakeRunner::default();
+        runner.reply(
+            "route -n get default",
+            "gateway: 192.168.1.1\n interface: en0\n",
+        );
+        let (service, _dir) = build(Box::new(WorkingWg), runner);
+        // A secondary WireGuard is up (it carries one network).
+        let up = call(
+            &service,
+            method::WIREGUARD_CONNECT,
+            json!({"profileId": "wg", "config": wg_config(), "role": "secondary",
+                   "routes": [{"destination": "10.7.0.0/24", "metric": 5}]}),
+        );
+        assert!(up.outcome.is_ok(), "{up:?}");
+        // A primary of another kind is allowed next to it: it gets as far as
+        // its own checks (no Xray install / no bundled OpenVPN here).
+        for (name, params) in [
+            (
+                method::XRAY_CONNECT,
+                json!({"profileId": "x", "config": "{}"}),
+            ),
+            (
+                method::OPENVPN_CONNECT,
+                json!({"profileId": "o", "config": "client\nremote a.example\n", "assets": {}}),
+            ),
+        ] {
+            let error = call(&service, name, params).outcome.unwrap_err();
+            assert_ne!(error.code, ErrorCode::Conflict, "{name}: {}", error.message);
+        }
+        call(
+            &service,
+            method::WIREGUARD_DISCONNECT,
+            json!({"profileId": "wg"}),
+        );
+        // Now WireGuard is the primary: another primary conflicts, a secondary does not.
+        assert!(call(
+            &service,
+            method::WIREGUARD_CONNECT,
+            json!({"profileId": "wg", "config": wg_config()})
+        )
+        .outcome
+        .is_ok());
+        let error = call(
+            &service,
+            method::XRAY_CONNECT,
+            json!({"profileId": "x", "config": "{}"}),
+        )
+        .outcome
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        let error = call(
+            &service,
+            method::XRAY_CONNECT,
+            json!({"profileId": "x", "config": "{}", "role": "secondary",
+                   "routes": [{"destination": "10.9.0.0/16", "metric": 5}]}),
         )
         .outcome
         .unwrap_err();
