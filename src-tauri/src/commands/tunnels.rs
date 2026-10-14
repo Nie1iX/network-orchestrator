@@ -249,6 +249,7 @@ fn prepare_linux_xray_tun_params(
         interface_name: link_name_hint(profile),
         geo_assets: None,
         macos_data_root: None,
+        role: Default::default(),
     };
     check_xray_frame_size(&params)?;
     Ok(params)
@@ -638,6 +639,8 @@ fn prepare_linux_openvpn_request(
         assets,
         routes,
         interface_name: link_name_hint(profile),
+        role: Default::default(),
+        dns_domains: Vec::new(),
     };
     let request = OpenVpnConnectRequest {
         profile: params,
@@ -780,6 +783,8 @@ async fn linux_wireguard_connect(
                 config,
                 routes: profile.routes.clone(),
                 interface_name: link_name_hint(profile),
+                role: Default::default(),
+                dns_domains: Vec::new(),
             },
         )
         .await

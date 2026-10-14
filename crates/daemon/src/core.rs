@@ -235,6 +235,8 @@ mod openvpn_tests {
                 assets: BTreeMap::new(),
                 routes: vec![],
                 interface_name: None,
+                role: Default::default(),
+                dns_domains: Vec::new(),
             },
         )
         .unwrap()
@@ -347,6 +349,8 @@ mod openvpn_tests {
                 assets: BTreeMap::new(),
                 routes: vec![],
                 interface_name: Some("Home VPN".into()),
+                role: Default::default(),
+                dns_domains: Vec::new(),
             },
         )
         .unwrap();
@@ -384,6 +388,8 @@ mod openvpn_tests {
                 assets: BTreeMap::new(),
                 routes: vec![],
                 interface_name: Some("Home VPN".into()),
+                role: Default::default(),
+                dns_domains: Vec::new(),
             },
         )
         .unwrap();
@@ -461,6 +467,8 @@ mod openvpn_tests {
             assets: BTreeMap::new(),
             routes: vec![],
             interface_name: None,
+            role: Default::default(),
+            dns_domains: Vec::new(),
         });
         request.credentials = Some(OpenVpnCredentials {
             auth_user_pass: Some(OpenVpnUserPass {
@@ -603,6 +611,8 @@ mod openvpn_tests {
                 assets: BTreeMap::new(),
                 routes: vec![],
                 interface_name: None,
+                role: Default::default(),
+                dns_domains: Vec::new(),
             },
         )
         .unwrap();
@@ -831,6 +841,8 @@ mod openvpn_tests {
                 assets: BTreeMap::new(),
                 routes: vec![],
                 interface_name: None,
+                role: Default::default(),
+                dns_domains: Vec::new(),
             },
         )
         .unwrap();
@@ -1005,6 +1017,8 @@ mod openvpn_tests {
                 assets: BTreeMap::new(),
                 routes: vec![],
                 interface_name: None,
+                role: Default::default(),
+                dns_domains: Vec::new(),
             },
         )
         .unwrap();
@@ -6415,6 +6429,7 @@ mod xray_core_tests {
             interface_name: None,
             geo_assets: None,
             macos_data_root: None,
+            role: Default::default(),
         }
     }
 

@@ -275,6 +275,10 @@ export interface Profile {
   proxyBypass: string[];
   subscription: SubscriptionMeta | null;
   xrayMode: XrayMode;
+  /** macOS: a secondary connection carries only `tunnelNetworks`. */
+  tunnelRole?: "primary" | "secondary";
+  tunnelNetworks?: string[];
+  tunnelDnsDomains?: string[];
   xrayTunInterface: string | null;
   xrayTunIp: string | null;
   /** Optional HTTPS URLs overriding the bundled geoip.dat / geosite.dat. */

@@ -420,6 +420,8 @@ mod tests {
             config: "PrivateKey = secret-marker".into(),
             routes: Vec::new(),
             interface_name: None,
+            role: Default::default(),
+            dns_domains: Vec::new(),
         })
     }
 
