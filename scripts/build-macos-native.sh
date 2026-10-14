@@ -29,6 +29,20 @@ cd "$REPO_ROOT"
 python3 scripts/generate-ui-theme.py --check
 python3 scripts/generate-localizations.py --check
 bash "$REPO_ROOT/scripts/stage-macos-bridge.sh" "$CARGO_PROFILE"
+# The helper runs a pinned, self-contained OpenVPN shipped in the bundle. Its
+# SHA-256 is compiled into the helper (crates/macos-helper/backends.json), so
+# the pin is written before the helper is built.
+OPENVPN_BIN="$(bash "$REPO_ROOT/scripts/build-macos-openvpn.sh")"
+python3 - "$OPENVPN_BIN" "$REPO_ROOT/crates/macos-helper/backends.json" <<'PY'
+import hashlib, json, os, re, sys
+binary, target = sys.argv[1], sys.argv[2]
+version = re.search(r'openvpn-(\d+\.\d+\.\d+)$', os.path.basename(binary)).group(1)
+digest = hashlib.sha256(open(binary, 'rb').read()).hexdigest()
+document = {"backends": [{"name": "openvpn", "version": version, "file": "openvpn", "sha256": digest}]}
+text = json.dumps(document, indent=2) + "\n"
+if not os.path.exists(target) or open(target).read() != text:
+    open(target, 'w').write(text)
+PY
 cargo build --profile "$CARGO_PROFILE" -p network-orchestrator-macos-helper
 swift build --package-path macos --configuration "$SWIFT_CONFIG" --scratch-path target/macos-swift
 VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "net-manager-macos-bridge"))')"
@@ -40,6 +54,10 @@ install -m 0755 "$BIN_DIR/NetworkOrchestrator" "$APP_DIR/Contents/MacOS/NetworkO
 # process it serves.
 HELPER_LABEL="com.netmanager.app.helper"
 install -m 0755 "$REPO_ROOT/target/$CARGO_PROFILE/network-orchestrator-helper" "$APP_DIR/Contents/MacOS/network-orchestrator-helper"
+# Pinned backend binaries live in Contents/Helpers; the helper verifies each
+# against the hash compiled into it and only runs a private copy.
+mkdir -p "$APP_DIR/Contents/Helpers"
+install -m 0755 "$OPENVPN_BIN" "$APP_DIR/Contents/Helpers/openvpn"
 mkdir -p "$APP_DIR/Contents/Library/LaunchDaemons"
 python3 - "$APP_DIR/Contents/Library/LaunchDaemons/$HELPER_LABEL.plist" "$HELPER_LABEL" <<'PY'
 import plistlib, sys
