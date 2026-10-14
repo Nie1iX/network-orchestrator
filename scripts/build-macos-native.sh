@@ -81,8 +81,12 @@ info = {
 with open(sys.argv[1], 'wb') as output:
     plistlib.dump(info, output)
 PY
-# Local ad-hoc signature; Developer ID/notarization are separate release steps.
-codesign --force --sign - "$APP_DIR/Contents/MacOS/network-orchestrator-helper"
-codesign --force --sign - "$APP_DIR"
+# Default: local ad-hoc signature. macOS does not let SMAppService find a
+# daemon in an ad-hoc signed bundle (status "not found"), so the privileged
+# helper needs a real identity: CODESIGN_IDENTITY="Apple Development: ..." (or a
+# Developer ID). Notarization is a separate release step.
+SIGN_ID="${CODESIGN_IDENTITY:--}"
+codesign --force --sign "$SIGN_ID" "$APP_DIR/Contents/MacOS/network-orchestrator-helper"
+codesign --force --sign "$SIGN_ID" "$APP_DIR"
 codesign --verify --strict "$APP_DIR"
 echo "$APP_DIR"

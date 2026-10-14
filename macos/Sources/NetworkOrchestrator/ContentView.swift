@@ -23,6 +23,18 @@ struct ContentView: View {
               }
             }
           }
+          if model.helperOutdated {
+            AppCard {
+              HStack {
+                Text(L10n.text("native.helperOutdated")).foregroundStyle(
+                  AppPalette(scheme: scheme)["warn"])
+                Spacer()
+                Button(L10n.text("native.helperInstall")) {
+                  Task { await model.installHelper() }
+                }
+              }
+            }
+          }
           switch model.section {
           case .home: HomeView(model: model, modal: $modal)
           case .connections: ConnectionsView(model: model, modal: $modal)
@@ -68,6 +80,12 @@ struct ContentView: View {
       .environment(\.palette, AppPalette(scheme: scheme)).buttonStyle(TauriButtonStyle())
       .environment(\.locale, Locale(identifier: L10n.shared.language))
       .environment(\.layoutDirection, L10n.shared.direction)
+    }
+    .alert(L10n.text("native.helperPromptTitle"), isPresented: $model.helperPrompt) {
+      Button(L10n.text("native.helperInstall")) { Task { await model.installHelper() } }
+      Button(L10n.text("common.cancel"), role: .cancel) {}
+    } message: {
+      Text(L10n.text("native.helperPromptBody"))
     }
     .sheet(item: $model.inspecting) { profile in
       InspectionView(model: model, profile: profile).environment(

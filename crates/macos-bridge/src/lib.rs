@@ -12,6 +12,7 @@ use std::sync::{Mutex, OnceLock};
 mod routing;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
+mod user_network;
 // The proxy runtime needs the managed Xray package, pinned for Apple
 // Silicon; on other targets the bridge still builds so subscription,
 // profile and inventory commands can be exercised off-macOS.
@@ -78,14 +79,17 @@ fn store_error(_: std::io::Error) -> String {
 fn local_port_available(port: u16) -> bool {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
 }
+/// Socket of the privileged helper; QA runs may point it elsewhere.
+pub(crate) fn helper_socket() -> PathBuf {
+    std::env::var_os("NETORCH_HELPER_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| net_manager_core::daemon_protocol::MACOS_SOCKET_PATH.into())
+}
 /// Whether the privileged helper answers on its socket and accepts this app.
 /// The Swift side adds the launchd registration state (`SMAppService`).
 fn helper_status() -> Value {
     use net_manager_core::helper_client::{is_denied, HelperClient, HelperError};
-    let socket = std::env::var_os("NETORCH_HELPER_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| net_manager_core::daemon_protocol::MACOS_SOCKET_PATH.into());
-    match HelperClient::new(socket)
+    match HelperClient::new(helper_socket())
         .with_timeout(std::time::Duration::from_secs(3))
         .hello()
     {
@@ -369,14 +373,15 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
     if !root.is_absolute() {
         return Err("App data location must be absolute".into());
     }
-    // Delay probes take seconds; they only read the store, so they run
-    // outside the transaction lock and never stall other calls.
+    // Delay probes take seconds and system reads never touch the store, so
+    // they run outside the transaction lock and never stall other calls.
     match method {
         "refresh_subscription" => return refresh_subscription(root, args),
         "measure_delays" => return measure_delays(root, args),
         "measure_delay" => return measure_delay(root, args),
         "check_exit_ip" => return check_exit_ip(root, args),
         "helper_status" => return Ok(helper_status()),
+        "user_network_settings" => return encode(user_network::read()),
         _ => {}
     }
     let _lock = TRANSACTION
@@ -661,6 +666,32 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 return Err("Routing rules are available for Xray connections".into());
             }
             routing::apply_draft(&mut profile, args)?;
+            runtime::restart_around(root, &store, id, || {
+                let document = store.upsert(profile).map_err(store_error)?;
+                encode(net_manager_core::subscription::public_profiles(
+                    document.profiles,
+                ))
+            })
+        }
+        "set_xray_mode" => {
+            let id = text_arg(args, "id")?;
+            let mode = match text_arg(args, "mode")? {
+                "socks" => net_manager_core::models::XrayMode::Socks,
+                "tun" => net_manager_core::models::XrayMode::Tun,
+                _ => return Err("Unknown connection mode".into()),
+            };
+            let mut profile = store
+                .load()
+                .map_err(store_error)?
+                .profiles
+                .into_iter()
+                .find(|p| p.id == id)
+                .ok_or("Profile not found")?;
+            if profile.backend != TunnelBackend::Xray {
+                return Err("The mode can be changed for Xray connections".into());
+            }
+            profile.xray_mode = mode;
+            // A running connection is restarted in the new mode.
             runtime::restart_around(root, &store, id, || {
                 let document = store.upsert(profile).map_err(store_error)?;
                 encode(net_manager_core::subscription::public_profiles(
@@ -1465,6 +1496,52 @@ mod tests {
         let status = dispatch(dir.path(), "helper_status", &json!({})).unwrap();
         assert_eq!(status["reachable"], false);
         assert_eq!(status["capabilities"], json!([]));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn xray_mode_can_be_switched_and_is_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "m1");
+        let profiles = dispatch(
+            dir.path(),
+            "set_xray_mode",
+            &json!({"id":"m1", "mode":"tun"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["xrayMode"], "tun");
+        let profiles = dispatch(
+            dir.path(),
+            "set_xray_mode",
+            &json!({"id":"m1", "mode":"socks"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["xrayMode"], "socks");
+        for args in [
+            json!({"id":"m1", "mode":"bridge"}),
+            json!({"id":"missing", "mode":"tun"}),
+            json!({"mode":"tun"}),
+        ] {
+            assert!(dispatch(dir.path(), "set_xray_mode", &args).is_err());
+        }
+    }
+
+    #[test]
+    fn user_network_settings_are_read_without_touching_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dispatch(dir.path(), "user_network_settings", &json!({})).unwrap();
+        for key in [
+            "persistentRoutes",
+            "staticRoutes",
+            "startupJobs",
+            "resolvers",
+            "hosts",
+            "services",
+            "unreadable",
+        ] {
+            assert!(settings[key].is_array(), "{key}");
+        }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 

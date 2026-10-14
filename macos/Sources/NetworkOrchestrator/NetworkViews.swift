@@ -93,7 +93,8 @@ struct NetworkView: View {
                 categories.contains(category) ? p.text : p.muted
               ).padding(.horizontal, 10).padding(.vertical, 4).background(p.card, in: Capsule())
               .overlay(
-                Capsule().stroke(categories.contains(category) ? p.accent : p.border, lineWidth: 1))
+                Capsule().stroke(
+                  categories.contains(category) ? p.accent : p.border, lineWidth: 1))
             }.buttonStyle(.plain)
           }
         }
@@ -234,6 +235,7 @@ enum RouteTab: String, CaseIterable {
   case tree = "Tree"
   case table = "Raw table"
   case lookup = "Lookup"
+  case user = "My routing settings"
 }
 struct RoutesView: View {
   @Environment(\.palette) private var p
@@ -260,7 +262,8 @@ struct RoutesView: View {
           AppHeading(title: "Routes")
           RouteRows(routes: model.snapshot?.routes ?? [])
         }
-      case .lookup: RouteLookupView(model: model)
+        case .lookup: RouteLookupView(model: model)
+        case .user: UserRoutingView(model: model)
       }
     }.frame(minHeight: 300, alignment: .topLeading)
   }

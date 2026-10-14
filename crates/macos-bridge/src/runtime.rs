@@ -1,7 +1,14 @@
 //! Unprivileged runtime for the native client: Xray in loopback SOCKS/HTTP
 //! mode plus the per-user macOS system proxy. Routes, interfaces and DNS stay
 //! out of this crate; they belong to the privileged launchd helper (plan 14).
+//! Xray TUN profiles are delegated to that helper over `daemon_protocol`
+//! (`docs/plans/2026-10-14-16-macos-xray-tun.md`); this crate only asks.
 use net_manager_core::config_vault::ConfigVault;
+use net_manager_core::daemon_protocol::{
+    method, XrayConnectParams, XrayConnectResult, XrayDisconnectResult, XrayProfileParams,
+    XrayStatusResult,
+};
+use net_manager_core::helper_client::{HelperClient, HelperError};
 use net_manager_core::managed_xray;
 use net_manager_core::models::{Profile, TunnelBackend, TunnelState, TunnelStatus, XrayMode};
 use net_manager_core::profile_import;
@@ -17,6 +24,7 @@ use std::time::Duration;
 const HELPER_REQUIRED: &str =
     "This connection type needs the macOS privileged helper, which is not available yet";
 const LOG_TAIL_BYTES: usize = 16 * 1024;
+const MAX_BYPASS_RESOLVERS: usize = 8;
 
 struct Session {
     tunnels: TunnelManager,
@@ -100,11 +108,182 @@ fn find(profiles: &[Profile], args: &Value) -> Result<Profile, String> {
         .ok_or_else(|| "Profile not found".into())
 }
 
+fn is_tun(profile: &Profile) -> bool {
+    profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun
+}
+
+fn helper() -> HelperClient {
+    HelperClient::new(crate::helper_socket()).with_timeout(Duration::from_secs(20))
+}
+
+fn helper_error(error: HelperError) -> String {
+    match error {
+        HelperError::Unreachable(_) => {
+            "The privileged helper is not running. Install it in Settings.".into()
+        }
+        HelperError::Rejected(body) => body.message,
+        HelperError::Protocol(_) => "The privileged helper answered unexpectedly".into(),
+    }
+}
+
+/// The helper owns the tunnel's Xray, which logs next to its socket.
+fn tun_log_path() -> PathBuf {
+    crate::helper_socket().with_file_name("xray-tun.log")
+}
+
+fn tun_log_tail() -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(tun_log_path()).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(LOG_TAIL_BYTES as u64)))
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn last_log_line(log: &str) -> Option<String> {
+    log.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+}
+
+/// Live state of a TUN profile, from the helper. An unreachable helper owns
+/// nothing, so the profile reads as stopped.
+fn tun_status(profile: &Profile) -> TunnelStatus {
+    tun_status_via(&helper(), profile)
+}
+
+fn tun_status_via(client: &HelperClient, profile: &Profile) -> TunnelStatus {
+    let stopped = TunnelStatus {
+        profile_id: profile.id.clone(),
+        state: TunnelState::Stopped,
+        message: None,
+        interface_name: None,
+    };
+    match client.call::<_, XrayStatusResult>(
+        method::XRAY_STATUS,
+        XrayProfileParams {
+            profile_id: profile.id.clone(),
+        },
+    ) {
+        Ok(status) => TunnelStatus {
+            message: (status.state == TunnelState::Failed)
+                .then(|| tun_log_tail().and_then(|log| last_log_line(&log)))
+                .flatten()
+                .map(|line| format!("Xray stopped: {line}")),
+            state: status.state,
+            interface_name: status.interface_name,
+            ..stopped
+        },
+        Err(_) => stopped,
+    }
+}
+
+fn status_of(session: &mut Session, profile: &Profile) -> TunnelStatus {
+    if is_tun(profile) {
+        tun_status(profile)
+    } else {
+        session.tunnels.status(profile)
+    }
+}
+
+fn running(session: &mut Session, profile: &Profile) -> bool {
+    status_of(session, profile).state == TunnelState::Running
+}
+
+fn stop(session: &mut Session, profile: &Profile) -> Result<(), String> {
+    if is_tun(profile) {
+        let result: XrayDisconnectResult = helper()
+            .call(
+                method::XRAY_DISCONNECT,
+                XrayProfileParams {
+                    profile_id: profile.id.clone(),
+                },
+            )
+            .map_err(helper_error)?;
+        return result
+            .stopped
+            .then_some(())
+            .ok_or_else(|| "The connection is not running".into());
+    }
+    session
+        .tunnels
+        .disconnect(profile)
+        .map(|_| ())
+        .map_err(|_| "The connection is not running".to_string())
+}
+
 fn statuses(session: &mut Session, profiles: &[Profile]) -> Vec<TunnelStatus> {
     profiles
         .iter()
-        .map(|profile| session.tunnels.status(profile))
+        .map(|profile| status_of(session, profile))
         .collect()
+}
+
+/// IPv4 resolvers the machine currently uses; they keep a direct route
+/// around the tunnel so name resolution survives while it captures traffic.
+fn resolver_bypass() -> Vec<String> {
+    let mut resolvers: Vec<String> = std::fs::read_to_string("/etc/resolv.conf")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.strip_prefix("nameserver "))
+        .filter_map(|ip| ip.trim().parse::<std::net::Ipv4Addr>().ok())
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        .map(|ip| ip.to_string())
+        .collect();
+    resolvers.dedup();
+    resolvers.truncate(MAX_BYPASS_RESOLVERS);
+    resolvers
+}
+
+/// Start a full-tunnel Xray through the privileged helper.
+fn start_tun(root: &Path, profile: &Profile) -> Result<(), String> {
+    let client = helper();
+    let hello = client.hello().map_err(helper_error)?;
+    if !hello
+        .capabilities
+        .iter()
+        .any(|name| name == method::XRAY_CONNECT)
+    {
+        return Err(HELPER_REQUIRED.into());
+    }
+    let executable = managed_executable(root).ok_or("Install Xray to start this connection")?;
+    let config = net_manager_core::vpn::prepare_xray_config_base(profile)
+        .map_err(|_| "The Xray configuration could not be prepared".to_string())?;
+    // Validated here, as the user: a tun inbound would need privileges, and
+    // the helper adds it only after this passes.
+    net_manager_core::vpn::run_xray_validation(&executable, &config)
+        .map_err(|_| "The Xray configuration is invalid".to_string())?;
+    request_tunnel(&client, root, profile, config, resolver_bypass())
+}
+
+/// The `xray.connect` request. The config carries no tun inbound: the helper
+/// picks the uplink and adds it, so no caller can steer the binding.
+fn request_tunnel(
+    client: &HelperClient,
+    root: &Path,
+    profile: &Profile,
+    config: Vec<u8>,
+    dns_bypass: Vec<String>,
+) -> Result<(), String> {
+    let params = XrayConnectParams {
+        profile_id: profile.id.clone(),
+        config: String::from_utf8(config)
+            .map_err(|_| "The Xray configuration could not be prepared".to_string())?,
+        routes: Vec::new(),
+        dns_servers: Vec::new(),
+        dns_domains: Vec::new(),
+        dns_bypass,
+        interface_name: None,
+        geo_assets: None,
+        macos_data_root: Some(root.to_string_lossy().into_owned()),
+    };
+    client
+        .call::<_, XrayConnectResult>(method::XRAY_CONNECT, params)
+        .map(|_| ())
+        .map_err(helper_error)
 }
 
 fn snapshot(root: &Path, session: &mut Session, profiles: &[Profile]) -> Value {
@@ -151,9 +330,7 @@ fn failure_message(session: &TunnelManager, profile: &Profile) -> String {
 }
 
 pub(crate) fn is_running(root: &Path, profile: &Profile) -> Result<bool, String> {
-    with_session(root, |session| {
-        Ok(session.tunnels.status(profile).state == TunnelState::Running)
-    })
+    with_session(root, |session| Ok(running(session, profile)))
 }
 
 /// Move the profile off listener ports another process already holds; the
@@ -171,7 +348,28 @@ fn free_listener_ports(root: &Path, store: &ProfileStore, profile: &mut Profile)
 /// Start a loopback Xray connection and confirm it survived startup.
 fn start(root: &Path, store: &ProfileStore, profile: &Profile) -> Result<(), String> {
     let mut profile = profile.clone();
-    if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Socks {
+    if is_tun(&profile) {
+        let profile = &profile;
+        return with_session(root, |session| {
+            // The tunnel captures everything; a leftover per-app proxy for
+            // this profile would point at a listener that no longer runs.
+            if session
+                .proxy
+                .ownership()
+                .is_some_and(|owner| owner.profile_id == profile.id)
+            {
+                session
+                    .proxy
+                    .restore(&profile.id)
+                    .map_err(|_| "The previous system proxy could not be restored".to_string())?;
+            }
+            if running(session, profile) {
+                return Err("The connection is already running".into());
+            }
+            start_tun(root, profile)
+        });
+    }
+    if profile.backend != TunnelBackend::Xray {
         return Err(HELPER_REQUIRED.into());
     }
     let executable = managed_executable(root).ok_or("Install Xray to start this connection")?;
@@ -214,16 +412,10 @@ pub(crate) fn restart_around(
     };
     let id_arg = json!({ "id": id });
     let before = find(&load()?, &id_arg)?;
-    let was_running = with_session(root, |session| {
-        Ok(session.tunnels.status(&before).state == TunnelState::Running)
-    })?;
+    let was_running = with_session(root, |session| Ok(running(session, &before)))?;
     if was_running {
         with_session(root, |session| {
-            session
-                .tunnels
-                .disconnect(&before)
-                .map(|_| ())
-                .map_err(|_| "The connection could not be restarted".to_string())
+            stop(session, &before).map_err(|_| "The connection could not be restarted".to_string())
         })?;
     }
     let result = change();
@@ -269,10 +461,7 @@ pub(crate) fn handle(
                         "The previous system proxy could not be restored".to_string()
                     })?;
                 }
-                session
-                    .tunnels
-                    .disconnect(&profile)
-                    .map_err(|_| "The connection is not running".to_string())?;
+                stop(session, &profile)?;
                 Ok(snapshot(root, session, &profiles))
             })
         }),
@@ -281,6 +470,9 @@ pub(crate) fn handle(
             let enable = args["enabled"].as_str() == Some("true");
             with_session(root, |session| {
                 if enable {
+                    if is_tun(&profile) {
+                        return Err("The system proxy is not used in tunnel mode".into());
+                    }
                     if session.tunnels.status(&profile).state != TunnelState::Running {
                         return Err("Start the connection first".into());
                     }
@@ -314,8 +506,8 @@ pub(crate) fn handle(
             with_session(root, |session| {
                 let restored = session.proxy.restore_any();
                 for profile in &profiles {
-                    if session.tunnels.status(profile).state == TunnelState::Running {
-                        let _ = session.tunnels.disconnect(profile);
+                    if running(session, profile) {
+                        let _ = stop(session, profile);
                     }
                 }
                 restored
@@ -325,6 +517,9 @@ pub(crate) fn handle(
         }),
         "log" => load().and_then(|profiles| {
             let profile = find(&profiles, args)?;
+            if is_tun(&profile) {
+                return Ok(json!(tun_log_tail().unwrap_or_default()));
+            }
             with_session(root, |session| {
                 Ok(json!(session
                     .tunnels
@@ -376,6 +571,12 @@ fn install_xray(root: &Path, archive_path: Option<&str>) -> Result<Value, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use net_manager_core::daemon_protocol::{
+        encode_line, ErrorCode, HelloResult, RequestFrame, ResponseFrame, PROTOCOL_VERSION,
+    };
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
 
     #[test]
     fn stale_pattern_is_anchored_and_escaped() {
@@ -384,5 +585,134 @@ mod tests {
             pattern,
             "^/data/x\\.y/backends/xray/v26\\.7\\.28/xray run -config stdin:$"
         );
+    }
+
+    fn tun_profile() -> Profile {
+        Profile {
+            id: "tun1".into(),
+            name: "Tun".into(),
+            backend: TunnelBackend::Xray,
+            xray_mode: XrayMode::Tun,
+            ..Default::default()
+        }
+    }
+
+    /// Serves hello plus one request; reports the request it saw.
+    fn fake_helper(
+        dir: &Path,
+        reply: impl FnOnce(&RequestFrame) -> ResponseFrame + Send + 'static,
+    ) -> (HelperClient, mpsc::Receiver<RequestFrame>) {
+        let socket = dir.join("h.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let hello: RequestFrame = serde_json::from_str(&line).unwrap();
+            let result = HelloResult {
+                protocol: PROTOCOL_VERSION,
+                daemon_version: "t".into(),
+                uid: 501,
+                capabilities: vec![method::XRAY_CONNECT.into()],
+                tools: Default::default(),
+            };
+            let ok = ResponseFrame::ok(hello.id, serde_json::to_value(result).unwrap());
+            stream.write_all(&encode_line(&ok).unwrap()).unwrap();
+            line.clear();
+            if reader.read_line(&mut line).unwrap() > 0 {
+                let request: RequestFrame = serde_json::from_str(&line).unwrap();
+                let response = reply(&request);
+                let _ = tx.send(request);
+                stream.write_all(&encode_line(&response).unwrap()).unwrap();
+            }
+        });
+        (HelperClient::new(socket), rx)
+    }
+
+    fn status_json(state: &str) -> Value {
+        json!({"profileId":"tun1","state":state,"interfaceName":"utun10",
+               "dnsApplied":true,"ipv4Covered":true,"ipv6Covered":true})
+    }
+
+    #[test]
+    fn tunnel_request_carries_config_and_data_root_but_no_uplink_or_tun_inbound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(dir.path(), |request| {
+            ResponseFrame::ok(request.id, json!({"status": status_json("running")}))
+        });
+        let config = br#"{"inbounds":[{"protocol":"socks"}],"outbounds":[]}"#.to_vec();
+        request_tunnel(
+            &client,
+            Path::new("/data/root"),
+            &tun_profile(),
+            config,
+            vec!["192.168.1.1".into()],
+        )
+        .unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.method, method::XRAY_CONNECT);
+        assert_eq!(request.params["profileId"], "tun1");
+        assert_eq!(request.params["macosDataRoot"], "/data/root");
+        assert_eq!(request.params["dnsBypass"], json!(["192.168.1.1"]));
+        let text = request.params["config"].as_str().unwrap();
+        let sent: Value = serde_json::from_str(text).unwrap();
+        assert!(!net_manager_core::xray::has_tun_inbound(&sent));
+        assert!(!text.contains("autoOutboundsInterface"));
+    }
+
+    #[test]
+    fn helper_refusals_reach_the_user_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _) = fake_helper(dir.path(), |request| {
+            ResponseFrame::error(
+                request.id,
+                ErrorCode::Conflict,
+                "another VPN already owns the default route",
+            )
+        });
+        let error = request_tunnel(
+            &client,
+            Path::new("/d"),
+            &tun_profile(),
+            b"{}".to_vec(),
+            vec![],
+        )
+        .unwrap_err();
+        assert_eq!(error, "another VPN already owns the default route");
+    }
+
+    #[test]
+    fn tun_status_maps_the_helper_state_and_an_absent_helper_reads_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _) = fake_helper(dir.path(), |request| {
+            ResponseFrame::ok(request.id, status_json("running"))
+        });
+        let status = tun_status_via(&client, &tun_profile());
+        assert_eq!(status.state, TunnelState::Running);
+        assert_eq!(status.interface_name.as_deref(), Some("utun10"));
+        let missing = HelperClient::new(dir.path().join("none.sock"));
+        assert_eq!(
+            tun_status_via(&missing, &tun_profile()).state,
+            TunnelState::Stopped
+        );
+    }
+
+    #[test]
+    fn only_xray_tun_profiles_are_delegated() {
+        assert!(is_tun(&tun_profile()));
+        let mut socks = tun_profile();
+        socks.xray_mode = XrayMode::Socks;
+        assert!(!is_tun(&socks));
+        let mut other = tun_profile();
+        other.backend = TunnelBackend::WireGuard;
+        assert!(!is_tun(&other));
+    }
+
+    #[test]
+    fn unreachable_helper_gets_an_actionable_message() {
+        let error = helper_error(HelperError::Unreachable(std::io::Error::other("x")));
+        assert!(error.contains("Install it in Settings"));
     }
 }

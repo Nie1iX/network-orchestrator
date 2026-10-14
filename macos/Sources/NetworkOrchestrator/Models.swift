@@ -13,6 +13,8 @@ struct TunnelStatus: Decodable, Sendable {
   let profileId: String
   let state: String
   let message: String?
+  /// `utunN` of a running full tunnel; nil for loopback proxies.
+  var interfaceName: String? = nil
 }
 struct RuntimeState: Decodable, Sendable {
   let xrayInstalled: Bool
@@ -57,6 +59,8 @@ struct Profile: Decodable, Identifiable, Sendable {
   /// Xray in loopback SOCKS/HTTP mode is the only kind this client can start
   /// without the privileged helper.
   var startsWithoutHelper: Bool { backend == "xray" && (xrayMode ?? "socks") == "socks" }
+  /// Xray as a system-wide tunnel; the privileged helper owns it.
+  var isTun: Bool { backend == "xray" && xrayMode == "tun" }
   var kind: String {
     switch backend {
     case "wireGuard": "WireGuard"
@@ -180,6 +184,60 @@ struct Route: Decodable, Identifiable, Sendable {
   let metric: UInt32
   var cidr: String { "\(destination)/\(prefixLen)" }
   var id: String { "\(cidr)|\(interfaceIndex)|\(gateway ?? "")|\(metric)" }
+}
+/// Routing settings a person made on this Mac (`user_network_settings`).
+struct UserNetworkSettings: Decodable, Sendable {
+  struct PersistentRoute: Decodable, Sendable {
+    let service: String
+    let interface: String?
+    let destination: String
+    let gateway: String?
+    let active: Bool
+  }
+  struct StaticRoute: Decodable, Sendable {
+    let destination: String
+    let gateway: String
+    let interface: String
+    let flags: String
+    let source: String
+  }
+  struct StartupJob: Decodable, Sendable {
+    let label: String
+    let path: String
+    let scope: String
+    let command: String
+    let runAtLoad: Bool
+    let intervalSeconds: UInt64?
+    let route: String?
+    let active: Bool?
+  }
+  struct Resolver: Decodable, Sendable {
+    let domain: String
+    let nameservers: [String]
+    let port: UInt16?
+    let searchOrder: UInt32?
+  }
+  struct HostEntry: Decodable, Sendable {
+    let address: String
+    let names: [String]
+  }
+  struct Setting: Decodable, Sendable {
+    let kind: String
+    let value: String
+  }
+  struct Service: Decodable, Sendable {
+    let service: String
+    let interface: String?
+    let enabled: Bool
+    let items: [Setting]
+  }
+  let persistentRoutes: [PersistentRoute]
+  let staticRoutes: [StaticRoute]
+  let startupJobs: [StartupJob]
+  let resolvers: [Resolver]
+  let hosts: [HostEntry]
+  let services: [Service]
+  let unreadable: [String]
 }
 struct PlannedRoute: Decodable, Sendable {
   let destination: String
