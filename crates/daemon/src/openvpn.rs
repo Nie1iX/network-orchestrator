@@ -179,6 +179,8 @@ mod tests {
             assets: BTreeMap::new(),
             routes: vec![],
             interface_name: None,
+            role: Default::default(),
+            dns_domains: Vec::new(),
         }
     }
 

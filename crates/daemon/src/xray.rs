@@ -1136,6 +1136,7 @@ mod tests {
             interface_name: None,
             geo_assets: None,
             macos_data_root: None,
+            role: Default::default(),
         }
     }
 
