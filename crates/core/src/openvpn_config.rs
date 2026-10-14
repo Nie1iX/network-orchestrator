@@ -47,6 +47,73 @@ impl fmt::Debug for SanitizedOpenVpnConfig {
     }
 }
 
+/// What a profile needs from the user before it can connect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CredentialRequirements {
+    /// `auth-user-pass` without a credentials file.
+    pub user_pass: bool,
+    /// A bare `askpass` or an encrypted private key without a passphrase file.
+    pub key_passphrase: bool,
+}
+
+fn has_encrypted_key(bytes: &[u8]) -> bool {
+    const MARKERS: [&[u8]; 2] = [
+        b"-----BEGIN ENCRYPTED PRIVATE KEY-----",
+        b"Proc-Type: 4,ENCRYPTED",
+    ];
+    MARKERS
+        .iter()
+        .any(|marker| bytes.windows(marker.len()).any(|part| part == *marker))
+}
+
+/// The same rules the Linux client applies before it asks for credentials
+/// (`src-tauri` keeps its own copy behind `cfg(linux)`).
+pub fn credential_requirements(
+    config: &str,
+    assets: &BTreeMap<String, Vec<u8>>,
+) -> CredentialRequirements {
+    let mut user_pass = false;
+    let mut askpass_prompt = false;
+    let mut askpass_file = false;
+    // Inline block contents are not directives.
+    let mut in_block = false;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if in_block {
+            if trimmed.starts_with("</") {
+                in_block = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with('<') && !trimmed.starts_with("</") {
+            in_block = true;
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        let Some(word) = tokens.next() else { continue };
+        let word = word.trim_start_matches('-');
+        if word.eq_ignore_ascii_case("auth-user-pass") {
+            // `username-only` still prompts; a file argument does not.
+            match tokens.next().map(|arg| arg.trim_matches('"')) {
+                None | Some("username-only") => user_pass = true,
+                Some(_) => {}
+            }
+        } else if word.eq_ignore_ascii_case("askpass") {
+            if tokens.next().is_none() {
+                askpass_prompt = true;
+            } else {
+                askpass_file = true;
+            }
+        }
+    }
+    let encrypted_key = has_encrypted_key(config.as_bytes())
+        || assets.values().any(|asset| has_encrypted_key(asset));
+    CredentialRequirements {
+        user_pass,
+        key_passphrase: (askpass_prompt || encrypted_key) && !askpass_file,
+    }
+}
+
 /// Validates an imported client config without opening any source path.
 ///
 /// The caller must supply only bytes already read from ConfigVault and must create
@@ -272,11 +339,16 @@ pub fn sanitize_openvpn_config(
     })
 }
 
+/// Runtime roots a privileged service stages secrets under: the Linux daemon
+/// and the macOS helper (`/var/run` is cleared at boot on both).
+const STAGING_ROOTS: [&str; 2] = ["/run/network-orchestrator", "/var/run/network-orchestrator"];
+
 fn safe_staging_dir(path: &Path) -> bool {
     path.as_os_str().len() <= 256
-        && path
-            .strip_prefix("/run/network-orchestrator")
-            .is_ok_and(|relative| relative.components().next().is_some())
+        && STAGING_ROOTS.iter().any(|root| {
+            path.strip_prefix(root)
+                .is_ok_and(|relative| relative.components().next().is_some())
+        })
         && path.components().all(|part| match part {
             Component::RootDir => true,
             Component::Normal(name) => name.to_str().is_some_and(|s| {
@@ -753,6 +825,52 @@ mod tests {
             assert!(
                 sanitize(&format!("client\nremote vpn.example\n{input}")).is_err(),
                 "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_requirements_follow_the_directives_not_inline_text() {
+        let none = BTreeMap::new();
+        let r = credential_requirements("client\nremote a\n", &none);
+        assert_eq!(r, CredentialRequirements::default());
+        assert!(credential_requirements("auth-user-pass\n", &none).user_pass);
+        assert!(credential_requirements("auth-user-pass username-only\n", &none).user_pass);
+        assert!(!credential_requirements("auth-user-pass creds.txt\n", &none).user_pass);
+        // Inside an inline block it is certificate text, not a directive.
+        assert!(!credential_requirements("<ca>\nauth-user-pass\n</ca>\n", &none).user_pass);
+        assert!(credential_requirements("askpass\n", &none).key_passphrase);
+        assert!(!credential_requirements("askpass key.pass\n", &none).key_passphrase);
+        let mut assets = BTreeMap::new();
+        assets.insert(
+            "assets/key.pem".to_string(),
+            b"-----BEGIN ENCRYPTED PRIVATE KEY-----\nxx".to_vec(),
+        );
+        assert!(credential_requirements("client\n", &assets).key_passphrase);
+        assert!(!credential_requirements("client\naskpass p.txt\n", &assets).key_passphrase);
+    }
+
+    #[test]
+    fn the_macos_runtime_root_is_an_accepted_staging_location() {
+        let staged = sanitize_openvpn_config(
+            "client\nremote vpn.example\n",
+            &BTreeMap::new(),
+            Path::new("/var/run/network-orchestrator/openvpn/501/ovpn-abc"),
+        );
+        assert!(staged.is_ok());
+        for bad in [
+            "/var/run/network-orchestrator",
+            "/var/run/other/x",
+            "/var/run/network-orchestrator/../tmp",
+        ] {
+            assert!(
+                sanitize_openvpn_config(
+                    "client\nremote vpn.example\n",
+                    &BTreeMap::new(),
+                    Path::new(bad)
+                )
+                .is_err(),
+                "{bad}"
             );
         }
     }
