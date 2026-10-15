@@ -54,6 +54,7 @@ struct ContentView: View {
     }
     StatusBar(model: model)
     }
+    .background(WindowChrome(color: AppPalette(scheme: scheme).app))
     .font(.system(size: 14)).foregroundStyle(AppPalette(scheme: scheme).text).tint(
       AppPalette(scheme: scheme).accent
     )
@@ -391,5 +392,20 @@ struct LogSheet: View {
         }
       }.padding(14)
     }.task { text = await load() }
+  }
+}
+
+/// Paints the title bar in the page colour so the traffic-light strip is one
+/// flat tone with the app name centred, instead of a white system material.
+struct WindowChrome: NSViewRepresentable {
+  let color: Color
+  func makeNSView(context: Context) -> NSView { NSView() }
+  func updateNSView(_ view: NSView, context: Context) {
+    DispatchQueue.main.async {
+      guard let window = view.window else { return }
+      window.titlebarAppearsTransparent = true
+      window.titleVisibility = .visible
+      window.backgroundColor = NSColor(color)
+    }
   }
 }
