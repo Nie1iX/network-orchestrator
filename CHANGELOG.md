@@ -8,6 +8,20 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-10-15
+
+### Fixed
+
+- Profiles page: dragging the list/detail splitter no longer makes the text
+  flicker. macOS measured the drag in the splitter's own moving coordinate
+  space; the web client re-rendered the whole screen on every pointer move and
+  let scrollbars toggle mid-resize.
+
+### Changed
+
+- macOS: the title bar is one flat colour with the app name centred, instead of
+  a white system material behind the window buttons.
+
 ## [0.8.5] - 2026-10-14
 
 ### Added
