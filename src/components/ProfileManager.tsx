@@ -280,6 +280,33 @@ export default function ProfileManager() {
     }
   }, [listWidth]);
 
+  // While dragging, the width goes straight into a CSS variable (one write per
+  // animation frame) so React does not re-render this whole screen on every
+  // pointermove; state and storage are committed once on release.
+  const dragWidth = useRef(listWidth);
+  const dragFrame = useRef(0);
+  const applyDragWidth = (w: number) => {
+    dragWidth.current = w;
+    if (dragFrame.current) return;
+    dragFrame.current = requestAnimationFrame(() => {
+      dragFrame.current = 0;
+      layoutRef.current?.style.setProperty(
+        "--profiles-list-w",
+        `${dragWidth.current}px`,
+      );
+    });
+  };
+  const finishDrag = () => {
+    if (!splitDrag.current) return;
+    splitDrag.current = null;
+    if (dragFrame.current) {
+      cancelAnimationFrame(dragFrame.current);
+      dragFrame.current = 0;
+    }
+    setListWidth(dragWidth.current);
+    setSplitDragging(false);
+  };
+
   useEffect(() => {
     if (!splitDragging) return;
     document.body.style.cursor = "col-resize";
@@ -303,6 +330,7 @@ export default function ProfileManager() {
       e.preventDefault();
       e.currentTarget.setPointerCapture(e.pointerId);
       splitDrag.current = { x: e.clientX, w: listWidth };
+      dragWidth.current = listWidth;
       setSplitDragging(true);
     },
     onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
@@ -311,18 +339,17 @@ export default function ProfileManager() {
       const max = layoutRef.current
         ? Math.min(LIST_WIDTH_MAX, layoutRef.current.clientWidth - 400)
         : LIST_WIDTH_MAX;
-      setListWidth(
-        Math.max(LIST_WIDTH_MIN, Math.min(max, drag.w + e.clientX - drag.x)),
+      applyDragWidth(
+        Math.round(
+          Math.max(
+            LIST_WIDTH_MIN,
+            Math.min(max, drag.w + e.clientX - drag.x),
+          ),
+        ),
       );
     },
-    onPointerUp: () => {
-      splitDrag.current = null;
-      setSplitDragging(false);
-    },
-    onPointerCancel: () => {
-      splitDrag.current = null;
-      setSplitDragging(false);
-    },
+    onPointerUp: finishDrag,
+    onPointerCancel: finishDrag,
     onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => {
       if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
         e.preventDefault();
