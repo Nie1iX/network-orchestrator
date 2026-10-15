@@ -24,8 +24,12 @@ struct ConnectionsView: View {
   @State private var name = ""
   @State private var savingSet = false
   @State private var setName = ""
-  @AppStorage("connectionsListWidth") private var listWidth = 400.0
+  @AppStorage("connectionsListWidth") private var storedListWidth = 400.0
+  /// Live width while the splitter is dragged; persisted once on release so
+  /// UserDefaults is not hit (and observers are not woken) on every frame.
+  @State private var dragWidth: Double?
   @State private var dragStartWidth: Double?
+  private var listWidth: Double { dragWidth ?? storedListWidth }
   var body: some View {
     VStack(alignment: .leading, spacing: 10.5) {
       HStack(spacing: 7) {
@@ -99,14 +103,24 @@ struct ConnectionsView: View {
       .frame(maxHeight: .infinity)
       .contentShape(Rectangle())
       .onHover { inside in inside ? NSCursor.resizeLeftRight.push() : NSCursor.pop() }
+      // Global space: the splitter moves with the cursor, so a local
+      // translation would feed back into itself and make the panes jitter.
       .gesture(
-        DragGesture(minimumDistance: 1)
+        DragGesture(minimumDistance: 1, coordinateSpace: .global)
           .onChanged { value in
-            let start = dragStartWidth ?? listWidth
+            let start = dragStartWidth ?? storedListWidth
             dragStartWidth = start
-            listWidth = min(max(start + value.translation.width, 300), 640)
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+              dragWidth = min(max(start + value.translation.width, 300), 640)
+            }
           }
-          .onEnded { _ in dragStartWidth = nil })
+          .onEnded { _ in
+            if let dragWidth { storedListWidth = dragWidth }
+            dragWidth = nil
+            dragStartWidth = nil
+          })
   }
   /// Saved combinations of connections, applied in one click.
   private var setsBar: some View {
