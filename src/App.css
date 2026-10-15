@@ -3521,6 +3521,10 @@ a:focus-visible,
 .profiles-detail-pane {
   overflow-y: auto;
   min-height: 0;
+  /* A scrollbar appearing at the overflow threshold would re-wrap the text
+     mid-resize; reserve its space and isolate the pane's layout/paint. */
+  scrollbar-gutter: stable;
+  contain: layout paint;
 }
 
 .profiles-list-pane {
