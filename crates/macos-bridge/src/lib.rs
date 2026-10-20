@@ -430,6 +430,25 @@ fn machine_seed(root: &Path) -> Result<String, String> {
     std::fs::rename(&temp, &path).map_err(store_error)?;
     Ok(seed)
 }
+/// The Tailscale guard follows the tunnels and Tailscale itself. The client
+/// asks on every refresh, so repeat questions inside a short window are
+/// answered from the last result instead of running the CLI again.
+fn tailscale_sync(root: &Path) -> Value {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<(Instant, Value)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, value)) = last.as_ref() {
+        if at.elapsed() < Duration::from_secs(20) {
+            return value.clone();
+        }
+    }
+    let value = net_manager_engine::Engine::new(root)
+        .sync_tailscale()
+        .unwrap_or_else(|| json!({"state": "unavailable"}));
+    *last = Some((Instant::now(), value.clone()));
+    value
+}
 fn encode(value: impl serde::Serialize) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|_| "Could not encode the result".into())
 }
@@ -456,6 +475,13 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
         }
         "netbird_down" => return netbird::NetBird::detect().down(),
         "netbird_log" => return Ok(json!(netbird::log_tail(&root.join("runtime")))),
+        // The user's own Tailscale, driven through its CLI; no store access.
+        "tailscale_status" => {
+            return Ok(net_manager_engine::tailscale::Tailscale::detect().status())
+        }
+        "tailscale_up" => return net_manager_engine::tailscale::Tailscale::detect().up(),
+        "tailscale_down" => return net_manager_engine::tailscale::Tailscale::detect().down(),
+        "tailscale_sync" => return Ok(tailscale_sync(root)),
         "user_network_settings" => return encode(user_network::read()),
         _ => {}
     }
@@ -917,6 +943,12 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
         ),
     }
 }
+/// The bridge's methods for Rust callers (the `netorch` CLI): the same
+/// profile, import, subscription and routing services the native client uses.
+/// Runtime methods (`connect`, `disconnect`, ...) belong to `net-manager-engine`.
+pub fn call(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
+    dispatch(root, method, args)
+}
 fn response(bytes: &[u8]) -> Value {
     let result = serde_json::from_slice::<Request>(bytes)
         .map_err(|_| "Invalid bridge request".to_string())
@@ -943,12 +975,6 @@ pub unsafe extern "C" fn netorch_call(bytes: *const u8, length: usize) -> *mut c
 }
 /// # Safety
 /// `value` must be null or a still-owned pointer returned by `netorch_call`.
-/// The bridge's methods for Rust callers (the `netorch` CLI): the same
-/// profile, import, subscription and routing services the native client uses.
-/// Runtime methods (`connect`, `disconnect`, ...) belong to `net-manager-engine`.
-pub fn call(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
-    dispatch(root, method, args)
-}
 #[no_mangle]
 pub unsafe extern "C" fn netorch_free(value: *mut c_char) {
     if !value.is_null() {
