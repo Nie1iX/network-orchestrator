@@ -8,6 +8,8 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-10-20
+
 ### Added
 
 - macOS: `netorch`, a command line tool in the app bundle that does what the
