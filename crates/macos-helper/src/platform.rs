@@ -335,6 +335,24 @@ impl OvpnPlatform for RealOvpnPlatform {
             .unwrap_or_default()
     }
 
+    fn resolve_direct(&self, host: &str, servers: &[std::net::IpAddr]) -> Vec<std::net::IpAddr> {
+        if host.is_empty() || host.len() > 253 {
+            return Vec::new();
+        }
+        for server in servers {
+            if let Ok(found) = crate::dnsquery::resolve_a(host, *server) {
+                if !found.is_empty() {
+                    return found
+                        .into_iter()
+                        .map(std::net::IpAddr::V4)
+                        .take(MAX_RESOLVED_BYPASS)
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
+    }
+
     fn is_our_openvpn(&self, pid: u32) -> bool {
         crate::peer::process_path(pid)
             .map(|path| path.starts_with(&self.stage_dir))
