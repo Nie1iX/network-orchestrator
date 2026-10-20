@@ -66,17 +66,18 @@ pub fn process_path(pid: u32) -> io::Result<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe"))
 }
 
-/// The console user, running the app executable the helper was installed with.
+/// The console user, running one of the programs the helper was installed
+/// with: the app executable or the `netorch` command line tool of its bundle.
 pub struct AppClientPolicy {
-    client: PathBuf,
+    clients: Vec<PathBuf>,
     console_uid: Box<dyn Fn() -> Option<u32> + Send + Sync>,
     process_path: Box<dyn Fn(u32) -> io::Result<PathBuf> + Send + Sync>,
 }
 
 impl AppClientPolicy {
-    pub fn new(client: PathBuf) -> Self {
+    pub fn new(clients: Vec<PathBuf>) -> Self {
         Self {
-            client,
+            clients,
             console_uid: Box::new(console_uid),
             process_path: Box::new(process_path),
         }
@@ -84,12 +85,12 @@ impl AppClientPolicy {
 
     #[cfg(test)]
     fn with(
-        client: PathBuf,
+        clients: Vec<PathBuf>,
         console_uid: impl Fn() -> Option<u32> + Send + Sync + 'static,
         process_path: impl Fn(u32) -> io::Result<PathBuf> + Send + Sync + 'static,
     ) -> Self {
         Self {
-            client,
+            clients,
             console_uid: Box::new(console_uid),
             process_path: Box::new(process_path),
         }
@@ -103,16 +104,21 @@ impl ClientPolicy for AppClientPolicy {
         }
         let path = (self.process_path)(peer.pid)
             .map_err(|_| "the calling process could not be identified".to_string())?;
-        if path != self.client {
-            return Err("the calling process is not the Network Orchestrator app".into());
+        if !self.clients.contains(&path) {
+            return Err("the calling process is not part of Network Orchestrator".into());
         }
         Ok(())
     }
 }
 
-/// The app executable that sits next to the helper inside the same bundle.
-pub fn sibling_client(helper: &Path) -> Option<PathBuf> {
-    Some(helper.parent()?.join("NetworkOrchestrator"))
+/// The programs that sit next to the helper inside the same bundle: the app
+/// executable and the `netorch` command line tool.
+pub fn sibling_clients(helper: &Path) -> Option<Vec<PathBuf>> {
+    let directory = helper.parent()?;
+    Some(vec![
+        directory.join("NetworkOrchestrator"),
+        directory.join("netorch"),
+    ])
 }
 
 #[cfg(test)]
@@ -121,9 +127,12 @@ mod tests {
 
     fn policy(console: Option<u32>, path: &'static str) -> AppClientPolicy {
         AppClientPolicy::with(
-            PathBuf::from(
-                "/Applications/Network Orchestrator.app/Contents/MacOS/NetworkOrchestrator",
-            ),
+            vec![
+                PathBuf::from(
+                    "/Applications/Network Orchestrator.app/Contents/MacOS/NetworkOrchestrator",
+                ),
+                PathBuf::from("/Applications/Network Orchestrator.app/Contents/MacOS/netorch"),
+            ],
             move || console,
             move |_| Ok(PathBuf::from(path)),
         )
@@ -147,9 +156,24 @@ mod tests {
     }
 
     #[test]
+    fn the_command_line_tool_of_the_same_bundle_is_accepted_too() {
+        let cli = "/Applications/Network Orchestrator.app/Contents/MacOS/netorch";
+        let peer = Peer { uid: 501, pid: 42 };
+        assert!(policy(Some(501), cli).check(&peer).is_ok());
+        // Same bundle directory is not enough: only the named programs.
+        let other =
+            "/Applications/Network Orchestrator.app/Contents/MacOS/network-orchestrator-helper";
+        assert!(policy(Some(501), other).check(&peer).is_err());
+        // The tool is held to the same console-user rule as the app.
+        assert!(policy(Some(502), cli).check(&peer).is_err());
+        let root = Peer { uid: 0, pid: 42 };
+        assert!(policy(Some(501), cli).check(&root).is_err());
+    }
+
+    #[test]
     fn unreadable_process_is_rejected() {
         let policy = AppClientPolicy::with(
-            PathBuf::from(APP),
+            vec![PathBuf::from(APP)],
             || Some(501),
             |_| Err(io::Error::other("gone")),
         );
@@ -157,11 +181,14 @@ mod tests {
     }
 
     #[test]
-    fn client_is_resolved_next_to_the_helper() {
+    fn clients_are_resolved_next_to_the_helper() {
         let helper = Path::new("/A.app/Contents/MacOS/network-orchestrator-helper");
         assert_eq!(
-            sibling_client(helper).unwrap(),
-            Path::new("/A.app/Contents/MacOS/NetworkOrchestrator")
+            sibling_clients(helper).unwrap(),
+            [
+                PathBuf::from("/A.app/Contents/MacOS/NetworkOrchestrator"),
+                PathBuf::from("/A.app/Contents/MacOS/netorch"),
+            ]
         );
     }
 
