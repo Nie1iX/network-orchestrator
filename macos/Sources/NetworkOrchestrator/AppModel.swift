@@ -87,6 +87,15 @@ import SystemConfiguration
   private static func loadSets() -> [ConnectionSet] {
     guard let data = UserDefaults.standard.data(forKey: setsKey) else { return [] }
     return (try? JSONDecoder().decode([ConnectionSet].self, from: data)) ?? []
+  /// The profile last connected from this app, for the Home quick action.
+  private static let lastProfileKey = "lastConnectedProfile"
+  var lastProfileID: String? = UserDefaults.standard.string(forKey: AppModel.lastProfileKey) {
+    didSet { UserDefaults.standard.set(lastProfileID, forKey: Self.lastProfileKey) }
+  }
+  var lastProfile: Profile? {
+    lastProfileID.flatMap { id in snapshot?.profiles.first { $0.id == id } }
+  }
+
   }
   private func saveSets() {
     if let data = try? JSONEncoder().encode(connectionSets) {
@@ -252,6 +261,7 @@ import SystemConfiguration
   }
   func loadInspection(_ profile: Profile) async {
     guard inspections[profile.id] == nil else { return }
+        lastProfileID = profile.id
     if let result: Inspection = try? await core.call("inspect", args: ["id": profile.id]) {
       inspections[profile.id] = result
     }
