@@ -1,21 +1,21 @@
 //! WireGuard and OpenVPN profiles. The bridge only reads the profile's managed
 //! files and asks the privileged helper over `daemon_protocol`; routes,
 //! interfaces, DNS and the VPN processes themselves stay in the helper.
+use crate::privileged::Privileged;
 use base64::Engine as _;
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::daemon_protocol::{
     method, OpenVpnConnectParams, OpenVpnConnectRequest, OpenVpnConnectResult,
     OpenVpnConnectionState, OpenVpnCredentials, OpenVpnDisconnectResult, OpenVpnFailure,
-    OpenVpnProfileParams, OpenVpnStatusResult, OpenVpnUserPass, OpenVpnWarning,
-    WireGuardConnectParams, WireGuardConnectResult, WireGuardDisconnectResult,
-    WireGuardProfileParams, WireGuardStatusResult, WireGuardWarning,
+    OpenVpnProfileParams, OpenVpnStatusResult, OpenVpnWarning, WireGuardConnectParams,
+    WireGuardConnectResult, WireGuardDisconnectResult, WireGuardProfileParams,
+    WireGuardStatusResult, WireGuardWarning,
 };
-use net_manager_core::helper_client::{HelperClient, HelperError};
+use net_manager_core::helper_client::HelperError;
 use net_manager_core::models::{
     secondary_networks, PolicyRoute, Profile, TunnelBackend, TunnelRole, TunnelState, TunnelStatus,
 };
 use net_manager_core::openvpn_config::{credential_requirements, CredentialRequirements};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -23,7 +23,7 @@ const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_ASSET_BYTES: u64 = 512 * 1024;
 const MAX_ASSETS: usize = 32;
 /// Shown (and translated) by the client; also what the Swift side matches.
-pub(crate) const CREDENTIALS_REQUIRED: &str = "OpenVPN credentials required";
+pub const CREDENTIALS_REQUIRED: &str = "OpenVPN credentials required";
 
 /// The routes the helper is asked to install: a secondary connection carries
 /// exactly the networks listed for it, a primary one keeps what the profile has.
@@ -75,7 +75,7 @@ fn wireguard_notice(status: &WireGuardStatusResult) -> Option<String> {
         .map(str::to_string)
 }
 
-pub(crate) fn wireguard_status(client: &HelperClient, profile: &Profile) -> TunnelStatus {
+pub(crate) fn wireguard_status(client: &dyn Privileged, profile: &Profile) -> TunnelStatus {
     match client.call::<_, WireGuardStatusResult>(
         method::WIREGUARD_STATUS,
         WireGuardProfileParams {
@@ -128,7 +128,7 @@ fn openvpn_notice(status: &OpenVpnStatusResult) -> Option<String> {
     text.map(str::to_string)
 }
 
-pub(crate) fn openvpn_status(client: &HelperClient, profile: &Profile) -> TunnelStatus {
+pub(crate) fn openvpn_status(client: &dyn Privileged, profile: &Profile) -> TunnelStatus {
     match client.call::<_, OpenVpnStatusResult>(
         method::OPENVPN_STATUS,
         OpenVpnProfileParams {
@@ -150,7 +150,7 @@ pub(crate) fn openvpn_status(client: &HelperClient, profile: &Profile) -> Tunnel
 }
 
 pub(crate) fn stop(
-    client: &HelperClient,
+    client: &dyn Privileged,
     profile: &Profile,
     helper_error: impl Fn(HelperError) -> String,
 ) -> Result<(), String> {
@@ -237,8 +237,8 @@ fn read_assets(
     Ok(assets)
 }
 
-fn capable(client: &HelperClient, name: &str, missing: &str) -> Result<(), String> {
-    let hello = client.hello().map_err(crate::runtime::helper_error)?;
+fn capable(client: &dyn Privileged, name: &str, missing: &str) -> Result<(), String> {
+    let hello = client.hello().map_err(crate::helper_error)?;
     if hello
         .capabilities
         .iter()
@@ -252,7 +252,7 @@ fn capable(client: &HelperClient, name: &str, missing: &str) -> Result<(), Strin
 
 pub(crate) fn start_wireguard(
     root: &Path,
-    client: &HelperClient,
+    client: &dyn Privileged,
     profile: &Profile,
 ) -> Result<(), String> {
     check_role(profile)?;
@@ -268,7 +268,7 @@ pub(crate) fn start_wireguard(
 
 /// The `wireguard.connect` request.
 pub(crate) fn request_wireguard(
-    client: &HelperClient,
+    client: &dyn Privileged,
     profile: &Profile,
     config: String,
 ) -> Result<(), String> {
@@ -285,7 +285,7 @@ pub(crate) fn request_wireguard(
             },
         )
         .map(|_| ())
-        .map_err(crate::runtime::helper_error)
+        .map_err(crate::helper_error)
 }
 
 /// What the profile needs from the user before it can connect.
@@ -300,25 +300,6 @@ pub(crate) fn requirements(
     let config = read_managed_text(&vault, profile, &profile.config_path)?;
     let assets = read_assets(&vault, profile)?;
     Ok(credential_requirements(&config, &assets))
-}
-
-/// Credentials typed into the app, passed as flat strings.
-pub(crate) fn credentials_from_args(args: &Value) -> Option<OpenVpnCredentials> {
-    let text = |key: &str| {
-        args[key]
-            .as_str()
-            .map(str::to_string)
-            .filter(|value| !value.is_empty())
-    };
-    let user_pass = match (text("username"), text("password")) {
-        (Some(username), Some(password)) => Some(OpenVpnUserPass { username, password }),
-        _ => None,
-    };
-    let passphrase = text("passphrase");
-    (user_pass.is_some() || passphrase.is_some()).then_some(OpenVpnCredentials {
-        auth_user_pass: user_pass,
-        private_key_passphrase: passphrase,
-    })
 }
 
 /// Builds the request, refusing early when a needed credential is missing and
@@ -394,7 +375,7 @@ pub(crate) fn openvpn_request(
 
 pub(crate) fn start_openvpn(
     root: &Path,
-    client: &HelperClient,
+    client: &dyn Privileged,
     profile: &Profile,
     credentials: Option<OpenVpnCredentials>,
 ) -> Result<(), String> {
@@ -408,15 +389,17 @@ pub(crate) fn start_openvpn(
     client
         .call::<_, OpenVpnConnectResult>(method::OPENVPN_CONNECT, request)
         .map(|_| ())
-        .map_err(crate::runtime::helper_error)
+        .map_err(crate::helper_error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use net_manager_core::daemon_protocol::{
-        encode_line, ErrorCode, HelloResult, RequestFrame, ResponseFrame, PROTOCOL_VERSION,
+        encode_line, ErrorCode, HelloResult, OpenVpnUserPass, RequestFrame, ResponseFrame,
+        PROTOCOL_VERSION,
     };
+    use net_manager_core::helper_client::HelperClient;
     use serde_json::json;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
@@ -550,7 +533,13 @@ mod tests {
         );
         let error = openvpn_request(dir.path(), &profile, None).unwrap_err();
         assert_eq!(error, CREDENTIALS_REQUIRED);
-        let supplied = credentials_from_args(&json!({"username": "u", "password": "p"}));
+        let supplied = Some(OpenVpnCredentials {
+            auth_user_pass: Some(OpenVpnUserPass {
+                username: "u".into(),
+                password: "p".into(),
+            }),
+            private_key_passphrase: None,
+        });
         let request = openvpn_request(dir.path(), &profile, supplied).unwrap();
         assert_eq!(request.profile.assets["assets/ca.crt"], "Q0VSVA==");
         let user = request.credentials.unwrap().auth_user_pass.unwrap();
@@ -561,12 +550,15 @@ mod tests {
     fn credentials_the_profile_does_not_ask_for_are_not_sent() {
         let dir = tempfile::tempdir().unwrap();
         let profile = openvpn_profile(dir.path(), "client\nremote vpn.example\nca assets/ca.crt\n");
-        let supplied =
-            credentials_from_args(&json!({"username": "u", "password": "p", "passphrase": "k"}));
+        let supplied = Some(OpenVpnCredentials {
+            auth_user_pass: Some(OpenVpnUserPass {
+                username: "u".into(),
+                password: "p".into(),
+            }),
+            private_key_passphrase: Some("k".into()),
+        });
         let request = openvpn_request(dir.path(), &profile, supplied).unwrap();
         assert!(request.credentials.is_none());
-        assert!(credentials_from_args(&json!({"username": "u"})).is_none());
-        assert!(credentials_from_args(&json!({})).is_none());
     }
 
     #[test]

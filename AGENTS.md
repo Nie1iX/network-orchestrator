@@ -11,8 +11,16 @@ Guidance for agents/contributors working in this repository.
 - `crates/daemon` — Linux privileged system service: Unix socket protocol,
   polkit authorization, netlink mutations, ownership journal and recovery.
   Hard-learned netlink quirks live in `MEMORY.md`.
+- `crates/engine` — typed connection engine (`Engine`): connect/disconnect/
+  status/system proxy/Xray install and the requests to the privileged helper.
+  macOS (aarch64) only for now; shared by the bridge and the planned `netorch`
+  CLI (`docs/plans/2026-10-15-19-netorch-cli.md`). No UI, no FFI.
+- `crates/cli` — the `netorch` command line tool (macOS): clap commands over
+  `crates/engine` and the bridge's profile/import/routing services; ships in
+  the app bundle next to the helper.
 - `crates/macos-bridge` — unprivileged JSON C ABI staticlib the Swift client
-  links; every macOS core operation goes through it.
+  links; every macOS core operation goes through it. A thin JSON wrapper over
+  `crates/engine` for runtime operations.
 - `crates/macos-helper` — privileged launchd helper daemon for root macOS
   network mutations; design in
   `docs/plans/2026-09-30-14-macos-privileged-helper.md`.
@@ -66,6 +74,8 @@ mirrors this gate on Windows.
 - `cargo test -p net-manager-core <filter>` / `-p net-manager-app <filter>` —
   focused Rust tests; `swift test --package-path macos --scratch-path
   target/macos-swift --filter <name>` — focused Swift tests.
+- `cargo run -p net-manager-cli -- <args>` — the `netorch` CLI against the
+  default data dir; add `NETORCH_MACOS_DATA_DIR=<dir>` for an isolated one.
 - `npm run test` — frontend Node unit tests (format, i18n, sandbox,
   subscriptions, intent doctor).
 - `npm run dev:sandbox` — browser-only frontend on :1422 with an in-memory
@@ -115,6 +125,14 @@ mirrors this gate on Windows.
 - Managed backend downloads must stay fixed-version, hash-pinned, bounded,
   allowlisted, and atomic; tests use synthetic archives and never hit the
   network or install into real app data.
+- `netorch` (`crates/cli`) is an unprivileged client of the helper like the
+  app. Its `sudo netorch up` mode runs the helper's own executors in-process
+  (same rules: Xray only as the console user, the pinned OpenVPN, no script
+  hooks) and refuses when the helper is running; as root it must never write
+  into the user's data directory (root-owned files would lock the app out),
+  execute a binary from a user-writable directory, or run local Xray.
+  Loopback Xray runs only in a foreground `netorch up` holding the data
+  directory's `.instance.lock`, which the app takes too.
 - `crates/macos-bridge` stays unprivileged: never add `daemon_protocol`
   methods or network mutations to it. macOS mutations go through a launchd
   helper speaking `daemon_protocol` over a Unix socket
