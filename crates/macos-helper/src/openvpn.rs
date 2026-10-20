@@ -8,6 +8,7 @@
 //! session ends, however it ends.
 
 use crate::dns;
+use crate::dnsquery::is_fake_pool;
 use crate::journal::{Journal, Record};
 use crate::resolver;
 use crate::routes::{self, RouteOp, Target, Uplink};
@@ -64,6 +65,12 @@ pub trait OvpnPlatform: Send + Sync {
     fn free_unit(&self) -> io::Result<String>;
     fn spawn(&self, spec: &SpawnSpec) -> io::Result<Box<dyn Process>>;
     fn resolve(&self, host: &str) -> Vec<IpAddr>;
+    /// `host` as answered by `servers` directly, bypassing the system
+    /// resolver (which another tunnel may answer with fake addresses).
+    fn resolve_direct(&self, host: &str, servers: &[IpAddr]) -> Vec<IpAddr> {
+        let _ = (host, servers);
+        Vec::new()
+    }
     /// Whether `pid` is still an OpenVPN of ours (recovery only).
     fn is_our_openvpn(&self, pid: u32) -> bool;
     fn kill(&self, pid: u32);
@@ -268,6 +275,35 @@ pub fn remote_hosts(config: &str) -> Vec<String> {
     hosts
 }
 
+/// Rewrites `remote <host>` lines so OpenVPN dials the address in `pinned`
+/// instead of resolving the name itself (the system resolver may answer with
+/// another tunnel's fake address). Certificates are checked by name, not by
+/// the dialed host, so verification is unaffected.
+pub fn pin_remotes(config: &str, pinned: &[(String, IpAddr)]) -> String {
+    if pinned.is_empty() {
+        return config.to_owned();
+    }
+    let mut out = String::with_capacity(config.len());
+    for line in config.lines() {
+        let trimmed = line.trim_start();
+        let mut tokens = trimmed.split_whitespace();
+        let replacement = (tokens.next() == Some("remote"))
+            .then(|| tokens.next())
+            .flatten()
+            .and_then(|host| pinned.iter().find(|(name, _)| name == host));
+        match replacement {
+            Some((host, ip)) => {
+                let indent = &line[..line.len() - trimmed.len()];
+                out.push_str(indent);
+                out.push_str(&trimmed.replacen(host.as_str(), &ip.to_string(), 1));
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// The server address in a `>STATE:` line (field 5 after the timestamp).
 pub fn remote_ip_of_state(line: &str) -> Option<IpAddr> {
     let data = line
@@ -351,6 +387,47 @@ impl Inner {
     }
 
     /// Install what the server pushed (or re-install if it changed).
+    /// Server addresses of the config's `remote` hosts, and the names whose
+    /// system answer was another tunnel's fake address (with the real
+    /// address, asked of the uplink's own resolvers, to dial instead).
+    fn resolve_remotes(
+        &self,
+        config: &str,
+        uplink: &Uplink,
+    ) -> (Vec<IpAddr>, Vec<(String, IpAddr)>) {
+        let mut remotes: Vec<IpAddr> = Vec::new();
+        let mut pinned: Vec<(String, IpAddr)> = Vec::new();
+        let mut local: Option<Vec<IpAddr>> = None;
+        for host in remote_hosts(config) {
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                remotes.push(ip);
+                continue;
+            }
+            let (fake, mut real): (Vec<IpAddr>, Vec<IpAddr>) = self
+                .platform
+                .resolve(&host)
+                .into_iter()
+                .partition(is_fake_pool);
+            if !fake.is_empty() {
+                let servers = local.get_or_insert_with(|| {
+                    let snapshot = dns::snapshot(&*self.runner, &uplink.interface).ok();
+                    dns::local_resolvers(&*self.runner, &uplink.interface, snapshot.as_ref())
+                });
+                real = self
+                    .platform
+                    .resolve_direct(&host, servers)
+                    .into_iter()
+                    .filter(|ip| !is_fake_pool(ip))
+                    .collect();
+                if let Some(ip) = real.first() {
+                    pinned.push((host.clone(), *ip));
+                }
+            }
+            remotes.extend(real);
+        }
+        (remotes, pinned)
+    }
+
     fn apply_network(&self, active: &mut Active) -> Result<(), String> {
         let Some(push) = active.snapshot.active_push.as_ref() else {
             return Ok(());
@@ -677,12 +754,24 @@ impl OpenVpnExecutor {
         };
         self.reap();
         let mut guard = inner.lock_active();
-        if let Some(active) = guard.as_ref() {
-            return Err(Error::Conflict(if active.profile_id == params.profile_id {
-                "this connection is already running".into()
-            } else {
-                "another OpenVPN connection already owns the tunnel".into()
-            }));
+        while let Some(active) = guard.as_ref() {
+            if active.profile_id == params.profile_id {
+                return Err(Error::Conflict("this connection is already running".into()));
+            }
+            // A session that never came up (still dialing, or retrying) must
+            // not lock out another profile of the same user; one that is up
+            // is only replaced by an explicit disconnect.
+            let stale =
+                active.owner_uid == uid && active.snapshot.state != Some(OpenVpnState::Connected);
+            if !stale {
+                return Err(Error::Conflict(
+                    "another OpenVPN connection already owns the tunnel".into(),
+                ));
+            }
+            let stale = guard.take().expect("checked above");
+            drop(guard);
+            inner.teardown(stale, None, true);
+            guard = inner.lock_active();
         }
         *inner.finished.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.recover_locked()?;
@@ -691,15 +780,8 @@ impl OpenVpnExecutor {
         // The sanitizer embeds this path for staged assets; it is the real
         // path in production and a stand-in under test.
         let logical = Path::new(RUNTIME_ROOT).join(uid.to_string()).join(&name);
-        let sanitized = sanitize_openvpn_config(&params.config, &assets, &logical)
+        let mut sanitized = sanitize_openvpn_config(&params.config, &assets, &logical)
             .map_err(|_| Error::Invalid("the OpenVPN configuration is not accepted".into()))?;
-        let remotes = remote_hosts(&sanitized.config)
-            .iter()
-            .flat_map(|host| match host.parse::<IpAddr>() {
-                Ok(ip) => vec![ip],
-                Err(_) => inner.platform.resolve(host),
-            })
-            .collect::<Vec<_>>();
         let uplink = routes::detect_uplink(&*inner.runner).map_err(|err| {
             if err.kind() == io::ErrorKind::AlreadyExists {
                 Error::Conflict(err.to_string())
@@ -707,6 +789,28 @@ impl OpenVpnExecutor {
                 Error::Unavailable("There is no network connection to use".into())
             }
         })?;
+        let (remotes, pinned) = inner.resolve_remotes(&sanitized.config, &uplink);
+        sanitized.config = pin_remotes(&sanitized.config, &pinned);
+        // The handshake must not ride another tunnel that captured the
+        // default route: the server stays reachable through the uplink from
+        // the first packet, not only once the push is applied.
+        let bypass: Vec<RouteOp> = match uplink.gateway {
+            Some(gateway) => remotes
+                .iter()
+                .filter_map(|ip| match ip {
+                    IpAddr::V4(v4) if *v4 != gateway => Some(RouteOp {
+                        network: *ip,
+                        prefix: 32,
+                        target: Target::Gateway {
+                            address: IpAddr::V4(gateway),
+                        },
+                        optional: true,
+                    }),
+                    _ => None,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         let binary = inner.platform.stage_binary().map_err(|err| {
             eprintln!("network-orchestrator-helper: openvpn binary: {err}");
             Error::Unavailable(
@@ -730,10 +834,14 @@ impl OpenVpnExecutor {
             .journal
             .save(&record)
             .map_err(|_| Error::Unavailable("The tunnel state could not be recorded".into()))?;
+        let installed = routes::apply(&*inner.runner, &bypass).unwrap_or_default();
+        record.routes = installed.clone();
+        let _ = inner.journal.save(&record);
         let cleanup = |dir: Option<&Path>| {
             if let Some(dir) = dir {
                 let _ = fs::remove_dir_all(dir);
             }
+            routes::remove(&*inner.runner, &installed);
             let _ = inner.journal.clear();
         };
         let stage = stage_config(&inner.staging_root, uid, &name, &sanitized).map_err(|err| {
@@ -984,6 +1092,8 @@ mod tests {
         AuthFails,
         /// Connects, then dies without a goodbye.
         DiesAfterConnect,
+        /// Starts dialing and never gets anywhere.
+        Hangs,
     }
 
     struct FakeChild {
@@ -1063,6 +1173,12 @@ mod tests {
                     }
                 }
                 let _ = stream.write_all(b">STATE:1700000001,CONNECTING,,,,,,\n");
+                if behavior == Behavior::Hangs {
+                    while alive_t.load(Ordering::SeqCst) {
+                        read_some(&mut stream, &received);
+                    }
+                    return;
+                }
                 let _ = stream.write_all(b">PASSWORD:Need 'Auth' username/password\n");
                 if behavior == Behavior::AuthFails {
                     std::thread::sleep(Duration::from_millis(200));
@@ -1096,8 +1212,17 @@ mod tests {
             Ok(Box::new(FakeChild { alive }))
         }
         fn resolve(&self, host: &str) -> Vec<IpAddr> {
-            if host == "vpn.example" {
-                vec!["203.0.113.5".parse().unwrap()]
+            match host {
+                "vpn.example" => vec!["203.0.113.5".parse().unwrap()],
+                // Another tunnel's fake-IP DNS answers for this one.
+                "captured.example" => vec!["198.18.7.7".parse().unwrap()],
+                _ => vec![],
+            }
+        }
+        fn resolve_direct(&self, host: &str, servers: &[IpAddr]) -> Vec<IpAddr> {
+            let uplink_dns: IpAddr = "1.1.1.1".parse().unwrap();
+            if host == "captured.example" && servers.contains(&uplink_dns) {
+                vec!["203.0.113.9".parse().unwrap()]
             } else {
                 vec![]
             }
@@ -1136,6 +1261,9 @@ mod tests {
         }
         fn resolve(&self, host: &str) -> Vec<IpAddr> {
             self.0.resolve(host)
+        }
+        fn resolve_direct(&self, host: &str, servers: &[IpAddr]) -> Vec<IpAddr> {
+            self.0.resolve_direct(host, servers)
         }
         fn is_our_openvpn(&self, pid: u32) -> bool {
             self.0.is_our_openvpn(pid)
@@ -1278,11 +1406,13 @@ mod tests {
             status.failure_reason,
             Some(OpenVpnFailure::AuthenticationFailure)
         );
-        assert!(!f
-            .runner
-            .calls()
+        // Only the server bypass was ever installed, and it is gone again.
+        let calls = f.runner.calls();
+        assert!(calls
             .iter()
-            .any(|c| c.starts_with("route -n add")));
+            .filter(|c| c.starts_with("route -n add"))
+            .all(|c| c == "route -n add -host 203.0.113.5 -gateway 192.168.1.1"));
+        assert!(calls.contains(&"route -n delete -host 203.0.113.5".to_string()));
         assert!(!f
             .runner
             .calls()
@@ -1309,11 +1439,13 @@ mod tests {
             f.executor.status(501, "office").failure_reason,
             Some(OpenVpnFailure::CredentialsRequired)
         );
-        assert!(!f
-            .runner
-            .calls()
+        // Only the server bypass was ever installed, and it is gone again.
+        let calls = f.runner.calls();
+        assert!(calls
             .iter()
-            .any(|c| c.starts_with("route -n add")));
+            .filter(|c| c.starts_with("route -n add"))
+            .all(|c| c == "route -n add -host 203.0.113.5 -gateway 192.168.1.1"));
+        assert!(calls.contains(&"route -n delete -host 203.0.113.5".to_string()));
     }
 
     #[test]
@@ -1377,6 +1509,92 @@ mod tests {
             OpenVpnConnectionState::Stopped
         );
         assert!(!f.executor.disconnect(502, "office").unwrap().stopped);
+        assert!(f.executor.disconnect(501, "office").unwrap().stopped);
+    }
+
+    #[test]
+    fn a_name_answered_with_a_fake_address_is_pinned_to_the_real_one() {
+        let f = fixture(Behavior::Hangs);
+        let mut req = request(true);
+        req.profile.config = "client\ndev tun\nremote captured.example 1194 udp\n".into();
+        f.executor.connect(501, req).unwrap();
+        let calls = f.runner.calls();
+        // The handshake is routed around any other tunnel before OpenVPN starts.
+        assert!(
+            calls.contains(&"route -n add -host 203.0.113.9 -gateway 192.168.1.1".to_string()),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("198.18.7.7")), "{calls:?}");
+        let staged = f
+            .dir
+            .path()
+            .join("run/501")
+            .read_dir()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("config.ovpn");
+        let config = std::fs::read_to_string(staged).unwrap();
+        assert!(config.contains("remote 203.0.113.9 1194 udp"), "{config}");
+        assert!(!config.contains("captured.example"));
+        assert!(f.executor.disconnect(501, "office").unwrap().stopped);
+        assert!(f
+            .runner
+            .calls()
+            .contains(&"route -n delete -host 203.0.113.9".to_string()));
+    }
+
+    #[test]
+    fn remote_lines_are_pinned_by_name_only() {
+        let pinned = vec![("vpn.example".to_string(), "203.0.113.9".parse().unwrap())];
+        let config = "client\n  remote vpn.example 1194\nremote other.example 443\n<ca>\nremote vpn.example\n</ca>\n";
+        let out = pin_remotes(config, &pinned);
+        assert!(out.contains("  remote 203.0.113.9 1194\n"));
+        assert!(out.contains("remote other.example 443\n"));
+        assert_eq!(pin_remotes(config, &[]), config);
+    }
+
+    #[test]
+    fn a_session_that_never_came_up_gives_way_to_another_profile() {
+        let f = fixture(Behavior::Hangs);
+        f.executor.connect(501, request(true)).unwrap();
+        let mut other = request(true);
+        other.profile.profile_id = "other".into();
+        f.executor.connect(501, other).unwrap();
+        assert_eq!(f.platform.spawned.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            f.executor.status(501, "office").state,
+            OpenVpnConnectionState::Stopped
+        );
+        assert_eq!(
+            f.executor.status(501, "other").state,
+            OpenVpnConnectionState::Connecting
+        );
+        // Another user's session is never touched.
+        let mut third = request(true);
+        third.profile.profile_id = "third".into();
+        assert!(matches!(
+            f.executor.connect(502, third),
+            Err(Error::Conflict(_))
+        ));
+        assert!(f.executor.disconnect(501, "other").unwrap().stopped);
+    }
+
+    #[test]
+    fn a_connected_session_is_not_replaced_by_another_profile() {
+        let f = fixture(Behavior::Connects);
+        f.executor.connect(501, request(true)).unwrap();
+        wait_for("connected", || {
+            f.executor.status(501, "office").state == OpenVpnConnectionState::Connected
+        });
+        let mut other = request(true);
+        other.profile.profile_id = "other".into();
+        assert!(matches!(
+            f.executor.connect(501, other),
+            Err(Error::Conflict(_))
+        ));
         assert!(f.executor.disconnect(501, "office").unwrap().stopped);
     }
 

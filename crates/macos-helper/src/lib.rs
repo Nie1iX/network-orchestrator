@@ -9,6 +9,7 @@
 
 pub mod backends;
 pub mod dns;
+pub mod dnsquery;
 pub mod journal;
 pub mod openvpn;
 pub mod peer;
