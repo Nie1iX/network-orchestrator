@@ -26,6 +26,15 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
   status, system proxy, Xray install, helper requests) behind a `Privileged`
   trait, shared by the native client's bridge and `netorch`.
 
+- macOS: Tailscale stays reachable next to any primary tunnel (Xray, WireGuard,
+  OpenVPN). The connections page gets a Tailscale row in "External" (status,
+  tailnet, peers online, on/off, sign-in page) instead of the bare VPN entry.
+  While a tunnel is up, the app asks the helper (`tailscale.protect`) to pin
+  the tailnet prefixes to Tailscale's interface if another route wins them and
+  to route Tailscale's own remote hosts (direct peers, DERP relays from the
+  tailnet's map, the control server) around the tunnel through the physical
+  gateway. Everything is journaled and released with the last tunnel.
+
 ### Changed
 
 - macOS: the privileged helper admits the `netorch` tool of its own bundle next
