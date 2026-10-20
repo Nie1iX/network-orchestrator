@@ -280,12 +280,24 @@ pub struct RealOvpnPlatform {
     pub stage_dir: PathBuf,
     /// Log file next to the helper's socket, owned by the console user.
     pub log: PathBuf,
+    /// `Contents/` of the app bundle holding `Helpers/openvpn`, when the
+    /// helper binary itself lives elsewhere (installed by `netorch`).
+    pub bundle: Option<PathBuf>,
+}
+
+impl RealOvpnPlatform {
+    /// Where the pinned backends are: the configured bundle, or the one the
+    /// running executable sits in.
+    fn contents(&self, exe: &Path) -> Option<PathBuf> {
+        self.bundle.clone().or_else(|| bundle_contents(exe))
+    }
 }
 
 impl OvpnPlatform for RealOvpnPlatform {
     fn stage_binary(&self) -> io::Result<PathBuf> {
         let helper = std::env::current_exe()?;
-        let contents = bundle_contents(&helper)
+        let contents = self
+            .contents(&helper)
             .ok_or_else(|| io::Error::other("the app bundle could not be located"))?;
         if !self.stage_dir.exists() {
             fs::create_dir_all(&self.stage_dir)?;
@@ -368,6 +380,25 @@ impl OvpnPlatform for RealOvpnPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_backends_come_from_the_configured_bundle_or_the_executables_own() {
+        let platform = |bundle: Option<&str>| RealOvpnPlatform {
+            stage_dir: PathBuf::from("/stage"),
+            log: PathBuf::from("/log"),
+            bundle: bundle.map(PathBuf::from),
+        };
+        let exe = Path::new("/A.app/Contents/MacOS/netorch");
+        assert_eq!(
+            platform(None).contents(exe),
+            Some(PathBuf::from("/A.app/Contents"))
+        );
+        let installed = Path::new("/Library/PrivilegedHelperTools/helper");
+        assert_eq!(
+            platform(Some("/B.app/Contents")).contents(installed),
+            Some(PathBuf::from("/B.app/Contents"))
+        );
+    }
 
     #[test]
     fn account_of_the_current_user_resolves() {

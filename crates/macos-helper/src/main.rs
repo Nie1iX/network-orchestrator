@@ -1,6 +1,6 @@
 use network_orchestrator_macos_helper::journal::Journal;
 use network_orchestrator_macos_helper::openvpn::OpenVpnExecutor;
-use network_orchestrator_macos_helper::peer::{sibling_client, AppClientPolicy};
+use network_orchestrator_macos_helper::peer::{sibling_clients, AppClientPolicy};
 use network_orchestrator_macos_helper::platform::{RealOvpnPlatform, RealPlatform, RealWgPlatform};
 use network_orchestrator_macos_helper::server::{bind_socket, serve, ServerContext};
 use network_orchestrator_macos_helper::service::HelperService;
@@ -13,33 +13,53 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 
-const USAGE: &str = "usage: network-orchestrator-helper [--socket PATH] [--client PATH]";
+const USAGE: &str =
+    "usage: network-orchestrator-helper [--socket PATH] [--client PATH]... [--bundle CONTENTS]";
 
 struct Options {
     socket: PathBuf,
-    client: PathBuf,
+    clients: Vec<PathBuf>,
+    /// `Contents/` holding `Helpers/openvpn` when this binary is not inside
+    /// the bundle (a copy installed by `netorch service install`).
+    bundle: Option<PathBuf>,
 }
 
+/// `--client` may repeat; without it the programs next to the helper are used.
 fn parse_args(args: Vec<String>, helper: &std::path::Path) -> Result<Options, String> {
     let mut socket = None;
-    let mut client = None;
+    let mut clients = Vec::new();
+    let mut bundle = None;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
-        let slot = match flag.as_str() {
-            "--socket" => &mut socket,
-            "--client" => &mut client,
-            _ => return Err(format!("unknown argument '{flag}'\n{USAGE}")),
-        };
-        *slot = Some(PathBuf::from(
+        let value = |args: &mut std::vec::IntoIter<String>| {
             args.next()
-                .ok_or_else(|| format!("{flag} needs a value\n{USAGE}"))?,
-        ));
+                .map(PathBuf::from)
+                .ok_or_else(|| format!("{flag} needs a value\n{USAGE}"))
+        };
+        match flag.as_str() {
+            "--socket" => socket = Some(value(&mut args)?),
+            "--client" => clients.push(value(&mut args)?),
+            "--bundle" => {
+                let path = value(&mut args)?;
+                if !path.is_absolute()
+                    || path.file_name().and_then(|n| n.to_str()) != Some("Contents")
+                {
+                    return Err(format!(
+                        "--bundle must be an absolute .../Contents path\n{USAGE}"
+                    ));
+                }
+                bundle = Some(path);
+            }
+            _ => return Err(format!("unknown argument '{flag}'\n{USAGE}")),
+        }
+    }
+    if clients.is_empty() {
+        clients = sibling_clients(helper).ok_or("the app executable could not be located")?;
     }
     Ok(Options {
         socket: socket.unwrap_or_else(|| PathBuf::from(SOCKET_PATH)),
-        client: client
-            .or_else(|| sibling_client(helper))
-            .ok_or("the app executable could not be located")?,
+        clients,
+        bundle,
     })
 }
 
@@ -90,6 +110,7 @@ async fn run(options: Options) -> std::io::Result<()> {
         Box::new(RealOvpnPlatform {
             stage_dir: state_dir.join("backends"),
             log: std::path::Path::new(SOCKET_DIR).join("openvpn.log"),
+            bundle: options.bundle.clone(),
         }),
         Box::new(SystemRunner),
         Journal::named(state_dir, "openvpn.json"),
@@ -115,7 +136,7 @@ async fn run(options: Options) -> std::io::Result<()> {
         watch_ovpn.reap();
     });
     let ctx = Arc::new(ServerContext::new(
-        Box::new(AppClientPolicy::new(options.client)),
+        Box::new(AppClientPolicy::new(options.clients)),
         Arc::new(HelperService::new(
             xray.clone(),
             wireguard.clone(),
@@ -135,4 +156,47 @@ async fn run(options: Options) -> std::io::Result<()> {
     openvpn.shutdown();
     let _ = std::fs::remove_file(&options.socket);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn parse(args: &[&str]) -> Result<Options, String> {
+        parse_args(
+            args.iter().map(|arg| arg.to_string()).collect(),
+            Path::new("/A.app/Contents/MacOS/network-orchestrator-helper"),
+        )
+    }
+
+    #[test]
+    fn without_flags_the_programs_next_to_the_helper_are_the_clients() {
+        let options = parse(&[]).unwrap();
+        assert_eq!(options.clients.len(), 2);
+        assert!(options.bundle.is_none());
+    }
+
+    #[test]
+    fn an_installed_copy_names_its_clients_and_bundle() {
+        let options = parse(&[
+            "--client",
+            "/Applications/N.app/Contents/MacOS/netorch",
+            "--bundle",
+            "/Applications/N.app/Contents",
+        ])
+        .unwrap();
+        assert_eq!(options.clients.len(), 1);
+        assert_eq!(
+            options.bundle.as_deref(),
+            Some(Path::new("/Applications/N.app/Contents"))
+        );
+    }
+
+    #[test]
+    fn a_bundle_that_is_not_an_absolute_contents_directory_is_refused() {
+        assert!(parse(&["--bundle", "Contents"]).is_err());
+        assert!(parse(&["--bundle", "/Applications/N.app"]).is_err());
+        assert!(parse(&["--bundle"]).is_err());
+    }
 }
