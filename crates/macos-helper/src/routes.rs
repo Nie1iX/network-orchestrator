@@ -160,6 +160,12 @@ pub fn plan(uplink: &Uplink, tun: &str, bypass: &[Ipv4Addr]) -> Vec<RouteOp> {
             if *host == gateway {
                 continue;
             }
+            // A tailnet address (Tailscale's MagicDNS among the system
+            // resolvers) lives on Tailscale's interface; a route to the
+            // router would only cut it off.
+            if host.octets()[0] == 100 && (host.octets()[1] & 0xc0) == 0x40 {
+                continue;
+            }
             ops.push(RouteOp {
                 network: IpAddr::V4(*host),
                 prefix: 32,
@@ -349,6 +355,27 @@ mod tests {
         );
         assert_eq!(ops[1].network.to_string(), "128.0.0.0");
         assert!(matches!(&ops[9].target, Target::Interface { name } if name == "utun10"));
+    }
+
+    #[test]
+    fn a_tailnet_resolver_is_never_routed_to_the_gateway() {
+        let uplink = Uplink {
+            interface: "en0".into(),
+            gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+        };
+        // MagicDNS among the system resolvers stays on Tailscale's interface.
+        let ops = plan(
+            &uplink,
+            "utun10",
+            &[Ipv4Addr::new(100, 100, 100, 100), Ipv4Addr::new(1, 1, 1, 1)],
+        );
+        assert_eq!(ops.len(), 1 + 8 + 2);
+        assert!(!ops
+            .iter()
+            .any(|op| op.network.to_string() == "100.100.100.100"));
+        // 100.128/9 is outside the tailnet range and is still a normal host.
+        let ops = plan(&uplink, "utun10", &[Ipv4Addr::new(100, 128, 0, 1)]);
+        assert_eq!(ops.len(), 1 + 8 + 2);
     }
 
     #[test]
