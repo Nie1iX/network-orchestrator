@@ -24,8 +24,12 @@ struct ConnectionsView: View {
   @State private var name = ""
   @State private var savingSet = false
   @State private var setName = ""
-  @AppStorage("connectionsListWidth") private var listWidth = 400.0
+  @AppStorage("connectionsListWidth") private var storedListWidth = 400.0
+  /// Live width while the splitter is dragged; persisted once on release so
+  /// UserDefaults is not hit (and observers are not woken) on every frame.
+  @State private var dragWidth: Double?
   @State private var dragStartWidth: Double?
+  private var listWidth: Double { dragWidth ?? storedListWidth }
   var body: some View {
     VStack(alignment: .leading, spacing: 10.5) {
       HStack(spacing: 7) {
@@ -99,14 +103,24 @@ struct ConnectionsView: View {
       .frame(maxHeight: .infinity)
       .contentShape(Rectangle())
       .onHover { inside in inside ? NSCursor.resizeLeftRight.push() : NSCursor.pop() }
+      // Global space: the splitter moves with the cursor, so a local
+      // translation would feed back into itself and make the panes jitter.
       .gesture(
-        DragGesture(minimumDistance: 1)
+        DragGesture(minimumDistance: 1, coordinateSpace: .global)
           .onChanged { value in
-            let start = dragStartWidth ?? listWidth
+            let start = dragStartWidth ?? storedListWidth
             dragStartWidth = start
-            listWidth = min(max(start + value.translation.width, 300), 640)
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+              dragWidth = min(max(start + value.translation.width, 300), 640)
+            }
           }
-          .onEnded { _ in dragStartWidth = nil })
+          .onEnded { _ in
+            if let dragWidth { storedListWidth = dragWidth }
+            dragWidth = nil
+            dragStartWidth = nil
+          })
   }
   /// Saved combinations of connections, applied in one click.
   private var setsBar: some View {
@@ -200,14 +214,86 @@ struct ConnectionsView: View {
           }
         }
       }
-      if !model.externalVPNs.isEmpty || model.netbird?.installed == true {
+      if !model.externalVPNs.isEmpty || model.netbird?.installed == true
+        || model.tailscale?.installed == true
+      {
         Text(L10n.text("profiles.external")).font(.system(size: 11.2, weight: .semibold))
           .foregroundStyle(p.secondary).padding(.horizontal, 8).padding(.top, 14).padding(
             .bottom, 5)
         Rectangle().fill(p.border).frame(height: 1)
         if let netbird = model.netbird, netbird.installed { netbirdRow(netbird) }
-        ForEach(model.externalVPNs) { vpn in externalRow(vpn) }
+        if let tailscale = model.tailscale, tailscale.installed { tailscaleRow(tailscale) }
+        ForEach(model.externalVPNs.filter { !model.isTailscaleService($0) }) { vpn in
+          externalRow(vpn)
+        }
       }
+    }
+  }
+  /// Tailscale: the user's own daemon, switched on and off like another app's
+  /// VPN, with a note when the app is keeping it reachable next to a tunnel.
+  private func tailscaleRow(_ state: TailscaleState) -> some View {
+    let service = model.externalVPNs.first { model.isTailscaleService($0) }
+    let busy =
+      model.tailscaleBusy || state.state == "connecting"
+      || (service.map { model.switchingExternal.contains($0.id) } ?? false)
+    return HStack(spacing: 8) {
+      StateDot(
+        state: state.state == "connected" ? "running" : state.state == "needsLogin" ? "failed" : "stopped")
+      NativeIcon(name: "VpnIcon", size: 14).foregroundStyle(p.secondary)
+      VStack(alignment: .leading, spacing: 1) {
+        Text("Tailscale").font(.system(size: 12.3, weight: .semibold)).lineLimit(1)
+        Text(tailscaleSubtitle(state)).font(.system(size: 10.5))
+          .foregroundStyle(state.state == "needsLogin" ? p["warn"] : p.muted).lineLimit(2)
+      }
+      Spacer(minLength: 8)
+      if let page = state.authUrl.flatMap({ URL(string: $0) }) {
+        Menu {
+          Button(L10n.text("native.tailscale.signIn")) { NSWorkspace.shared.open(page) }
+        } label: {
+          NativeIcon(name: "DotsVerticalIcon", size: 14).frame(width: 22, height: 22)
+        }.menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).foregroundStyle(p.secondary)
+          .frame(width: 22)
+      }
+      if busy {
+        Spinner(size: 12).frame(width: 34)
+      } else {
+        Button {
+          Task { await model.toggleTailscale() }
+        } label: {
+          Capsule().fill(state.isOn ? p["up"] : p.border).frame(width: 34, height: 20).overlay(
+            alignment: state.isOn ? .trailing : .leading
+          ) {
+            Circle().fill(.white).frame(width: 16, height: 16).padding(2)
+          }
+        }.buttonStyle(.plain).disabled(!state.canToggle)
+          .help(L10n.text(state.isOn ? "common.disconnect" : "common.connect"))
+          .accessibilityLabel(L10n.text(state.isOn ? "common.disconnect" : "common.connect"))
+      }
+    }
+    .padding(.horizontal, 8).padding(.vertical, 5)
+    .overlay(alignment: .bottom) { Rectangle().fill(p.border).frame(height: 1) }
+  }
+  private func tailscaleSubtitle(_ state: TailscaleState) -> String {
+    switch state.state {
+    case "connected":
+      var parts = [state.ip ?? ""]
+      if let online = state.peersOnline, let total = state.peersTotal {
+        parts.append(
+          L10n.text(
+            "native.tailscale.peers", ["online": String(online), "total": String(total)]))
+      }
+      if state.exitNode == true { parts.append(L10n.text("native.tailscale.exitNode")) }
+      let guardState = model.tailscaleGuard?.state
+      if guardState == "protected" {
+        parts.append(L10n.text("native.tailscale.guarded"))
+      } else if guardState == "unsupported" && !model.ownTunnelInterfaces.isEmpty {
+        parts.append(L10n.text("native.tailscale.guardOutdated"))
+      }
+      return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+    case "connecting": return L10n.text("native.tailscale.connecting")
+    case "needsLogin": return L10n.text("native.tailscale.needsLogin")
+    case "unavailable": return L10n.text("native.tailscale.unavailable")
+    default: return L10n.text("native.tailscale.disconnected")
     }
   }
   /// NetBird: the user's own daemon, switched on and off like another app's VPN.

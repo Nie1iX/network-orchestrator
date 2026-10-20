@@ -23,6 +23,11 @@ import SystemConfiguration
   var netbird: NetBirdState?
   var netbirdBusy = false
   var showingNetBirdSetup = false
+  /// The user's Tailscale, when one is installed, and what keeps it reachable
+  /// next to a running tunnel.
+  var tailscale: TailscaleState?
+  var tailscaleGuard: TailscaleGuardState?
+  var tailscaleBusy = false
   var switchingExternal = Set<String>()
   var snapshot: Snapshot?
   var capabilities: Capabilities?
@@ -80,6 +85,15 @@ import SystemConfiguration
     }
     instanceLock = descriptor
     return true
+  }
+
+  /// The profile last connected from this app, for the Home quick action.
+  private static let lastProfileKey = "lastConnectedProfile"
+  var lastProfileID: String? = UserDefaults.standard.string(forKey: AppModel.lastProfileKey) {
+    didSet { UserDefaults.standard.set(lastProfileID, forKey: Self.lastProfileKey) }
+  }
+  var lastProfile: Profile? {
+    lastProfileID.flatMap { id in snapshot?.profiles.first { $0.id == id } }
   }
 
   var connectionSets: [ConnectionSet] = []
@@ -177,10 +191,47 @@ import SystemConfiguration
     guard !isDuplicate else { return }
     primaryInterface = Self.currentPrimaryInterface()
     helperStatus = try? await core.callConcurrently("helper_status")
+    // A "helper is not running" banner left from before it was (re)enabled.
+    if helperStatus?.reachable == true,
+      error == "The privileged helper is not running. Install it in Settings."
+    {
+      error = nil
+    }
     await retireOutdatedHelper()
     do { runtime = try await core.call("runtime") } catch { runtime = nil }
     if let list: [ExternalVpn] = try? await core.call("external_vpns") { externalVPNs = list }
     netbird = try? await core.callConcurrently("netbird_status")
+    tailscale = try? await core.callConcurrently("tailscale_status")
+    await syncTailscaleGuard()
+  }
+  /// Asks the core to keep the tailnet reachable next to whatever tunnel is
+  /// up (or to let go when none is). The core answers repeats from a cache.
+  private func syncTailscaleGuard() async {
+    guard tailscale?.installed == true else {
+      tailscaleGuard = nil
+      return
+    }
+    tailscaleGuard = try? await core.callConcurrently("tailscale_sync")
+  }
+  /// Another app's VPN entry that is really Tailscale's (shown by its own row).
+  func isTailscaleService(_ vpn: ExternalVpn) -> Bool {
+    tailscale?.installed == true && (vpn.provider ?? "").hasPrefix("io.tailscale.")
+  }
+  /// Connects Tailscale or, when it is on, disconnects it. The Mac app's own
+  /// VPN service is switched like any other app's VPN; otherwise the CLI is.
+  func toggleTailscale() async {
+    guard !tailscaleBusy, let current = tailscale, current.canToggle else { return }
+    tailscaleBusy = true
+    defer { tailscaleBusy = false }
+    if let service = externalVPNs.first(where: { isTailscaleService($0) }) {
+      await setExternalVPN(service, connect: !current.isOn)
+      return
+    }
+    do {
+      tailscale = try await core.callConcurrently(current.isOn ? "tailscale_down" : "tailscale_up")
+      error = nil
+    } catch { self.error = error.localizedDescription }
+    await refreshRuntime()
   }
   /// Connect or disconnect another app's VPN, as the VPN menu would.
   func setExternalVPN(_ vpn: ExternalVpn, connect: Bool) async {
@@ -210,6 +261,7 @@ import SystemConfiguration
         guard let extra = try await credentialArguments(profile) else { return }
         runtime = try await core.call("connect", args: ["id": profile.id].merging(extra) { $1 })
         await rememberAfterConnect(profile)
+        lastProfileID = profile.id
       }
       error = nil
     } catch {

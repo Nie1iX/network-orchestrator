@@ -54,6 +54,7 @@ struct ContentView: View {
     }
     StatusBar(model: model)
     }
+    .background(WindowChrome(color: AppPalette(scheme: scheme).app))
     .font(.system(size: 14)).foregroundStyle(AppPalette(scheme: scheme).text).tint(
       AppPalette(scheme: scheme).accent
     )
@@ -191,6 +192,12 @@ struct HomeView: View {
       VStack(alignment: .leading, spacing: 0) {
         AppHeading(title: "Quick actions")
         HStack(spacing: 7) {
+          if let last = model.lastProfile, !model.isRunning(last) {
+            Button(L10n.text("Connect {name}", ["name": last.name])) {
+              Task { await model.toggle(last) }
+            }.buttonStyle(TauriButtonStyle(kind: .accent)).disabled(model.pending.contains(last.id))
+          }
+          Button(L10n.text("profiles.title")) { model.section = .connections }
           Button(L10n.text("+ Add connection")) { modal = .add }.buttonStyle(
             TauriButtonStyle(kind: .accent))
           Button(L10n.text("Import…")) { modal = .importConfig(nil) }.buttonStyle(
@@ -391,5 +398,20 @@ struct LogSheet: View {
         }
       }.padding(14)
     }.task { text = await load() }
+  }
+}
+
+/// Paints the title bar in the page colour so the traffic-light strip is one
+/// flat tone with the app name centred, instead of a white system material.
+struct WindowChrome: NSViewRepresentable {
+  let color: Color
+  func makeNSView(context: Context) -> NSView { NSView() }
+  func updateNSView(_ view: NSView, context: Context) {
+    DispatchQueue.main.async {
+      guard let window = view.window else { return }
+      window.titlebarAppearsTransparent = true
+      window.titleVisibility = .visible
+      window.backgroundColor = NSColor(color)
+    }
   }
 }

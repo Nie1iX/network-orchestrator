@@ -43,7 +43,7 @@ text = json.dumps(document, indent=2) + "\n"
 if not os.path.exists(target) or open(target).read() != text:
     open(target, 'w').write(text)
 PY
-cargo build --profile "$CARGO_PROFILE" -p network-orchestrator-macos-helper
+cargo build --profile "$CARGO_PROFILE" -p network-orchestrator-macos-helper -p net-manager-cli
 swift build --package-path macos --configuration "$SWIFT_CONFIG" --scratch-path target/macos-swift
 VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "net-manager-macos-bridge"))')"
 BIN_DIR="$(swift build --package-path macos --configuration "$SWIFT_CONFIG" --scratch-path target/macos-swift --show-bin-path)"
@@ -54,6 +54,11 @@ install -m 0755 "$BIN_DIR/NetworkOrchestrator" "$APP_DIR/Contents/MacOS/NetworkO
 # process it serves.
 HELPER_LABEL="com.netmanager.app.helper"
 install -m 0755 "$REPO_ROOT/target/$CARGO_PROFILE/network-orchestrator-helper" "$APP_DIR/Contents/MacOS/network-orchestrator-helper"
+# The netorch command line tool lives in the bundle too: the helper admits it
+# next to the app (peer policy), and `sudo netorch` finds the pinned OpenVPN
+# through the bundle. Link it into PATH with
+#   ln -s "/Applications/Network Orchestrator.app/Contents/MacOS/netorch" /usr/local/bin/netorch
+install -m 0755 "$REPO_ROOT/target/$CARGO_PROFILE/netorch" "$APP_DIR/Contents/MacOS/netorch"
 # Pinned backend binaries live in Contents/Helpers; the helper verifies each
 # against the hash compiled into it and only runs a private copy.
 mkdir -p "$APP_DIR/Contents/Helpers"
@@ -132,6 +137,7 @@ else
     fi
 fi
 codesign --force --sign "$SIGN_ID" "$APP_DIR/Contents/MacOS/network-orchestrator-helper"
+codesign --force --sign "$SIGN_ID" "$APP_DIR/Contents/MacOS/netorch"
 codesign --force --sign "$SIGN_ID" "$APP_DIR"
 codesign --verify --strict "$APP_DIR"
 echo "$APP_DIR"

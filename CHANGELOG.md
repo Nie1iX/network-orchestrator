@@ -8,6 +8,54 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-10-20
+
+### Added
+
+- macOS: `netorch`, a command line tool in the app bundle that does what the
+  app does without writing configs by hand: `netorch up <link | subscription
+  URL | .conf | .ovpn | name>` imports, picks ports and mode, connects and
+  undoes everything on exit. Also `ls`, `status`, `add`, `rm`, `rename`,
+  `down`, `logs`, `test` (subscription delays, exit IP), `route
+  show|set|check|lookup`, `doctor`, `backend install`, `service status` and
+  shell completions; `--json` everywhere. It shares profiles with the app and
+  talks to the privileged helper like the app does, or, with `sudo netorch up`,
+  runs the helper's executors inside its own process (no helper needed; only
+  for the user at the console). `sudo netorch service install` installs the
+  helper without the app: it copies the helper into `/Library/PrivilegedHelperTools`
+  (root-owned) and registers it with launchd; `service remove` undoes it.
+- `net-manager-engine` crate: the connection engine (connect, disconnect,
+  status, system proxy, Xray install, helper requests) behind a `Privileged`
+  trait, shared by the native client's bridge and `netorch`.
+
+- macOS: Tailscale stays reachable next to any primary tunnel (Xray, WireGuard,
+  OpenVPN). The connections page gets a Tailscale row in "External" (status,
+  tailnet, peers online, on/off, sign-in page) instead of the bare VPN entry.
+  While a tunnel is up, the app asks the helper (`tailscale.protect`) to pin
+  the tailnet prefixes to Tailscale's interface if another route wins them and
+  to route Tailscale's own remote hosts (direct peers, DERP relays from the
+  tailnet's map, the control server) around the tunnel through the physical
+  gateway. Everything is journaled and released with the last tunnel.
+
+### Changed
+
+- macOS: the privileged helper admits the `netorch` tool of its own bundle next
+  to the app executable; the same console-user rule applies.
+
+## [0.8.6] - 2026-10-15
+
+### Fixed
+
+- Profiles page: dragging the list/detail splitter no longer makes the text
+  flicker. macOS measured the drag in the splitter's own moving coordinate
+  space; the web client re-rendered the whole screen on every pointer move and
+  let scrollbars toggle mid-resize.
+
+### Changed
+
+- macOS: the title bar is one flat colour with the app name centred, instead of
+  a white system material behind the window buttons.
+
 ## [0.8.5] - 2026-10-14
 
 ### Added

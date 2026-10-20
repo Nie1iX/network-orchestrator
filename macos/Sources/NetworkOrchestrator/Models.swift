@@ -19,6 +19,33 @@ struct NetBirdState: Decodable, Sendable, Equatable {
   var canToggle: Bool { installed && state != "daemonStopped" && state != "unavailable" }
 }
 
+/// The user's own Tailscale as the bridge summarises it (no keys, no peer names).
+struct TailscaleState: Decodable, Sendable, Equatable {
+  let installed: Bool
+  /// connected, connecting, disconnected, needsLogin, notInstalled or unavailable.
+  let state: String
+  var ip: String? = nil
+  var tailnet: String? = nil
+  var host: String? = nil
+  var version: String? = nil
+  var peersOnline: Int? = nil
+  var peersTotal: Int? = nil
+  var exitNode: Bool? = nil
+  /// The page to finish signing in on; only while sign-in is needed.
+  var authUrl: String? = nil
+  var isOn: Bool { state == "connected" || state == "connecting" }
+  var canToggle: Bool { installed && state != "unavailable" }
+}
+
+/// What the helper does to keep Tailscale reachable next to a tunnel.
+struct TailscaleGuardState: Decodable, Sendable, Equatable {
+  /// protected, idle, off, unsupported or unavailable.
+  let state: String
+  var interface: String? = nil
+  var pinned: [String]? = nil
+  var bypassed: Int? = nil
+}
+
 struct Capabilities: Decodable, Sendable {
   let os: String
   let minimumOS: String

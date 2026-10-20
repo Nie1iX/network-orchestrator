@@ -9,6 +9,7 @@
 
 pub mod backends;
 pub mod dns;
+pub mod dnsquery;
 pub mod journal;
 pub mod openvpn;
 pub mod peer;
@@ -18,6 +19,7 @@ pub mod routes;
 pub mod server;
 pub mod service;
 pub mod sysexec;
+pub mod tailscale;
 pub mod trusted_exec;
 pub mod tun;
 pub mod wg_engine;

@@ -67,6 +67,30 @@ still need the privileged launchd helper
 (`docs/plans/2026-09-30-14-macos-privileged-helper.md`); the bridge refuses
 them instead of simulating success.
 
+## Command line (`netorch`)
+
+The bundle contains `Contents/MacOS/netorch`; link it into PATH with
+`ln -s "/Applications/Network Orchestrator.app/Contents/MacOS/netorch" /usr/local/bin/netorch`.
+
+```bash
+netorch up 'vless://…'            # import + connect a local proxy; Ctrl+C disconnects
+netorch up https://sub.example/s  # subscription, then pick with `netorch test <name>`
+netorch up office.ovpn --auth-stdin < creds.txt
+netorch up home --mode tun        # needs the helper (installed from the app)
+sudo netorch up home              # same tunnel without the helper, for this process
+netorch route set home --direct geosite:ru --block domain:ads.example
+netorch doctor                    # what is missing
+sudo netorch service install      # the helper without the app (run from the bundle)
+```
+
+Loopback Xray (`--mode socks`, the default for links) runs inside the
+foreground `netorch up`; `netorch down` / `status` from another terminal find it
+through a state file. It holds the data directory's `.instance.lock`, so the app
+and a second `netorch` cannot also run connections there. Tunnels (TUN,
+WireGuard, OpenVPN) live in the helper and outlive the terminal. Secrets are
+never accepted as arguments (`--auth-stdin`, `--passphrase-stdin` or a hidden
+prompt) and never printed.
+
 ## Storage and isolation
 
 Default data: `~/Library/Application Support/com.netmanager.app.macos`.

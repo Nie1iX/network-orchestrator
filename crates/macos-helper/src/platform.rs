@@ -280,12 +280,24 @@ pub struct RealOvpnPlatform {
     pub stage_dir: PathBuf,
     /// Log file next to the helper's socket, owned by the console user.
     pub log: PathBuf,
+    /// `Contents/` of the app bundle holding `Helpers/openvpn`, when the
+    /// helper binary itself lives elsewhere (installed by `netorch`).
+    pub bundle: Option<PathBuf>,
+}
+
+impl RealOvpnPlatform {
+    /// Where the pinned backends are: the configured bundle, or the one the
+    /// running executable sits in.
+    fn contents(&self, exe: &Path) -> Option<PathBuf> {
+        self.bundle.clone().or_else(|| bundle_contents(exe))
+    }
 }
 
 impl OvpnPlatform for RealOvpnPlatform {
     fn stage_binary(&self) -> io::Result<PathBuf> {
         let helper = std::env::current_exe()?;
-        let contents = bundle_contents(&helper)
+        let contents = self
+            .contents(&helper)
             .ok_or_else(|| io::Error::other("the app bundle could not be located"))?;
         if !self.stage_dir.exists() {
             fs::create_dir_all(&self.stage_dir)?;
@@ -335,6 +347,24 @@ impl OvpnPlatform for RealOvpnPlatform {
             .unwrap_or_default()
     }
 
+    fn resolve_direct(&self, host: &str, servers: &[std::net::IpAddr]) -> Vec<std::net::IpAddr> {
+        if host.is_empty() || host.len() > 253 {
+            return Vec::new();
+        }
+        for server in servers {
+            if let Ok(found) = crate::dnsquery::resolve_a(host, *server) {
+                if !found.is_empty() {
+                    return found
+                        .into_iter()
+                        .map(std::net::IpAddr::V4)
+                        .take(MAX_RESOLVED_BYPASS)
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
+    }
+
     fn is_our_openvpn(&self, pid: u32) -> bool {
         crate::peer::process_path(pid)
             .map(|path| path.starts_with(&self.stage_dir))
@@ -350,6 +380,25 @@ impl OvpnPlatform for RealOvpnPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_backends_come_from_the_configured_bundle_or_the_executables_own() {
+        let platform = |bundle: Option<&str>| RealOvpnPlatform {
+            stage_dir: PathBuf::from("/stage"),
+            log: PathBuf::from("/log"),
+            bundle: bundle.map(PathBuf::from),
+        };
+        let exe = Path::new("/A.app/Contents/MacOS/netorch");
+        assert_eq!(
+            platform(None).contents(exe),
+            Some(PathBuf::from("/A.app/Contents"))
+        );
+        let installed = Path::new("/Library/PrivilegedHelperTools/helper");
+        assert_eq!(
+            platform(Some("/B.app/Contents")).contents(installed),
+            Some(PathBuf::from("/B.app/Contents"))
+        );
+    }
 
     #[test]
     fn account_of_the_current_user_resolves() {

@@ -162,6 +162,7 @@
     "Predicted routes": "Predicted routes",
     "Prefix": "Prefix",
     "Quick actions": "Quick actions",
+    "Connect {name}": "Connect {name}",
     "Raw table": "Raw table",
     "Refresh": "Refresh",
     "Refresh network": "Refresh network",
@@ -1229,6 +1230,15 @@
     "Secure web proxy (HTTPS)": "Secure web proxy (HTTPS)",
     "SOCKS proxy": "SOCKS proxy",
     "Automatic proxy configuration": "Automatic proxy configuration",
-    "Proxy auto-discovery": "Proxy auto-discovery"
+    "Proxy auto-discovery": "Proxy auto-discovery",
+    "native.tailscale.peers": "{online}/{total} online",
+    "native.tailscale.exitNode": "exit node on",
+    "native.tailscale.guarded": "kept reachable next to your VPN",
+    "native.tailscale.guardOutdated": "Update the helper in Settings to keep it reachable next to a VPN",
+    "native.tailscale.connecting": "Connecting… finish signing in in your browser if it opened",
+    "native.tailscale.needsLogin": "Sign-in required: turn it on to sign in through your browser",
+    "native.tailscale.unavailable": "Tailscale is not responding",
+    "native.tailscale.disconnected": "Disconnected",
+    "native.tailscale.signIn": "Open sign-in page"
   }
 }
