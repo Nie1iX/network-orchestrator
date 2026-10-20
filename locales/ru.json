@@ -1311,6 +1311,15 @@
     "Secure web proxy (HTTPS)": "Защищённый веб-прокси (HTTPS)",
     "SOCKS proxy": "SOCKS-прокси",
     "Automatic proxy configuration": "Автонастройка прокси",
-    "Proxy auto-discovery": "Автообнаружение прокси"
+    "Proxy auto-discovery": "Автообнаружение прокси",
+    "native.tailscale.peers": "{online}/{total} в сети",
+    "native.tailscale.exitNode": "выходной узел включён",
+    "native.tailscale.guarded": "остаётся доступным рядом с вашим VPN",
+    "native.tailscale.guardOutdated": "Обновите helper в настройках, чтобы Tailscale оставался доступным рядом с VPN",
+    "native.tailscale.connecting": "Подключение… завершите вход в браузере, если он открылся",
+    "native.tailscale.needsLogin": "Нужен вход: включите, чтобы войти через браузер",
+    "native.tailscale.unavailable": "Tailscale не отвечает",
+    "native.tailscale.disconnected": "Отключено",
+    "native.tailscale.signIn": "Открыть страницу входа"
   }
 }
