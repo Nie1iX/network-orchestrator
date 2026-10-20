@@ -59,6 +59,10 @@ pub mod method {
     pub const TAILSCALE_STATUS: &str = "tailscale.status";
     pub const TAILSCALE_UP: &str = "tailscale.up";
     pub const TAILSCALE_DOWN: &str = "tailscale.down";
+    /// macOS helper only (not in [`CAPABILITIES`], the Linux daemon's list):
+    /// keep the user's Tailscale reachable next to a primary tunnel.
+    pub const TAILSCALE_PROTECT: &str = "tailscale.protect";
+    pub const TAILSCALE_RELEASE: &str = "tailscale.release";
     pub const ALWAYS_ON_SET: &str = "alwaysOn.set";
     pub const ALWAYS_ON_LIST: &str = "alwaysOn.list";
     pub const ALWAYS_ON_REMOVE: &str = "alwaysOn.remove";
@@ -1297,6 +1301,43 @@ pub struct TailscaleStatusResult {
     pub peers: Vec<TailscalePeer>,
 }
 
+/// macOS: what the user's own Tailscale needs so that a primary tunnel does
+/// not cut the tailnet off. The unprivileged side reads Tailscale's state and
+/// the helper only validates and installs routes: `self_ips` identify which
+/// utun is Tailscale's (the one carrying one of these addresses), `endpoints`
+/// are the remote addresses its own traffic uses (direct peers, DERP, the
+/// control server) and must keep reaching the physical uplink.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleProtectParams {
+    #[serde(default)]
+    pub self_ips: Vec<std::net::IpAddr>,
+    #[serde(default)]
+    pub endpoints: Vec<std::net::IpAddr>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleProtectResult {
+    /// Tailscale's interface, when one carries a given address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
+    /// Tailnet prefixes the helper had to pin to that interface because
+    /// something else was winning them (empty when Tailscale's own routes
+    /// already win, the usual case).
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    /// Remote hosts now routed around the primary tunnel.
+    #[serde(default)]
+    pub bypassed: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TailscaleReleaseResult {
+    pub released: bool,
+}
+
 /// Only these backends support pre-login replay. OpenVPN credentials and Xray
 /// plaintext need a separate persistence/security review before enrollment.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1819,6 +1860,27 @@ mod tests {
             r#"{"id":42,"ok":true,"result":{"available":false,"backendState":"Unavailable","selfIps":[],"exitNodeActive":false,"peers":[]}}"#,
         );
         assert!(!empty.available);
+    }
+
+    #[test]
+    fn golden_tailscale_protect() {
+        let (frame, params): (_, TailscaleProtectParams) = request(
+            r#"{"id":50,"method":"tailscale.protect","params":{"selfIps":["100.115.39.70","fd7a:115c:a1e0::c82f:2747"],"endpoints":["203.0.113.7"]}}"#,
+        );
+        assert_eq!(frame.method, method::TAILSCALE_PROTECT);
+        assert_eq!(params.self_ips.len(), 2);
+        assert_eq!(
+            params.endpoints,
+            ["203.0.113.7".parse::<std::net::IpAddr>().unwrap()]
+        );
+        let (_, result): (_, TailscaleProtectResult) = ok_response(
+            r#"{"id":51,"ok":true,"result":{"interface":"utun12","pinned":["100.64.0.0/10"],"bypassed":1}}"#,
+        );
+        assert_eq!(result.interface.as_deref(), Some("utun12"));
+        assert_eq!(result.bypassed, 1);
+        let none: TailscaleProtectResult = serde_json::from_str("{}").unwrap();
+        assert_eq!(none, TailscaleProtectResult::default());
+        assert!(!method::CAPABILITIES.contains(&method::TAILSCALE_PROTECT));
     }
 
     #[test]
