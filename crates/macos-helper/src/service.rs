@@ -6,13 +6,15 @@ use crate::journal::Record;
 use crate::openvpn::OpenVpnExecutor;
 use crate::peer::Peer;
 use crate::server::Handler;
+use crate::tailscale::{self, TailscaleGuard};
 use crate::wireguard::WireGuardExecutor;
 use crate::xray::{Error, XrayExecutor};
 use net_manager_core::daemon_protocol::{
     from_value, method, CleanupResult, ErrorCode, OpenVpnConnectRequest, OpenVpnProcessResource,
     OpenVpnProfileParams, OwnedEntry, OwnedListResult, OwnedResource, OwnedState, RequestFrame,
-    ResponseFrame, WireGuardConnectParams, WireGuardLinkResource, WireGuardProfileParams,
-    XrayConnectParams, XrayProcessResource, XrayProfileParams,
+    ResponseFrame, TailscaleProtectParams, TailscaleReleaseResult, WireGuardConnectParams,
+    WireGuardLinkResource, WireGuardProfileParams, XrayConnectParams, XrayProcessResource,
+    XrayProfileParams,
 };
 use net_manager_core::models::TunnelRole;
 use serde::{de::DeserializeOwned, Serialize};
@@ -22,6 +24,7 @@ pub struct HelperService {
     xray: Arc<XrayExecutor>,
     wireguard: Arc<WireGuardExecutor>,
     openvpn: Arc<OpenVpnExecutor>,
+    tailscale: Option<Arc<TailscaleGuard>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,7 +54,14 @@ impl HelperService {
             xray,
             wireguard,
             openvpn,
+            tailscale: None,
         }
+    }
+
+    /// Serve `tailscale.protect` / `tailscale.release` with this guard.
+    pub fn with_tailscale(mut self, guard: Arc<TailscaleGuard>) -> Self {
+        self.tailscale = Some(guard);
+        self
     }
 
     /// Tunnels of different kinds run together, but only one of them may be
@@ -76,6 +86,15 @@ fn ok<T: Serialize>(id: u64, value: &T) -> ResponseFrame {
     match serde_json::to_value(value) {
         Ok(value) => ResponseFrame::ok(id, value),
         Err(err) => ResponseFrame::error(id, ErrorCode::Internal, err.to_string()),
+    }
+}
+
+impl From<tailscale::Error> for Error {
+    fn from(error: tailscale::Error) -> Self {
+        match error {
+            tailscale::Error::Invalid(message) => Error::Invalid(message),
+            tailscale::Error::Unavailable(message) => Error::Unavailable(message),
+        }
     }
 }
 
@@ -155,6 +174,10 @@ fn owned_entry(kind: Kind, record: Record) -> OwnedEntry {
 
 impl Handler for HelperService {
     fn capabilities(&self) -> Vec<String> {
+        let tailscale = self
+            .tailscale
+            .iter()
+            .flat_map(|_| [method::TAILSCALE_PROTECT, method::TAILSCALE_RELEASE]);
         [
             method::OWNED_LIST,
             method::RECOVERY_CLEANUP,
@@ -168,7 +191,8 @@ impl Handler for HelperService {
             method::OPENVPN_DISCONNECT,
             method::OPENVPN_STATUS,
         ]
-        .iter()
+        .into_iter()
+        .chain(tailscale)
         .map(|name| name.to_string())
         .collect()
     }
@@ -256,6 +280,19 @@ impl Handler for HelperService {
             method::OPENVPN_DISCONNECT => call(request, |params: OpenVpnProfileParams| {
                 self.openvpn.disconnect(uid, &params.profile_id)
             }),
+            method::TAILSCALE_PROTECT if self.tailscale.is_some() => {
+                call(request, |params: TailscaleProtectParams| {
+                    let guard = self.tailscale.as_ref().expect("checked by the arm");
+                    Ok(guard.protect(&params)?)
+                })
+            }
+            method::TAILSCALE_RELEASE if self.tailscale.is_some() => {
+                let guard = self.tailscale.as_ref().expect("checked by the arm");
+                match guard.release() {
+                    Ok(released) => ok(id, &TailscaleReleaseResult { released }),
+                    Err(error) => failure(id, error.into()),
+                }
+            }
             _ => ResponseFrame::error(
                 id,
                 ErrorCode::UnsupportedMethod,
@@ -460,6 +497,36 @@ mod tests {
             assert_eq!(error.code, ErrorCode::UnsupportedMethod, "{name}");
             assert!(!capabilities.iter().any(|c| c == name), "{name}");
         }
+    }
+
+    #[test]
+    fn tailscale_protection_is_served_only_when_a_guard_is_attached() {
+        let (service, dir) = service();
+        for name in [method::TAILSCALE_PROTECT, method::TAILSCALE_RELEASE] {
+            assert!(!service.capabilities().iter().any(|c| c == name), "{name}");
+            let error = call(&service, name, json!({})).outcome.unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedMethod, "{name}");
+        }
+        let service = service.with_tailscale(Arc::new(TailscaleGuard::new(
+            Box::new(FakeRunner::default()),
+            Journal::named(dir.path(), "tailscale.json"),
+        )));
+        for name in [method::TAILSCALE_PROTECT, method::TAILSCALE_RELEASE] {
+            assert!(service.capabilities().iter().any(|c| c == name), "{name}");
+        }
+        // Addresses that are not Tailscale's are refused before any command runs.
+        let error = call(
+            &service,
+            method::TAILSCALE_PROTECT,
+            json!({"selfIps": ["192.168.1.2"]}),
+        )
+        .outcome
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidParams);
+        let released = call(&service, method::TAILSCALE_RELEASE, json!({}))
+            .outcome
+            .unwrap();
+        assert_eq!(released["released"], false);
     }
 
     #[test]

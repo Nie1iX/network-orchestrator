@@ -5,6 +5,7 @@ use network_orchestrator_macos_helper::platform::{RealOvpnPlatform, RealPlatform
 use network_orchestrator_macos_helper::server::{bind_socket, serve, ServerContext};
 use network_orchestrator_macos_helper::service::HelperService;
 use network_orchestrator_macos_helper::sysexec::SystemRunner;
+use network_orchestrator_macos_helper::tailscale::TailscaleGuard;
 use network_orchestrator_macos_helper::wireguard::WireGuardExecutor;
 use network_orchestrator_macos_helper::xray::XrayExecutor;
 use network_orchestrator_macos_helper::{SOCKET_DIR, SOCKET_PATH, STATE_DIR};
@@ -117,11 +118,16 @@ async fn run(options: Options) -> std::io::Result<()> {
         std::path::PathBuf::from(network_orchestrator_macos_helper::openvpn::RUNTIME_ROOT),
         std::path::PathBuf::from(network_orchestrator_macos_helper::resolver::DIR),
     ));
+    let tailscale = Arc::new(TailscaleGuard::new(
+        Box::new(SystemRunner),
+        Journal::named(state_dir, "tailscale.json"),
+    ));
     // A tunnel a previous helper left behind must not outlive its owner.
     for (name, result) in [
         ("xray", xray.recover()),
         ("wireguard", wireguard.recover()),
         ("openvpn", openvpn.recover()),
+        ("tailscale", tailscale.recover()),
     ] {
         if let Err(err) = result {
             eprintln!("network-orchestrator-helper: {name} recovery failed: {err}");
@@ -137,11 +143,10 @@ async fn run(options: Options) -> std::io::Result<()> {
     });
     let ctx = Arc::new(ServerContext::new(
         Box::new(AppClientPolicy::new(options.clients)),
-        Arc::new(HelperService::new(
-            xray.clone(),
-            wireguard.clone(),
-            openvpn.clone(),
-        )),
+        Arc::new(
+            HelperService::new(xray.clone(), wireguard.clone(), openvpn.clone())
+                .with_tailscale(tailscale.clone()),
+        ),
         env!("CARGO_PKG_VERSION"),
     ));
     let mut terminate = signal(SignalKind::terminate())?;
@@ -154,6 +159,7 @@ async fn run(options: Options) -> std::io::Result<()> {
     xray.shutdown();
     wireguard.shutdown();
     openvpn.shutdown();
+    let _ = tailscale.release();
     let _ = std::fs::remove_file(&options.socket);
     Ok(())
 }

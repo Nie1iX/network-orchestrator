@@ -19,6 +19,7 @@ pub mod routes;
 pub mod server;
 pub mod service;
 pub mod sysexec;
+pub mod tailscale;
 pub mod trusted_exec;
 pub mod tun;
 pub mod wg_engine;
