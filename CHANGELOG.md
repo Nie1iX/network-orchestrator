@@ -8,6 +8,29 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+### Added
+
+- macOS: `netorch`, a command line tool in the app bundle that does what the
+  app does without writing configs by hand: `netorch up <link | subscription
+  URL | .conf | .ovpn | name>` imports, picks ports and mode, connects and
+  undoes everything on exit. Also `ls`, `status`, `add`, `rm`, `rename`,
+  `down`, `logs`, `test` (subscription delays, exit IP), `route
+  show|set|check|lookup`, `doctor`, `backend install`, `service status` and
+  shell completions; `--json` everywhere. It shares profiles with the app and
+  talks to the privileged helper like the app does, or, with `sudo netorch up`,
+  runs the helper's executors inside its own process (no helper needed; only
+  for the user at the console). `sudo netorch service install` installs the
+  helper without the app: it copies the helper into `/Library/PrivilegedHelperTools`
+  (root-owned) and registers it with launchd; `service remove` undoes it.
+- `net-manager-engine` crate: the connection engine (connect, disconnect,
+  status, system proxy, Xray install, helper requests) behind a `Privileged`
+  trait, shared by the native client's bridge and `netorch`.
+
+### Changed
+
+- macOS: the privileged helper admits the `netorch` tool of its own bundle next
+  to the app executable; the same console-user rule applies.
+
 ## [0.8.6] - 2026-10-15
 
 ### Fixed

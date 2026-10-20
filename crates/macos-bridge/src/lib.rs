@@ -14,8 +14,6 @@ mod routing;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
 mod user_network;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod vpn_backends;
 // The proxy runtime needs the managed Xray package, pinned for Apple
 // Silicon; on other targets the bridge still builds so subscription,
 // profile and inventory commands can be exercised off-macOS.
@@ -149,9 +147,7 @@ fn local_port_available(port: u16) -> bool {
 }
 /// Socket of the privileged helper; QA runs may point it elsewhere.
 pub(crate) fn helper_socket() -> PathBuf {
-    std::env::var_os("NETORCH_HELPER_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| net_manager_core::daemon_protocol::MACOS_SOCKET_PATH.into())
+    net_manager_engine::helper_socket()
 }
 /// Whether the privileged helper answers on its socket and accepts this app.
 /// The Swift side adds the launchd registration state (`SMAppService`).
@@ -947,6 +943,12 @@ pub unsafe extern "C" fn netorch_call(bytes: *const u8, length: usize) -> *mut c
 }
 /// # Safety
 /// `value` must be null or a still-owned pointer returned by `netorch_call`.
+/// The bridge's methods for Rust callers (the `netorch` CLI): the same
+/// profile, import, subscription and routing services the native client uses.
+/// Runtime methods (`connect`, `disconnect`, ...) belong to `net-manager-engine`.
+pub fn call(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
+    dispatch(root, method, args)
+}
 #[no_mangle]
 pub unsafe extern "C" fn netorch_free(value: *mut c_char) {
     if !value.is_null() {
