@@ -192,6 +192,12 @@ struct HomeView: View {
       VStack(alignment: .leading, spacing: 0) {
         AppHeading(title: "Quick actions")
         HStack(spacing: 7) {
+          if let last = model.lastProfile, !model.isRunning(last) {
+            Button(L10n.text("Connect {name}", ["name": last.name])) {
+              Task { await model.toggle(last) }
+            }.buttonStyle(TauriButtonStyle(kind: .accent)).disabled(model.pending.contains(last.id))
+          }
+          Button(L10n.text("profiles.title")) { model.section = .connections }
           Button(L10n.text("+ Add connection")) { modal = .add }.buttonStyle(
             TauriButtonStyle(kind: .accent))
           Button(L10n.text("Import…")) { modal = .importConfig(nil) }.buttonStyle(
