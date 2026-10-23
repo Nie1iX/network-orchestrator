@@ -7,6 +7,7 @@ pub(crate) mod explorer;
 pub(crate) mod happ_routing;
 pub(crate) mod logs;
 pub(crate) mod net_tables;
+pub(crate) mod netbird;
 pub(crate) mod nm;
 pub(crate) mod profiles;
 pub(crate) mod proxies;
@@ -34,6 +35,7 @@ pub(crate) use net_tables::{
     get_net_tables, net_dns_probe, net_dns_status, net_explain, net_intent_del, net_intent_list,
     net_intent_set, net_route_add, net_route_del, net_rule_add, net_rule_del,
 };
+pub(crate) use netbird::{netbird_down, netbird_status, netbird_up};
 pub(crate) use nm::{nm_list_connections, nm_set_active};
 pub(crate) use profiles::{
     delete_profile, get_profiles, get_subscription_endpoints, import_configs_batch,
