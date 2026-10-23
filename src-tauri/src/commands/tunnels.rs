@@ -1105,9 +1105,9 @@ async fn connect_profile_inner(
             profile.use_system_proxy = false;
         }
     }
-    // The system proxy exists only on Windows; a profile imported from there
-    // must still connect elsewhere, just without touching proxy settings.
-    if !cfg!(windows) {
+    // A profile imported from another platform must still connect where the
+    // system proxy is unavailable, just without touching proxy settings.
+    if !super::system::system_proxy_supported() {
         profile.use_system_proxy = false;
     }
     let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;

@@ -14,6 +14,43 @@ pub struct ProxySnapshot {
     /// macOS: per-service proxy state captured before apply. Empty elsewhere.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub macos_services: Vec<MacServiceProxy>,
+    /// Linux/GNOME: `org.gnome.system.proxy` state captured before apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gnome: Option<GnomeProxy>,
+    /// Linux/KDE: `kioslaverc` `[Proxy Settings]` captured before apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kde: Option<KdeProxy>,
+}
+
+/// KDE proxy settings (`kioslaverc`, group `Proxy Settings`). `None` means the
+/// key was absent (or empty) and is deleted again on restore.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KdeProxy {
+    pub proxy_type: Option<String>,
+    pub http_proxy: Option<String>,
+    pub https_proxy: Option<String>,
+    pub socks_proxy: Option<String>,
+    pub no_proxy_for: Option<String>,
+}
+
+/// GNOME proxy settings (`gsettings org.gnome.system.proxy`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GnomeProxy {
+    /// `none`, `manual` or `auto`.
+    pub mode: String,
+    pub http: GnomeProxyHost,
+    pub https: GnomeProxyHost,
+    pub socks: GnomeProxyHost,
+    pub ignore_hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GnomeProxyHost {
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,7 +125,13 @@ impl SystemProxyManager {
         Self::with_adapter(path, Box::new(macos::MacProxyAdapter::system()))
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    pub fn new(path: impl Into<PathBuf>) -> io::Result<Self> {
+        let adapter = linux::system_adapter().unwrap_or_else(|| Box::new(UnsupportedProxyAdapter));
+        Self::with_adapter(path, adapter)
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     pub fn new(path: impl Into<PathBuf>) -> io::Result<Self> {
         Self::with_adapter(path, Box::new(UnsupportedProxyAdapter))
     }
@@ -278,6 +321,38 @@ pub fn snapshot_matches(expected: &ProxySnapshot, actual: &ProxySnapshot) -> boo
     expected == actual
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Parse `http=127.0.0.1:P;https=…;socks=…`; only loopback targets are
+/// accepted so a corrupted ownership record can never redirect traffic.
+pub(crate) fn parse_server(
+    server: &str,
+) -> io::Result<std::collections::HashMap<&'static str, u16>> {
+    let mut targets = std::collections::HashMap::new();
+    for part in server.split(';').filter(|part| !part.is_empty()) {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid proxy target");
+        let (scheme, address) = part.split_once('=').ok_or_else(invalid)?;
+        let port = address
+            .strip_prefix("127.0.0.1:")
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .ok_or_else(invalid)?;
+        let key = match scheme {
+            "http" => "web",
+            "https" => "secure",
+            "socks" => "socks",
+            _ => return Err(invalid()),
+        };
+        targets.insert(key, port);
+    }
+    if targets.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no proxy target",
+        ));
+    }
+    Ok(targets)
+}
+
 #[cfg(not(any(windows, target_os = "macos")))]
 struct UnsupportedProxyAdapter;
 
@@ -298,7 +373,7 @@ impl ProxyAdapter for UnsupportedProxyAdapter {
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        "system proxy is supported on Windows only",
+        "system proxy is not supported on this platform",
     )
 }
 
@@ -603,7 +678,7 @@ impl ProxyAdapter for WindowsProxyAdapter {
 /// left untouched). Runs as the logged-in admin user; no root helper.
 #[cfg(target_os = "macos")]
 pub mod macos {
-    use super::{MacProxyEndpoint, MacServiceProxy, ProxyAdapter, ProxySnapshot};
+    use super::{parse_server, MacProxyEndpoint, MacServiceProxy, ProxyAdapter, ProxySnapshot};
     use std::io;
     use std::process::Command;
 
@@ -822,34 +897,582 @@ pub mod macos {
             .map(str::to_string)
             .collect()
     }
+}
 
-    /// Parse `http=127.0.0.1:P;https=…;socks=…`; only loopback targets are
-    /// accepted so a corrupted ownership record can never redirect traffic.
-    fn parse_server(server: &str) -> io::Result<std::collections::HashMap<&'static str, u16>> {
-        let mut targets = std::collections::HashMap::new();
-        for part in server.split(';').filter(|part| !part.is_empty()) {
-            let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid proxy target");
-            let (scheme, address) = part.split_once('=').ok_or_else(invalid)?;
-            let port = address
-                .strip_prefix("127.0.0.1:")
-                .and_then(|port| port.parse::<u16>().ok())
-                .filter(|port| *port != 0)
-                .ok_or_else(invalid)?;
-            let key = match scheme {
-                "http" => "web",
-                "https" => "secure",
-                "socks" => "socks",
-                _ => return Err(invalid()),
+/// Linux system proxy for the logged-in user: GNOME-family desktops through
+/// `gsettings` (`org.gnome.system.proxy`) and KDE Plasma through
+/// `kwriteconfig` (`kioslaverc`). Bare window managers without either report
+/// the proxy as unavailable.
+#[cfg(target_os = "linux")]
+pub mod linux {
+    use super::{parse_server, GnomeProxy, GnomeProxyHost, KdeProxy, ProxyAdapter, ProxySnapshot};
+    use std::io;
+    use std::process::Command;
+
+    const SCHEMA: &str = "org.gnome.system.proxy";
+
+    pub trait GsettingsRunner: Send {
+        fn run(&mut self, args: &[String]) -> io::Result<String>;
+    }
+
+    pub struct SystemGsettings;
+
+    impl GsettingsRunner for SystemGsettings {
+        fn run(&mut self, args: &[String]) -> io::Result<String> {
+            let output = Command::new("gsettings").args(args).output()?;
+            if !output.status.success() {
+                return Err(io::Error::other("gsettings failed"));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+    }
+
+    /// Whether the GNOME proxy schema can be read, i.e. `gsettings` exists and
+    /// the schema is installed. A missing session bus fails here too.
+    fn gnome_available() -> bool {
+        SystemGsettings
+            .run(&["get".into(), SCHEMA.into(), "mode".into()])
+            .is_ok()
+    }
+
+    /// The adapter for the running desktop, or `None` when neither backend is
+    /// usable. KDE sessions prefer `kioslaverc`; everything else prefers GNOME's
+    /// schema, which GTK applications honor on any desktop.
+    pub fn system_adapter() -> Option<Box<dyn ProxyAdapter>> {
+        let kde_session = std::env::var("XDG_CURRENT_DESKTOP")
+            .map(|desktop| desktop.to_ascii_lowercase().contains("kde"))
+            .unwrap_or(false);
+        if kde_session {
+            if let Some(adapter) = KdeProxyAdapter::system() {
+                return Some(Box::new(adapter));
+            }
+        }
+        gnome_available().then(|| Box::new(GnomeProxyAdapter::system()) as Box<dyn ProxyAdapter>)
+    }
+
+    pub fn available() -> bool {
+        system_adapter().is_some()
+    }
+
+    pub struct GnomeProxyAdapter<R: GsettingsRunner = SystemGsettings> {
+        runner: R,
+    }
+
+    impl GnomeProxyAdapter<SystemGsettings> {
+        pub fn system() -> Self {
+            Self::with_runner(SystemGsettings)
+        }
+    }
+
+    impl<R: GsettingsRunner> GnomeProxyAdapter<R> {
+        pub fn with_runner(runner: R) -> Self {
+            Self { runner }
+        }
+
+        pub fn runner(&self) -> &R {
+            &self.runner
+        }
+
+        fn get(&mut self, schema: &str, key: &str) -> io::Result<String> {
+            self.runner
+                .run(&["get".into(), schema.into(), key.into()])
+                .map(|text| text.trim().to_string())
+        }
+
+        fn set(&mut self, schema: &str, key: &str, value: &str) -> io::Result<()> {
+            self.runner
+                .run(&["set".into(), schema.into(), key.into(), value.into()])
+                .map(|_| ())
+        }
+
+        fn read_host(&mut self, protocol: &str) -> io::Result<GnomeProxyHost> {
+            let schema = format!("{SCHEMA}.{protocol}");
+            Ok(GnomeProxyHost {
+                host: parse_string(&self.get(&schema, "host")?),
+                port: self.get(&schema, "port")?.parse().unwrap_or(0),
+            })
+        }
+
+        fn write_host(&mut self, protocol: &str, host: &GnomeProxyHost) -> io::Result<()> {
+            let schema = format!("{SCHEMA}.{protocol}");
+            self.set(&schema, "host", &quote(&host.host))?;
+            self.set(&schema, "port", &host.port.to_string())
+        }
+    }
+
+    impl<R: GsettingsRunner> ProxyAdapter for GnomeProxyAdapter<R> {
+        fn snapshot(&mut self) -> io::Result<ProxySnapshot> {
+            let gnome = GnomeProxy {
+                mode: parse_string(&self.get(SCHEMA, "mode")?),
+                http: self.read_host("http")?,
+                https: self.read_host("https")?,
+                socks: self.read_host("socks")?,
+                ignore_hosts: parse_list(&self.get(SCHEMA, "ignore-hosts")?),
             };
-            targets.insert(key, port);
+            Ok(ProxySnapshot {
+                gnome: Some(gnome),
+                ..Default::default()
+            })
         }
-        if targets.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no proxy target",
-            ));
+
+        fn apply(&mut self, server: &str, bypass: &str) -> io::Result<()> {
+            let targets = parse_server(server)?;
+            let bypass: Vec<String> = bypass
+                .split(';')
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect();
+            // A protocol without a target is cleared so a previous manual
+            // setting cannot leak traffic past the profile.
+            for (key, protocol) in [("web", "http"), ("secure", "https"), ("socks", "socks")] {
+                let host = match targets.get(key) {
+                    Some(port) => GnomeProxyHost {
+                        host: "127.0.0.1".into(),
+                        port: *port,
+                    },
+                    None => GnomeProxyHost::default(),
+                };
+                self.write_host(protocol, &host)?;
+            }
+            self.set(SCHEMA, "ignore-hosts", &format_list(&bypass))?;
+            self.set(SCHEMA, "mode", "'manual'")
         }
-        Ok(targets)
+
+        fn restore(&mut self, snapshot: &ProxySnapshot) -> io::Result<()> {
+            let Some(saved) = &snapshot.gnome else {
+                return Ok(());
+            };
+            self.write_host("http", &saved.http)?;
+            self.write_host("https", &saved.https)?;
+            self.write_host("socks", &saved.socks)?;
+            self.set(SCHEMA, "ignore-hosts", &format_list(&saved.ignore_hosts))?;
+            self.set(SCHEMA, "mode", &quote(&saved.mode))
+        }
+
+        fn default_bypass(&self) -> Vec<String> {
+            default_bypass_list()
+        }
+    }
+
+    pub trait KdeRunner: Send {
+        fn run(&mut self, program: &str, args: &[String]) -> io::Result<String>;
+    }
+
+    pub struct SystemKde;
+
+    impl KdeRunner for SystemKde {
+        fn run(&mut self, program: &str, args: &[String]) -> io::Result<String> {
+            let output = Command::new(program).args(args).output()?;
+            if !output.status.success() {
+                return Err(io::Error::other(format!("{program} failed")));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+    }
+
+    const KDE_FILE: &str = "kioslaverc";
+    const KDE_GROUP: &str = "Proxy Settings";
+
+    pub struct KdeProxyAdapter<R: KdeRunner = SystemKde> {
+        runner: R,
+        /// Tool generation suffix: `6` or `5` (`kwriteconfig6`).
+        version: &'static str,
+    }
+
+    impl KdeProxyAdapter<SystemKde> {
+        /// Plasma 6 first, then Plasma 5; `None` when neither tool answers.
+        pub fn system() -> Option<Self> {
+            ["6", "5"].into_iter().find_map(|version| {
+                let mut adapter = Self::with_runner(SystemKde, version);
+                adapter.read("ProxyType").ok().map(|_| adapter)
+            })
+        }
+    }
+
+    impl<R: KdeRunner> KdeProxyAdapter<R> {
+        pub fn with_runner(runner: R, version: &'static str) -> Self {
+            Self { runner, version }
+        }
+
+        pub fn runner(&self) -> &R {
+            &self.runner
+        }
+
+        fn read(&mut self, key: &str) -> io::Result<Option<String>> {
+            let args = ["--file", KDE_FILE, "--group", KDE_GROUP, "--key", key].map(String::from);
+            let text = self
+                .runner
+                .run(&format!("kreadconfig{}", self.version), &args)?;
+            let value = text.trim();
+            Ok((!value.is_empty()).then(|| value.to_string()))
+        }
+
+        fn write(&mut self, key: &str, value: Option<&str>) -> io::Result<()> {
+            let mut args: Vec<String> = ["--file", KDE_FILE, "--group", KDE_GROUP, "--key", key]
+                .map(String::from)
+                .to_vec();
+            match value {
+                Some(value) => args.push(value.to_string()),
+                None => args.push("--delete".to_string()),
+            }
+            self.runner
+                .run(&format!("kwriteconfig{}", self.version), &args)
+                .map(|_| ())
+        }
+
+        /// Running KDE applications re-read the proxy settings on this signal;
+        /// without it they keep the old values until restarted. Best effort.
+        fn notify(&mut self) {
+            let args = [
+                "--type=signal",
+                "/KIO/Scheduler",
+                "org.kde.KIO.Scheduler.reparseSlaveConfiguration",
+                "string:",
+            ]
+            .map(String::from);
+            let _ = self.runner.run("dbus-send", &args);
+        }
+    }
+
+    impl<R: KdeRunner> ProxyAdapter for KdeProxyAdapter<R> {
+        fn snapshot(&mut self) -> io::Result<ProxySnapshot> {
+            let kde = KdeProxy {
+                proxy_type: self.read("ProxyType")?,
+                http_proxy: self.read("httpProxy")?,
+                https_proxy: self.read("httpsProxy")?,
+                socks_proxy: self.read("socksProxy")?,
+                no_proxy_for: self.read("NoProxyFor")?,
+            };
+            Ok(ProxySnapshot {
+                kde: Some(kde),
+                ..Default::default()
+            })
+        }
+
+        fn apply(&mut self, server: &str, bypass: &str) -> io::Result<()> {
+            let targets = parse_server(server)?;
+            let bypass: Vec<&str> = bypass.split(';').filter(|e| !e.is_empty()).collect();
+            // KDE stores `scheme://host port`; unset protocols are deleted so
+            // an earlier manual setting cannot bypass the profile.
+            let value = |key: &str, scheme: &str| {
+                targets
+                    .get(key)
+                    .map(|port| format!("{scheme}://127.0.0.1 {port}"))
+            };
+            self.write("httpProxy", value("web", "http").as_deref())?;
+            self.write("httpsProxy", value("secure", "http").as_deref())?;
+            self.write("socksProxy", value("socks", "socks").as_deref())?;
+            self.write("NoProxyFor", Some(&bypass.join(",")))?;
+            self.write("ProxyType", Some("1"))?;
+            self.notify();
+            Ok(())
+        }
+
+        fn restore(&mut self, snapshot: &ProxySnapshot) -> io::Result<()> {
+            let Some(saved) = &snapshot.kde else {
+                return Ok(());
+            };
+            self.write("httpProxy", saved.http_proxy.as_deref())?;
+            self.write("httpsProxy", saved.https_proxy.as_deref())?;
+            self.write("socksProxy", saved.socks_proxy.as_deref())?;
+            self.write("NoProxyFor", saved.no_proxy_for.as_deref())?;
+            self.write("ProxyType", saved.proxy_type.as_deref())?;
+            self.notify();
+            Ok(())
+        }
+
+        fn default_bypass(&self) -> Vec<String> {
+            default_bypass_list()
+        }
+    }
+
+    /// Loopback and LAN destinations that must never be proxied; GNOME and KDE
+    /// both accept host names, wildcards and CIDR in one list.
+    fn default_bypass_list() -> Vec<String> {
+        [
+            "localhost",
+            "127.0.0.0/8",
+            "::1",
+            "*.local",
+            "169.254.0.0/16",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "fe80::/10",
+            "fc00::/7",
+        ]
+        .iter()
+        .map(|entry| entry.to_string())
+        .collect()
+    }
+
+    fn quote(value: &str) -> String {
+        format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+
+    fn format_list(items: &[String]) -> String {
+        let quoted: Vec<String> = items.iter().map(|item| quote(item)).collect();
+        format!("[{}]", quoted.join(", "))
+    }
+
+    /// `'manual'` → `manual`.
+    fn parse_string(text: &str) -> String {
+        let inner = text.trim();
+        let inner = inner.strip_prefix('\'').unwrap_or(inner);
+        let inner = inner.strip_suffix('\'').unwrap_or(inner);
+        inner.replace("\\'", "'").replace("\\\\", "\\")
+    }
+
+    /// `['a', 'b']` or `@as []` → `["a", "b"]`.
+    fn parse_list(text: &str) -> Vec<String> {
+        let text = text.trim();
+        let Some(body) = text
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        else {
+            return Vec::new();
+        };
+        body.split(',')
+            .map(parse_string)
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashMap;
+
+        #[derive(Default)]
+        struct FakeGsettings {
+            values: HashMap<String, String>,
+            writes: Vec<String>,
+            fail_on: Option<String>,
+        }
+
+        impl GsettingsRunner for FakeGsettings {
+            fn run(&mut self, args: &[String]) -> io::Result<String> {
+                let key = format!("{} {}", args[1], args[2]);
+                match args[0].as_str() {
+                    "get" => Ok(format!(
+                        "{}\n",
+                        self.values.get(&key).cloned().unwrap_or_default()
+                    )),
+                    _ => {
+                        if self.fail_on.as_deref() == Some(key.as_str()) {
+                            return Err(io::Error::other("gsettings failed"));
+                        }
+                        self.writes.push(format!("{key}={}", args[3]));
+                        self.values.insert(key, args[3].clone());
+                        Ok(String::new())
+                    }
+                }
+            }
+        }
+
+        fn seeded() -> FakeGsettings {
+            let mut fake = FakeGsettings::default();
+            for (key, value) in [
+                ("org.gnome.system.proxy mode", "'none'"),
+                (
+                    "org.gnome.system.proxy ignore-hosts",
+                    "['localhost', '10.0.0.0/8']",
+                ),
+                ("org.gnome.system.proxy.http host", "'corp'"),
+                ("org.gnome.system.proxy.http port", "3128"),
+                ("org.gnome.system.proxy.https host", "''"),
+                ("org.gnome.system.proxy.https port", "0"),
+                ("org.gnome.system.proxy.socks host", "''"),
+                ("org.gnome.system.proxy.socks port", "0"),
+            ] {
+                fake.values.insert(key.into(), value.into());
+            }
+            fake
+        }
+
+        #[test]
+        fn snapshot_reads_gsettings_values() {
+            let mut adapter = GnomeProxyAdapter::with_runner(seeded());
+            let gnome = adapter.snapshot().unwrap().gnome.unwrap();
+            assert_eq!(gnome.mode, "none");
+            assert_eq!(gnome.http.host, "corp");
+            assert_eq!(gnome.http.port, 3128);
+            assert_eq!(gnome.ignore_hosts, vec!["localhost", "10.0.0.0/8"]);
+        }
+
+        #[test]
+        fn empty_list_parses_from_typed_literal() {
+            assert!(parse_list("@as []").is_empty());
+            assert_eq!(format_list(&[]), "[]");
+        }
+
+        #[test]
+        fn apply_sets_loopback_targets_and_clears_missing_ones() {
+            let mut adapter = GnomeProxyAdapter::with_runner(seeded());
+            adapter
+                .apply("socks=127.0.0.1:1080", "localhost;10.0.0.0/8")
+                .unwrap();
+            let values = &adapter.runner().values;
+            assert_eq!(values["org.gnome.system.proxy mode"], "'manual'");
+            assert_eq!(values["org.gnome.system.proxy.socks host"], "'127.0.0.1'");
+            assert_eq!(values["org.gnome.system.proxy.socks port"], "1080");
+            assert_eq!(values["org.gnome.system.proxy.http host"], "''");
+            assert_eq!(
+                values["org.gnome.system.proxy ignore-hosts"],
+                "['localhost', '10.0.0.0/8']"
+            );
+        }
+
+        #[test]
+        fn mode_is_switched_last_when_applying_and_restoring() {
+            let mut adapter = GnomeProxyAdapter::with_runner(seeded());
+            let snapshot = adapter.snapshot().unwrap();
+            adapter.apply("socks=127.0.0.1:1080", "").unwrap();
+            assert_eq!(
+                adapter.runner().writes.last().unwrap(),
+                "org.gnome.system.proxy mode='manual'"
+            );
+            adapter.restore(&snapshot).unwrap();
+            assert_eq!(
+                adapter.runner().writes.last().unwrap(),
+                "org.gnome.system.proxy mode='none'"
+            );
+        }
+
+        #[test]
+        fn restore_returns_previous_settings() {
+            let mut adapter = GnomeProxyAdapter::with_runner(seeded());
+            let snapshot = adapter.snapshot().unwrap();
+            adapter
+                .apply("http=127.0.0.1:8080;socks=127.0.0.1:1080", "x")
+                .unwrap();
+            adapter.restore(&snapshot).unwrap();
+            assert_eq!(adapter.snapshot().unwrap(), snapshot);
+        }
+
+        #[test]
+        fn rejects_non_loopback_targets() {
+            let mut adapter = GnomeProxyAdapter::with_runner(seeded());
+            let err = adapter.apply("socks=10.1.1.1:1080", "").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(adapter.runner().writes.is_empty());
+        }
+
+        #[test]
+        fn apply_failure_surfaces_runner_error() {
+            let mut fake = seeded();
+            fake.fail_on = Some("org.gnome.system.proxy.socks port".into());
+            let mut adapter = GnomeProxyAdapter::with_runner(fake);
+            assert!(adapter.apply("socks=127.0.0.1:1080", "").is_err());
+        }
+    }
+    #[cfg(test)]
+    mod kde_tests {
+        use super::*;
+        use std::collections::HashMap;
+
+        #[derive(Default)]
+        struct FakeKde {
+            values: HashMap<String, String>,
+            calls: Vec<String>,
+            notified: usize,
+        }
+
+        impl KdeRunner for FakeKde {
+            fn run(&mut self, program: &str, args: &[String]) -> io::Result<String> {
+                self.calls.push(format!("{program} {}", args.join(" ")));
+                if program.starts_with("kreadconfig") {
+                    let key = args.last().unwrap();
+                    return Ok(format!(
+                        "{}\n",
+                        self.values.get(key).cloned().unwrap_or_default()
+                    ));
+                }
+                if program.starts_with("kwriteconfig") {
+                    let key = args[args.iter().position(|a| a == "--key").unwrap() + 1].clone();
+                    if args.iter().any(|a| a == "--delete") {
+                        self.values.remove(&key);
+                    } else {
+                        self.values.insert(key, args.last().unwrap().clone());
+                    }
+                    return Ok(String::new());
+                }
+                self.notified += 1;
+                Ok(String::new())
+            }
+        }
+
+        fn seeded() -> FakeKde {
+            let mut fake = FakeKde::default();
+            fake.values.insert("ProxyType".into(), "0".into());
+            fake.values
+                .insert("NoProxyFor".into(), "localhost,10.0.0.0/8".into());
+            fake
+        }
+
+        #[test]
+        fn snapshot_treats_empty_values_as_absent() {
+            let mut adapter = KdeProxyAdapter::with_runner(seeded(), "6");
+            let kde = adapter.snapshot().unwrap().kde.unwrap();
+            assert_eq!(kde.proxy_type.as_deref(), Some("0"));
+            assert_eq!(kde.no_proxy_for.as_deref(), Some("localhost,10.0.0.0/8"));
+            assert_eq!(kde.http_proxy, None);
+        }
+
+        #[test]
+        fn apply_writes_kio_style_targets_and_notifies() {
+            let mut adapter = KdeProxyAdapter::with_runner(seeded(), "6");
+            adapter
+                .apply(
+                    "http=127.0.0.1:8080;socks=127.0.0.1:1080",
+                    "localhost;*.local",
+                )
+                .unwrap();
+            let values = &adapter.runner().values;
+            assert_eq!(values["ProxyType"], "1");
+            assert_eq!(values["httpProxy"], "http://127.0.0.1 8080");
+            assert_eq!(values["socksProxy"], "socks://127.0.0.1 1080");
+            assert_eq!(values["NoProxyFor"], "localhost,*.local");
+            assert!(!values.contains_key("httpsProxy"));
+            assert_eq!(adapter.runner().notified, 1);
+        }
+
+        #[test]
+        fn restore_deletes_keys_that_were_absent() {
+            let mut adapter = KdeProxyAdapter::with_runner(seeded(), "6");
+            let snapshot = adapter.snapshot().unwrap();
+            adapter.apply("socks=127.0.0.1:1080", "x").unwrap();
+            adapter.restore(&snapshot).unwrap();
+            let values = &adapter.runner().values;
+            assert_eq!(values["ProxyType"], "0");
+            assert_eq!(values["NoProxyFor"], "localhost,10.0.0.0/8");
+            assert!(!values.contains_key("socksProxy"));
+            assert_eq!(adapter.snapshot().unwrap(), snapshot);
+        }
+
+        #[test]
+        fn rejects_non_loopback_targets_without_writing() {
+            let mut adapter = KdeProxyAdapter::with_runner(seeded(), "6");
+            assert!(adapter.apply("socks=10.1.1.1:1080", "").is_err());
+            assert!(adapter
+                .runner()
+                .calls
+                .iter()
+                .all(|c| !c.starts_with("kwriteconfig")));
+        }
+
+        #[test]
+        fn proxy_type_is_switched_last() {
+            let mut adapter = KdeProxyAdapter::with_runner(seeded(), "6");
+            adapter.apply("socks=127.0.0.1:1080", "").unwrap();
+            let writes: Vec<&String> = adapter
+                .runner()
+                .calls
+                .iter()
+                .filter(|c| c.starts_with("kwriteconfig"))
+                .collect();
+            assert!(writes.last().unwrap().contains("ProxyType"));
+        }
     }
 }
 

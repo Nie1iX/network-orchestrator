@@ -548,11 +548,29 @@ fn app_updates_available(windows: bool, _bundle: Option<tauri::utils::config::Bu
     windows
 }
 
+/// Windows always has a system proxy; Linux only when the GNOME proxy schema
+/// is readable (probed once, the desktop does not change under a running app).
+pub(crate) fn system_proxy_supported() -> bool {
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(net_manager_core::system_proxy::linux::available)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
+    }
+}
+
 fn platform_capabilities() -> PlatformCapabilities {
     let windows = cfg!(windows);
     PlatformCapabilities {
         os: std::env::consts::OS,
-        system_proxy: windows,
+        system_proxy: system_proxy_supported(),
         wireguard_standard_import: windows,
         managed_xray_install: cfg!(all(
             any(target_os = "windows", target_os = "linux"),
@@ -1064,7 +1082,10 @@ mod tests {
     fn linux_capabilities_hide_windows_only_features() {
         let caps = platform_capabilities();
         assert_eq!(caps.os, "linux");
-        assert!(!caps.system_proxy);
+        assert_eq!(
+            caps.system_proxy,
+            net_manager_core::system_proxy::linux::available()
+        );
         assert!(!caps.wireguard_standard_import);
         // Managed Xray is offered on 64-bit Linux too — the daemon installs
         // the pinned package root-owned.
