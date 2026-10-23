@@ -418,7 +418,8 @@ export type RecoveryIssueKind =
   | "missingOwnedRoutes"
   | "orphanRouteOwnership"
   | "statusCheckFailed"
-  | "proxyOwnership";
+  | "proxyOwnership"
+  | "leftoverTunnel";
 
 export interface RecoveryIssue {
   kind: RecoveryIssueKind;

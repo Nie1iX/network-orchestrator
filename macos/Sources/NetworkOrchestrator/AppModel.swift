@@ -624,6 +624,34 @@ import SystemConfiguration
     } catch { self.error = error.localizedDescription }
     await refreshRuntime()
   }
+  /// Leftovers of a previous session, offered for cleanup once per launch.
+  /// Runs before auto-connect so a start never races a cleanup. An answer that
+  /// cannot be read (no helper) is not an error: the helper banner covers it.
+  var recoveryReport: RecoveryReport?
+  var showingRecovery = false
+  private var recoveryChecked = false
+  func checkRecovery() async {
+    guard !recoveryChecked, !isDuplicate else { return }
+    recoveryChecked = true
+    guard let report: RecoveryReport = try? await core.call("recovery_report"),
+      !report.issues.isEmpty
+    else { return }
+    recoveryReport = report
+    showingRecovery = true
+  }
+  /// Asks the helper to undo the leftovers; what remains stays listed.
+  func cleanUpRecovery() async {
+    do {
+      let report: RecoveryReport = try await core.call("recovery_cleanup")
+      recoveryReport = report.issues.isEmpty ? nil : report
+      showingRecovery = !report.issues.isEmpty
+      error = nil
+    } catch {
+      self.error = error.localizedDescription
+      recoveryReport = nil
+    }
+    await refreshRuntime()
+  }
   /// Starts the connections flagged "connect when the app starts", once per
   /// launch and in saved order. One that fails does not stop the others; the
   /// count is reported in a notice. A flagged connection that needs the

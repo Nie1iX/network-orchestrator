@@ -123,3 +123,28 @@ private func running(_ ids: [String]) throws -> RuntimeState {
   #expect(model.activeCount == 2)
   #expect(profiles.filter { model.isRunning($0) }.map(\.id) == ["p0", "p2"])
 }
+
+@Test func recoveryReportsDecodeFromTheBridgeAnswer() async throws {
+  let report = try JSONDecoder().decode(
+    RecoveryReport.self,
+    from: Data(
+      #"{"issues":[{"kind":"leftoverTunnel","profileId":"wg1","message":"m"}],"requiresElevation":false}"#
+        .utf8))
+  #expect(report.issues.first?.kind == "leftoverTunnel")
+  #expect(report.issues.first?.profileId == "wg1" && !report.requiresElevation)
+
+  // The real method, read-only: it lists helper records or answers with none.
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let live: RecoveryReport = try await CoreBridge(root: directory).call("recovery_report")
+  #expect(!live.requiresElevation)
+}
+
+@Test @MainActor func aDuplicateInstanceNeverChecksOrOffersRecovery() async throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  let (_, _) = try await model([], directory: directory)  // takes the instance lock
+  let (second, _) = try await model([], directory: directory)
+  #expect(second.isDuplicate)
+  await second.checkRecovery()
+  #expect(second.recoveryReport == nil && !second.showingRecovery)
+}

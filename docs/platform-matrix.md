@@ -52,7 +52,7 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 | Command line (`netorch`) | ❌ | ❌ | ✅ `crates/cli` | Bundle tool: profiles, import, `up`/`down`, routing rules, diagnostics. Shares the app's data; privileged work through the helper, or `sudo netorch up` with the helper's executors in its own process — `docs/plans/2026-10-15-19-netorch-cli.md`. Windows/Linux need `Privileged`/`UserRuntime` adapters for `crates/engine` |
 | In-app updater | ✅ | — | ❌ | `appUpdates` is `windows`-only; Linux ships `.deb`/`.rpm`/AUR → package manager |
 | Per-link DNS | — | ✅ | — | `crates/daemon/src/dns.rs`, systemd-resolved; Windows relies on pushed/adapter DNS |
-| Recovery prompt (leftover resources) | ✅ | ✅ | ⚠️ | Win: orphaned adapters/routes; Linux: stale daemon owners; macOS: the helper undoes a dead tunnel's routes/DNS on its own start (`recovery.cleanup` is the manual trigger), no UI prompt |
+| Recovery prompt (leftover resources) | ✅ | ✅ | ✅ | Win: orphaned adapters/routes; Linux: stale daemon owners; macOS: the helper undoes a dead tunnel's routes/DNS on its own start; at launch the app lists what it still records for a tunnel that is not running (or a stale system proxy) and `recovery.cleanup` clears it on request, a running tunnel is never touched |
 | App mode (orchestrator/manager/combined) | ✅ | ✅ | ❌ | UI capability filter in Settings → Profiles; `orchestrator` hides managed backend creation/connect, `manager` hides NM/external orchestration; the native macOS app has no mode switch yet |
 
 ## Observability

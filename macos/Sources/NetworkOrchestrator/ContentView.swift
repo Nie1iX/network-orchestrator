@@ -65,6 +65,7 @@ struct ContentView: View {
       if let initialModal { modal = initialModal }
       guard loadsOnAppear else { return }
       await model.refresh()
+      await model.checkRecovery()
       await model.autoConnectOnLaunch()
       model.startMonitoring()
     }
@@ -90,6 +91,15 @@ struct ContentView: View {
       Button(L10n.text("common.cancel"), role: .cancel) {}
     } message: {
       Text(L10n.text("native.helperPromptBody"))
+    }
+    .alert(L10n.text("recovery.required"), isPresented: $model.showingRecovery) {
+      Button(L10n.text("recovery.cleanUp")) { Task { await model.cleanUpRecovery() } }
+      Button(L10n.text("recovery.keep"), role: .cancel) {}
+    } message: {
+      Text(
+        ([L10n.text("recovery.explanation")]
+          + (model.recoveryReport?.issues.prefix(5).map { "• " + $0.message } ?? []))
+          .joined(separator: "\n"))
     }
     .sheet(item: $model.inspecting) { profile in
       InspectionView(model: model, profile: profile).environment(

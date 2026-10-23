@@ -15,6 +15,8 @@ pub mod linux_engine;
 #[cfg(unix)]
 pub mod privileged;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod recovery;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
 #[cfg(unix)]
 pub mod tailscale;

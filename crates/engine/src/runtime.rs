@@ -4,6 +4,7 @@
 //! OpenVPN profiles are delegated to that helper over `daemon_protocol`; this
 //! crate only asks.
 use crate::privileged::Privileged;
+use crate::recovery;
 use crate::tailscale::{self, Tailscale};
 use crate::vpn_backends;
 use crate::{helper_error, helper_socket};
@@ -15,7 +16,7 @@ use net_manager_core::daemon_protocol::{
 use net_manager_core::helper_client::HelperClient;
 use net_manager_core::managed_xray;
 use net_manager_core::models::{
-    Profile, TunnelBackend, TunnelRole, TunnelState, TunnelStatus, XrayMode,
+    Profile, RecoveryReport, TunnelBackend, TunnelRole, TunnelState, TunnelStatus, XrayMode,
 };
 use net_manager_core::openvpn_config::CredentialRequirements;
 use net_manager_core::profile_import;
@@ -349,6 +350,20 @@ fn request_tunnel(
         .map_err(helper_error)
 }
 
+/// The profile owning the system proxy when that connection is not running.
+fn stale_proxy_owner(
+    session: &mut Session,
+    privileged: &dyn Privileged,
+    profiles: &[Profile],
+) -> Option<String> {
+    let owner = session.proxy.ownership()?.profile_id.clone();
+    let live = profiles
+        .iter()
+        .find(|profile| profile.id == owner)
+        .is_some_and(|profile| running(session, privileged, profile));
+    (!live).then_some(owner)
+}
+
 fn snapshot_of(engine: &Engine, session: &mut Session, profiles: &[Profile]) -> Snapshot {
     Snapshot {
         xray_installed: engine.managed_executable().is_some(),
@@ -628,6 +643,32 @@ impl Engine {
                     .map_err(|_| "The previous system proxy could not be restored".to_string())?;
             }
             Ok(snapshot_of(self, session, profiles))
+        })
+    }
+
+    /// What a crashed session left behind: tunnels the helper still records
+    /// that no longer run, and a system proxy for a connection that is gone.
+    pub fn recovery_report(&self, profiles: &[Profile]) -> Result<RecoveryReport, String> {
+        with_session(&self.root, |session| {
+            let stale = stale_proxy_owner(session, self.privileged(), profiles);
+            Ok(recovery::report(self.privileged(), stale.as_deref()))
+        })
+    }
+
+    /// Undo what [`Engine::recovery_report`] lists and report what remains.
+    /// Running connections are never touched.
+    pub fn recovery_cleanup(&self, profiles: &[Profile]) -> Result<RecoveryReport, String> {
+        with_session(&self.root, |session| {
+            let helper = recovery::cleanup(self.privileged());
+            if let Some(owner) = stale_proxy_owner(session, self.privileged(), profiles) {
+                session
+                    .proxy
+                    .restore(&owner)
+                    .map_err(|_| "The previous system proxy could not be restored".to_string())?;
+            }
+            helper?;
+            let stale = stale_proxy_owner(session, self.privileged(), profiles);
+            Ok(recovery::report(self.privileged(), stale.as_deref()))
         })
     }
 

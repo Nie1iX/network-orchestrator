@@ -325,6 +325,17 @@ struct RouteMap: Decodable, Sendable {
   let warnings: [String]
   let diffs: [RouteDiff]
 }
+/// What a crashed session left behind (leftover tunnels, a stale system proxy).
+struct RecoveryIssue: Decodable, Sendable, Equatable {
+  let kind: String
+  let profileId: String?
+  let message: String
+}
+struct RecoveryReport: Decodable, Sendable, Equatable {
+  let issues: [RecoveryIssue]
+  let requiresElevation: Bool
+}
+
 struct Snapshot: Decodable, Sendable {
   let profiles: [Profile]
   let interfaces: [NetworkInterface]

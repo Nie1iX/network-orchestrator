@@ -880,6 +880,8 @@ pub enum RecoveryIssueKind {
     OrphanRouteOwnership,
     StatusCheckFailed,
     ProxyOwnership,
+    /// The privileged helper still records a tunnel that is not running.
+    LeftoverTunnel,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

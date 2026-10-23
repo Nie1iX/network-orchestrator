@@ -92,6 +92,12 @@ pub(crate) fn handle(
             let enable = args["enabled"].as_str() == Some("true");
             encode(engine.set_system_proxy(&profile, &profiles, enable)?)
         }),
+        // Leftovers of a crashed session; the helper does the cleanup itself,
+        // so no elevation is ever asked for.
+        "recovery_report" => load().and_then(|profiles| encode(engine.recovery_report(&profiles)?)),
+        "recovery_cleanup" => {
+            load().and_then(|profiles| encode(engine.recovery_cleanup(&profiles)?))
+        }
         "shutdown" => load().and_then(|profiles| {
             engine.shutdown(&profiles)?;
             Ok(json!({}))
@@ -127,6 +133,18 @@ mod tests {
             find(&[], &json!({"id": "x"})).unwrap_err(),
             "Profile not found"
         );
+    }
+
+    #[test]
+    fn the_recovery_report_has_the_shared_shape_and_asks_for_no_elevation() {
+        // Read-only: lists the helper's records when one answers, else nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(dir.path().join("profiles.json"));
+        let report = handle(dir.path(), &store, "recovery_report", &json!({}))
+            .unwrap()
+            .unwrap();
+        assert!(report["issues"].is_array());
+        assert_eq!(report["requiresElevation"], false);
     }
 
     #[test]
