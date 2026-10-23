@@ -473,8 +473,13 @@ impl XrayExecutor {
     }
 
     /// Undo whatever a dead helper left in the journal.
+    /// A live tunnel is left to its own disconnect; only what a dead helper
+    /// left in the journal is undone.
     pub fn recover(&self) -> io::Result<bool> {
-        let _guard = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return Ok(false);
+        }
         self.recover_locked_io()
     }
 
@@ -795,6 +800,18 @@ mod tests {
             .calls()
             .contains(&"networksetup -setdnsservers Wi-Fi 1.1.1.1".to_string()));
         assert_eq!(f.executor.status(501, "p").state, TunnelState::Stopped);
+    }
+
+    #[test]
+    fn recovery_leaves_a_live_tunnel_alone() {
+        let f = fixture();
+        f.executor.connect(501, params("p")).unwrap();
+        let calls = f.runner.calls().len();
+        assert!(!f.executor.recover().unwrap());
+        assert_eq!(f.flags.killed.load(Ordering::SeqCst), 0);
+        assert_eq!(f.runner.calls().len(), calls);
+        assert!(f.executor.owned().is_some());
+        assert_eq!(f.executor.status(501, "p").state, TunnelState::Running);
     }
 
     #[test]

@@ -452,8 +452,13 @@ impl WireGuardExecutor {
             .or_else(|| self.journal.load().ok().flatten())
     }
 
+    /// A live tunnel is left to its own disconnect; only what a dead helper
+    /// left in the journal is undone.
     pub fn recover(&self) -> io::Result<bool> {
-        let _guard = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return Ok(false);
+        }
         self.recover_locked_io()
     }
 
@@ -789,6 +794,17 @@ mod tests {
         ));
         assert_eq!(f.executor.status(502, "wg").state, TunnelState::Stopped);
         assert!(!f.executor.disconnect(502, "wg").unwrap().stopped);
+    }
+
+    #[test]
+    fn recovery_leaves_a_live_tunnel_alone() {
+        let f = fixture();
+        f.executor
+            .connect(501, params("wg", config("0.0.0.0/0", "")))
+            .unwrap();
+        assert!(!f.executor.recover().unwrap());
+        assert!(f.executor.owned().is_some());
+        assert_eq!(f.executor.status(501, "wg").state, TunnelState::Running);
     }
 
     #[test]

@@ -1025,8 +1025,13 @@ impl OpenVpnExecutor {
             .or_else(|| self.0.journal.load().ok().flatten())
     }
 
+    /// A live tunnel is left to its own disconnect; only what a dead helper
+    /// left in the journal is undone.
     pub fn recover(&self) -> io::Result<bool> {
-        let _guard = self.0.lock_active();
+        let guard = self.0.lock_active();
+        if guard.is_some() {
+            return Ok(false);
+        }
         self.recover_locked_io()
     }
 
@@ -1391,6 +1396,21 @@ mod tests {
         assert_eq!(
             f.executor.status(501, "office").state,
             OpenVpnConnectionState::Stopped
+        );
+    }
+
+    #[test]
+    fn recovery_leaves_a_live_tunnel_alone() {
+        let f = fixture(Behavior::Connects);
+        f.executor.connect(501, request(true)).unwrap();
+        wait_for("connected", || {
+            f.executor.status(501, "office").state == OpenVpnConnectionState::Connected
+        });
+        assert!(!f.executor.recover().unwrap());
+        assert!(f.executor.owned().is_some());
+        assert_eq!(
+            f.executor.status(501, "office").state,
+            OpenVpnConnectionState::Connected
         );
     }
 
