@@ -198,8 +198,7 @@ macOS перед коммитом.
 3. ✅ Recovery: при запуске `recovery_report` (`core::recovery::helper_report` + `Engine::recovery_report`) показывает диалог с остатками, «Clean up» вызывает `recovery.cleanup`. Попутно исправлено: `recover()` в helper'е убивал живой туннель.
 4. ✅ Logs и Monitor: Monitor (`ThroughputSampler`, метод моста `interfaces`) и Logs (`LogLines`; источники — события приложения (`AppLog`), лог каждого подключения (у WireGuard — `wireguard.log`, который пишет helper), лог helper'а, NetBird и импорта).
 5. ✅ Диагностика профиля: `core::diagnostics` (проверки как чистые функции), `Engine::diagnose`, метод моста `diagnose`, лист в Swift. Общие проверки (путь до endpoint'а, статический анализ, endpoints/listeners, системный прокси) открыты как публичные функции; `src-tauri/.../diagnostics.rs` пока на своей копии — переключить его на них можно там, где собирается Tauri (Linux/Windows), и удалить дубликат.
-6. Режимы приложения (combined/orchestrator/manager): фильтр возможностей в
-   настройках.
+6. ⏸ Режимы приложения (combined/orchestrator/manager): отложено до п.9. Режим — только UI-фильтр (`localStorage`): `orchestrator` прячет управляемые бэкенды и блокирует подключение всего, кроме статических маршрутов (`none`); `manager` прячет список NetworkManager. На macOS бэкенда `none` и внешнего интерфейса пока нет, поэтому `orchestrator` заблокировал бы все подключения, а `manager` скрывал бы лишь incy/NetBird/Tailscale. Вернуться после п.9.
 7. Сеть: управление состоянием интерфейса, DNS-диагностика, таблицы
    маршрутов и правил — требуют новых методов в `macos-helper`.
 8. Intents и Conditions — поверх п.7 (оценка условий по адресам интерфейсов,
