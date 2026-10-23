@@ -102,6 +102,7 @@ pub(crate) fn handle(
             engine.shutdown(&profiles)?;
             Ok(json!({}))
         }),
+        "helper_log" => Ok(json!(engine.helper_log())),
         "log" => load().and_then(|profiles| {
             let profile = find(&profiles, args)?;
             Ok(json!(engine.log(&profile)?))

@@ -1,3 +1,4 @@
+use network_orchestrator_macos_helper::event_log::EventLog;
 use network_orchestrator_macos_helper::journal::Journal;
 use network_orchestrator_macos_helper::openvpn::OpenVpnExecutor;
 use network_orchestrator_macos_helper::peer::{sibling_clients, AppClientPolicy};
@@ -101,12 +102,17 @@ async fn run(options: Options) -> std::io::Result<()> {
         std::path::Path::new(SOCKET_DIR).join("xray-tun.log"),
     ));
     let state_dir = std::path::Path::new(STATE_DIR);
-    let wireguard = Arc::new(WireGuardExecutor::new(
-        Box::new(RealWgPlatform),
-        Box::new(SystemRunner),
-        Journal::named(state_dir, "wireguard.json"),
-        std::path::PathBuf::from(network_orchestrator_macos_helper::resolver::DIR),
-    ));
+    let wireguard = Arc::new(
+        WireGuardExecutor::new(
+            Box::new(RealWgPlatform),
+            Box::new(SystemRunner),
+            Journal::named(state_dir, "wireguard.json"),
+            std::path::PathBuf::from(network_orchestrator_macos_helper::resolver::DIR),
+        )
+        .with_log(EventLog::at(
+            std::path::Path::new(SOCKET_DIR).join("wireguard.log"),
+        )),
+    );
     let openvpn = Arc::new(OpenVpnExecutor::new(
         Box::new(RealOvpnPlatform {
             stage_dir: state_dir.join("backends"),

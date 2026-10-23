@@ -10,6 +10,7 @@
 pub mod backends;
 pub mod dns;
 pub mod dnsquery;
+pub mod event_log;
 pub mod journal;
 pub mod openvpn;
 pub mod peer;

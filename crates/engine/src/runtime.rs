@@ -148,6 +148,22 @@ fn openvpn_log_tail(privileged: &dyn Privileged) -> Option<String> {
     tail_of(&privileged.log_dir().join("openvpn.log"))
 }
 
+/// WireGuard runs inside the helper, which writes its events here.
+fn wireguard_log_tail(privileged: &dyn Privileged) -> Option<String> {
+    tail_of(&privileged.log_dir().join("wireguard.log"))
+}
+
+/// Where launchd collects the helper's own stderr.
+const HELPER_LOG: &str = "/var/log/network-orchestrator-helper.log";
+
+/// The helper's own log with public addresses masked; empty when the file is
+/// missing or unreadable.
+pub fn helper_log_text(path: &Path) -> String {
+    tail_of(path)
+        .map(|text| net_manager_core::log_sanitize::sanitize_log_text(&text))
+        .unwrap_or_default()
+}
+
 fn tail_of(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
@@ -686,6 +702,12 @@ impl Engine {
         })
     }
 
+    /// Tail of the privileged helper's own log (start-up recovery, device and
+    /// route errors).
+    pub fn helper_log(&self) -> String {
+        helper_log_text(Path::new(HELPER_LOG))
+    }
+
     /// Tail of the connection's log, empty when it has none.
     pub fn log(&self, profile: &Profile) -> Result<String, String> {
         if is_tun(profile) {
@@ -695,8 +717,7 @@ impl Engine {
             return Ok(openvpn_log_tail(self.privileged()).unwrap_or_default());
         }
         if vpn_backends::is_wireguard(profile) {
-            // The engine keeps no text log; the status carries its notices.
-            return Ok(String::new());
+            return Ok(wireguard_log_tail(self.privileged()).unwrap_or_default());
         }
         with_session(&self.root, |session| {
             Ok(session
@@ -919,6 +940,38 @@ mod tests {
             tun_status(&missing, &tun_profile()).state,
             TunnelState::Stopped
         );
+    }
+
+    #[test]
+    fn the_wireguard_log_is_read_from_the_helpers_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("wireguard.log"),
+            "2026/10/23 12:00:00 [Info] connected on utun5\n",
+        )
+        .unwrap();
+        let client = HelperClient::new(dir.path().join("h.sock"));
+        assert_eq!(
+            wireguard_log_tail(&client).as_deref(),
+            Some("2026/10/23 12:00:00 [Info] connected on utun5\n")
+        );
+        let empty = tempfile::tempdir().unwrap();
+        let none = HelperClient::new(empty.path().join("h.sock"));
+        assert!(wireguard_log_tail(&none).is_none());
+    }
+
+    #[test]
+    fn the_helper_log_masks_public_addresses_and_may_be_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("helper.log");
+        std::fs::write(&path, "dial 203.0.113.7:443 failed\nlocal 192.168.1.5 ok\n").unwrap();
+        let text = helper_log_text(&path);
+        assert!(
+            text.contains("203.0.x.x:443") && !text.contains("203.0.113.7"),
+            "{text}"
+        );
+        assert!(text.contains("192.168.1.5"));
+        assert_eq!(helper_log_text(&dir.path().join("missing.log")), "");
     }
 
     #[test]

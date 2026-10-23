@@ -4,6 +4,7 @@
 //! all journaled so a crash, an exit or a restart leaves nothing behind.
 
 use crate::dns;
+use crate::event_log::EventLog;
 use crate::journal::{Journal, Record};
 use crate::resolver;
 use crate::routes;
@@ -51,6 +52,7 @@ pub struct WireGuardExecutor {
     /// Where split-DNS files go (`/etc/resolver`).
     resolver_dir: PathBuf,
     active: Mutex<Option<Active>>,
+    log: EventLog,
 }
 
 fn warning(warning: Warning) -> WireGuardWarning {
@@ -99,7 +101,14 @@ impl WireGuardExecutor {
             journal,
             resolver_dir,
             active: Mutex::new(None),
+            log: EventLog::default(),
         }
+    }
+
+    /// Where connect, disconnect and failures are written for the app's Logs page.
+    pub fn with_log(mut self, log: EventLog) -> Self {
+        self.log = log;
+        self
     }
 
     fn status_of(active: &Active) -> WireGuardStatusResult {
@@ -161,12 +170,55 @@ impl WireGuardExecutor {
         let mut guard = self.active.lock().unwrap_or_else(|e| e.into_inner());
         if guard.as_ref().is_some_and(|active| !active.engine.alive()) {
             if let Some(active) = guard.take() {
+                self.log
+                    .warning("the tunnel stopped on its own; its routes and DNS were undone");
                 let _ = self.teardown(active);
             }
         }
     }
 
     pub fn connect(
+        &self,
+        uid: u32,
+        params: WireGuardConnectParams,
+    ) -> Result<WireGuardConnectResult, Error> {
+        self.log.hand_to(uid);
+        self.log.info(&format!(
+            "connecting ({})",
+            if params.role == TunnelRole::Secondary {
+                "secondary"
+            } else {
+                "primary"
+            }
+        ));
+        let result = self.connect_logged(uid, params);
+        match &result {
+            Ok(connected) => {
+                let status = &connected.status;
+                self.log.info(&format!(
+                    "connected on {}",
+                    status
+                        .interface_name
+                        .as_deref()
+                        .unwrap_or("an unnamed interface")
+                ));
+                for warning in &status.warnings {
+                    self.log.warning(match warning {
+                        WireGuardWarning::Ipv6NotCovered => {
+                            "IPv6 is not covered by the allowed addresses and keeps using the uplink"
+                        }
+                        WireGuardWarning::DnsNotApplied => "the tunnel's DNS settings were not applied",
+                        WireGuardWarning::IgnoredHook => "a PostUp/PreDown hook in the config was ignored",
+                        WireGuardWarning::IgnoredSaveConfig => "SaveConfig in the config was ignored",
+                    });
+                }
+            }
+            Err(error) => self.log.error(&error.to_string()),
+        }
+        result
+    }
+
+    fn connect_logged(
         &self,
         uid: u32,
         params: WireGuardConnectParams,
@@ -424,8 +476,11 @@ impl WireGuardExecutor {
         }
         let active = guard.take().expect("checked above");
         self.teardown(active).map_err(|_| {
+            self.log
+                .error("the previous DNS settings could not be restored");
             Error::Unavailable("The previous DNS settings could not be restored".into())
         })?;
+        self.log.info("disconnected");
         Ok(WireGuardDisconnectResult { stopped: true })
     }
 
@@ -794,6 +849,52 @@ mod tests {
         ));
         assert_eq!(f.executor.status(502, "wg").state, TunnelState::Stopped);
         assert!(!f.executor.disconnect(502, "wg").unwrap().stopped);
+    }
+
+    fn logged(f: &Fixture) -> String {
+        std::fs::read_to_string(f.dir.path().join("wireguard.log")).unwrap_or_default()
+    }
+
+    #[test]
+    fn connecting_and_disconnecting_leave_a_readable_trail() {
+        let mut f = fixture();
+        f.executor = f
+            .executor
+            .with_log(EventLog::at(f.dir.path().join("wireguard.log")));
+        f.executor
+            .connect(501, params("wg", config("0.0.0.0/0", "")))
+            .unwrap();
+        f.executor.disconnect(501, "wg").unwrap();
+        let log = logged(&f);
+        assert!(log.contains("[Info] connecting (primary)"), "{log}");
+        assert!(log.contains("[Info] connected on utun"), "{log}");
+        assert!(log.contains("[Warning] IPv6 is not covered"), "{log}");
+        assert!(log.contains("[Info] disconnected"), "{log}");
+        // No keys, endpoints or profile ids.
+        assert!(
+            !log.contains("vpn.example.com") && !log.contains("wg\n"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn a_failed_connect_is_logged_with_the_reason_shown_to_the_user() {
+        let mut f = fixture();
+        f.executor = f
+            .executor
+            .with_log(EventLog::at(f.dir.path().join("wireguard.log")));
+        f.flags
+            .unresolvable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(f
+            .executor
+            .connect(501, params("wg", config("0.0.0.0/0", "")))
+            .is_err());
+        assert!(
+            logged(&f).contains("[Error] The WireGuard endpoint could not be resolved"),
+            "{}",
+            logged(&f)
+        );
     }
 
     #[test]
