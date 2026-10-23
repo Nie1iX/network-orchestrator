@@ -82,6 +82,14 @@ private func running(_ ids: [String]) throws -> RuntimeState {
   #expect(several.error == nil)  // the notice replaces a stale error
 }
 
+@Test @MainActor func autoConnectFailuresAreWrittenToTheAppLog() async throws {
+  let (model, _) = try await model([("a", true), ("b", true)])
+  await model.autoConnectOnLaunch()
+  let lines = LogLines.parse(await model.logText(for: .app))
+  #expect(lines.count == 1 && lines[0].level == .warn)
+  #expect(lines[0].text.contains("2 connection(s) flagged to start with the app did not start"))
+}
+
 @Test @MainActor func autoConnectRunsOncePerLaunch() async throws {
   let (model, _) = try await model([("a", true)])
   await model.autoConnectOnLaunch()

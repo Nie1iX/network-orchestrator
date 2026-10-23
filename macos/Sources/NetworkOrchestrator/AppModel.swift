@@ -36,8 +36,15 @@ import SystemConfiguration
   /// User-facing error. Bridge errors are secret-free by design, so they are
   /// also mirrored to the unified log (Xcode console, Console.app).
   var error: String? {
-    didSet { if let error { Self.log.error("\(error, privacy: .public)") } }
+    didSet {
+      guard let error else { return }
+      Self.log.error("\(error, privacy: .public)")
+      if error != oldValue { appLog.add(.error, error) }
+    }
   }
+  /// The app's own events, shown on the Logs page.
+  private(set) var appLog = AppLog()
+  func record(_ level: LogLevel, _ message: String) { appLog.add(level, message) }
   private static let log = Logger(subsystem: "com.netmanager.app.macos", category: "app")
   var busy = false
   var subscriptionEndpoints: [String: [SubscriptionEndpoint]] = [:]
@@ -256,12 +263,14 @@ import SystemConfiguration
     do {
       if isRunning(profile) {
         runtime = try await core.call("disconnect", args: ["id": profile.id])
+        record(.info, "Disconnected \(profile.name)")
       } else {
         // OpenVPN may need a login; nil means the sign-in sheet is showing.
         guard let extra = try await credentialArguments(profile) else { return }
         runtime = try await core.call("connect", args: ["id": profile.id].merging(extra) { $1 })
         await rememberAfterConnect(profile)
         lastProfileID = profile.id
+        record(.info, "Connected \(profile.name)")
       }
       error = nil
     } catch {
@@ -660,6 +669,7 @@ import SystemConfiguration
     else { return }
     recoveryReport = report
     showingRecovery = true
+    record(.warn, "Found \(report.issues.count) leftover item(s) from a previous session")
   }
   /// Asks the helper to undo the leftovers; what remains stays listed.
   func cleanUpRecovery() async {
@@ -667,6 +677,11 @@ import SystemConfiguration
       let report: RecoveryReport = try await core.call("recovery_cleanup")
       recoveryReport = report.issues.isEmpty ? nil : report
       showingRecovery = !report.issues.isEmpty
+      record(
+        report.issues.isEmpty ? .info : .warn,
+        report.issues.isEmpty
+          ? "Cleaned up the leftovers of a previous session"
+          : "\(report.issues.count) leftover item(s) remain after cleanup")
       error = nil
     } catch {
       self.error = error.localizedDescription
@@ -692,6 +707,7 @@ import SystemConfiguration
       if !isRunning(profile) { failed += 1 }
     }
     if failed > 0 {
+      record(.warn, "\(failed) connection(s) flagged to start with the app did not start")
       error = nil
       notice = failed == 1 ? "events.autoConnectFailed" : "events.autoConnectPartial"
       autoConnectFailures = failed
@@ -802,6 +818,21 @@ import SystemConfiguration
   }
   func connectionLog(_ profile: Profile) async -> String {
     (try? await core.call("log", args: ["id": profile.id]) as String) ?? ""
+  }
+  /// The text behind one entry of the Logs page.
+  func logText(for source: LogSource) async -> String {
+    switch source {
+    case .app: appLog.text
+    case .importer: await importLog()
+    case .helper: (try? await core.call("helper_log") as String) ?? ""
+    case .netbird: (try? await core.call("netbird_log") as String) ?? ""
+    case .connection(let id):
+      if let profile = snapshot?.profiles.first(where: { $0.id == id }) {
+        await connectionLog(profile)
+      } else {
+        ""
+      }
+    }
   }
   func importLog() async -> String {
     (try? await core.call("import_log") as String) ?? ""

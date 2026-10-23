@@ -1,22 +1,19 @@
 import SwiftUI
 
-/// Backend logs of one connection (or the import log) with level and text
-/// filters, refreshed while the page is open. Text is already redacted by the
+/// The app's events, a connection's backend log, the helper's, NetBird's or
+/// the import log, with level and text filters, refreshed while the page is open. Text is already redacted by the
 /// core; nothing here reads a log file itself.
 struct LogsView: View {
   @Environment(\.palette) private var p
   @Bindable var model: AppModel
-  /// A profile id, or `importSource` for the subscription/import log.
-  @State private var source: String?
+  @State private var source: LogSource?
   @State private var lines: [LogLine] = []
   @State private var level: LogLevel?
   @State private var query = ""
-  private static let importSource = "·import"
   private var profiles: [Profile] { model.snapshot?.profiles ?? [] }
-  /// Running connection first, then any connection, then the import log.
-  private var activeSource: String {
-    source ?? profiles.first { model.isRunning($0) }?.id ?? profiles.first?.id
-      ?? Self.importSource
+  /// A running connection first; otherwise the app's own events.
+  private var activeSource: LogSource {
+    source ?? profiles.first { model.isRunning($0) }.map { .connection($0.id) } ?? .app
   }
   var body: some View {
     let result = LogLines.filter(lines, level: level, query: query)
@@ -71,8 +68,11 @@ struct LogsView: View {
   private func controls(_ shown: [LogLine]) -> some View {
     HStack(spacing: 8) {
       Picker("", selection: Binding(get: { activeSource }, set: { source = $0 })) {
-        ForEach(profiles) { Text($0.name).tag($0.id) }
-        Text(L10n.text("native.importLog")).tag(Self.importSource)
+        Text(L10n.text("native.logs.app")).tag(LogSource.app)
+        ForEach(profiles) { Text($0.name).tag(LogSource.connection($0.id)) }
+        Text(L10n.text("native.logs.helper")).tag(LogSource.helper)
+        if model.netbird?.installed == true { Text("NetBird").tag(LogSource.netbird) }
+        Text(L10n.text("native.importLog")).tag(LogSource.importer)
       }.labelsHidden().frame(maxWidth: 220)
       Picker("", selection: $level) {
         Text(L10n.text("logs.allLevels")).tag(LogLevel?.none)
@@ -98,17 +98,10 @@ struct LogsView: View {
   }
 
   private func load() async {
-    let id = activeSource
-    let text: String
-    if id == Self.importSource {
-      text = await model.importLog()
-    } else if let profile = profiles.first(where: { $0.id == id }) {
-      text = await model.connectionLog(profile)
-    } else {
-      text = ""
-    }
+    let chosen = activeSource
+    let text = await model.logText(for: chosen)
     // A slow read must not overwrite what the user switched to meanwhile.
-    guard id == activeSource else { return }
+    guard chosen == activeSource else { return }
     lines = LogLines.parse(text)
   }
 }

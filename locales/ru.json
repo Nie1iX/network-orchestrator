@@ -815,6 +815,8 @@
     "native.menuBar.quit": "Выйти из Network Orchestrator",
     "native.menuBar.setting": "Показывать в строке меню",
     "native.menuBar.settingSub": "Переключайте подключения из строки меню, не открывая окно.",
+    "native.logs.app": "События приложения",
+    "native.logs.helper": "Привилегированный помощник",
     "native.ms": "{ms} мс",
     "native.open": "Открыть",
     "native.openBrowser": "Открыть браузер через подключение",
