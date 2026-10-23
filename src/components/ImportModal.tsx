@@ -3,11 +3,22 @@ import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import Modal from "./Modal";
 import { ensureElevation } from "../elevation";
-import { BatchImportResult } from "../types";
+import { BatchImportResult, TunnelBackend } from "../types";
 import { usePlatformCapabilities } from "../platform";
 import { tr, useT } from "../i18n";
 
 type ImportTab = "files" | "link" | "subscription" | "wireguard";
+
+const REFRESH_OPTIONS: { minutes: number | null; label: () => string }[] = [
+  { minutes: null, label: () => "" },
+  { minutes: 15, label: () => tr("15 min") },
+  { minutes: 60, label: () => tr("1 hour") },
+  { minutes: 360, label: () => tr("6 hours") },
+];
+
+const isSubscriptionUrl = (text: string) => /^https?:\/\//i.test(text.trim());
+
+const baseName = (path: string) => path.split(/[\\/]/).pop() || path;
 
 interface ImportModalProps {
   open: boolean;
@@ -25,35 +36,43 @@ export default function ImportModal({
   const [tab, setTab] = useState<ImportTab>("files");
   const caps = usePlatformCapabilities();
   const [busy, setBusy] = useState(false);
+  const [files, setFiles] = useState<string[]>([]);
+  const [fileBackend, setFileBackend] = useState<TunnelBackend | "">("");
   const [shareLink, setShareLink] = useState("");
   const [linkName, setLinkName] = useState("");
-  const [linkError, setLinkError] = useState<string | null>(null);
   const [subUrl, setSubUrl] = useState("");
   const [subHwid, setSubHwid] = useState("");
   const [subRefreshMinutes, setSubRefreshMinutes] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const t = useT();
 
-  const onImportLink = async () => {
-    if (busy || !shareLink.trim()) return;
+  const switchTab = (next: ImportTab) => {
+    setTab(next);
+    setError(null);
+  };
+
+  const run = async (job: () => Promise<BatchImportResult | null>) => {
     setBusy(true);
-    setLinkError(null);
+    setError(null);
     try {
-      const result = await invoke<BatchImportResult>("import_share_link", {
-        link: shareLink.trim(), name: linkName.trim(),
-      });
+      const result = await job();
+      if (!result) return;
       onImported(result);
+      setFiles([]);
       setShareLink("");
       setLinkName("");
+      setSubUrl("");
+      setSubHwid("");
+      setSubRefreshMinutes(null);
       onClose();
     } catch (err) {
-      setLinkError(err instanceof Error ? err.message : String(err));
+      setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
   };
 
-  const onImportFiles = async () => {
-    setBusy(true);
+  const chooseFiles = async () => {
     try {
       const selected = await openDialog({
         multiple: true,
@@ -63,71 +82,102 @@ export default function ImportModal({
             name: t("import.filesFilter"),
             extensions: ["conf", "dpapi", "ovpn", "json"],
           },
+          { name: tr("All files"), extensions: ["*"] },
         ],
       });
-      const paths = Array.isArray(selected)
-        ? selected
-        : selected
-          ? [selected]
-          : [];
-      if (paths.length === 0) return;
-      const result = await invoke<BatchImportResult>("import_configs_batch", {
-        paths,
-        defaultBackend: null,
-      });
-      onImported(result);
-      onClose();
+      const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+      if (paths.length > 0) {
+        setFiles(paths);
+        setError(null);
+      }
     } catch (err) {
-      onError(String(err));
-    } finally {
-      setBusy(false);
+      setError(String(err));
     }
   };
 
-  const onImportSubscription = async () => {
-    if (!subUrl.trim()) return;
-    setBusy(true);
-    try {
-      const result = await invoke<BatchImportResult>("import_subscription", {
-        url: subUrl.trim(),
-        hwid: subHwid.trim(),
-        refreshIntervalMinutes: subRefreshMinutes,
+  const submit = () => {
+    if (busy) return;
+    if (tab === "files") {
+      if (files.length === 0) return;
+      void run(() =>
+        invoke<BatchImportResult>("import_configs_batch", {
+          paths: files,
+          defaultBackend: fileBackend || null,
+        }),
+      );
+    } else if (tab === "link") {
+      const link = shareLink.trim();
+      if (!link) return;
+      // A pasted http(s) URL is a subscription, like in the native client.
+      if (isSubscriptionUrl(link)) {
+        void run(() =>
+          invoke<BatchImportResult>("import_subscription", {
+            url: link,
+            hwid: subHwid.trim(),
+            refreshIntervalMinutes: null,
+          }),
+        );
+      } else {
+        void run(() =>
+          invoke<BatchImportResult>("import_share_link", {
+            link,
+            name: linkName.trim(),
+          }),
+        );
+      }
+    } else if (tab === "subscription") {
+      if (!subUrl.trim()) return;
+      void run(() =>
+        invoke<BatchImportResult>("import_subscription", {
+          url: subUrl.trim(),
+          hwid: subHwid.trim(),
+          refreshIntervalMinutes: subRefreshMinutes,
+        }),
+      );
+    } else {
+      void run(async () => {
+        if (!(await ensureElevation(t("elev.actImportWg")))) return null;
+        const paths = await invoke<string[]>("discover_wireguard_configs");
+        if (paths.length === 0) {
+          onError(t("import.noWgConfigs"));
+          return null;
+        }
+        return invoke<BatchImportResult>("import_configs_batch", {
+          paths,
+          defaultBackend: "wireGuard",
+        });
       });
-      onImported(result);
-      setSubUrl("");
-      setSubHwid("");
-      setSubRefreshMinutes(null);
-      onClose();
-    } catch (err) {
-      onError(String(err));
-    } finally {
-      setBusy(false);
     }
   };
 
-  const onImportWireGuardStandard = async () => {
-    setBusy(true);
-    try {
-      if (!(await ensureElevation(t("elev.actImportWg")))) {
-        return;
-      }
-      const paths = await invoke<string[]>("discover_wireguard_configs");
-      if (paths.length === 0) {
-        onError(t("import.noWgConfigs"));
-        return;
-      }
-      const result = await invoke<BatchImportResult>("import_configs_batch", {
-        paths,
-        defaultBackend: "wireGuard",
-      });
-      onImported(result);
-      onClose();
-    } catch (err) {
-      onError(String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const canSubmit =
+    !busy &&
+    (tab === "files"
+      ? files.length > 0
+      : tab === "link"
+        ? shareLink.trim() !== ""
+        : tab === "subscription"
+          ? subUrl.trim() !== ""
+          : true);
+
+  const submitLabel = busy
+    ? tab === "subscription" || (tab === "link" && isSubscriptionUrl(shareLink))
+      ? t("import.fetching")
+      : t("import.importing")
+    : tab === "subscription"
+      ? t("import.fetch")
+      : tab === "wireguard"
+        ? t("import.wgImport")
+        : tr("Import");
+
+  const tabs: { id: ImportTab; label: string }[] = [
+    { id: "files", label: t("import.tabFiles") },
+    { id: "link", label: tr("Link") },
+    { id: "subscription", label: t("import.tabSub") },
+    ...(caps?.wireguardStandardImport
+      ? [{ id: "wireguard" as const, label: tr("WireGuard location") }]
+      : []),
+  ];
 
   return (
     <Modal
@@ -135,146 +185,180 @@ export default function ImportModal({
       title={t("import.title")}
       onClose={onClose}
       maxWidth="520px"
+      footer={
+        <>
+          <button type="button" onClick={onClose}>
+            {t("common.cancel")}
+          </button>
+          <button type="submit" form="import-form" className="btn-primary" disabled={!canSubmit}>
+            {submitLabel}
+          </button>
+        </>
+      }
     >
       <div className="modal-tabs">
-        <button
-          type="button"
-          className={`modal-tab ${tab === "files" ? "active" : ""}`}
-          onClick={() => setTab("files")}
-        >
-          {t("import.tabFiles")}
-        </button>
-        <button
-          type="button"
-          className={`modal-tab ${tab === "link" ? "active" : ""}`}
-          onClick={() => setTab("link")}
-          disabled={busy}
-        >
-          {tr("Link")}
-        </button>
-        <button
-          type="button"
-          className={`modal-tab ${tab === "subscription" ? "active" : ""}`}
-          onClick={() => setTab("subscription")}
-        >
-          {t("import.tabSub")}
-        </button>
-        {caps?.wireguardStandardImport && (
+        {tabs.map((item) => (
           <button
+            key={item.id}
             type="button"
-            className={`modal-tab ${tab === "wireguard" ? "active" : ""}`}
-            onClick={() => setTab("wireguard")}
+            className={`modal-tab ${tab === item.id ? "active" : ""}`}
+            onClick={() => switchTab(item.id)}
+            disabled={busy}
           >
-            WireGuard (standard)
+            {item.label}
           </button>
-        )}
+        ))}
       </div>
 
-      {tab === "link" && (
-        <form className="modal-tab-body" onSubmit={(event) => { event.preventDefault(); void onImportLink(); }}>
-          <p className="profile-help">{tr("Paste a vless://, hysteria2:// or hy2:// share link. Import saves a connection without starting a VPN.")}</p>
-          <label>
-            {tr("Share link")}
-            <input
-              type="password"
-              value={shareLink}
-              onChange={(event) => { setShareLink(event.target.value); setLinkError(null); }}
-              placeholder={tr("vless:// or hysteria2://…")}
-              autoComplete="off"
-              spellCheck={false}
-              maxLength={65536}
-              disabled={busy}
-            />
-          </label>
-          <label>
-            {tr("Connection name (optional)")}
-            <input type="text" value={linkName} onChange={(event) => setLinkName(event.target.value)}
-              placeholder={tr("Use the name from the link")} disabled={busy} />
-          </label>
-          {linkError && <p role="alert" className="error">{tr(linkError)}</p>}
-          <button type="submit" className="profile-import-btn" disabled={busy || !shareLink.trim()}>
-            {busy ? tr("Importing…") : tr("Import link")}
-          </button>
-        </form>
-      )}
+      <form
+        id="import-form"
+        className="modal-tab-body"
+        onSubmit={(event) => {
+          event.preventDefault();
+          submit();
+        }}
+      >
+        {tab === "files" && (
+          <>
+            <p className="profile-help">{t("import.filesHelp")}</p>
+            <div>
+              <button type="button" onClick={() => void chooseFiles()} disabled={busy}>
+                {tr("Choose files…")}
+              </button>
+            </div>
+            {files.length > 0 && (
+              <>
+                <ul className="import-file-list">
+                  {files.map((path) => (
+                    <li key={path} title={path}>
+                      {baseName(path)}
+                    </li>
+                  ))}
+                </ul>
+                <label className="import-row">
+                  <span>{tr("Backend")}</span>
+                  <select
+                    value={fileBackend}
+                    onChange={(event) => setFileBackend(event.target.value as TunnelBackend | "")}
+                    disabled={busy}
+                  >
+                    <option value="">{tr("Detect from file")}</option>
+                    <option value="wireGuard">{tr("WireGuard")}</option>
+                    <option value="openVpn">{tr("OpenVPN")}</option>
+                    <option value="xray">{tr("Xray")}</option>
+                  </select>
+                </label>
+              </>
+            )}
+            <p className="profile-help">
+              {tr("A private, managed copy is stored locally. Import does not start a VPN.")}
+            </p>
+          </>
+        )}
 
-      {tab === "files" && (
-        <div className="modal-tab-body">
-          <p className="profile-help">
-            {t("import.filesHelp")}
-          </p>
-          <button
-            type="button"
-            className="btn-primary"
-            onClick={onImportFiles}
-            disabled={busy}
-          >
-            {busy ? t("import.importing") : t("import.browse")}
-          </button>
-        </div>
-      )}
+        {tab === "link" && (
+          <>
+            <p className="profile-help">
+              {t("native.linkHint")}
+            </p>
+            <label>
+              {tr("Share link")}
+              <input
+                type="password"
+                value={shareLink}
+                onChange={(event) => { setShareLink(event.target.value); setError(null); }}
+                placeholder={tr("vless:// or hysteria2://…")}
+                autoComplete="off"
+                spellCheck={false}
+                maxLength={65536}
+                disabled={busy}
+                autoFocus
+              />
+            </label>
+            {!isSubscriptionUrl(shareLink) ? (
+              <label>
+                {tr("Connection name (optional)")}
+                <input
+                  type="text"
+                  value={linkName}
+                  onChange={(event) => setLinkName(event.target.value)}
+                  placeholder={tr("Use the name from the link")}
+                  disabled={busy}
+                />
+              </label>
+            ) : (
+              <label>
+                {t("import.hwid")}
+                <input
+                  type="password"
+                  value={subHwid}
+                  onChange={(event) => setSubHwid(event.target.value)}
+                  placeholder="device-hwid"
+                  autoComplete="off"
+                  disabled={busy}
+                />
+              </label>
+            )}
+          </>
+        )}
 
-      {tab === "subscription" && (
-        <div className="modal-tab-body">
-          <p className="profile-help">
-            {t("import.subHelp")}
-          </p>
-          <label>
-            {t("import.subUrl")}
-            <input
-              type="text"
-              value={subUrl}
-              onChange={(e) => setSubUrl(e.target.value)}
-              placeholder="https://example.com/sub"
-            />
-          </label>
-          <label>
-            {t("import.hwid")}
-            <input
-              type="password"
-              value={subHwid}
-              onChange={(e) => setSubHwid(e.target.value)}
-              placeholder="device-hwid"
-            />
-          </label>
-          <label>
-            {t("import.autoRefresh")}
-            <select
-              value={subRefreshMinutes ?? ""}
-              onChange={(event) => setSubRefreshMinutes(event.target.value ? Number(event.target.value) : null)}
-            >
-              <option value="">{t("common.off")}</option>
-              <option value="15">{t("detail.every15")}</option>
-              <option value="60">{t("detail.everyHour")}</option>
-              <option value="360">{t("detail.every6h")}</option>
-            </select>
-          </label>
-          <button
-            type="button"
-            className="btn-primary"
-            onClick={onImportSubscription}
-            disabled={busy || !subUrl.trim()}
-          >
-            {busy ? t("import.fetching") : t("import.fetch")}
-          </button>
-        </div>
-      )}
+        {tab === "subscription" && (
+          <>
+            <p className="profile-help">{t("import.subHelp")}</p>
+            <label>
+              {t("import.subUrl")}
+              <input
+                type="text"
+                value={subUrl}
+                onChange={(event) => { setSubUrl(event.target.value); setError(null); }}
+                placeholder="https://example.com/sub"
+                autoComplete="off"
+                spellCheck={false}
+                disabled={busy}
+                autoFocus
+              />
+            </label>
+            <label>
+              {t("import.hwid")}
+              <input
+                type="password"
+                value={subHwid}
+                onChange={(event) => setSubHwid(event.target.value)}
+                placeholder="device-hwid"
+                autoComplete="off"
+                disabled={busy}
+              />
+            </label>
+            <div className="import-row">
+              <span>{t("import.autoRefresh")}</span>
+              <div className="filter-state" role="radiogroup" aria-label={t("import.autoRefresh")}>
+                {REFRESH_OPTIONS.map((option) => (
+                  <button
+                    key={option.minutes ?? "off"}
+                    type="button"
+                    role="radio"
+                    aria-checked={subRefreshMinutes === option.minutes}
+                    className={`filter-btn ${subRefreshMinutes === option.minutes ? "active" : ""}`}
+                    onClick={() => setSubRefreshMinutes(option.minutes)}
+                    disabled={busy}
+                  >
+                    {option.minutes === null ? t("common.off") : option.label()}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <p className="profile-help">
+              {tr("Import does not start a VPN.")}
+            </p>
+          </>
+        )}
 
-      {tab === "wireguard" && caps?.wireguardStandardImport && (
-        <div className="modal-tab-body">
-          <p className="profile-help">
-            {t("import.wgHelp")}
-          </p>
-          <button
-            type="button"
-            className="btn-primary"
-            onClick={onImportWireGuardStandard}
-            disabled={busy}
-          >
-            {busy ? t("import.importing") : t("import.wgImport")}
-          </button>
-        </div>
-      )}
+        {tab === "wireguard" && caps?.wireguardStandardImport && (
+          <p className="profile-help">{t("import.wgHelp")}</p>
+        )}
+
+        {error && <p role="alert" className="error">{tr(error)}</p>}
+      </form>
     </Modal>
   );
 }
