@@ -819,6 +819,32 @@ import SystemConfiguration
   func connectionLog(_ profile: Profile) async -> String {
     (try? await core.call("log", args: ["id": profile.id]) as String) ?? ""
   }
+  /// The helper offers `link.set_state`, and this is not loopback or the
+  /// device of a connection this app runs (those are stopped by disconnecting).
+  func canSwitch(_ interface: NetworkInterface) -> Bool {
+    helperOffers("link.set_state") && interface.name != "lo0"
+      && !ownTunnelInterfaces.contains(interface.name)
+  }
+  /// What the confirmation says before an interface is turned off.
+  func switchOffWarning(_ interface: NetworkInterface) -> String {
+    interface.name == primaryInterface ? "native.link.offDefault" : "native.link.off"
+  }
+  var switchingInterface = false
+  /// Turns an interface on or off through the helper, then reloads the lists.
+  func setInterfaceState(_ interface: NetworkInterface, up: Bool) async -> Bool {
+    switchingInterface = true
+    defer { switchingInterface = false }
+    do {
+      let _: [String: String] = try await core.call(
+        "set_interface_state", args: ["name": interface.name, "up": up ? "true" : "false"])
+      record(.info, "\(up ? "Turned on" : "Turned off") \(interface.name)")
+      await refresh()
+      return true
+    } catch {
+      self.error = error.localizedDescription
+      return false
+    }
+  }
   /// The system's DNS resolvers (`scutil --dns`), read-only.
   var dnsConfig: DnsConfig?
   func loadDns() async {

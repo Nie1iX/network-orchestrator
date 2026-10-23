@@ -32,6 +32,7 @@ struct NetworkView: View {
   @State private var preset = "Main adapters"
   @State private var collapsed = Set<String>()
   @State private var selected: NetworkInterface?
+  @State private var confirmingOff = false
   private var interfaces: [NetworkInterface] { model.snapshot?.interfaces ?? [] }
   private var filtered: [NetworkInterface] {
     interfaces.filter {
@@ -146,7 +147,8 @@ struct NetworkView: View {
           }.padding(.bottom, 14)
         }
       }
-    }.sheet(item: $selected) { interface in
+    }
+    .sheet(item: $selected) { interface in
       AppModal(
         title: interface.friendlyName, width: 620, onClose: { selected = nil },
         translatesTitle: false
@@ -154,6 +156,20 @@ struct NetworkView: View {
         ScrollView {
           VStack(alignment: .leading, spacing: 14) {
             InterfaceCard(interface: interface)
+            if model.canSwitch(interface) {
+              HStack {
+                Spacer()
+                Button(
+                  L10n.text(interface.state == "up" ? "native.link.turnOff" : "native.link.turnOn")
+                ) {
+                  if interface.state == "up" {
+                    confirmingOff = true
+                  } else {
+                    Task { await switchInterface(interface, up: true) }
+                  }
+                }.disabled(model.switchingInterface)
+              }
+            }
             AppHeading(title: "Routes")
             Text(
               L10n.text(
@@ -171,7 +187,25 @@ struct NetworkView: View {
           }.padding(14)
         }.frame(height: 520)
       }.environment(\.palette, p)
+        // On the sheet itself: an alert of the parent would sit behind it.
+        .alert(
+          L10n.text("native.link.offTitle"), isPresented: $confirmingOff, presenting: selected
+        ) { interface in
+          Button(L10n.text("native.link.turnOff"), role: .destructive) {
+            Task { await switchInterface(interface, up: false) }
+          }
+          Button(L10n.text("common.cancel"), role: .cancel) {}
+        } message: { interface in
+          Text(L10n.text(model.switchOffWarning(interface), ["name": interface.friendlyName]))
+        }
     }
+  }
+}
+extension NetworkView {
+  /// Switches the interface and shows its new state in the open sheet.
+  fileprivate func switchInterface(_ interface: NetworkInterface, up: Bool) async {
+    guard await model.setInterfaceState(interface, up: up) else { return }
+    selected = model.snapshot?.interfaces.first { $0.ifIndex == interface.ifIndex }
   }
 }
 struct InterfaceCard: View {
