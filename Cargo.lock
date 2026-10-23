@@ -2851,6 +2851,7 @@ dependencies = [
  "futures-util",
  "libc",
  "net-manager-core",
+ "net-manager-engine",
  "reqwest",
  "serde",
  "serde_json",

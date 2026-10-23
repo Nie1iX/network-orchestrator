@@ -966,6 +966,79 @@ fn set_subscription_refresh_interval_into(
     Ok(redact_profiles_for_ipc(document.profiles))
 }
 
+/// The profile a role change applies to: static routes create no tunnel.
+fn tunnel_profile(
+    store: &net_manager_core::profiles::ProfileStore,
+    id: &str,
+) -> Result<Profile, String> {
+    let profile = store
+        .load()
+        .map_err(|_| "failed to load profiles".to_string())?
+        .profiles
+        .into_iter()
+        .find(|profile| profile.id == id)
+        .ok_or_else(|| "profile not found".to_string())?;
+    if profile.backend == TunnelBackend::None {
+        return Err("Static routes do not create a tunnel".into());
+    }
+    Ok(profile)
+}
+
+fn set_tunnel_role_into(
+    store: &net_manager_core::profiles::ProfileStore,
+    id: &str,
+    role: net_manager_core::models::TunnelRole,
+) -> Result<Vec<Profile>, String> {
+    let mut profile = tunnel_profile(store, id)?;
+    profile.tunnel_role = role;
+    let document = store
+        .upsert(profile)
+        .map_err(|_| "failed to store the connection role".to_string())?;
+    Ok(redact_profiles_for_ipc(document.profiles))
+}
+
+fn set_tunnel_networks_into(
+    store: &net_manager_core::profiles::ProfileStore,
+    id: &str,
+    networks: &str,
+    dns_domains: &str,
+) -> Result<Vec<Profile>, String> {
+    let mut profile = tunnel_profile(store, id)?;
+    profile.tunnel_networks = net_manager_core::models::parse_networks(networks)?;
+    profile.tunnel_dns_domains = net_manager_core::models::parse_dns_domains(dns_domains)?;
+    let document = store
+        .upsert(profile)
+        .map_err(|_| "failed to store the connection networks".to_string())?;
+    Ok(redact_profiles_for_ipc(document.profiles))
+}
+
+/// Primary takes all traffic; secondary only its own networks. A running
+/// connection is stopped first so the role applies to a fresh start.
+#[tauri::command]
+pub(crate) async fn set_tunnel_role(
+    id: String,
+    role: net_manager_core::models::TunnelRole,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let profile = tunnel_profile(&state.profiles, &id)?;
+    ensure_profile_stopped(&state, &profile, "changing the connection role").await?;
+    set_tunnel_role_into(&state.profiles, &id, role)
+}
+
+/// Networks (CIDR or single addresses) and split-DNS domains of a secondary
+/// connection, typed as text; validated here, never trusted by the daemon.
+#[tauri::command]
+pub(crate) async fn set_tunnel_networks(
+    id: String,
+    networks: String,
+    dns_domains: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let profile = tunnel_profile(&state.profiles, &id)?;
+    ensure_profile_stopped(&state, &profile, "changing the connection networks").await?;
+    set_tunnel_networks_into(&state.profiles, &id, &networks, &dns_domains)
+}
+
 #[tauri::command]
 pub(crate) async fn set_subscription_refresh_interval(
     profile_id: String,
@@ -1863,6 +1936,53 @@ mod tests {
         assert!(subscription_refresh_due(&meta, 1900));
         meta.refresh_interval_minutes = None;
         assert!(!subscription_refresh_due(&meta, 10_000));
+    }
+
+    #[test]
+    fn tunnel_role_and_networks_are_validated_and_persisted() {
+        use net_manager_core::models::TunnelRole;
+        let dir = unique_dir("tunnel-role");
+        let store = net_manager_core::profiles::ProfileStore::new(dir.join("profiles.json"));
+        store
+            .upsert(Profile {
+                id: "wg1".into(),
+                name: "Office".into(),
+                backend: TunnelBackend::WireGuard,
+                config_path: dir.join("wg1.conf"),
+                interface_name: "wg1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .upsert(Profile {
+                id: "static".into(),
+                name: "Static".into(),
+                backend: TunnelBackend::None,
+                interface_name: "eth9".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let profiles = set_tunnel_role_into(&store, "wg1", TunnelRole::Secondary).unwrap();
+        assert_eq!(profiles[0].tunnel_role, TunnelRole::Secondary);
+        let profiles = set_tunnel_networks_into(
+            &store,
+            "wg1",
+            "10.10.4.7/16, 192.168.5.0/24",
+            "Corp.Example",
+        )
+        .unwrap();
+        assert_eq!(profiles[0].tunnel_networks.len(), 2);
+        assert_eq!(profiles[0].tunnel_dns_domains, vec!["corp.example"]);
+        let stored = store.load().unwrap().profiles.remove(0);
+        assert_eq!(stored.effective_routes().len(), 2);
+
+        assert!(set_tunnel_networks_into(&store, "wg1", "0.0.0.0/0", "").is_err());
+        assert!(set_tunnel_networks_into(&store, "wg1", "10.0.0.0/8", "a/b").is_err());
+        assert!(set_tunnel_role_into(&store, "static", TunnelRole::Secondary).is_err());
+        assert!(set_tunnel_role_into(&store, "missing", TunnelRole::Primary).is_err());
+        // Rejected input leaves the stored networks alone.
+        assert_eq!(store.load().unwrap().profiles[0].tunnel_networks.len(), 2);
     }
 
     #[test]
