@@ -4,6 +4,7 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import { ensureElevation, requiresElevation } from "../elevation";
 import { usePlatformCapabilities } from "../platform";
 import {
+  setLastProfileId,
   useAppMode,
   useProfileListMode,
   useScanLocalProxies,
@@ -48,6 +49,7 @@ import NmConnectionPanel from "./NmConnectionPanel";
 import TailscalePanel from "./TailscalePanel";
 import ToggleSwitch from "./ui/ToggleSwitch";
 import NetBirdRow, { useNetBird } from "./NetBirdRow";
+import OpenVpnCredentialsModal from "./OpenVpnCredentialsModal";
 import { useToast } from "./ui/Toast";
 import ProfileFormModal, {
   editFormState,
@@ -218,12 +220,6 @@ export default function ProfileManager() {
   const [refreshingSubscription, setRefreshingSubscription] = useState<string | null>(null);
   const [settingRefreshInterval, setSettingRefreshInterval] = useState<string | null>(null);
   const [openVpnCredentialProfile, setOpenVpnCredentialProfile] = useState<Profile | null>(null);
-  const [openVpnUsername, setOpenVpnUsername] = useState("");
-  const [openVpnPassword, setOpenVpnPassword] = useState("");
-  const [openVpnKeyPassphrase, setOpenVpnKeyPassphrase] = useState("");
-  const [rememberOpenVpnCredentials, setRememberOpenVpnCredentials] = useState(false);
-  const [openVpnCredentialError, setOpenVpnCredentialError] = useState<string | null>(null);
-  const [openVpnCredentialBusy, setOpenVpnCredentialBusy] = useState(false);
   const [measuringEndpoints, setMeasuringEndpoints] = useState<Set<string>>(
     new Set(),
   );
@@ -826,64 +822,17 @@ export default function ProfileManager() {
           status.message ??
             t("profiles.connectFailedDiag", { name: profile.name }),
         );
-      } else if (status.message) {
-        toast("info", status.message);
+      } else {
+        setLastProfileId(profile.id);
+        if (status.message) toast("info", status.message);
       }
     }, (err) => {
       if (caps?.os === "linux" && profile.backend === "openVpn" && String(err) === "OpenVPN credentials required") {
         setOpenVpnCredentialProfile(profile);
-        setOpenVpnCredentialError(null);
       } else {
         toast("error", String(err));
       }
     });
-  };
-
-  const closeOpenVpnCredentials = () => {
-    if (openVpnCredentialBusy) return;
-    setOpenVpnCredentialProfile(null);
-    setOpenVpnUsername("");
-    setOpenVpnPassword("");
-    setOpenVpnKeyPassphrase("");
-    setRememberOpenVpnCredentials(false);
-    setOpenVpnCredentialError(null);
-  };
-
-  const submitOpenVpnCredentials = async () => {
-    if (!openVpnCredentialProfile) return;
-    if (openVpnPassword && !openVpnUsername) {
-      setOpenVpnCredentialError(t("ovpn.errUserPass"));
-      return;
-    }
-    if (!openVpnUsername && !openVpnKeyPassphrase) {
-      setOpenVpnCredentialError(t("ovpn.errCreds"));
-      return;
-    }
-    setOpenVpnCredentialBusy(true);
-    setOpenVpnCredentialError(null);
-    try {
-      const status = await invoke<TunnelStatus>("connect_openvpn_with_credentials", {
-        id: openVpnCredentialProfile.id,
-        credentials: {
-          ...(openVpnUsername ? { authUserPass: { username: openVpnUsername, password: openVpnPassword } } : {}),
-          ...(openVpnKeyPassphrase ? { privateKeyPassphrase: openVpnKeyPassphrase } : {}),
-        },
-        remember: rememberOpenVpnCredentials,
-      });
-      if (status.message) toast("info", status.message);
-      setOpenVpnCredentialProfile(null);
-      setOpenVpnUsername("");
-      setOpenVpnPassword("");
-      setOpenVpnKeyPassphrase("");
-      setRememberOpenVpnCredentials(false);
-      await refreshAll();
-    } catch (err) {
-      setOpenVpnCredentialError(
-        t("ovpn.errFailed", { err: String(err) }),
-      );
-    } finally {
-      setOpenVpnCredentialBusy(false);
-    }
   };
 
   const onDisconnect = async (profile: Profile) => {
@@ -2075,7 +2024,6 @@ export default function ProfileManager() {
               }
               onCredentials={() => {
                 setOpenVpnCredentialProfile(selected);
-                setOpenVpnCredentialError(null);
               }}
               onRefreshSubscription={() =>
                 void onRefreshSubscription(selected)
@@ -2151,43 +2099,16 @@ export default function ProfileManager() {
         />
       )}
 
-      <Modal
-        open={openVpnCredentialProfile !== null}
-        title={t("ovpn.title")}
-        onClose={closeOpenVpnCredentials}
-        maxWidth="420px"
-        footer={
-          <>
-            <button type="button" onClick={closeOpenVpnCredentials} disabled={openVpnCredentialBusy}>
-              {t("common.cancel")}
-            </button>
-            <button type="button" className="btn-primary" onClick={submitOpenVpnCredentials} disabled={openVpnCredentialBusy}>
-              {openVpnCredentialBusy ? t("common.connecting") : t("common.connect")}
-            </button>
-          </>
-        }
-      >
-        <form className="profile-form" onSubmit={(event) => { event.preventDefault(); void submitOpenVpnCredentials(); }}>
-          <label>
-            {t("ovpn.username")}
-            <input type="text" autoComplete="username" value={openVpnUsername} onChange={(event) => setOpenVpnUsername(event.target.value)} />
-          </label>
-          <label>
-            {t("ovpn.password")}
-            <input type="password" autoComplete="current-password" value={openVpnPassword} onChange={(event) => setOpenVpnPassword(event.target.value)} />
-          </label>
-          <label>
-            {t("ovpn.keyPass")}
-            <input type="password" autoComplete="off" value={openVpnKeyPassphrase} onChange={(event) => setOpenVpnKeyPassphrase(event.target.value)} />
-          </label>
-          <label className="profile-proxy-toggle">
-            <input type="checkbox" checked={rememberOpenVpnCredentials} onChange={(event) => setRememberOpenVpnCredentials(event.target.checked)} />
-            {t("ovpn.remember")}
-          </label>
-          <span className="profile-help">{t("ovpn.keyringHelp")}</span>
-          {openVpnCredentialError && <p className="error" role="alert">{openVpnCredentialError}</p>}
-        </form>
-      </Modal>
+      <OpenVpnCredentialsModal
+        profile={openVpnCredentialProfile}
+        onClose={() => setOpenVpnCredentialProfile(null)}
+        onConnected={(profile, status) => {
+          if (status.message) toast("info", status.message);
+          setLastProfileId(profile.id);
+          setOpenVpnCredentialProfile(null);
+          void refreshAll();
+        }}
+      />
 
       <Modal
         open={saveModalOpen}
