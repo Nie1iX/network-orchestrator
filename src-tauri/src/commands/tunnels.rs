@@ -1,12 +1,14 @@
 use crate::commands::profiles::loopback_port_available;
 use crate::state::{find_profile, AppState, RuntimeState};
 use net_manager_core::analysis;
+use net_manager_core::connect_plan::{
+    active_profile_conflicts, derive_installable_routes, has_target_interface,
+    resolve_install_interface, wait_for_openvpn_pushed_routes, wait_for_tcp_listener,
+};
 use net_manager_core::explorer;
 use net_manager_core::models::*;
-use net_manager_core::vpn::TunnelManager;
 use std::io::ErrorKind;
-use std::net::{Ipv4Addr, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::{Emitter, State};
 
 #[cfg(target_os = "linux")]
@@ -330,14 +332,6 @@ async fn linux_wireguard_disconnect(
     })
 }
 
-fn has_target_interface(profile: &Profile, interfaces: &[NetworkInterface]) -> bool {
-    interfaces.iter().any(|iface| {
-        matches!(iface.state, InterfaceState::Up)
-            && (iface.friendly_name == profile.interface_name
-                || iface.name == profile.interface_name)
-    })
-}
-
 async fn cleanup_stale_routes_before_connect(
     runtime: &mut RuntimeState,
     profile: &Profile,
@@ -355,160 +349,6 @@ async fn cleanup_stale_routes_before_connect(
             .map_err(|err| format!("failed to clean previously applied routes: {err}"))?;
     }
     Ok(())
-}
-
-fn unknown_route_conflicts(
-    candidate: &ConfigAnalysis,
-    other: &Profile,
-    other_analysis: &ConfigAnalysis,
-) -> Vec<ProfileConflict> {
-    let mut conflicts = Vec::new();
-    if !other_analysis.route_knowledge_complete
-        && (!candidate.os_routes.is_empty() || !candidate.route_knowledge_complete)
-    {
-        conflicts.push(ProfileConflict {
-            kind: ConflictKind::RouteOverlap,
-            message: format!(
-                "cannot verify route conflicts with active profile '{}' because its effective routes are not fully known",
-                other.name
-            ),
-            other_profile_id: Some(other.id.clone()),
-            blocking: true,
-        });
-    } else if !candidate.route_knowledge_complete && !other_analysis.os_routes.is_empty() {
-        conflicts.push(ProfileConflict {
-            kind: ConflictKind::RouteOverlap,
-            message: format!(
-                "candidate routes are not fully known and may conflict with routes of active profile '{}'",
-                other.name
-            ),
-            other_profile_id: Some(other.id.clone()),
-            blocking: true,
-        });
-    }
-    conflicts
-}
-
-fn active_profile_conflicts(
-    tunnels: &mut TunnelManager,
-    candidate_id: &str,
-    candidate: &ConfigAnalysis,
-    profiles: &[Profile],
-) -> Result<Vec<ProfileConflict>, String> {
-    let mut conflicts = Vec::new();
-    for other in profiles {
-        if other.id == candidate_id {
-            continue;
-        }
-        if tunnels.status(other).state != TunnelState::Running {
-            continue;
-        }
-        let other_analysis = analysis::analyze_profile(other).map_err(|_| {
-            format!(
-                "cannot verify conflicts with active profile '{}'",
-                other.name
-            )
-        })?;
-        conflicts.extend(unknown_route_conflicts(candidate, other, &other_analysis));
-        conflicts.extend(analysis::conflicts_between(
-            candidate,
-            &other_analysis,
-            true,
-        ));
-    }
-    Ok(conflicts)
-}
-
-async fn wait_for_tcp_listener(port: u16, timeout: Duration, interval: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-/// Wait for OpenVPN to log `PUSH_REPLY` (or `Initialization Sequence Completed`)
-/// after connect, then return the server-pushed routes parsed from the log.
-/// Returns an empty vec if the deadline passes without a PUSH_REPLY.
-async fn wait_for_openvpn_pushed_routes(
-    tunnels: &mut TunnelManager,
-    profile: &Profile,
-    timeout: Duration,
-    interval: Duration,
-) -> Vec<AnalyzedRoute> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let routes = tunnels.openvpn_pushed_routes(&profile.id);
-        if !routes.is_empty() {
-            return routes;
-        }
-        if Instant::now() >= deadline {
-            return Vec::new();
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-/// Derive the routes to install for a profile when `profile.routes` is empty.
-/// The app is the sole route installer, so when the user has not specified
-/// explicit policy routes, we derive them from the backend's own route
-/// information:
-/// - WireGuard: AllowedIPs (static, known pre-connect from analysis).
-/// - OpenVPN: server-pushed routes (dynamic, read from log post-connect).
-/// - Xray SOCKS: no OS routes (proxy-based, no interface routes).
-/// - None: no derivation (static-routes profiles require explicit routes).
-fn derive_installable_routes(
-    analysis: &ConfigAnalysis,
-    pushed: &[AnalyzedRoute],
-    backend: TunnelBackend,
-) -> Vec<PolicyRoute> {
-    match backend {
-        TunnelBackend::WireGuard => analysis
-            .os_routes
-            .iter()
-            .filter(|r| r.source.contains("WireGuard"))
-            .map(|r| PolicyRoute {
-                destination: r.destination,
-                metric: 5,
-                via: None,
-            })
-            .collect(),
-        TunnelBackend::OpenVpn => pushed
-            .iter()
-            .chain(
-                analysis
-                    .os_routes
-                    .iter()
-                    .filter(|r| r.source.contains("OpenVPN") && !r.source.contains("pushed")),
-            )
-            .map(|r| PolicyRoute {
-                destination: r.destination,
-                metric: 5,
-                via: None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Resolve the interface name for route installation. For WireGuard, if the
-/// profile has no explicit interface name, derive it from the config file name
-/// (the tunnel service creates an interface named after the config stem).
-fn resolve_install_interface(profile: &Profile) -> Option<String> {
-    if !profile.interface_name.trim().is_empty() {
-        return Some(profile.interface_name.clone());
-    }
-    match profile.backend {
-        TunnelBackend::WireGuard => {
-            net_manager_core::vpn::wireguard_tunnel_name(&profile.config_path).ok()
-        }
-        _ => None,
-    }
 }
 
 #[tauri::command]
@@ -2324,67 +2164,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn target_interface_matches_exact_friendly_or_raw_name() {
-        let p = profile("wg-work");
-        let interfaces = vec![
-            iface("if0", "wg-work", InterfaceState::Up),
-            iface("if1", "other", InterfaceState::Up),
-        ];
-        assert!(has_target_interface(&p, &interfaces));
-
-        let p_raw = profile("if1");
-        assert!(has_target_interface(&p_raw, &interfaces));
-    }
-
-    #[test]
-    fn target_interface_rejects_down_state() {
-        let p = profile("wg-work");
-        let interfaces = vec![iface("if0", "wg-work", InterfaceState::Down)];
-        assert!(!has_target_interface(&p, &interfaces));
-    }
-
-    #[test]
-    fn target_interface_rejects_substring_matches() {
-        let p = profile("wg-work");
-        let interfaces = vec![
-            iface("wg-work-extra", "wg", InterfaceState::Up),
-            iface("xwg-work", "my-wg-work-tunnel", InterfaceState::Up),
-        ];
-        assert!(!has_target_interface(&p, &interfaces));
-    }
-
-    #[test]
-    fn active_profile_conflicts_skips_non_running_profiles() {
-        let mut tunnels = TunnelManager::new();
-        let candidate = ConfigAnalysis {
-            profile_id: "a".into(),
-            os_routes: vec![AnalyzedRoute {
-                metric: None,
-                destination: "10.0.0.0/8".parse().unwrap(),
-                source: "test".into(),
-            }],
-            internal_routes: vec![],
-            listeners: vec![],
-            endpoints: vec![],
-            domain_patterns: vec![],
-            warnings: vec![],
-            route_knowledge_complete: true,
-            peers: Vec::new(),
-            interface_details: Vec::new(),
-        };
-        let mut other = profile("wg-b");
-        other.id = "b".into();
-        other.config_path = std::path::PathBuf::from("nonexistent.conf");
-
-        let conflicts = active_profile_conflicts(&mut tunnels, "a", &candidate, &[other]).unwrap();
-        assert!(conflicts.is_empty());
-
-        let same = active_profile_conflicts(&mut tunnels, "a", &candidate, &[candidate_profile()])
-            .unwrap();
-        assert!(same.is_empty());
-    }
-
     #[tokio::test]
     #[cfg_attr(not(target_os = "linux"), allow(irrefutable_let_patterns))]
     async fn cleanup_stale_clears_tracked_routes_and_persists_registry() {
@@ -2416,99 +2195,12 @@ mod tests {
                 .unwrap();
         assert!(loaded.profiles.is_empty());
     }
-
-    #[test]
-    fn unknown_route_conflicts_cover_uncertainty_both_directions() {
-        let mut other = profile("ovpn-b");
-        other.id = "b".into();
-        other.name = "B".into();
-
-        let mut complete_with_route = blank_analysis("a");
-        complete_with_route.os_routes.push(AnalyzedRoute {
-            metric: None,
-            destination: "10.0.0.0/8".parse().unwrap(),
-            source: "test".into(),
-        });
-        let mut incomplete_other = blank_analysis("b");
-        incomplete_other.route_knowledge_complete = false;
-
-        let conflicts = unknown_route_conflicts(&complete_with_route, &other, &incomplete_other);
-        assert_eq!(conflicts.len(), 1);
-        assert!(conflicts[0].blocking);
-        assert!(conflicts[0].message.contains("'B'"));
-        assert!(conflicts[0]
-            .message
-            .contains("effective routes are not fully known"));
-
-        let mut incomplete_candidate = blank_analysis("a");
-        incomplete_candidate.route_knowledge_complete = false;
-        let mut known_other = blank_analysis("b");
-        known_other.os_routes.push(AnalyzedRoute {
-            metric: None,
-            destination: "10.0.0.0/8".parse().unwrap(),
-            source: "test".into(),
-        });
-        let conflicts = unknown_route_conflicts(&incomplete_candidate, &other, &known_other);
-        assert_eq!(conflicts.len(), 1);
-        assert!(conflicts[0].message.contains("not fully known"));
-        assert!(conflicts[0].message.contains("'B'"));
-
-        let mut both_incomplete_other = blank_analysis("b");
-        both_incomplete_other.route_knowledge_complete = false;
-        both_incomplete_other.os_routes.push(AnalyzedRoute {
-            metric: None,
-            destination: "10.0.0.0/8".parse().unwrap(),
-            source: "test".into(),
-        });
-        let conflicts =
-            unknown_route_conflicts(&incomplete_candidate, &other, &both_incomplete_other);
-        assert_eq!(conflicts.len(), 1);
-        assert!(conflicts[0]
-            .message
-            .contains("effective routes are not fully known"));
-    }
-
-    #[test]
-    fn unknown_route_conflicts_skip_complete_candidate_without_routes() {
-        let mut other = profile("ovpn-b");
-        other.id = "b".into();
-        other.name = "B".into();
-        let candidate = blank_analysis("a");
-        let mut incomplete_other = blank_analysis("b");
-        incomplete_other.route_knowledge_complete = false;
-
-        assert!(unknown_route_conflicts(&candidate, &other, &incomplete_other).is_empty());
-
-        let mut known_other = blank_analysis("b");
-        known_other.os_routes.push(AnalyzedRoute {
-            metric: None,
-            destination: "10.0.0.0/8".parse().unwrap(),
-            source: "test".into(),
-        });
-        assert!(unknown_route_conflicts(&candidate, &other, &known_other).is_empty());
-    }
 }
 
 #[cfg(test)]
 mod proxy_tests {
     use super::*;
     use crate::test_support::profile;
-    use std::net::TcpListener;
-
-    #[tokio::test]
-    async fn wait_for_tcp_listener_detects_live_and_dead_ports() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        assert!(
-            wait_for_tcp_listener(port, Duration::from_millis(500), Duration::from_millis(50))
-                .await
-        );
-        drop(listener);
-        assert!(
-            !wait_for_tcp_listener(port, Duration::from_millis(200), Duration::from_millis(50))
-                .await
-        );
-    }
 
     #[test]
     fn connect_port_reallocation_skips_own_http_port_and_other_listeners() {

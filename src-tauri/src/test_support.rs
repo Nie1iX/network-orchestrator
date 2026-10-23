@@ -70,12 +70,6 @@ pub(crate) fn os_route(dest: &str, prefix_len: u8) -> RouteEntry {
     }
 }
 
-pub(crate) fn candidate_profile() -> Profile {
-    let mut p = profile("wg-a");
-    p.id = "a".into();
-    p
-}
-
 pub(crate) struct NoopExecutor;
 
 impl net_manager_core::policy::RouteExecutor for NoopExecutor {
@@ -195,19 +189,4 @@ pub(crate) fn diag_input(p: &Profile) -> DiagnosticsInput {
 
 pub(crate) fn check_named<'a>(checks: &'a [DiagnosticCheck], name: &str) -> &'a DiagnosticCheck {
     checks.iter().find(|c| c.name == name).unwrap()
-}
-
-pub(crate) fn blank_analysis(id: &str) -> ConfigAnalysis {
-    ConfigAnalysis {
-        profile_id: id.into(),
-        os_routes: vec![],
-        internal_routes: vec![],
-        listeners: vec![],
-        endpoints: vec![],
-        domain_patterns: vec![],
-        warnings: vec![],
-        route_knowledge_complete: true,
-        peers: Vec::new(),
-        interface_details: Vec::new(),
-    }
 }

@@ -3,6 +3,7 @@ pub mod backend_settings;
 pub mod cidr_bulk;
 pub mod config_security;
 pub mod config_vault;
+pub mod connect_plan;
 pub mod daemon_protocol;
 pub mod exit_ip;
 pub mod explorer;

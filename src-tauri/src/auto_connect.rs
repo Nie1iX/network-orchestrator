@@ -65,12 +65,10 @@ where
     Fut: Future<Output = Result<(), String>>,
 {
     let mut failures = Vec::new();
-    for profile in profiles {
-        if !profile.auto_connect
-            || daemon_owner(profile).is_some_and(|owner| owners.contains(&owner))
-        {
-            continue;
-        }
+    let candidates = net_manager_core::connect_plan::auto_connect_candidates(profiles, |profile| {
+        daemon_owner(profile).is_some_and(|owner| owners.contains(&owner))
+    });
+    for profile in candidates {
         if connect(profile.id.clone()).await.is_err() {
             failures.push(profile.id.clone());
         }
