@@ -60,8 +60,9 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 Windows and Linux share these tabs. The native macOS client reads
 interfaces and routes through `getifaddrs`/`net-route` (read-only) and has
 its own route lookup and exit-IP check on Home, and a Monitor page (tunnel
-throughput chart and per-tunnel rates from the interface byte counters); it has
-no Logs tab or Diagnostics report.
+throughput chart and per-tunnel rates from the interface byte counters); a Logs
+page (per-connection and import logs with level/text filters); it has no
+Diagnostics report.
 
 | Feature | Where |
 |---|---|

@@ -41,11 +41,12 @@ struct ContentView: View {
           case .network: NetworkView(model: model)
           case .routes: RoutesView(model: model)
           case .monitor: MonitorView(model: model)
+          case .logs: LogsView(model: model)
           case .settings: SettingsView(model: model)
           }
         }.frame(
           maxWidth: model.section == .network || model.section == .routes
-            || model.section == .monitor || model.section == .connections
+            || model.section == .monitor || model.section == .logs || model.section == .connections
             ? .infinity : DesignMetrics.pageNarrow, alignment: .leading
         )
         .frame(maxWidth: .infinity, alignment: .top).padding(
@@ -127,6 +128,7 @@ struct NavigationRail: View {
       railButton(.network, muted: true)
       railButton(.routes, muted: true)
       railButton(.monitor, muted: true)
+      railButton(.logs, muted: true)
       Spacer(minLength: 0)
       railButton(.settings)
     }.padding(.vertical, 10.5).frame(width: Self.width).frame(maxHeight: .infinity)
