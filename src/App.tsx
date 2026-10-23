@@ -3,6 +3,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
 import AppEvents from "./components/AppEvents";
+import Home from "./components/Home";
 import CondRules from "./components/CondRules";
 import InterfaceList from "./components/InterfaceList";
 import Logs from "./components/Logs";
@@ -20,7 +21,7 @@ import { applyAppearance, readAppearance } from "./theme";
 import "./App.css";
 
 function App() {
-  const [tab, setTab] = useState<Tab>("profiles");
+  const [tab, setTab] = useState<Tab>("home");
   const [activeCount, setActiveCount] = useState(0);
 
   useEffect(() => {
@@ -77,6 +78,7 @@ function App() {
         <div className="app-layout">
           <NavRail tab={tab} setTab={setTab} activeCount={activeCount} />
           <main className="content">
+            {tab === "home" && <Home onNavigate={setTab} />}
             {tab === "profiles" && <ProfileManager />}
             {tab === "monitor" && <Monitor />}
             {tab === "routes" && <RouteView />}

@@ -4200,3 +4200,18 @@ a:focus-visible,
   gap: var(--sp-2);
   font-weight: var(--fw-strong);
 }
+
+.home-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.segmented {
+  display: inline-flex;
+  gap: var(--sp-1);
+}
+
+.row-value.warn {
+  color: var(--warn);
+}
