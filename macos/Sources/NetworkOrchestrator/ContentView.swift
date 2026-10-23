@@ -65,6 +65,7 @@ struct ContentView: View {
       if let initialModal { modal = initialModal }
       guard loadsOnAppear else { return }
       await model.refresh()
+      await model.autoConnectOnLaunch()
       // Xray can exit on its own (bad server, port taken); keep the UI honest.
       var tick = 0
       while !Task.isCancelled {

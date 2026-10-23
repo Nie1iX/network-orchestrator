@@ -181,8 +181,14 @@ struct ConnectionsView: View {
       }
     }
     if let notice = model.notice {
-      NoticeBar(color: notice == "native.proxyOverridden" ? "warn" : "up") {
-        Text(L10n.text(notice, ["iface": model.primaryInterface ?? ""]))
+      NoticeBar(color: notice == "native.proxyOverridden" || notice.hasPrefix("events.autoConnect") ? "warn" : "up") {
+        Text(
+          L10n.text(
+            notice,
+            [
+              "iface": model.primaryInterface ?? "",
+              "n": String(model.autoConnectFailures),
+            ]))
         Spacer()
         Button(L10n.text("common.dismiss")) { model.notice = nil }.buttonStyle(
           TauriButtonStyle(compact: true))
@@ -655,6 +661,7 @@ struct ProfileDetailView: View {
             ? L10n.text("detail.notAssigned") : profile.interfaceName))
       }
       if profile.backend == "xray" && model.canStartConnections { modePicker }
+      if model.canTryStart(profile) { autoConnectRow }
       if profile.needsHelper && model.canStartConnections { roleRows }
       if profile.isTun {
         row(
@@ -937,6 +944,20 @@ struct ProfileDetailView: View {
       model.canStart(profile) || profile.startsWithoutHelper || !model.canStartConnections
         ? L10n.text("detail.stopped") : L10n.text("native.helperRequired")
     }
+  }
+  /// Starts this connection when the app launches.
+  private var autoConnectRow: some View {
+    HStack {
+      Text(L10n.text("form.autoConnect")).foregroundStyle(p.muted)
+      Spacer()
+      Toggle(
+        "",
+        isOn: Binding(
+          get: { profile.connectsOnLaunch },
+          set: { value in Task { await model.setAutoConnect(profile, enabled: value) } })
+      ).toggleStyle(.switch).controlSize(.small).labelsHidden()
+        .disabled(model.pending.contains(profile.id))
+    }.font(.system(size: 11.9)).padding(.vertical, 5)
   }
   /// Primary or secondary, and for a secondary one its networks.
   @ViewBuilder private var roleRows: some View {

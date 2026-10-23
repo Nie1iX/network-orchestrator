@@ -753,6 +753,20 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 ))
             })
         }
+        "set_auto_connect" => {
+            let id = text_arg(args, "id")?;
+            let enabled = args["enabled"].as_str() == Some("true");
+            let document = store.set_auto_connect(id, enabled).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    "Profile not found".to_string()
+                } else {
+                    store_error(error)
+                }
+            })?;
+            encode(net_manager_core::subscription::public_profiles(
+                document.profiles,
+            ))
+        }
         "set_tunnel_role" => {
             let id = text_arg(args, "id")?;
             let role = match text_arg(args, "role")? {
@@ -1731,6 +1745,33 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn auto_connect_is_saved_on_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "a1");
+        let profiles = dispatch(
+            dir.path(),
+            "set_auto_connect",
+            &json!({"id":"a1", "enabled":"true"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["autoConnect"], true);
+        let profiles = dispatch(
+            dir.path(),
+            "set_auto_connect",
+            &json!({"id":"a1", "enabled":"false"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["autoConnect"], false);
+        assert!(dispatch(
+            dir.path(),
+            "set_auto_connect",
+            &json!({"id":"missing", "enabled":"true"}),
+        )
+        .is_err());
     }
 
     #[test]

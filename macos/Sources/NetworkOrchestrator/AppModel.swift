@@ -624,6 +624,34 @@ import SystemConfiguration
     } catch { self.error = error.localizedDescription }
     await refreshRuntime()
   }
+  /// Starts the connections flagged "connect when the app starts", once per
+  /// launch and in saved order. One that fails does not stop the others; the
+  /// count is reported in a notice. A flagged connection that needs the
+  /// privileged helper is skipped when it is not serving, never prompting.
+  private var autoConnectDone = false
+  func autoConnectOnLaunch() async {
+    guard !autoConnectDone, !isDuplicate else { return }
+    autoConnectDone = true
+    var failed = 0
+    for profile in snapshot?.profiles ?? [] where profile.connectsOnLaunch && !isRunning(profile) {
+      guard canStart(profile) else {
+        failed += 1
+        continue
+      }
+      await toggle(profile)
+      if !isRunning(profile) { failed += 1 }
+    }
+    if failed > 0 {
+      error = nil
+      notice = failed == 1 ? "events.autoConnectFailed" : "events.autoConnectPartial"
+      autoConnectFailures = failed
+    }
+  }
+  var autoConnectFailures = 0
+  func setAutoConnect(_ profile: Profile, enabled: Bool) async {
+    _ = await change(
+      "set_auto_connect", args: ["id": profile.id, "enabled": enabled ? "true" : "false"])
+  }
   /// Primary connections take all traffic; secondary ones only their networks.
   func setTunnelRole(_ profile: Profile, role: String) async {
     guard !pending.contains(profile.id) else { return }

@@ -93,6 +93,25 @@ impl ProfileStore {
         Ok(document)
     }
 
+    /// Flags whether the app starts this profile when it launches.
+    pub fn set_auto_connect(&self, id: &str, enabled: bool) -> io::Result<ProfileDocument> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let mut document = self.load()?;
+        let profile = document
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("profile '{id}' not found"))
+            })?;
+        profile.auto_connect = enabled;
+        self.save_locked(&document)?;
+        Ok(document)
+    }
+
     pub fn delete(&self, id: &str) -> io::Result<ProfileDocument> {
         let _guard = self
             .write_lock
@@ -322,6 +341,32 @@ mod tests {
             auto_connect: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn auto_connect_flag_is_persisted_per_profile_and_unknown_ids_fail() {
+        let dir = unique_dir("auto-connect-flag");
+        let store = ProfileStore::new(dir.join("profiles.json"));
+        let mut a = wg_profile();
+        a.id = "a".into();
+        a.auto_connect = false;
+        let mut b = wg_profile();
+        b.id = "b".into();
+        b.auto_connect = false;
+        store.upsert(a).unwrap();
+        store.upsert(b).unwrap();
+
+        let document = store.set_auto_connect("b", true).unwrap();
+        assert!(!document.profiles[0].auto_connect);
+        assert!(document.profiles[1].auto_connect);
+        assert!(store.load().unwrap().profiles[1].auto_connect);
+
+        let document = store.set_auto_connect("b", false).unwrap();
+        assert!(!document.profiles[1].auto_connect);
+
+        let err = store.set_auto_connect("missing", true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

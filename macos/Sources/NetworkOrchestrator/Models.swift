@@ -85,6 +85,9 @@ struct Profile: Decodable, Identifiable, Sendable {
   var tunnelNetworks: [String]? = nil
   var tunnelDnsDomains: [String]? = nil
   var isSecondary: Bool { tunnelRole == "secondary" }
+  /// Started once when the app launches.
+  var autoConnect: Bool? = nil
+  var connectsOnLaunch: Bool { autoConnect == true }
   var domainPolicies: [DomainPolicy]? = nil
   var privateLanDirect: Bool? = nil
   var xrayDns: DnsSummary? = nil
