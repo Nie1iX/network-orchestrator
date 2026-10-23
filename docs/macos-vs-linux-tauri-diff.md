@@ -124,7 +124,7 @@
 | Exit IP | ✅ (на Home) | ✅ (`ExitIpPanel`, вкладка Monitor) |
 | Открыть отдельный Chrome через подключение | ✅ | ❌ (решено не переносить) |
 | Копирование `HTTP(S)_PROXY` / `ALL_PROXY` | ✅ | ✅ (на Home, у активных профилей) |
-| Вкладка Monitor (графики, трафик) | ⚠️ графиков в Swift-коде не найдено | ✅ |
+| Вкладка Monitor (графики, трафик) | ✅ страница Monitor: график, скорости туннелей, Exit IP | ✅ |
 | Вкладка Logs (лог приложения и демона) | ⚠️ только `LogSheet` с редактированными логами | ✅ полная |
 | Вкладка Routes: карта, дерево, таблица, flow, lookup | ✅ шесть вкладок | ✅ |
 | Вкладка Network: интерфейсы, throughput | ✅ (read-only) | ✅ плюс управление состоянием интерфейса |
@@ -196,7 +196,7 @@ macOS перед коммитом.
    `ProfileStore::set_auto_connect`, команда `set_auto_connect`, Swift).
 2. ✅ Меню-бар (Tray): `MenuBarExtra`, фоновый опрос состояния перенесён из `ContentView` в `AppModel.startMonitoring()`.
 3. ✅ Recovery: при запуске `recovery_report` (`core::recovery::helper_report` + `Engine::recovery_report`) показывает диалог с остатками, «Clean up» вызывает `recovery.cleanup`. Попутно исправлено: `recover()` в helper'е убивал живой туннель.
-4. Logs и Monitor: полная вкладка логов, графики трафика.
+4. Logs и Monitor: ✅ Monitor (`ThroughputSampler`, метод моста `interfaces`); вкладка Logs — следующий шаг.
 5. Диагностика профиля: вынести `diagnose_profile` из `src-tauri` в `core`,
    показать отчёт в Swift.
 6. Режимы приложения (combined/orchestrator/manager): фильтр возможностей в

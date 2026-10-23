@@ -624,6 +624,28 @@ import SystemConfiguration
     } catch { self.error = error.localizedDescription }
     await refreshRuntime()
   }
+  /// Live rates for the Monitor page, fed only while that page is open.
+  var throughput = ThroughputSampler()
+  private var interfaceIDs: [String: UInt32] = [:]
+  func pollThroughput() async {
+    guard !isDuplicate,
+      let list: [NetworkInterface] = try? await core.callConcurrently("interfaces")
+    else { return }
+    let tracked = Set(
+      runtime?.statuses.compactMap { $0.state == "running" ? $0.interfaceName : nil } ?? [])
+    interfaceIDs = Dictionary(
+      list.flatMap { item in [item.name, item.friendlyName].map { ($0, item.ifIndex) } },
+      uniquingKeysWith: { first, _ in first })
+    throughput.ingest(
+      list.map {
+        CounterReading(
+          id: $0.ifIndex, names: [$0.name, $0.friendlyName], rx: $0.rxBytes, tx: $0.txBytes)
+      }, tracked: tracked, now: Date())
+  }
+  /// The tunnel interface's current rate; nil for a loopback proxy, which has none.
+  func rate(of profile: Profile) -> RateSample? {
+    status(profile)?.interfaceName.flatMap { interfaceIDs[$0] }.flatMap { throughput.rates[$0] }
+  }
   /// Leftovers of a previous session, offered for cleanup once per launch.
   /// Runs before auto-connect so a start never races a cleanup. An answer that
   /// cannot be read (no helper) is not an error: the helper banner covers it.

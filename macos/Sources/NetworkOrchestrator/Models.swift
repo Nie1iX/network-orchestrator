@@ -386,6 +386,7 @@ enum Section: String, CaseIterable, Identifiable {
   case connections = "Connections"
   case network = "Network"
   case routes = "Routes"
+  case monitor = "Monitor"
   case settings = "Settings"
   var id: Self { self }
   var iconName: String {
@@ -394,6 +395,7 @@ enum Section: String, CaseIterable, Identifiable {
     case .connections: "ProfileIcon"
     case .network: "NetworkIcon"
     case .routes: "RouteIcon"
+    case .monitor: "ActivityIcon"
     case .settings: "SettingsIcon"
     }
   }
@@ -403,6 +405,7 @@ enum Section: String, CaseIterable, Identifiable {
     case .connections: "shield.lefthalf.filled"
     case .network: "network"
     case .routes: "arrow.triangle.branch"
+    case .monitor: "chart.xyaxis.line"
     case .settings: "gearshape"
     }
   }

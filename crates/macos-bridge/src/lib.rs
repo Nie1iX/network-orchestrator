@@ -436,6 +436,14 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
         "tailscale_down" => return net_manager_engine::tailscale::Tailscale::detect().down(),
         "tailscale_sync" => return Ok(tailscale_sync(root)),
         "user_network_settings" => return encode(user_network::read()),
+        // Interfaces with their byte counters, without the routes `snapshot`
+        // adds: cheap enough for the Monitor page to poll every second.
+        "interfaces" => {
+            return encode(
+                explorer::list_interfaces()
+                    .map_err(|_| "Network interfaces could not be read. Try refreshing.")?,
+            )
+        }
         _ => {}
     }
     let _lock = TRANSACTION
@@ -1745,6 +1753,19 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn interfaces_are_listed_without_touching_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let interfaces = dispatch(dir.path(), "interfaces", &json!({})).unwrap();
+        assert!(interfaces.is_array());
+        assert!(interfaces
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["name"].is_string()));
+        assert!(!dir.path().join("profiles.json").exists());
     }
 
     #[test]
