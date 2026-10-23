@@ -3015,9 +3015,9 @@ a:focus-visible,
   width: 36px;
   height: 36px;
   flex-shrink: 0;
-  border-radius: var(--r-md);
-  background: var(--bg-elev);
-  color: var(--text-secondary);
+  border-radius: var(--r-full);
+  background: var(--accent-dim);
+  color: var(--accent);
 }
 
 .add-connection-text {
