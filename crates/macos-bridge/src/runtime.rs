@@ -111,6 +111,13 @@ pub(crate) fn handle(
             engine.shutdown(&profiles)?;
             Ok(json!({}))
         }),
+        // Privileged: the helper decides what may be switched.
+        "set_interface_state" => engine
+            .set_interface_state(
+                args["name"].as_str().unwrap_or_default(),
+                args["up"].as_str() == Some("true"),
+            )
+            .map(|()| json!({})),
         "helper_log" => Ok(json!(engine.helper_log())),
         "log" => load().and_then(|profiles| {
             let profile = find(&profiles, args)?;

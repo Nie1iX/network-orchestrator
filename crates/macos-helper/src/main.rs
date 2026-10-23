@@ -151,7 +151,8 @@ async fn run(options: Options) -> std::io::Result<()> {
         Box::new(AppClientPolicy::new(options.clients)),
         Arc::new(
             HelperService::new(xray.clone(), wireguard.clone(), openvpn.clone())
-                .with_tailscale(tailscale.clone()),
+                .with_tailscale(tailscale.clone())
+                .with_links(Arc::new(SystemRunner)),
         ),
         env!("CARGO_PKG_VERSION"),
     ));

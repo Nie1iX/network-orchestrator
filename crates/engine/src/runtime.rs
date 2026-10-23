@@ -691,6 +691,29 @@ impl Engine {
         })
     }
 
+    /// Turn a network interface on or off through the helper. The helper
+    /// refuses loopback and the devices of the connections it runs.
+    pub fn set_interface_state(&self, name: &str, up: bool) -> Result<(), String> {
+        use net_manager_core::daemon_protocol::{ErrorCode, LinkSetStateParams};
+        use net_manager_core::helper_client::HelperError;
+        self.privileged()
+            .call::<_, serde_json::Value>(
+                method::LINK_SET_STATE,
+                LinkSetStateParams {
+                    name: name.to_string(),
+                    up,
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| match error {
+                HelperError::Rejected(body) if body.code == ErrorCode::UnsupportedMethod => {
+                    "The installed helper is too old to turn interfaces on or off. Update it in Settings."
+                        .to_string()
+                }
+                other => helper_error(other),
+            })
+    }
+
     /// What a crashed session left behind: tunnels the helper still records
     /// that no longer run, and a system proxy for a connection that is gone.
     pub fn recovery_report(&self, profiles: &[Profile]) -> Result<RecoveryReport, String> {
@@ -1001,6 +1024,41 @@ mod tests {
         );
         assert!(text.contains("192.168.1.5"));
         assert_eq!(helper_log_text(&dir.path().join("missing.log")), "");
+    }
+
+    #[test]
+    fn switching_an_interface_sends_the_request_and_explains_an_old_helper() {
+        use net_manager_core::daemon_protocol::ErrorCode;
+        let dir = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(dir.path(), |request| {
+            ResponseFrame::ok(request.id, Value::Null)
+        });
+        let engine = Engine::with_privileged(dir.path(), Arc::new(client));
+        engine.set_interface_state("en7", false).unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.method, method::LINK_SET_STATE);
+        assert_eq!(request.params, json!({"name": "en7", "up": false}));
+
+        let other = tempfile::tempdir().unwrap();
+        let (old, _) = fake_helper(other.path(), |request| {
+            ResponseFrame::error(request.id, ErrorCode::UnsupportedMethod, "unsupported")
+        });
+        let engine = Engine::with_privileged(other.path(), Arc::new(old));
+        let error = engine.set_interface_state("en7", true).unwrap_err();
+        assert!(
+            error.contains("too old") && error.contains("Settings"),
+            "{error}"
+        );
+
+        let third = tempfile::tempdir().unwrap();
+        let (refusing, _) = fake_helper(third.path(), |request| {
+            ResponseFrame::error(request.id, ErrorCode::Conflict, "disconnect it instead")
+        });
+        let engine = Engine::with_privileged(third.path(), Arc::new(refusing));
+        assert_eq!(
+            engine.set_interface_state("utun9", false).unwrap_err(),
+            "disconnect it instead"
+        );
     }
 
     #[test]

@@ -6,15 +6,16 @@ use crate::journal::Record;
 use crate::openvpn::OpenVpnExecutor;
 use crate::peer::Peer;
 use crate::server::Handler;
+use crate::sysexec::Runner;
 use crate::tailscale::{self, TailscaleGuard};
 use crate::wireguard::WireGuardExecutor;
 use crate::xray::{Error, XrayExecutor};
 use net_manager_core::daemon_protocol::{
-    from_value, method, CleanupResult, ErrorCode, OpenVpnConnectRequest, OpenVpnProcessResource,
-    OpenVpnProfileParams, OwnedEntry, OwnedListResult, OwnedResource, OwnedState, RequestFrame,
-    ResponseFrame, TailscaleProtectParams, TailscaleReleaseResult, WireGuardConnectParams,
-    WireGuardLinkResource, WireGuardProfileParams, XrayConnectParams, XrayProcessResource,
-    XrayProfileParams,
+    from_value, method, CleanupResult, ErrorCode, LinkSetStateParams, OpenVpnConnectRequest,
+    OpenVpnProcessResource, OpenVpnProfileParams, OwnedEntry, OwnedListResult, OwnedResource,
+    OwnedState, RequestFrame, ResponseFrame, TailscaleProtectParams, TailscaleReleaseResult,
+    WireGuardConnectParams, WireGuardLinkResource, WireGuardProfileParams, XrayConnectParams,
+    XrayProcessResource, XrayProfileParams,
 };
 use net_manager_core::models::TunnelRole;
 use serde::{de::DeserializeOwned, Serialize};
@@ -25,6 +26,9 @@ pub struct HelperService {
     wireguard: Arc<WireGuardExecutor>,
     openvpn: Arc<OpenVpnExecutor>,
     tailscale: Option<Arc<TailscaleGuard>>,
+    /// Runs `ifconfig` for `link.set_state`; the method is advertised only
+    /// when this is set.
+    links: Option<Arc<dyn Runner>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -55,6 +59,7 @@ impl HelperService {
             wireguard,
             openvpn,
             tailscale: None,
+            links: None,
         }
     }
 
@@ -62,6 +67,26 @@ impl HelperService {
     pub fn with_tailscale(mut self, guard: Arc<TailscaleGuard>) -> Self {
         self.tailscale = Some(guard);
         self
+    }
+
+    /// Serve `link.set_state` with this runner.
+    pub fn with_links(mut self, runner: Arc<dyn Runner>) -> Self {
+        self.links = Some(runner);
+        self
+    }
+
+    /// Devices of the tunnels this helper runs or still records.
+    fn own_interfaces(&self) -> Vec<String> {
+        [
+            self.xray.owned(),
+            self.wireguard.owned(),
+            self.openvpn.owned(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|record| record.interface)
+        .filter(|name| !name.is_empty())
+        .collect()
     }
 
     /// Tunnels of different kinds run together, but only one of them may be
@@ -193,6 +218,7 @@ impl Handler for HelperService {
         ]
         .into_iter()
         .chain(tailscale)
+        .chain(self.links.iter().map(|_| method::LINK_SET_STATE))
         .map(|name| name.to_string())
         .collect()
     }
@@ -243,6 +269,12 @@ impl Handler for HelperService {
                     }
                 }
                 ok(id, &result)
+            }
+            method::LINK_SET_STATE if self.links.is_some() => {
+                call(request, |params: LinkSetStateParams| {
+                    let runner = self.links.as_deref().expect("checked by the arm guard");
+                    crate::link::set_state(runner, &params.name, params.up, &self.own_interfaces())
+                })
             }
             method::XRAY_CONNECT => call(request, |params: XrayConnectParams| {
                 if let Some(error) = conflict(Kind::Xray, params.role) {
@@ -467,6 +499,118 @@ mod tests {
         assert!(call(&service, method::RECOVERY_CLEANUP, Value::Null)
             .outcome
             .is_ok());
+    }
+
+    /// Lets a test read what the helper ran.
+    struct Shared(Arc<FakeRunner>);
+    impl Runner for Shared {
+        fn run(&self, program: &str, args: &[String]) -> io::Result<String> {
+            self.0.run(program, args)
+        }
+    }
+
+    fn with_links() -> (HelperService, Arc<FakeRunner>, tempfile::TempDir) {
+        let runner = Arc::new(FakeRunner::default());
+        runner.reply("ifconfig -l", "lo0 en0 en7 utun9\n");
+        let (service, dir) = service();
+        (
+            service.with_links(Arc::new(Shared(runner.clone()))),
+            runner,
+            dir,
+        )
+    }
+
+    #[test]
+    fn turning_interfaces_on_or_off_is_advertised_only_when_it_is_enabled() {
+        let (plain, _dir) = service();
+        assert!(!plain
+            .capabilities()
+            .iter()
+            .any(|c| c == method::LINK_SET_STATE));
+        let error = call(
+            &plain,
+            method::LINK_SET_STATE,
+            json!({"name": "en7", "up": false}),
+        )
+        .outcome
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnsupportedMethod);
+        let (enabled, _runner, _dir) = with_links();
+        assert!(enabled
+            .capabilities()
+            .iter()
+            .any(|c| c == method::LINK_SET_STATE));
+    }
+
+    #[test]
+    fn an_interface_is_switched_through_ifconfig_and_bad_requests_are_refused() {
+        let (service, runner, _dir) = with_links();
+        assert!(call(
+            &service,
+            method::LINK_SET_STATE,
+            json!({"name": "en7", "up": false})
+        )
+        .outcome
+        .is_ok());
+        assert!(runner.calls().contains(&"ifconfig en7 down".to_string()));
+        let loopback = call(
+            &service,
+            method::LINK_SET_STATE,
+            json!({"name": "lo0", "up": false}),
+        )
+        .outcome
+        .unwrap_err();
+        assert_eq!(loopback.code, ErrorCode::InvalidParams);
+        let junk = call(
+            &service,
+            method::LINK_SET_STATE,
+            json!({"name": "en7; ls", "up": true}),
+        )
+        .outcome
+        .unwrap_err();
+        assert_eq!(junk.code, ErrorCode::InvalidParams);
+        let missing = call(
+            &service,
+            method::LINK_SET_STATE,
+            json!({"name": "en42", "up": true}),
+        )
+        .outcome
+        .unwrap_err();
+        assert_eq!(missing.code, ErrorCode::NotFound);
+        let wrong = call(&service, method::LINK_SET_STATE, json!({"name": "en7"}))
+            .outcome
+            .unwrap_err();
+        assert_eq!(wrong.code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn the_device_of_a_running_tunnel_cannot_be_switched_off() {
+        let route = FakeRunner::default();
+        route.reply(
+            "route -n get default",
+            "gateway: 192.168.1.1\n interface: en0\n",
+        );
+        let (service, _dir) = build(Box::new(WorkingWg), route);
+        let runner = Arc::new(FakeRunner::default());
+        runner.reply("ifconfig -l", "lo0 en0 utun9\n");
+        let service = service.with_links(Arc::new(Shared(runner.clone())));
+        let up = call(
+            &service,
+            method::WIREGUARD_CONNECT,
+            json!({"profileId": "wg", "config": wg_config()}),
+        );
+        assert!(up.outcome.is_ok(), "{up:?}");
+        let device = service.own_interfaces();
+        assert_eq!(device.len(), 1, "{device:?}");
+        let error = call(
+            &service,
+            method::LINK_SET_STATE,
+            json!({"name": device[0], "up": false}),
+        )
+        .outcome
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(!runner.calls().iter().any(|c| c.contains("down")));
     }
 
     #[test]
