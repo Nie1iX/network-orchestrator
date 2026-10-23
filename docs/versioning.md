@@ -10,16 +10,32 @@ The only source of truth is `[workspace.package].version` in the root
 `.deb`/`.rpm`/Arch packages and the macOS bundle read it at build time. Do not
 copy the version into `package.json`, `tauri.conf.json` or Swift sources.
 
-While the version is `0.y.z`, the project is pre-1.0:
+The app has no public API, so "breaking" is defined by what users and their
+data depend on, not by function signatures. A change is **breaking (MAJOR)**
+when, after updating, a user must do something or loses something:
 
-| Change | Bump | Example |
-| --- | --- | --- |
-| Bug fix, security fix, build/test/docs-only change that ships | PATCH | `0.1.1 → 0.1.2` |
-| New user-visible feature, new platform or backend | MINOR | `0.1.2 → 0.2.0` |
-| Incompatible change: store/journal format without migration, daemon protocol break, removed feature or setting | MINOR (pre-1.0) | `0.2.0 → 0.3.0` |
+- stored data (profiles, vault, settings, journal) cannot be read by the new
+  version without a manual step, or cannot be migrated automatically;
+- a feature, platform, backend, protocol or setting is removed, or its
+  behavior changes so existing profiles, routing rules or `netorch`
+  commands/flags/`--json` output stop working as before;
+- the app, CLI, privileged helper or daemon stop being compatible with each
+  other (`PROTOCOL_VERSION` break) so a partial update leaves a broken install;
+- the minimum supported OS version is raised.
 
-From `1.0.0` onward, incompatible changes bump MAJOR, features bump MINOR and
-fixes bump PATCH.
+Internal refactors, UI redesigns, new options and anything migrated
+automatically are not breaking.
+
+| Change | Commit | Bump | Example |
+| --- | --- | --- | --- |
+| Bug fix, security fix, performance improvement | `fix`, `perf` | PATCH | `1.1.0 → 1.1.1` |
+| New user-visible feature, platform or backend | `feat` | MINOR | `1.1.1 → 1.2.0` |
+| Breaking change (see above) | `feat!`/`fix!` or `BREAKING CHANGE:` footer | MAJOR | `1.2.0 → 2.0.0` |
+| `docs`, `chore`, `style`, `refactor`, `test`, `ci`, `build` | — | none by themselves | — |
+
+While the version is `0.y.z` (pre-1.0), breaking changes bump MINOR instead
+of MAJOR, and `docs`/`build`/`test` changes that ship in a release are
+covered by a PATCH bump.
 
 Document format versions (`PROFILE_DOCUMENT_VERSION`, `JOURNAL_VERSION`,
 `PROTOCOL_VERSION`, …) and pinned backend versions (`MANAGED_XRAY_VERSION`)
@@ -37,16 +53,41 @@ in English, imperative mood, with a scope where it helps:
 <type>(<scope>): <Summary without a trailing period>
 
 <Optional body: why the change is needed and what it affects.>
+
+<Optional footer: BREAKING CHANGE: what breaks and how to migrate.>
 ```
 
-Types: `feat`, `fix`, `perf`, `refactor`, `style`, `test`, `docs`, `build`,
-`ci`, `chore`. Mark incompatible changes with `!` after the type/scope and a
-`BREAKING CHANGE:` footer. Common scopes: `core`, `daemon`, `app`, `ui`,
-`i18n`, `macos`, `linux`, `windows`, `xray`, `openvpn`, `wireguard`, `e2e`,
-`packaging`, `release`.
+Types and their effect on the version:
 
-Each commit is one logical change. `feat` commits map to MINOR, `fix`/`perf`
-to PATCH and `!` to an incompatible bump, as in the table above.
+| Type | Meaning | Bump |
+| --- | --- | --- |
+| `feat` | new feature | MINOR |
+| `fix` | bug fix | PATCH |
+| `perf` | performance improvement | PATCH |
+| `feat!` / `fix!` / `BREAKING CHANGE:` footer | breaking change | MAJOR |
+| `docs`, `chore`, `style`, `refactor`, `test`, `build`, `ci` | service changes | none |
+
+Common scopes: `core`, `daemon`, `app`, `ui`, `i18n`, `macos`, `linux`,
+`windows`, `xray`, `openvpn`, `wireguard`, `cli`, `e2e`, `packaging`,
+`release`.
+
+Rules:
+
+- Every commit has a type prefix. Messages like `fix`, `last commit` or
+  `Edit foo.rs` are not allowed: tooling that builds the changelog and
+  decides the version skips them, so the work would never reach a release.
+- One commit is one logical change and one type. Do not mix `feat` and `fix`
+  in a single commit; split them.
+- A breaking change always carries `!` and/or a `BREAKING CHANGE:` footer
+  that says what breaks for the user and how to migrate.
+- Run the quality gate from `AGENTS.md` before pushing; a red gate blocks the
+  release.
+- Releases are cut only from `main`. Work happens on a personal branch and
+  reaches `main` through a pull request; never push to `main` directly.
+- How commits are counted depends on how the PR is merged: with **squash**
+  the PR title is the only commit and must carry the type prefix; with
+  **merge** or **fast-forward** every commit of the branch is read, so each
+  one needs its own prefix.
 
 ## Release steps
 
