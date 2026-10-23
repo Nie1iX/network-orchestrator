@@ -150,6 +150,8 @@ pub fn run() {
             switch_subscription_endpoint,
             delete_profile,
             reorder_profiles,
+            set_tunnel_role,
+            set_tunnel_networks,
             connect_profile,
             connect_openvpn_with_credentials,
             disconnect_profile,

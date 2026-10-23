@@ -8,6 +8,10 @@
 //! Privileged work stays in the launchd helper; this crate only asks it.
 use std::path::PathBuf;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "linux")]
+pub mod linux_engine;
 #[cfg(unix)]
 pub mod privileged;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

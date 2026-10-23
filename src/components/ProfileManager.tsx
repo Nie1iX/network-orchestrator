@@ -1982,6 +1982,7 @@ export default function ProfileManager() {
           ) : selected ? (
             <ProfileDetail
               profile={selected}
+              onRoleChanged={() => void refreshAll()}
               status={statusFor(selected.id)}
               rate={
                 statusFor(selected.id).state === "running"

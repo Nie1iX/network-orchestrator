@@ -208,7 +208,8 @@ pub fn secondary_networks(routes: &[PolicyRoute]) -> Result<Vec<IpNet>, &'static
     let mut networks: Vec<IpNet> = Vec::new();
     for route in routes {
         let network = route.destination.trunc();
-        if network.prefix_len() == 0 {
+        // `/0` and the two `/1` halves ("def1") are how a primary takes everything.
+        if network.prefix_len() <= 1 {
             return Err("A secondary connection cannot take all traffic; make it the primary");
         }
         if network.addr().is_multicast() || network.addr().is_loopback() {
@@ -219,6 +220,71 @@ pub fn secondary_networks(routes: &[PolicyRoute]) -> Result<Vec<IpNet>, &'static
         }
     }
     Ok(networks)
+}
+
+/// What the privileged side checks before it starts a secondary tunnel: the
+/// listed networks and the split-DNS domains. A primary has nothing to check.
+pub fn validate_secondary(
+    role: TunnelRole,
+    routes: &[PolicyRoute],
+    dns_domains: &[String],
+) -> Result<(), &'static str> {
+    if role != TunnelRole::Secondary {
+        return Ok(());
+    }
+    secondary_networks(routes)?;
+    if dns_domains.len() > 16 || !dns_domains.iter().all(|name| valid_dns_suffix(name)) {
+        return Err("A split-DNS domain is not valid");
+    }
+    Ok(())
+}
+
+/// Networks typed as CIDR or single addresses, separated by space, comma,
+/// semicolon or newline. Empty input clears the list.
+pub fn parse_networks(text: &str) -> Result<Vec<IpNet>, String> {
+    let mut networks = Vec::new();
+    for token in text
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|token| !token.is_empty())
+    {
+        let network = token
+            .parse::<IpNet>()
+            .or_else(|_| token.parse::<std::net::IpAddr>().map(IpNet::from))
+            .map_err(|_| format!("\"{token}\" is not a valid network"))?;
+        networks.push(network);
+    }
+    if networks.is_empty() {
+        return Ok(networks);
+    }
+    let routes: Vec<PolicyRoute> = networks
+        .iter()
+        .map(|network| PolicyRoute {
+            destination: *network,
+            metric: 5,
+            via: None,
+        })
+        .collect();
+    secondary_networks(&routes).map_err(str::to_string)
+}
+
+pub fn parse_dns_domains(text: &str) -> Result<Vec<String>, String> {
+    let mut domains: Vec<String> = Vec::new();
+    for token in text
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+        .filter(|token| !token.is_empty())
+    {
+        let domain = token.trim_start_matches("*.").to_ascii_lowercase();
+        if !valid_dns_suffix(&domain) {
+            return Err(format!("\"{token}\" is not a valid DNS domain"));
+        }
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    if domains.len() > 16 {
+        return Err("At most 16 DNS domains can be set".into());
+    }
+    Ok(domains)
 }
 
 /// Domain names acceptable as a split-DNS suffix (`corp.example`).
@@ -464,6 +530,30 @@ impl Profile {
                 via: None,
             })
             .collect()
+    }
+
+    /// The routes handed to the privileged side: a secondary connection
+    /// carries exactly the networks listed for it, a primary one keeps what the
+    /// profile has.
+    pub fn effective_routes(&self) -> Vec<PolicyRoute> {
+        if self.tunnel_role == TunnelRole::Secondary {
+            self.secondary_routes()
+        } else {
+            self.routes.clone()
+        }
+    }
+
+    /// A secondary connection must list valid networks and split-DNS domains
+    /// before anything is started.
+    pub fn check_role(&self) -> Result<(), String> {
+        if self.tunnel_role != TunnelRole::Secondary {
+            return Ok(());
+        }
+        secondary_networks(&self.secondary_routes()).map_err(str::to_string)?;
+        if !self.tunnel_dns_domains.iter().all(|d| valid_dns_suffix(d)) {
+            return Err("A split-DNS domain is not valid".into());
+        }
+        Ok(())
     }
 }
 
@@ -1005,6 +1095,35 @@ mod tests {
     }
 
     #[test]
+    fn effective_routes_follow_the_role() {
+        let mut profile = Profile {
+            routes: vec![route("0.0.0.0/1")],
+            tunnel_networks: vec!["10.10.0.0/16".parse().unwrap()],
+            ..Default::default()
+        };
+        assert_eq!(
+            profile.effective_routes()[0].destination.to_string(),
+            "0.0.0.0/1"
+        );
+        profile.tunnel_role = TunnelRole::Secondary;
+        let routes = profile.effective_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].destination.to_string(), "10.10.0.0/16");
+    }
+
+    #[test]
+    fn check_role_requires_networks_for_a_secondary() {
+        let mut profile = Profile::default();
+        assert!(profile.check_role().is_ok());
+        profile.tunnel_role = TunnelRole::Secondary;
+        assert!(profile.check_role().is_err());
+        profile.tunnel_networks = vec!["10.10.0.0/16".parse().unwrap()];
+        assert!(profile.check_role().is_ok());
+        profile.tunnel_dns_domains = vec!["bad..name".into()];
+        assert!(profile.check_role().is_err());
+    }
+
+    #[test]
     fn secondary_networks_are_checked_and_normalised() {
         let ok = secondary_networks(&[
             route("10.10.4.7/16"),
@@ -1021,6 +1140,8 @@ mod tests {
             vec![],
             vec![route("0.0.0.0/0")],
             vec![route("::/0")],
+            vec![route("0.0.0.0/1"), route("128.0.0.0/1")],
+            vec![route("8000::/1")],
             vec![route("224.0.0.0/4")],
             vec![route("127.0.0.0/8")],
         ] {

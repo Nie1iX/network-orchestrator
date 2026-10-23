@@ -38,6 +38,8 @@ impl std::error::Error for HelperError {}
 pub struct HelperClient {
     socket: PathBuf,
     timeout: Duration,
+    /// Sent in the handshake; the daemon logs it, never trusts it.
+    client_name: String,
 }
 
 impl HelperClient {
@@ -45,7 +47,14 @@ impl HelperClient {
         Self {
             socket: socket.into(),
             timeout: Duration::from_secs(10),
+            client_name: format!("net-manager-macos/{}", env!("CARGO_PKG_VERSION")),
         }
+    }
+
+    /// Names this client in the handshake (`netorch/0.9.0`).
+    pub fn with_client_name(mut self, name: impl Into<String>) -> Self {
+        self.client_name = name.into();
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -70,7 +79,7 @@ impl HelperClient {
     pub fn hello(&self) -> Result<HelloResult, HelperError> {
         let mut stream = self.connect()?;
         let mut reader = BufReader::new(stream.try_clone().map_err(HelperError::Unreachable)?);
-        handshake(&mut stream, &mut reader)
+        handshake(&mut stream, &mut reader, &self.client_name)
     }
 
     /// Handshake, then one request.
@@ -81,7 +90,7 @@ impl HelperClient {
     ) -> Result<R, HelperError> {
         let mut stream = self.connect()?;
         let mut reader = BufReader::new(stream.try_clone().map_err(HelperError::Unreachable)?);
-        handshake(&mut stream, &mut reader)?;
+        handshake(&mut stream, &mut reader, &self.client_name)?;
         let params =
             serde_json::to_value(params).map_err(|err| HelperError::Protocol(err.to_string()))?;
         let request = RequestFrame {
@@ -98,13 +107,14 @@ impl HelperClient {
 fn handshake(
     stream: &mut UnixStream,
     reader: &mut BufReader<UnixStream>,
+    client: &str,
 ) -> Result<HelloResult, HelperError> {
     let hello = RequestFrame {
         id: 1,
         method: method::HELLO.into(),
         params: serde_json::to_value(HelloParams {
             protocol: PROTOCOL_VERSION,
-            client: format!("net-manager-macos/{}", env!("CARGO_PKG_VERSION")),
+            client: client.to_string(),
         })
         .map_err(|err| HelperError::Protocol(err.to_string()))?,
     };
