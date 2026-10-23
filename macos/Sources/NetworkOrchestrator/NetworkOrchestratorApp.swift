@@ -34,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     _model = State(initialValue: model)
   }
   @AppStorage("appearance") private var appearance = "system"
+  @AppStorage("showMenuBar") private var showMenuBar = true
   var body: some Scene {
     WindowGroup("Network Orchestrator", id: "main") {
       ContentView(model: model).frame(minWidth: 960, minHeight: 640)
@@ -48,7 +49,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           .keyboardShortcut("r", modifiers: .command)
       }
     }
+    MenuBarExtra(isInserted: $showMenuBar) {
+      MenuBarContent(model: model)
+    } label: {
+      Image(
+        systemName: model.activeCount > 0 ? "network.badge.shield.half.filled" : "network")
+    }
+    .menuBarExtraStyle(.menu)
     Settings { NativeSettingsWindow(model: model).frame(width: 700) }
+  }
+}
+
+/// The menu bar menu: what is connected, a switch per connection, and the
+/// window. Works with the window closed; the model keeps polling.
+struct MenuBarContent: View {
+  @Bindable var model: AppModel
+  @Environment(\.openWindow) private var openWindow
+  private var profiles: [Profile] { model.snapshot?.profiles ?? [] }
+  var body: some View {
+    let active = profiles.filter { model.isRunning($0) }
+    Text(
+      active.isEmpty
+        ? L10n.text("All disconnected")
+        : L10n.text("native.connectedCount", ["count": String(active.count)]))
+    Divider()
+    if profiles.isEmpty {
+      Text(L10n.text("native.menuBar.noConnections"))
+    }
+    ForEach(profiles) { profile in
+      Toggle(
+        profile.name,
+        isOn: Binding(
+          get: { model.isRunning(profile) },
+          set: { _ in
+            Task {
+              await model.toggle(profile)
+              // A helper prompt or a login sheet lives in the window.
+              if model.helperPrompt || model.credentialRequest != nil { showWindow() }
+            }
+          })
+      ).disabled(!model.canTryStart(profile) || model.pending.contains(profile.id))
+    }
+    Divider()
+    Button(L10n.text("native.menuBar.disconnectAll")) { Task { await model.disconnectAll() } }
+      .disabled(active.isEmpty)
+    Button(L10n.text("native.menuBar.open")) { showWindow() }
+    Divider()
+    Button(L10n.text("native.menuBar.quit")) { NSApp.terminate(nil) }
+      .keyboardShortcut("q")
+  }
+  private func showWindow() {
+    openWindow(id: "main")
+    NSApp.activate()
   }
 }
 

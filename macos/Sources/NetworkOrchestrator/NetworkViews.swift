@@ -595,6 +595,7 @@ struct SettingsView: View {
   @Bindable var model: AppModel
   @State private var showingImportLog = false
   @State private var loginItemEnabled = false
+  @AppStorage("showMenuBar") private var showMenuBar = true
   @AppStorage("appearance") private var appearance = "system"
   @Bindable private var localizer = L10n.shared
   var body: some View {
@@ -687,6 +688,12 @@ struct SettingsView: View {
                 loginItemEnabled = SMAppService.mainApp.status == .enabled
               })
           ).toggleStyle(.switch).controlSize(.small).labelsHidden()
+        }.padding(.horizontal, 14).padding(.vertical, 10.5)
+        Rectangle().fill(p.border).frame(height: 1)
+        HStack {
+          settingText("native.menuBar.setting", "native.menuBar.settingSub")
+          Spacer()
+          Toggle("", isOn: $showMenuBar).toggleStyle(.switch).controlSize(.small).labelsHidden()
         }.padding(.horizontal, 14).padding(.vertical, 10.5)
       }
       .onAppear { loginItemEnabled = SMAppService.mainApp.status == .enabled }
