@@ -819,6 +819,16 @@ import SystemConfiguration
   func connectionLog(_ profile: Profile) async -> String {
     (try? await core.call("log", args: ["id": profile.id]) as String) ?? ""
   }
+  /// Runs every check for one connection (the helper's and the app's view,
+  /// static analysis, routes); nil with `error` set when it cannot be done.
+  func diagnose(_ profile: Profile) async -> ProfileDiagnostics? {
+    do {
+      return try await core.call("diagnose", args: ["id": profile.id])
+    } catch {
+      self.error = error.localizedDescription
+      return nil
+    }
+  }
   /// The text behind one entry of the Logs page.
   func logText(for source: LogSource) async -> String {
     switch source {

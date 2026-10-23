@@ -4,7 +4,7 @@ Guidance for agents/contributors working in this repository.
 
 ## Layout
 
-- `crates/core` — pure Rust library: models, static analysis, config vault,
+- `crates/core` — pure Rust library: models, static analysis, profile diagnostics checks, config vault,
   DPAPI, policy routes, tunnel manager, route plan, connect plan (conflict
   checks, route/interface derivation), system proxy, explorer,
   backend executable settings, managed Xray verification. Also hosts the

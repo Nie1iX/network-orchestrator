@@ -336,6 +336,40 @@ struct RecoveryReport: Decodable, Sendable, Equatable {
   let requiresElevation: Bool
 }
 
+enum DiagnosticLevel: String, Decodable, Sendable, Comparable {
+  case healthy, warning, error
+  private var rank: Int {
+    switch self {
+    case .healthy: 0
+    case .warning: 1
+    case .error: 2
+    }
+  }
+  static func < (lhs: Self, rhs: Self) -> Bool { lhs.rank < rhs.rank }
+}
+struct DiagnosticCheck: Decodable, Sendable, Identifiable {
+  let name: String
+  let level: DiagnosticLevel
+  let message: String
+  var id: String { name + "\u{1}" + message }
+}
+struct DiagnosticCounts: Equatable, Sendable {
+  var warnings: Int
+  var errors: Int
+}
+/// The checks `diagnose` returns for one connection.
+struct ProfileDiagnostics: Decodable, Sendable {
+  let profileId: String
+  let status: TunnelStatus
+  let checks: [DiagnosticCheck]
+  var worst: DiagnosticLevel { checks.map(\.level).max() ?? .healthy }
+  var counts: DiagnosticCounts {
+    DiagnosticCounts(
+      warnings: checks.filter { $0.level == .warning }.count,
+      errors: checks.filter { $0.level == .error }.count)
+  }
+}
+
 struct Snapshot: Decodable, Sendable {
   let profiles: [Profile]
   let interfaces: [NetworkInterface]

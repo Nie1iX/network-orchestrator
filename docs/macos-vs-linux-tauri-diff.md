@@ -129,7 +129,7 @@
 | Вкладка Routes: карта, дерево, таблица, flow, lookup | ✅ шесть вкладок | ✅ |
 | Вкладка Network: интерфейсы, throughput | ✅ (read-only) | ✅ плюс управление состоянием интерфейса |
 | Вкладка Conditions | ❌ | ✅ |
-| Диагностика профиля (`diagnose_profile`) | ⚠️ `inspect` и `netorch doctor` | ✅ полный отчёт |
+| Диагностика профиля (`diagnose_profile`) | ✅ «Diagnostics» в меню подключения: helper, Xray, статус, handshake, DNS/IPv6, владение helper'а, путь до endpoint'а, анализ конфигурации | ✅ полный отчёт |
 | `IntentsPanel`, `SystemTables`, `NmConnectionPanel` | ❌ | ✅ |
 | Темы System/Light/Dark, RU/EN | ✅ | ✅ (общие токены и локали) |
 
@@ -197,8 +197,7 @@ macOS перед коммитом.
 2. ✅ Меню-бар (Tray): `MenuBarExtra`, фоновый опрос состояния перенесён из `ContentView` в `AppModel.startMonitoring()`.
 3. ✅ Recovery: при запуске `recovery_report` (`core::recovery::helper_report` + `Engine::recovery_report`) показывает диалог с остатками, «Clean up» вызывает `recovery.cleanup`. Попутно исправлено: `recover()` в helper'е убивал живой туннель.
 4. ✅ Logs и Monitor: Monitor (`ThroughputSampler`, метод моста `interfaces`) и Logs (`LogLines`; источники — события приложения (`AppLog`), лог каждого подключения (у WireGuard — `wireguard.log`, который пишет helper), лог helper'а, NetBird и импорта).
-5. Диагностика профиля: вынести `diagnose_profile` из `src-tauri` в `core`,
-   показать отчёт в Swift.
+5. ✅ Диагностика профиля: `core::diagnostics` (проверки как чистые функции), `Engine::diagnose`, метод моста `diagnose`, лист в Swift. Общие проверки (путь до endpoint'а, статический анализ, endpoints/listeners, системный прокси) открыты как публичные функции; `src-tauri/.../diagnostics.rs` пока на своей копии — переключить его на них можно там, где собирается Tauri (Linux/Windows), и удалить дубликат.
 6. Режимы приложения (combined/orchestrator/manager): фильтр возможностей в
    настройках.
 7. Сеть: управление состоянием интерфейса, DNS-диагностика, таблицы

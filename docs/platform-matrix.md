@@ -61,8 +61,8 @@ Windows and Linux share these tabs. The native macOS client reads
 interfaces and routes through `getifaddrs`/`net-route` (read-only) and has
 its own route lookup and exit-IP check on Home, and a Monitor page (tunnel
 throughput chart and per-tunnel rates from the interface byte counters); a Logs
-page (app events, per-connection, helper, NetBird and import logs with level/text filters); it has no
-Diagnostics report.
+page (app events, per-connection, helper, NetBird and import logs with level/text filters) and a
+per-connection Diagnostics report (`core::diagnostics`).
 
 | Feature | Where |
 |---|---|

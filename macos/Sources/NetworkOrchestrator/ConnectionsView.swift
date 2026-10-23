@@ -589,6 +589,7 @@ struct ProfileDetailView: View {
   @Bindable var model: AppModel
   @State private var editingRules = false
   @State private var showingLog = false
+  @State private var showingDiagnostics = false
   @State private var editingNetworks = false
   let profile: Profile
   let onRename: () -> Void
@@ -620,6 +621,7 @@ struct ProfileDetailView: View {
         Menu {
           Button(L10n.text("Rename"), action: onRename)
           Button(L10n.text("Inspect configuration")) { Task { await model.inspect(profile) } }
+          Button(L10n.text("detail.diagnostics")) { showingDiagnostics = true }
           if profile.backend == "xray" || profile.backend == "openVpn" {
             Button(L10n.text("native.connectionLog")) { showingLog = true }
           }
@@ -717,6 +719,10 @@ struct ProfileDetailView: View {
     }
     .frame(maxWidth: .infinity, alignment: .leading)
     .task(id: profile.id) { await model.loadInspection(profile) }
+    .sheet(isPresented: $showingDiagnostics) {
+      DiagnosticsSheet(model: model, profile: profile) { showingDiagnostics = false }
+        .environment(\.palette, p).buttonStyle(TauriButtonStyle())
+    }
     .sheet(isPresented: $showingLog) {
       LogSheet(
         title: L10n.text("diag.title", ["name": profile.groupName]),
