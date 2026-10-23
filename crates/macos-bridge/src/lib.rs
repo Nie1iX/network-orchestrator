@@ -440,6 +440,69 @@ fn tailscale_sync(root: &Path) -> Value {
     *last = Some((Instant::now(), value.clone()));
     value
 }
+/// `scutil --dns` as data. Needs no privileges.
+fn read_dns_config() -> Result<net_manager_core::dns_diag::DnsConfig, String> {
+    let output = std::process::Command::new("/usr/sbin/scutil")
+        .arg("--dns")
+        .output()
+        .map_err(|_| "The DNS configuration could not be read".to_string())?;
+    if !output.status.success() {
+        return Err("The DNS configuration could not be read".into());
+    }
+    Ok(net_manager_core::dns_diag::parse_scutil_dns(
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
+/// One DNS query to `args["server"]`, or to the server the system would use
+/// for `args["hostname"]`, with the route that traffic takes.
+fn dns_probe(args: &Value) -> Result<Value, String> {
+    use net_manager_core::dns_diag::{choose_target, path_to};
+    use net_manager_core::dns_probe::{probe, DnsFamily};
+    let hostname = text_arg(args, "hostname")?;
+    let server = match args["server"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(text) => Some(
+            text.parse::<std::net::IpAddr>()
+                .map_err(|_| "Enter an IPv4 or IPv6 address as the server".to_string())?,
+        ),
+        None => None,
+    };
+    let family = if args["family"].as_str() == Some("aaaa") {
+        DnsFamily::Aaaa
+    } else {
+        DnsFamily::A
+    };
+    let config = if server.is_some() {
+        Default::default()
+    } else {
+        read_dns_config()?
+    };
+    let target = choose_target(&config, hostname, server).ok_or("No DNS server is configured")?;
+    let result = probe(
+        hostname,
+        std::net::SocketAddr::new(target.server, target.port),
+        family,
+        std::time::Duration::from_secs(3),
+    )
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::InvalidInput => "Enter a valid host name".to_string(),
+        std::io::ErrorKind::TimedOut => "The DNS server did not answer in time".to_string(),
+        _ => "The DNS query could not be sent".to_string(),
+    })?;
+    let routes = runtime_executor()?
+        .block_on(explorer::list_routes())
+        .unwrap_or_default();
+    Ok(json!({
+        "probe": result,
+        "resolverIndex": target.resolver_index,
+        "resolverDomain": target.resolver_domain,
+        "path": path_to(target.server, &routes),
+    }))
+}
 fn encode(value: impl serde::Serialize) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|_| "Could not encode the result".into())
 }
@@ -474,6 +537,9 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
         "tailscale_down" => return net_manager_engine::tailscale::Tailscale::detect().down(),
         "tailscale_sync" => return Ok(tailscale_sync(root)),
         "user_network_settings" => return encode(user_network::read()),
+        // The system resolvers (`scutil --dns`) and one real DNS query; read-only.
+        "dns_status" => return encode(read_dns_config()?),
+        "dns_probe" => return dns_probe(args),
         // Interfaces with their byte counters, without the routes `snapshot`
         // adds: cheap enough for the Monitor page to poll every second.
         "interfaces" => {
@@ -1792,6 +1858,37 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn dns_probe_refuses_bad_input_before_any_packet_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_name = dispatch(
+            dir.path(),
+            "dns_probe",
+            &json!({"hostname":"not a name","server":"127.0.0.1"}),
+        );
+        assert_eq!(bad_name.unwrap_err(), "Enter a valid host name");
+        let bad_server = dispatch(
+            dir.path(),
+            "dns_probe",
+            &json!({"hostname":"example.com","server":"dns.example"}),
+        );
+        assert_eq!(
+            bad_server.unwrap_err(),
+            "Enter an IPv4 or IPv6 address as the server"
+        );
+        assert!(dispatch(dir.path(), "dns_probe", &json!({})).is_err());
+        assert!(!dir.path().join("profiles.json").exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dns_status_reads_the_system_resolvers_without_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dispatch(dir.path(), "dns_status", &json!({})).unwrap();
+        assert!(status["resolvers"].is_array() && status["scoped"].is_array());
+        assert!(!dir.path().join("profiles.json").exists());
     }
 
     #[test]
