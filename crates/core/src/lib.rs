@@ -17,6 +17,8 @@ mod macos_inventory;
 pub mod macos_vpn;
 pub mod managed_xray;
 pub mod models;
+#[cfg(unix)]
+pub mod netbird;
 pub mod openvpn_config;
 pub mod openvpn_management;
 pub mod policy;

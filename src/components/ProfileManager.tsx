@@ -47,6 +47,7 @@ import LocalProxyPanel from "./LocalProxyPanel";
 import NmConnectionPanel from "./NmConnectionPanel";
 import TailscalePanel from "./TailscalePanel";
 import ToggleSwitch from "./ui/ToggleSwitch";
+import NetBirdRow, { useNetBird } from "./NetBirdRow";
 import { useToast } from "./ui/Toast";
 import ProfileFormModal, {
   editFormState,
@@ -257,6 +258,7 @@ export default function ProfileManager() {
   } | null>(null);
   const [tailscale, setTailscale] = useState<TailscaleStatusResult | null>(null);
   const [tailscaleBusy, setTailscaleBusy] = useState(false);
+  const netbird = useNetBird(caps?.os === "linux");
   const [serviceSelected, setServiceSelected] = useState(false);
   const [ctxMenu, setCtxMenu] = useState<{
     x: number;
@@ -1750,10 +1752,11 @@ export default function ProfileManager() {
         })
       )}
 
-      {tailscale !== null && (
+      {(tailscale !== null || netbird.state?.installed) && (
         <div className="profile-group">
           <div className="profile-group-label">{t("profiles.services")}</div>
           <div className="profile-rows">
+            {tailscale !== null && (
             <div
               role="button"
               tabIndex={0}
@@ -1806,6 +1809,8 @@ export default function ProfileManager() {
                 }
               />
             </div>
+            )}
+            <NetBirdRow netbird={netbird} />
           </div>
         </div>
       )}

@@ -1,4 +1,5 @@
 //! Bounded JSON C ABI for the native SwiftUI client. No privileged mutations.
+use net_manager_core::netbird;
 use net_manager_core::{
     analysis, cidr_bulk, config_vault::ConfigVault, explorer, models::*, profiles::ProfileStore,
     route_plan,
@@ -9,7 +10,6 @@ use std::ffi::{c_char, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-mod netbird;
 mod routing;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
