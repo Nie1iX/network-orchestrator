@@ -40,9 +40,16 @@ struct NetworkView: View {
           || $0.addresses.contains { $0.address.contains(search) })
     }
   }
+  @State private var tab = "Adapters"
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       AppHeading(title: "Network")
+      AppTabs(titles: ["Adapters", "DNS"], selected: $tab)
+      if tab == "DNS" { DnsView(model: model) } else { adapters }
+    }
+  }
+  @ViewBuilder private var adapters: some View {
+    VStack(alignment: .leading, spacing: 0) {
       HStack(spacing: 7) {
         AppInput(placeholder: "Search by name, MAC, address…", text: $search)
         AppSelect(

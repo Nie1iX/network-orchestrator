@@ -819,6 +819,24 @@ import SystemConfiguration
   func connectionLog(_ profile: Profile) async -> String {
     (try? await core.call("log", args: ["id": profile.id]) as String) ?? ""
   }
+  /// The system's DNS resolvers (`scutil --dns`), read-only.
+  var dnsConfig: DnsConfig?
+  func loadDns() async {
+    do {
+      dnsConfig = try await core.callConcurrently("dns_status")
+    } catch { self.error = error.localizedDescription }
+  }
+  /// One real DNS query; with no `server` it goes where the system would send
+  /// that name. Nil with `error` set when it cannot be done.
+  func probeDns(host: String, server: String, ipv6: Bool) async -> DnsProbeAnswer? {
+    do {
+      return try await core.callConcurrently(
+        "dns_probe", args: ["hostname": host, "server": server, "family": ipv6 ? "aaaa" : "a"])
+    } catch {
+      self.error = error.localizedDescription
+      return nil
+    }
+  }
   /// Runs every check for one connection (the helper's and the app's view,
   /// static analysis, routes); nil with `error` set when it cannot be done.
   func diagnose(_ profile: Profile) async -> ProfileDiagnostics? {

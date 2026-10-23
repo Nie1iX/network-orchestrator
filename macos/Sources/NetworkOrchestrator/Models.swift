@@ -370,6 +370,58 @@ struct ProfileDiagnostics: Decodable, Sendable {
   }
 }
 
+/// One block of `scutil --dns`.
+struct DnsResolver: Decodable, Sendable, Identifiable {
+  let index: UInt32
+  let domain: String?
+  let searchDomains: [String]
+  let nameservers: [String]
+  let port: UInt16?
+  let scoped: Bool
+  let interface: String?
+  let ifIndex: UInt32?
+  let supplemental: Bool
+  let mdns: Bool
+  let reachable: Bool
+  let order: UInt32?
+  let timeout: UInt32?
+  let flags: [String]
+  /// The same index appears in both sections, so the section is part of it.
+  var id: String { "\(scoped ? "scoped" : "global")-\(index)" }
+  /// The domain it is for; nil for the default resolver.
+  var title: String? { domain }
+  /// `10.0.0.1`, or `[fd00::1]:5353` when the port is not the DNS default.
+  var serverTexts: [String] {
+    nameservers.map { address in
+      guard let port, port != 53 else { return address }
+      return address.contains(":") ? "[\(address)]:\(port)" : "\(address):\(port)"
+    }
+  }
+}
+struct DnsConfig: Decodable, Sendable {
+  let resolvers: [DnsResolver]
+  let scoped: [DnsResolver]
+}
+struct DnsProbe: Decodable, Sendable {
+  let server: String
+  let port: UInt16
+  let status: String
+  let answers: [String]
+  let truncated: Bool
+  let fakePool: Bool
+  let rttMs: UInt64
+}
+struct DnsProbePath: Decodable, Sendable {
+  let interfaceName: String
+  let gateway: String?
+}
+struct DnsProbeAnswer: Decodable, Sendable {
+  let probe: DnsProbe
+  let resolverIndex: UInt32?
+  let resolverDomain: String?
+  let path: DnsProbePath?
+}
+
 struct Snapshot: Decodable, Sendable {
   let profiles: [Profile]
   let interfaces: [NetworkInterface]

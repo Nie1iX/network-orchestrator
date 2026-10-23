@@ -80,7 +80,9 @@
    Linux: `net.tables` (все таблицы и policy rules), `net_route_add/del`,
    `net_rule_add/del`, `net_explain`.
 3. **DNS-диагностика.** Linux: `net_dns_status`, `net_dns_probe`. macOS:
-   только `user_network_settings` (read-only чтение настроек).
+   вкладка DNS на странице Network (`dns_status` из `scutil --dns`,
+   `dns_probe`: реальный запрос к серверу, который система выбрала бы для имени,
+   с путём и признаком fake-IP), плюс `user_network_settings`.
 4. **Intents (`net_intent_*`).** Только Linux.
 5. **Policy-маршрутизация и Xray routing.** macOS: редактор правил Xray
    (`RoutingRulesEditor`), `set_routing_rules`, `check_route`, разбор Happ-routing,
@@ -199,8 +201,11 @@ macOS перед коммитом.
 4. ✅ Logs и Monitor: Monitor (`ThroughputSampler`, метод моста `interfaces`) и Logs (`LogLines`; источники — события приложения (`AppLog`), лог каждого подключения (у WireGuard — `wireguard.log`, который пишет helper), лог helper'а, NetBird и импорта).
 5. ✅ Диагностика профиля: `core::diagnostics` (проверки как чистые функции), `Engine::diagnose`, метод моста `diagnose`, лист в Swift. Общие проверки (путь до endpoint'а, статический анализ, endpoints/listeners, системный прокси) открыты как публичные функции; `src-tauri/.../diagnostics.rs` пока на своей копии — переключить его на них можно там, где собирается Tauri (Linux/Windows), и удалить дубликат.
 6. ⏸ Режимы приложения (combined/orchestrator/manager): отложено до п.9. Режим — только UI-фильтр (`localStorage`): `orchestrator` прячет управляемые бэкенды и блокирует подключение всего, кроме статических маршрутов (`none`); `manager` прячет список NetworkManager. На macOS бэкенда `none` и внешнего интерфейса пока нет, поэтому `orchestrator` заблокировал бы все подключения, а `manager` скрывал бы лишь incy/NetBird/Tailscale. Вернуться после п.9.
-7. Сеть: управление состоянием интерфейса, DNS-диагностика, таблицы
-   маршрутов и правил — требуют новых методов в `macos-helper`.
+7. Сеть. Решено разбить: **7a ✅ DNS-диагностика** (`core::dns_diag`,
+   `core::dns_probe`, методы моста `dns_status`/`dns_probe`, вкладка DNS; без
+   helper'а и привилегий). **7b** — включение/выключение интерфейса через
+   helper (`link.set_state`, с защитами). Таблицы и правила на macOS не имеют
+   аналога (один FIB), `route add/del` и explain отложены до п.8–9.
 8. Intents и Conditions — поверх п.7 (оценка условий по адресам интерфейсов,
    `SCDynamicStore` вместо netlink).
 9. Static routes, always-on, внешний интерфейс с bypass, geo-списки.
