@@ -8,6 +8,8 @@
 //! Privileged work stays in the launchd helper; this crate only asks it.
 use std::path::PathBuf;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod diagnose;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "linux")]
@@ -23,6 +25,8 @@ pub mod tailscale;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vpn_backends;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use diagnose::DiagnosticsContext;
 #[cfg(unix)]
 pub use privileged::Privileged;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

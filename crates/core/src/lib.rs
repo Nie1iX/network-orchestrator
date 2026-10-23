@@ -5,6 +5,7 @@ pub mod config_security;
 pub mod config_vault;
 pub mod connect_plan;
 pub mod daemon_protocol;
+pub mod diagnostics;
 pub mod exit_ip;
 pub mod explorer;
 pub mod geo_list;

@@ -16,7 +16,8 @@ use net_manager_core::daemon_protocol::{
 use net_manager_core::helper_client::HelperClient;
 use net_manager_core::managed_xray;
 use net_manager_core::models::{
-    Profile, RecoveryReport, TunnelBackend, TunnelRole, TunnelState, TunnelStatus, XrayMode,
+    Profile, ProtocolHealth, RecoveryReport, TunnelBackend, TunnelRole, TunnelState, TunnelStatus,
+    XrayMode,
 };
 use net_manager_core::openvpn_config::CredentialRequirements;
 use net_manager_core::profile_import;
@@ -659,6 +660,34 @@ impl Engine {
                     .map_err(|_| "The previous system proxy could not be restored".to_string())?;
             }
             Ok(snapshot_of(self, session, profiles))
+        })
+    }
+
+    /// The profile that owns the per-user system proxy, if any.
+    pub fn system_proxy_owner(&self) -> Result<Option<String>, String> {
+        with_session(&self.root, |session| {
+            Ok(session
+                .proxy
+                .ownership()
+                .map(|owner| owner.profile_id.clone()))
+        })
+    }
+
+    /// Status, protocol health and system-proxy owner of a profile this
+    /// process runs itself (loopback Xray), for diagnostics.
+    pub fn loopback_state(
+        &self,
+        profile: &Profile,
+    ) -> Result<(TunnelStatus, ProtocolHealth, Option<String>), String> {
+        with_session(&self.root, |session| {
+            Ok((
+                session.tunnels.status(profile),
+                session.tunnels.protocol_health(profile),
+                session
+                    .proxy
+                    .ownership()
+                    .map(|owner| owner.profile_id.clone()),
+            ))
         })
     }
 

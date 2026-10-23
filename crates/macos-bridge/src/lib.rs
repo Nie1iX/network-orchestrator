@@ -46,6 +46,44 @@ mod runtime {
     }
 }
 
+/// Profile diagnostics need the macOS engine.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn diagnose_profile(_: &Path, _: &ProfileStore, _: &Value) -> Result<Value, String> {
+    Err("Diagnostics need the macOS engine".into())
+}
+
+/// Every check for the profile in `args["id"]`: static analysis against the
+/// other profiles and the OS routes, then the helper's and the session's view.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn diagnose_profile(root: &Path, store: &ProfileStore, args: &Value) -> Result<Value, String> {
+    let profiles = store.load().map_err(store_error)?.profiles;
+    let profile = profiles
+        .iter()
+        .find(|p| Some(p.id.as_str()) == args["id"].as_str())
+        .cloned()
+        .ok_or("Profile not found")?;
+    let others: Vec<Profile> = profiles
+        .into_iter()
+        .filter(|p| p.id != profile.id)
+        .collect();
+    let os_routes = runtime_executor()?
+        .block_on(explorer::list_routes())
+        .map_err(|_| "the route table could not be read".to_string());
+    let interfaces = explorer::list_interfaces()
+        .map_err(|_| "the network interfaces could not be read".to_string());
+    let vault = ConfigVault::new(root.join("configs"));
+    runtime::diagnose(
+        root,
+        &profile,
+        net_manager_engine::DiagnosticsContext {
+            others: &others,
+            os_routes,
+            interfaces,
+            vault: &vault,
+        },
+    )
+}
+
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 static TRANSACTION: Mutex<()> = Mutex::new(());
 static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, std::io::Error>> = OnceLock::new();
@@ -901,6 +939,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 }
             }
         }
+        "diagnose" => diagnose_profile(root, &store, args),
         "inspect" => {
             let p = store
                 .load()
@@ -1766,6 +1805,32 @@ mod tests {
             .iter()
             .all(|i| i["name"].is_string()));
         assert!(!dir.path().join("profiles.json").exists());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn diagnostics_cover_a_loopback_profile_without_asking_the_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "dg");
+        let report = dispatch(dir.path(), "diagnose", &json!({"id":"dg"})).unwrap();
+        assert_eq!(report["profileId"], "dg");
+        assert_eq!(report["status"]["state"], "stopped");
+        let checks = report["checks"].as_array().unwrap();
+        let named = |name: &str| checks.iter().find(|c| c["name"] == name).unwrap();
+        assert_eq!(named("Configuration")["level"], "healthy");
+        // No Xray is installed in a fresh data directory.
+        assert_eq!(named("Backend executable")["level"], "error");
+        assert_eq!(named("Tunnel status")["level"], "warning");
+        assert!(checks.iter().all(|c| c["name"] != "Privileged helper"));
+        let text = report.to_string();
+        assert!(
+            !text.contains(dir.path().to_str().unwrap()),
+            "a path leaked"
+        );
+        assert_eq!(
+            dispatch(dir.path(), "diagnose", &json!({"id":"missing"})).unwrap_err(),
+            "Profile not found"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 use net_manager_core::daemon_protocol::{OpenVpnCredentials, OpenVpnUserPass};
 use net_manager_core::models::Profile;
 use net_manager_core::profiles::ProfileStore;
-use net_manager_engine::{find_profile, Engine};
+use net_manager_engine::{find_profile, DiagnosticsContext, Engine};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -53,6 +53,15 @@ pub(crate) fn credentials_from_args(args: &Value) -> Option<OpenVpnCredentials> 
         auth_user_pass: user_pass,
         private_key_passphrase: passphrase,
     })
+}
+
+/// Every check for one profile; the caller read the system tables.
+pub(crate) fn diagnose(
+    root: &Path,
+    profile: &Profile,
+    context: DiagnosticsContext<'_>,
+) -> Result<Value, String> {
+    encode(Engine::new(root).diagnose(profile, context)?)
 }
 
 pub(crate) fn handle(
