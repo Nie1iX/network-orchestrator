@@ -8,6 +8,16 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-23
+
+### Fixed
+
+- Linux: the window no longer aborts with "Could not create GBM EGL display"
+  on GPU/driver setups where WebKitGTK's DMABUF renderer fails (seen on
+  NVIDIA); the renderer is disabled unless the user set it explicitly.
+- Dialogs keep the focused field and open drop-downs while the screen behind
+  them refreshes.
+
 ## [0.9.0] - 2026-10-23
 
 ### Added
