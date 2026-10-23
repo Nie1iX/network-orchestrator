@@ -5,7 +5,8 @@ Guidance for agents/contributors working in this repository.
 ## Layout
 
 - `crates/core` — pure Rust library: models, static analysis, config vault,
-  DPAPI, policy routes, tunnel manager, route plan, system proxy, explorer,
+  DPAPI, policy routes, tunnel manager, route plan, connect plan (conflict
+  checks, route/interface derivation), system proxy, explorer,
   backend executable settings, managed Xray verification. Also hosts the
   opt-in `windows_e2e` integration tests (see Safety rules).
 - `crates/daemon` — Linux privileged system service: Unix socket protocol,
@@ -13,8 +14,11 @@ Guidance for agents/contributors working in this repository.
   Hard-learned netlink quirks live in `MEMORY.md`.
 - `crates/engine` — typed connection engine (`Engine`): connect/disconnect/
   status/system proxy/Xray install and the requests to the privileged helper.
-  macOS (aarch64) only for now; shared by the bridge and the planned `netorch`
-  CLI (`docs/plans/2026-10-15-19-netorch-cli.md`). No UI, no FFI.
+  macOS (aarch64) `Engine` is shared by the bridge and the `netorch` CLI
+  (`docs/plans/2026-10-15-19-netorch-cli.md`). On Linux, `linux` holds the pure
+  builders of the daemon's requests (shared with `src-tauri`) and
+  `linux_engine::LinuxEngine` connects/disconnects/reads status through the
+  daemon socket for the future Linux CLI. No UI, no FFI.
 - `crates/cli` — the `netorch` command line tool (macOS): clap commands over
   `crates/engine` and the bridge's profile/import/routing services; ships in
   the app bundle next to the helper.
@@ -168,8 +172,11 @@ mirrors this gate on Windows.
   root `Cargo.toml`; do not duplicate it in `package.json` or
   `tauri.conf.json` (neither has a version field).
 - Versioning, commit messages and releases follow `docs/versioning.md`
-  (SemVer, Conventional Commits in English, `CHANGELOG.md`); bump the version
-  in a separate `chore(release): X.Y.Z` commit after each group of changes.
+  (SemVer, Conventional Commits in English, `CHANGELOG.md`); read it before
+  committing or bumping the version. Every commit needs a `type(scope):`
+  prefix, one type per commit (never mix `feat` and `fix`), breaking changes
+  carry `!` or a `BREAKING CHANGE:` footer. Bump the version in a separate
+  `chore(release): X.Y.Z` commit after each group of changes.
 - Store files are versioned documents written atomically (temp + rename)
   and ACL-protected via `config_security::protect_path`.
 
