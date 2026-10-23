@@ -648,6 +648,27 @@ import SystemConfiguration
     }
   }
   var autoConnectFailures = 0
+  private var monitoring: Task<Void, Never>?
+  /// Keeps the runtime state fresh for as long as the app runs, window open
+  /// or not: Xray can exit on its own (bad server, port taken), and the menu
+  /// bar shows these states. Idempotent.
+  func startMonitoring() {
+    guard monitoring == nil, !isDuplicate else { return }
+    monitoring = Task { [weak self] in
+      var tick = 0
+      while !Task.isCancelled {
+        try? await Task.sleep(for: .seconds(3))
+        guard let self else { return }
+        await self.refreshRuntime()
+        tick += 1
+        if tick % 20 == 0 { await self.autoRefreshDue() }
+      }
+    }
+  }
+  /// Disconnects every running connection (the menu bar's "Disconnect all").
+  func disconnectAll() async {
+    for profile in snapshot?.profiles ?? [] where isRunning(profile) { await toggle(profile) }
+  }
   func setAutoConnect(_ profile: Profile, enabled: Bool) async {
     _ = await change(
       "set_auto_connect", args: ["id": profile.id, "enabled": enabled ? "true" : "false"])
