@@ -64,6 +64,36 @@ pub(crate) fn diagnose(
     encode(Engine::new(root).diagnose(profile, context)?)
 }
 
+/// A `net.intent.set` request from the client's string arguments:
+/// `destinations` separated by commas, spaces or lines; `kind` `direct` or
+/// `interface` with its `interface`.
+fn intent_params(
+    args: &Value,
+) -> Result<net_manager_core::daemon_protocol::NetIntentSetParams, String> {
+    use net_manager_core::daemon_protocol::{NetIntentPath, NetIntentSetParams};
+    let text = |key: &str| args[key].as_str().unwrap_or_default().trim().to_string();
+    let destinations = text("destinations")
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(String::from)
+        .collect();
+    let interface = text("interface");
+    Ok(NetIntentSetParams {
+        id: text("id"),
+        destinations,
+        path: NetIntentPath {
+            kind: text("kind"),
+            interface: (!interface.is_empty()).then_some(interface),
+        },
+        metric: text("metric").parse().ok(),
+        enabled: match args["enabled"].as_str() {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        },
+    })
+}
+
 pub(crate) fn handle(
     root: &Path,
     store: &ProfileStore,
@@ -118,6 +148,15 @@ pub(crate) fn handle(
                 args["up"].as_str() == Some("true"),
             )
             .map(|()| json!({})),
+        // Routing intents live in the helper; the bridge only forwards.
+        "intents" => engine.intents().and_then(encode),
+        "set_intent" => intent_params(args).and_then(|params| {
+            engine.set_intent(params)?;
+            Ok(json!({}))
+        }),
+        "delete_intent" => engine
+            .delete_intent(args["id"].as_str().unwrap_or_default())
+            .map(|()| json!({})),
         "helper_log" => Ok(json!(engine.helper_log())),
         "log" => load().and_then(|profiles| {
             let profile = find(&profiles, args)?;
@@ -162,6 +201,30 @@ mod tests {
             .unwrap();
         assert!(report["issues"].is_array());
         assert_eq!(report["requiresElevation"], false);
+    }
+
+    #[test]
+    fn intent_arguments_are_split_and_typed() {
+        let params = intent_params(&json!({
+            "id": "office", "destinations": "10.0.0.0/8, 172.16.0.0/12\n192.0.2.9;fd00::/8",
+            "kind": "interface", "interface": "utun5", "metric": "50", "enabled": "false",
+        }))
+        .unwrap();
+        assert_eq!(params.id, "office");
+        assert_eq!(
+            params.destinations,
+            ["10.0.0.0/8", "172.16.0.0/12", "192.0.2.9", "fd00::/8"]
+        );
+        assert_eq!(params.path.kind, "interface");
+        assert_eq!(params.path.interface.as_deref(), Some("utun5"));
+        assert_eq!((params.metric, params.enabled), (Some(50), Some(false)));
+        let plain =
+            intent_params(&json!({"id": "x", "destinations": "10.0.0.0/8", "kind": "direct"}))
+                .unwrap();
+        assert_eq!(
+            (plain.path.interface, plain.metric, plain.enabled),
+            (None, None, None)
+        );
     }
 
     #[test]

@@ -10,7 +10,8 @@ use crate::vpn_backends;
 use crate::{helper_error, helper_socket};
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::daemon_protocol::{
-    method, OpenVpnCredentials, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
+    method, NetIntentDelParams, NetIntentListResult, NetIntentResult, NetIntentSetParams,
+    NetIntentView, OpenVpnCredentials, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
     XrayProfileParams, XrayStatusResult,
 };
 use net_manager_core::helper_client::HelperClient;
@@ -25,6 +26,7 @@ use net_manager_core::profiles::ProfileStore;
 use net_manager_core::system_proxy::SystemProxyManager;
 use net_manager_core::vpn::TunnelManager;
 use serde::Serialize;
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -714,6 +716,44 @@ impl Engine {
             })
     }
 
+    /// The user's routing intents with their live status.
+    pub fn intents(&self) -> Result<Vec<NetIntentView>, String> {
+        self.intent_call::<_, NetIntentListResult>(method::NET_INTENT_LIST, json!({}))
+            .map(|list| list.intents)
+    }
+
+    /// Adds or replaces an intent; the helper applies it at once.
+    pub fn set_intent(&self, params: NetIntentSetParams) -> Result<(), String> {
+        self.intent_call::<_, NetIntentResult>(method::NET_INTENT_SET, params)
+            .map(|_| ())
+    }
+
+    pub fn delete_intent(&self, id: &str) -> Result<(), String> {
+        self.intent_call::<_, NetIntentResult>(
+            method::NET_INTENT_DEL,
+            NetIntentDelParams { id: id.to_string() },
+        )
+        .map(|_| ())
+    }
+
+    fn intent_call<P: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+        params: P,
+    ) -> Result<R, String> {
+        use net_manager_core::daemon_protocol::ErrorCode;
+        use net_manager_core::helper_client::HelperError;
+        self.privileged()
+            .call::<_, R>(name, params)
+            .map_err(|error| match error {
+                HelperError::Rejected(body) if body.code == ErrorCode::UnsupportedMethod => {
+                    "The installed helper is too old for routing intents. Update it in Settings."
+                        .to_string()
+                }
+                other => helper_error(other),
+            })
+    }
+
     /// What a crashed session left behind: tunnels the helper still records
     /// that no longer run, and a system proxy for a connection that is gone.
     pub fn recovery_report(&self, profiles: &[Profile]) -> Result<RecoveryReport, String> {
@@ -1058,6 +1098,87 @@ mod tests {
         assert_eq!(
             engine.set_interface_state("utun9", false).unwrap_err(),
             "disconnect it instead"
+        );
+    }
+
+    #[test]
+    fn intents_are_listed_set_and_deleted_through_the_helper() {
+        use net_manager_core::daemon_protocol::{ErrorCode, NetIntentPath};
+        let dir = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(dir.path(), |request| {
+            ResponseFrame::ok(
+                request.id,
+                json!({"intents": [{
+                    "id": "office", "destinations": ["10.0.0.0/8"],
+                    "path": {"kind": "direct"}, "metric": 100, "enabled": true,
+                    "status": "effective", "detail": "1 route(s) in place",
+                    "installed": 1, "wanted": 1
+                }]}),
+            )
+        });
+        let engine = Engine::with_privileged(dir.path(), Arc::new(client));
+        let list = engine.intents().unwrap();
+        assert_eq!(seen.recv().unwrap().method, method::NET_INTENT_LIST);
+        assert_eq!(list[0].id, "office");
+        assert_eq!((list[0].installed, list[0].wanted), (1, 1));
+
+        let other = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(other.path(), |request| {
+            ResponseFrame::ok(request.id, json!({"id": "office"}))
+        });
+        let engine = Engine::with_privileged(other.path(), Arc::new(client));
+        engine
+            .set_intent(NetIntentSetParams {
+                id: "office".into(),
+                destinations: vec!["10.0.0.0/8".into()],
+                path: NetIntentPath {
+                    kind: "interface".into(),
+                    interface: Some("utun5".into()),
+                },
+                metric: None,
+                enabled: None,
+            })
+            .unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.method, method::NET_INTENT_SET);
+        assert_eq!(request.params["id"], "office");
+        assert_eq!(request.params["path"]["interface"], "utun5");
+
+        let third = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(third.path(), |request| {
+            ResponseFrame::ok(request.id, json!({"id": "office"}))
+        });
+        Engine::with_privileged(third.path(), Arc::new(client))
+            .delete_intent("office")
+            .unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.method, method::NET_INTENT_DEL);
+        assert_eq!(request.params, json!({"id": "office"}));
+
+        let old = tempfile::tempdir().unwrap();
+        let (client, _) = fake_helper(old.path(), |request| {
+            ResponseFrame::error(request.id, ErrorCode::UnsupportedMethod, "unsupported")
+        });
+        let error = Engine::with_privileged(old.path(), Arc::new(client))
+            .intents()
+            .unwrap_err();
+        assert!(
+            error.contains("too old") && error.contains("Settings"),
+            "{error}"
+        );
+        let refused = tempfile::tempdir().unwrap();
+        let (client, _) = fake_helper(refused.path(), |request| {
+            ResponseFrame::error(
+                request.id,
+                ErrorCode::InvalidParams,
+                "Choose a network interface for this intent",
+            )
+        });
+        assert_eq!(
+            Engine::with_privileged(refused.path(), Arc::new(client))
+                .delete_intent("x")
+                .unwrap_err(),
+            "Choose a network interface for this intent"
         );
     }
 
