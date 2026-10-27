@@ -46,6 +46,60 @@ mod runtime {
     }
 }
 
+/// The literal server addresses of the user's connections: the endpoint
+/// bypasses they name and the IPs their configs connect to. Host names are not
+/// resolved here, so they are not listed.
+fn known_endpoints(profiles: &[Profile]) -> Vec<net_manager_core::intent_doctor::KnownEndpoint> {
+    use net_manager_core::intent_doctor::KnownEndpoint;
+    let mut found = Vec::new();
+    for profile in profiles {
+        let label = if profile.name.is_empty() {
+            &profile.id
+        } else {
+            &profile.name
+        };
+        let mut add = |text: &str| {
+            if let Ok(ip) = text.trim().parse::<std::net::IpAddr>() {
+                found.push(KnownEndpoint {
+                    ip,
+                    profile: label.clone(),
+                });
+            }
+        };
+        profile.endpoint_bypasses.iter().for_each(|text| add(text));
+        if let Ok(analysis) = analysis::analyze_profile(profile) {
+            analysis
+                .endpoints
+                .iter()
+                .for_each(|endpoint| add(&endpoint.address));
+        }
+    }
+    found
+}
+
+/// Intent doctor needs the macOS engine.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn intent_doctor(_: &Path, _: &ProfileStore) -> Result<Value, String> {
+    Err("The intent doctor needs the macOS engine".into())
+}
+
+/// Suggestions about the user's routing intents; see `core::intent_doctor`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn intent_doctor(root: &Path, store: &ProfileStore) -> Result<Value, String> {
+    let profiles = store.load().map_err(store_error)?.profiles;
+    let routes = runtime_executor()?
+        .block_on(explorer::list_routes())
+        .map_err(|_| "the route table could not be read".to_string())?;
+    let interfaces = explorer::list_interfaces().unwrap_or_default();
+    let intents = net_manager_engine::Engine::new(root).intents()?;
+    encode(net_manager_core::intent_doctor::analyze(
+        &intents,
+        &routes,
+        &interfaces,
+        &known_endpoints(&profiles),
+    ))
+}
+
 /// Profile diagnostics need the macOS engine.
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn diagnose_profile(_: &Path, _: &ProfileStore, _: &Value) -> Result<Value, String> {
@@ -1006,6 +1060,7 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
             }
         }
         "diagnose" => diagnose_profile(root, &store, args),
+        "intent_doctor" => intent_doctor(root, &store),
         "inspect" => {
             let p = store
                 .load()
@@ -1889,6 +1944,42 @@ mod tests {
         let status = dispatch(dir.path(), "dns_status", &json!({})).unwrap();
         assert!(status["resolvers"].is_array() && status["scoped"].is_array());
         assert!(!dir.path().join("profiles.json").exists());
+    }
+
+    #[test]
+    fn the_doctor_knows_literal_server_addresses_only() {
+        let dir = tempfile::tempdir().unwrap();
+        // `one.test` is a name; the second connection connects to an IP.
+        import_link(dir.path(), "named");
+        dispatch(
+            dir.path(),
+            "import_share_link",
+            &json!({"id":"literal", "name":"Literal", "link":"vless://00000000-0000-4000-8000-000000000000@203.0.113.7:443?security=tls#Lit"}),
+        )
+        .unwrap();
+        let profiles: Vec<Profile> = ProfileStore::new(dir.path().join("profiles.json"))
+            .load()
+            .unwrap()
+            .profiles;
+        let mut with_bypass = profiles.clone();
+        with_bypass[0].endpoint_bypasses = vec![" 198.51.100.9 ".into(), "vpn.example.com".into()];
+        let found: Vec<String> = known_endpoints(&with_bypass)
+            .iter()
+            .map(|e| format!("{} {}", e.ip, e.profile))
+            .collect();
+        assert!(
+            found.contains(&"198.51.100.9 Runtime".to_string()),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().any(|e| e.starts_with("203.0.113.7 ")),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().all(|e| !e.contains("example")),
+            "names are not resolved: {found:?}"
+        );
+        assert!(known_endpoints(&[]).is_empty());
     }
 
     #[test]
