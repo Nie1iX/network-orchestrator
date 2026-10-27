@@ -125,6 +125,94 @@ pub fn normalize(params: &NetIntentSetParams) -> Result<Intent, String> {
     })
 }
 
+// ---- static-route profiles ---------------------------------------------
+
+/// Intents the app creates for static-route profiles carry this prefix, and
+/// the Intents page leaves them to the profile's own switch.
+pub const STATIC_PREFIX: &str = "static-";
+
+pub fn is_static_intent_id(id: &str) -> bool {
+    id.starts_with(STATIC_PREFIX)
+}
+
+/// `static-<profile id>`, lowercased with anything else turned into `-`.
+pub fn static_intent_id(profile_id: &str) -> Result<String, String> {
+    let slug: String = profile_id
+        .chars()
+        .map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let id = format!("{STATIC_PREFIX}{slug}");
+    if slug.is_empty() || !valid_id(&id) {
+        return Err("This profile's identifier is too long for static routes".into());
+    }
+    Ok(id)
+}
+
+/// The intent that carries a static-route profile: its routes through its
+/// interface, armed until the interface exists. A route with its own gateway
+/// is not supported on macOS yet, so such a profile is refused rather than
+/// half applied.
+pub fn static_intent(profile: &crate::models::Profile) -> Result<NetIntentSetParams, String> {
+    use crate::models::TunnelBackend;
+    if profile.backend != TunnelBackend::None {
+        return Err("This is not a static-route profile".into());
+    }
+    let interface = profile.interface_name.trim();
+    if interface.is_empty() {
+        return Err("Choose the interface these routes go through".into());
+    }
+    if !valid_interface(interface) || interface == "lo0" {
+        return Err(format!(
+            "'{interface}' is not a macOS interface name such as en0 or utun4"
+        ));
+    }
+    if profile.routes.is_empty() {
+        return Err("Add at least one route".into());
+    }
+    if profile.routes.iter().any(|route| route.via.is_some()) {
+        return Err("Static routes with their own gateway are not supported on macOS yet".into());
+    }
+    Ok(NetIntentSetParams {
+        id: static_intent_id(&profile.id)?,
+        destinations: profile
+            .routes
+            .iter()
+            .map(|route| route.destination.to_string())
+            .collect(),
+        path: NetIntentPath {
+            kind: "interface".into(),
+            interface: Some(interface.to_string()),
+        },
+        metric: profile.routes.first().map(|route| route.metric),
+        enabled: Some(true),
+    })
+}
+
+/// What a static-route profile reports, given the helper's view of its
+/// intent (`None` when the helper has none). Waiting for the interface still
+/// counts as running: the routes are armed.
+pub fn static_state(view: Option<&NetIntentView>) -> (crate::models::TunnelState, Option<String>) {
+    use crate::models::TunnelState;
+    let Some(view) = view else {
+        return (TunnelState::Stopped, None);
+    };
+    match view.status {
+        ExplainStatus::Disabled => (TunnelState::Stopped, None),
+        ExplainStatus::Effective | ExplainStatus::Active => (TunnelState::Running, None),
+        ExplainStatus::Deferred | ExplainStatus::Missing => {
+            (TunnelState::Running, Some(view.detail.clone()))
+        }
+        ExplainStatus::Conflicted => (TunnelState::Failed, Some(view.detail.clone())),
+    }
+}
+
 /// The physical default route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Uplink {
@@ -770,5 +858,99 @@ mod tests {
         assert_eq!(v.destinations, ["10.0.0.0/8"]);
         assert_eq!(v.path, via("utun5"));
         assert_eq!(v.enabled, i.enabled);
+    }
+
+    // ---- static-route profiles ------------------------------------------
+
+    fn static_profile(id: &str, interface: &str, routes: &[&str]) -> crate::models::Profile {
+        crate::models::Profile {
+            id: id.into(),
+            name: "Static".into(),
+            backend: crate::models::TunnelBackend::None,
+            interface_name: interface.into(),
+            routes: routes
+                .iter()
+                .map(|r| crate::models::PolicyRoute {
+                    destination: r.parse().unwrap(),
+                    metric: 5,
+                    via: None,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_static_profile_becomes_an_interface_intent_with_a_reserved_name() {
+        let p = static_profile("office-lan", "en7", &["192.0.2.0/24", "198.51.100.0/24"]);
+        let intent = static_intent(&p).unwrap();
+        assert_eq!(intent.id, "static-office-lan");
+        assert_eq!(intent.destinations, ["192.0.2.0/24", "198.51.100.0/24"]);
+        assert_eq!(intent.path.kind, "interface");
+        assert_eq!(intent.path.interface.as_deref(), Some("en7"));
+        assert_eq!(intent.metric, Some(5));
+        // The helper accepts what the profile produces.
+        assert!(normalize(&intent).is_ok());
+        assert!(is_static_intent_id("static-office-lan"));
+        assert!(!is_static_intent_id("office"));
+    }
+
+    #[test]
+    fn a_profile_id_is_made_a_valid_intent_id_or_refused() {
+        assert_eq!(static_intent_id("Office.LAN").unwrap(), "static-office-lan");
+        assert_eq!(static_intent_id(&"a".repeat(41)).unwrap().len(), 48);
+        assert!(static_intent_id(&"a".repeat(42)).is_err());
+        assert!(static_intent_id("").is_err());
+    }
+
+    #[test]
+    fn a_static_profile_that_cannot_be_enforced_is_refused_with_a_reason() {
+        let ok = static_profile("s", "en7", &["192.0.2.0/24"]);
+        let mut other_backend = ok.clone();
+        other_backend.backend = crate::models::TunnelBackend::WireGuard;
+        assert!(static_intent(&other_backend).is_err());
+        let mut no_interface = ok.clone();
+        no_interface.interface_name = " ".into();
+        assert!(static_intent(&no_interface)
+            .unwrap_err()
+            .contains("interface"));
+        let mut bad_interface = ok.clone();
+        bad_interface.interface_name = "Ethernet 2".into();
+        assert!(static_intent(&bad_interface).unwrap_err().contains("macOS"));
+        let none = static_profile("s", "en7", &[]);
+        assert!(static_intent(&none).unwrap_err().contains("route"));
+        let mut with_gateway = ok;
+        with_gateway.routes[0].via = Some("10.0.0.1".parse().unwrap());
+        assert!(static_intent(&with_gateway)
+            .unwrap_err()
+            .contains("gateway"));
+    }
+
+    #[test]
+    fn the_state_of_a_static_profile_follows_its_intent() {
+        use crate::models::TunnelState;
+        let mut view = view(
+            &intent(&["192.0.2.0/24"], via("en7")),
+            &Derivation::Routes {
+                routes: vec![wanted_if("192.0.2.0/24", "en7")],
+                skipped: vec![],
+            },
+            &[RouteState::Present],
+        );
+        assert_eq!(static_state(None), (TunnelState::Stopped, None));
+        assert_eq!(static_state(Some(&view)).0, TunnelState::Running);
+        view.status = ExplainStatus::Deferred;
+        view.detail = "interface en7 is absent".into();
+        assert_eq!(
+            static_state(Some(&view)),
+            (TunnelState::Running, Some("interface en7 is absent".into()))
+        );
+        view.status = ExplainStatus::Missing;
+        assert_eq!(static_state(Some(&view)).0, TunnelState::Running);
+        view.status = ExplainStatus::Conflicted;
+        view.detail = "another route to 192.0.2.0/24 via en0 is in place".into();
+        assert_eq!(static_state(Some(&view)).0, TunnelState::Failed);
+        view.status = ExplainStatus::Disabled;
+        assert_eq!(static_state(Some(&view)), (TunnelState::Stopped, None));
     }
 }

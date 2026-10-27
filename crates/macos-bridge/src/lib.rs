@@ -1848,14 +1848,19 @@ mod tests {
         import_link(dir.path(), "rt");
         let error = dispatch(dir.path(), "connect", &json!({"id":"rt"})).unwrap_err();
         assert_eq!(error, "Install Xray to start this connection");
+        // A static-route profile on an interface this machine does not have:
+        // refused before the helper is asked, so the test never touches routes.
         dispatch(
             dir.path(),
             "create_static",
-            &json!({"id":"st", "name":"Static", "interfaceName":"en0", "cidrs":"192.0.2.0/24"}),
+            &json!({"id":"st", "name":"Static", "interfaceName":"en97", "cidrs":"192.0.2.0/24"}),
         )
         .unwrap();
         let error = dispatch(dir.path(), "connect", &json!({"id":"st"})).unwrap_err();
-        assert!(error.contains("privileged helper"), "{error}");
+        assert!(
+            error.contains("en97") && error.contains("not present"),
+            "{error}"
+        );
     }
 
     #[test]

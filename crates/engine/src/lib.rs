@@ -20,6 +20,8 @@ pub mod privileged;
 mod recovery;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod static_routes;
 #[cfg(unix)]
 pub mod tailscale;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

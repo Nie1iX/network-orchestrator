@@ -5,6 +5,7 @@
 //! crate only asks.
 use crate::privileged::Privileged;
 use crate::recovery;
+use crate::static_routes;
 use crate::tailscale::{self, Tailscale};
 use crate::vpn_backends;
 use crate::{helper_error, helper_socket};
@@ -217,7 +218,10 @@ fn tun_status(client: &dyn Privileged, profile: &Profile) -> TunnelStatus {
 
 /// Whether the privileged side, not this process, runs the profile.
 fn is_remote(profile: &Profile) -> bool {
-    is_tun(profile) || vpn_backends::is_wireguard(profile) || vpn_backends::is_openvpn(profile)
+    is_tun(profile)
+        || vpn_backends::is_wireguard(profile)
+        || vpn_backends::is_openvpn(profile)
+        || static_routes::is_static(profile)
 }
 
 /// State of a profile the privileged side runs; `None` for loopback Xray,
@@ -229,6 +233,8 @@ fn remote_status(privileged: &dyn Privileged, profile: &Profile) -> Option<Tunne
         Some(vpn_backends::wireguard_status(privileged, profile))
     } else if vpn_backends::is_openvpn(profile) {
         Some(vpn_backends::openvpn_status(privileged, profile))
+    } else if static_routes::is_static(profile) {
+        Some(static_routes::status(privileged, profile))
     } else {
         None
     }
@@ -248,6 +254,9 @@ fn running(session: &mut Session, privileged: &dyn Privileged, profile: &Profile
 
 /// Stop a profile the privileged side runs.
 fn stop_remote(privileged: &dyn Privileged, profile: &Profile) -> Result<(), String> {
+    if static_routes::is_static(profile) {
+        return static_routes::stop(privileged, profile);
+    }
     if vpn_backends::is_wireguard(profile) || vpn_backends::is_openvpn(profile) {
         return vpn_backends::stop(privileged, profile, helper_error);
     }
@@ -555,6 +564,8 @@ impl Engine {
             }
             let started = if is_tun(&profile) {
                 start_tun(self, &profile)
+            } else if static_routes::is_static(&profile) {
+                static_routes::start(privileged, &profile)
             } else if vpn_backends::is_wireguard(&profile) {
                 vpn_backends::start_wireguard(root, privileged, &profile)
             } else {

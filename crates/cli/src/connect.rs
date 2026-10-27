@@ -210,9 +210,6 @@ pub fn up(ctx: &Ctx, args: UpArgs) -> Result<(), String> {
     }
     apply_settings(ctx, &profile, &args)?;
     let profile = ctx.find(&profile.id)?;
-    if profile.backend == TunnelBackend::None {
-        return Err("Static routes cannot be connected from the command line yet".into());
-    }
     if args.system_proxy && !runs_locally(&profile) {
         return Err("--system-proxy applies to the local proxy (Xray --mode socks)".into());
     }
