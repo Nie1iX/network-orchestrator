@@ -30,6 +30,7 @@ pub mod profile_import;
 pub mod profiles;
 pub mod recovery;
 pub mod route_check;
+pub mod route_conditions;
 pub mod route_intents;
 pub mod route_plan;
 pub mod route_state;

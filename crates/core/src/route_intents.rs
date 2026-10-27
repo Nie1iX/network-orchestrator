@@ -55,13 +55,9 @@ fn valid_interface(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric())
 }
 
-fn parse_destination(text: &str) -> Result<IpNet, String> {
-    let text = text.trim();
-    let net = text
-        .parse::<IpNet>()
-        .or_else(|_| text.parse::<IpAddr>().map(IpNet::from))
-        .map_err(|_| format!("'{text}' is not an address or network"))?
-        .trunc();
+/// A destination no intent or rule may route: loopback, multicast, link-local
+/// and a single unspecified host.
+pub fn check_routable(net: &IpNet, text: &str) -> Result<(), String> {
     let address = net.network();
     let host = net.prefix_len() == net.max_prefix_len();
     let link_local = match address {
@@ -75,6 +71,17 @@ fn parse_destination(text: &str) -> Result<IpNet, String> {
     {
         return Err(format!("'{text}' cannot be routed by an intent"));
     }
+    Ok(())
+}
+
+fn parse_destination(text: &str) -> Result<IpNet, String> {
+    let text = text.trim();
+    let net = text
+        .parse::<IpNet>()
+        .or_else(|_| text.parse::<IpAddr>().map(IpNet::from))
+        .map_err(|_| format!("'{text}' is not an address or network"))?
+        .trunc();
+    check_routable(&net, text)?;
     Ok(net)
 }
 
@@ -125,11 +132,21 @@ pub struct Uplink {
     pub gateway: Option<IpAddr>,
 }
 
+/// One address assigned to a local interface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IfaceAddr {
+    pub if_index: u32,
+    pub interface: String,
+    pub address: IpNet,
+}
+
 /// What the helper sees of the network when it reconciles.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkView {
     pub uplink: Option<Uplink>,
     pub interfaces: Vec<String>,
+    /// Addresses on those interfaces, for conditional rules.
+    pub addresses: Vec<IfaceAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +371,7 @@ mod tests {
         NetworkView {
             uplink: Some(uplink()),
             interfaces: interfaces.iter().map(ToString::to_string).collect(),
+            addresses: Vec::new(),
         }
     }
 

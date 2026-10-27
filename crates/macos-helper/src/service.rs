@@ -658,6 +658,7 @@ mod tests {
             net_manager_core::route_intents::NetworkView {
                 uplink: None,
                 interfaces: vec!["utun5".into()],
+                addresses: Vec::new(),
             }
         }
         fn routes(&self) -> Vec<net_manager_core::models::RouteEntry> {

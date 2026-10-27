@@ -411,7 +411,27 @@ impl NetworkProbe for SystemProbe {
             .run(crate::sysexec::IFCONFIG, &["-l".to_string()])
             .map(|list| list.split_whitespace().map(String::from).collect())
             .unwrap_or_default();
-        NetworkView { uplink, interfaces }
+        // Addresses for conditional rules, as the app's own interface list
+        // reads them.
+        let addresses = net_manager_core::explorer::list_interfaces()
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|interface| {
+                let (if_index, name) = (interface.if_index, interface.name);
+                interface.addresses.into_iter().filter_map(move |a| {
+                    Some(net_manager_core::route_intents::IfaceAddr {
+                        if_index,
+                        interface: name.clone(),
+                        address: IpNet::new(a.address, a.prefix_len).ok()?,
+                    })
+                })
+            })
+            .collect();
+        NetworkView {
+            uplink,
+            interfaces,
+            addresses,
+        }
     }
 
     fn routes(&self) -> Vec<RouteEntry> {
@@ -448,6 +468,7 @@ mod tests {
                     gateway: Some("192.168.1.1".parse().unwrap()),
                 }),
                 interfaces: interfaces.iter().map(ToString::to_string).collect(),
+                addresses: Vec::new(),
             };
             world
         }
