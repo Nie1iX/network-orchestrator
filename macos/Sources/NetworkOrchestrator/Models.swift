@@ -479,6 +479,104 @@ struct RouteIntent: Decodable, Identifiable, Sendable {
     }
   }
 }
+/// Whether a conditional rule currently holds. A state a newer helper adds
+/// reads as `unknown`.
+enum RuleState: String, Decodable, Sendable {
+  case active, inactive, disabled, error, unknown
+  init(from decoder: Decoder) throws {
+    let text = try decoder.singleValueContainer().decode(String.self)
+    self = RuleState(rawValue: text) ?? .unknown
+  }
+  var badgeColor: String {
+    switch self {
+    case .active: "up"
+    case .error: "down"
+    case .inactive, .disabled, .unknown: "unknown"
+    }
+  }
+  /// Catalogue keys shared with the web client.
+  var label: String {
+    switch self {
+    case .active: "cond.stateActive"
+    case .inactive: "cond.stateInactive"
+    case .disabled: "cond.stateDisabled"
+    case .error, .unknown: "cond.stateError"
+    }
+  }
+  var hint: String {
+    switch self {
+    case .active: "cond.hintActive"
+    case .inactive: "cond.hintInactive"
+    case .disabled: "cond.hintDisabled"
+    case .error, .unknown: "cond.hintError"
+    }
+  }
+}
+struct RuleStatus: Decodable, Sendable {
+  let state: RuleState
+  let matchedInterface: String?
+  let appliedRoutes: Int
+  let detail: String?
+}
+struct RuleRoute: Decodable, Sendable {
+  let destination: String
+  let metric: UInt32
+  let via: String?
+  /// As the form takes it: `10.99.0.0/24` or `10.99.0.0/24 via 10.1.1.1`.
+  var text: String { via.map { "\(destination) via \($0)" } ?? destination }
+}
+/// A route set that exists only while a condition holds.
+struct ConditionalRule: Decodable, Sendable {
+  struct Condition: Decodable, Sendable {
+    let kind: String
+    let prefix: String
+  }
+  let id: String
+  let name: String
+  let enabled: Bool
+  let condition: Condition
+  let routes: [RuleRoute]
+  var prefix: String { condition.prefix }
+}
+struct ConditionalRuleEntry: Decodable, Identifiable, Sendable {
+  let rule: ConditionalRule
+  let status: RuleStatus
+  var id: String { rule.id }
+}
+/// The add/edit form for a conditional rule.
+struct RuleDraft: Equatable {
+  var id = ""
+  var name = ""
+  var prefix = ""
+  /// One route per line: `network` or `network via gateway`.
+  var routes = ""
+  var enabled = true
+  var editing = false
+  init() {}
+  init(editing entry: ConditionalRuleEntry) {
+    id = entry.rule.id
+    name = entry.rule.name
+    prefix = entry.rule.prefix
+    routes = entry.rule.routes.map(\.text).joined(separator: "\n")
+    enabled = entry.rule.enabled
+    editing = true
+  }
+  var isComplete: Bool {
+    !id.trimmingCharacters(in: .whitespaces).isEmpty
+      && !name.trimmingCharacters(in: .whitespaces).isEmpty
+      && !prefix.trimmingCharacters(in: .whitespaces).isEmpty
+      && !routes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+  var arguments: [String: String] {
+    [
+      "id": id.trimmingCharacters(in: .whitespaces),
+      "name": name.trimmingCharacters(in: .whitespaces),
+      "prefix": prefix.trimmingCharacters(in: .whitespaces),
+      "routes": routes,
+      "enabled": enabled ? "true" : "false",
+    ]
+  }
+}
 /// The add/edit form for an intent.
 struct IntentDraft: Equatable {
   var id = ""

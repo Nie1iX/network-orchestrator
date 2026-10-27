@@ -823,6 +823,44 @@ import SystemConfiguration
   var canUseIntents: Bool {
     ["net.intent.list", "net.intent.set", "net.intent.del"].allSatisfy(helperOffers)
   }
+  /// The helper offers all of `condRules.*`.
+  var canUseRules: Bool {
+    ["condRules.list", "condRules.put", "condRules.remove"].allSatisfy(helperOffers)
+  }
+  var rules: [ConditionalRuleEntry] = []
+  func loadRules() async {
+    guard canUseRules else {
+      rules = []
+      return
+    }
+    do {
+      rules = try await core.callConcurrently("cond_rules")
+    } catch { self.error = error.localizedDescription }
+  }
+  /// Adds or replaces a rule; the helper evaluates it at once.
+  func saveRule(_ draft: RuleDraft) async -> Bool {
+    do {
+      let _: RuleStatus = try await core.call("put_cond_rule", args: draft.arguments)
+      record(.info, "Saved conditional rule \(draft.id.trimmingCharacters(in: .whitespaces))")
+      await loadRules()
+      return true
+    } catch {
+      self.error = error.localizedDescription
+      return false
+    }
+  }
+  func deleteRule(_ entry: ConditionalRuleEntry) async {
+    do {
+      let _: [String: Bool] = try await core.call("delete_cond_rule", args: ["id": entry.id])
+      record(.info, "Deleted conditional rule \(entry.id)")
+      await loadRules()
+    } catch { self.error = error.localizedDescription }
+  }
+  func setRuleEnabled(_ entry: ConditionalRuleEntry, enabled: Bool) async {
+    var draft = RuleDraft(editing: entry)
+    draft.enabled = enabled
+    _ = await saveRule(draft)
+  }
   var intents: [RouteIntent] = []
   /// Reads the intents from the helper; none (and no error) without it.
   func loadIntents() async {

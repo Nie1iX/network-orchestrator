@@ -794,6 +794,8 @@
     "native.intents.needsHelper": "Routing intents need the privileged helper. Install or update it in Settings.",
     "native.intents.captureDefault": "This sends all internet traffic through the chosen path. Delete the intent to undo it.",
     "native.intents.interface": "Interface",
+    "native.rules.needsHelper": "Conditional rules need the privileged helper. Install or update it in Settings.",
+    "native.rules.routesHint": "One route per line: a network, or a network followed by \"via\" and a gateway.",
     "native.ms": "{ms} ms",
     "native.open": "Open",
     "native.openBrowser": "Open browser via connection",
