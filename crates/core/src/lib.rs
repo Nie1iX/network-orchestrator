@@ -14,6 +14,7 @@ pub mod geo_list;
 pub mod happ_routing;
 #[cfg(unix)]
 pub mod helper_client;
+pub mod intent_doctor;
 pub mod journal;
 pub mod log_sanitize;
 #[cfg(target_os = "macos")]
