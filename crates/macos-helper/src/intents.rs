@@ -14,11 +14,16 @@ use crate::routes::{RouteOp, Target};
 use crate::sysexec::Runner;
 use crate::xray::Error;
 use ipnet::IpNet;
-use net_manager_core::daemon_protocol::{NetIntentResult, NetIntentSetParams, NetIntentView};
+use net_manager_core::daemon_protocol::{
+    CondRulesPutResult, CondRulesRemoveResult, ConditionalRouteRule, ConditionalRuleEntry,
+    NetIntentResult, NetIntentSetParams, NetIntentView,
+};
 use net_manager_core::models::RouteEntry;
+use net_manager_core::route_conditions::{
+    condition_match, derive_rule, rule_status, validate_rule, MAX_RULES,
+};
 use net_manager_core::route_intents::{
-    derive, judge, normalize, view, Derivation, Intent, NetworkView, RouteState, RouteTarget,
-    WantedRoute,
+    derive, judge, normalize, view, Derivation, NetworkView, RouteState, RouteTarget, WantedRoute,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -51,15 +56,28 @@ struct Stored {
     installed: Vec<RouteOp>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredRule {
+    uid: u32,
+    rule: ConditionalRouteRule,
+    #[serde(default)]
+    installed: Vec<RouteOp>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Document {
     version: u32,
     intents: Vec<Stored>,
+    /// Absent in a store written before conditional rules existed.
+    #[serde(default)]
+    conditions: Vec<StoredRule>,
 }
 
 struct State {
     intents: Vec<Stored>,
+    rules: Vec<StoredRule>,
     last_view: Option<NetworkView>,
     last_full: Option<Instant>,
 }
@@ -110,13 +128,13 @@ impl IntentExecutor {
         probe: Box<dyn NetworkProbe>,
         path: PathBuf,
     ) -> io::Result<Self> {
-        let intents = match fs::read(&path) {
+        let (intents, rules) = match fs::read(&path) {
             Ok(bytes) => {
                 let document: Document = serde_json::from_slice(&bytes)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "corrupt intents"))?;
-                document.intents
+                (document.intents, document.conditions)
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (Vec::new(), Vec::new()),
             Err(error) => return Err(error),
         };
         Ok(Self {
@@ -125,6 +143,7 @@ impl IntentExecutor {
             path,
             state: Mutex::new(State {
                 intents,
+                rules,
                 last_view: None,
                 last_full: None,
             }),
@@ -144,6 +163,7 @@ impl IntentExecutor {
         let document = Document {
             version: DOCUMENT_VERSION,
             intents: state.intents.clone(),
+            conditions: state.rules.clone(),
         };
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -176,7 +196,12 @@ impl IntentExecutor {
             .enumerate()
             .filter(|(index, _)| Some(*index) != position)
             .map(|(_, s)| s.params.destinations.len())
-            .sum();
+            .sum::<usize>()
+            + state
+                .rules
+                .iter()
+                .map(|r| r.rule.routes.len())
+                .sum::<usize>();
         if others + intent.destinations.len() > MAX_DESTINATIONS_TOTAL {
             return Err(Error::Conflict(format!(
                 "All intents together can route at most {MAX_DESTINATIONS_TOTAL} networks"
@@ -247,9 +272,122 @@ impl IntentExecutor {
             .collect()
     }
 
+    // ---- conditional rules ----------------------------------------------
+
+    fn rule_entry(
+        &self,
+        stored: &StoredRule,
+        network: &NetworkView,
+        table: &[RouteEntry],
+    ) -> ConditionalRuleEntry {
+        let derivation = derive_rule(&stored.rule, network);
+        let states = self.judge_all(&derivation, &stored.installed, table);
+        let matched = condition_match(&stored.rule, network);
+        ConditionalRuleEntry {
+            rule: stored.rule.clone(),
+            status: rule_status(&stored.rule, &derivation, &states, matched.as_deref()),
+        }
+    }
+
+    /// Adds or replaces the caller's rule and evaluates it at once.
+    pub fn put_rule(
+        &self,
+        uid: u32,
+        rule: ConditionalRouteRule,
+    ) -> Result<CondRulesPutResult, Error> {
+        validate_rule(&rule).map_err(invalid)?;
+        let mut state = self.lock();
+        let position = state
+            .rules
+            .iter()
+            .position(|r| r.uid == uid && r.rule.id == rule.id);
+        let mine = state.rules.iter().filter(|r| r.uid == uid).count();
+        if position.is_none() && mine >= MAX_RULES {
+            return Err(Error::Conflict(format!(
+                "There can be at most {MAX_RULES} conditional rules"
+            )));
+        }
+        let others: usize = state
+            .intents
+            .iter()
+            .map(|s| s.params.destinations.len())
+            .sum::<usize>()
+            + state
+                .rules
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| Some(*index) != position)
+                .map(|(_, r)| r.rule.routes.len())
+                .sum::<usize>();
+        if others + rule.routes.len() > MAX_DESTINATIONS_TOTAL {
+            return Err(Error::Conflict(format!(
+                "All intents and rules together can route at most {MAX_DESTINATIONS_TOTAL} networks"
+            )));
+        }
+        let installed = position
+            .map(|index| state.rules[index].installed.clone())
+            .unwrap_or_default();
+        let id = rule.id.clone();
+        let stored = StoredRule {
+            uid,
+            rule,
+            installed,
+        };
+        match position {
+            Some(index) => state.rules[index] = stored,
+            None => state.rules.push(stored),
+        }
+        self.reconcile_locked(&mut state);
+        self.save(&state)
+            .map_err(|_| Error::Unavailable("The rules could not be saved".into()))?;
+        let network = self.probe.view();
+        let table = self.probe.routes();
+        let entry = state
+            .rules
+            .iter()
+            .find(|r| r.uid == uid && r.rule.id == id)
+            .map(|stored| self.rule_entry(stored, &network, &table))
+            .expect("just stored");
+        Ok(CondRulesPutResult {
+            stored: true,
+            status: entry.status,
+        })
+    }
+
+    /// Removes the caller's rule and the routes it installed.
+    pub fn remove_rule(&self, uid: u32, id: &str) -> CondRulesRemoveResult {
+        let mut state = self.lock();
+        let Some(index) = state
+            .rules
+            .iter()
+            .position(|r| r.uid == uid && r.rule.id == id)
+        else {
+            return CondRulesRemoveResult { removed: false };
+        };
+        let table = self.probe.routes();
+        let removed = state.rules.remove(index);
+        self.withdraw(&removed.installed, &table);
+        let _ = self.save(&state);
+        CondRulesRemoveResult { removed: true }
+    }
+
+    /// The caller's rules with their live status. Changes nothing.
+    pub fn list_rules(&self, uid: u32) -> Vec<ConditionalRuleEntry> {
+        let state = self.lock();
+        let network = self.probe.view();
+        let table = self.probe.routes();
+        state
+            .rules
+            .iter()
+            .filter(|r| r.uid == uid)
+            .map(|stored| self.rule_entry(stored, &network, &table))
+            .collect()
+    }
+
     /// Whether any intent is stored (the background tick does nothing else).
     pub fn is_empty(&self) -> bool {
-        self.lock().intents.is_empty()
+        let state = self.lock();
+        state.intents.is_empty() && state.rules.is_empty()
     }
 
     /// Brings the system in line with every intent, regardless of caller.
@@ -263,7 +401,7 @@ impl IntentExecutor {
     /// full comparison when the network changed or every [`FULL_CHECK`].
     pub fn tick(&self) {
         let mut state = self.lock();
-        if state.intents.is_empty() {
+        if state.intents.is_empty() && state.rules.is_empty() {
             return;
         }
         let view = self.probe.view();
@@ -282,11 +420,17 @@ impl IntentExecutor {
     pub fn shutdown(&self) {
         let mut state = self.lock();
         let table = self.probe.routes();
-        let installed: Vec<RouteOp> = state
+        let mut installed: Vec<RouteOp> = state
             .intents
             .iter_mut()
             .flat_map(|s| std::mem::take(&mut s.installed))
             .collect();
+        installed.extend(
+            state
+                .rules
+                .iter_mut()
+                .flat_map(|r| std::mem::take(&mut r.installed)),
+        );
         self.withdraw(&installed, &table);
         let _ = self.save(&state);
     }
@@ -328,9 +472,16 @@ impl IntentExecutor {
             let Ok(intent) = normalize(&stored.params) else {
                 continue;
             };
+            let derivation = derive(&intent, &network);
             // What the previous steps changed must be visible to the next
             // comparison, or a route we just removed looks like a rival.
-            if self.reconcile_one(&intent, stored, &network, &table) {
+            if self.apply(&mut stored.installed, &derivation, &table) {
+                table = self.probe.routes();
+            }
+        }
+        for stored in &mut state.rules {
+            let derivation = derive_rule(&stored.rule, &network);
+            if self.apply(&mut stored.installed, &derivation, &table) {
                 table = self.probe.routes();
             }
         }
@@ -338,27 +489,26 @@ impl IntentExecutor {
         state.last_full = Some(Instant::now());
     }
 
-    /// Returns whether it ran a route command.
-    fn reconcile_one(
+    /// Makes `installed` match what `derivation` wants: removes routes no
+    /// longer wanted, adds missing ones, forgets (never deletes) routes
+    /// someone else now holds. Returns whether it ran a route command.
+    fn apply(
         &self,
-        intent: &Intent,
-        stored: &mut Stored,
-        network: &NetworkView,
+        installed: &mut Vec<RouteOp>,
+        derivation: &Derivation,
         table: &[RouteEntry],
     ) -> bool {
-        let wanted = match derive(intent, network) {
-            Derivation::Routes { routes, .. } => routes,
-            _ => Vec::new(),
+        let wanted = match derivation {
+            Derivation::Routes { routes, .. } => routes.as_slice(),
+            _ => &[],
         };
         let wanted_ops: Vec<RouteOp> = wanted.iter().map(op_of).collect();
-        // Routes no longer wanted (path changed, intent off, device gone).
-        let (keep, stale): (Vec<RouteOp>, Vec<RouteOp>) = stored
-            .installed
-            .drain(..)
-            .partition(|op| wanted_ops.contains(op));
+        // Routes no longer wanted (path changed, switched off, device gone).
+        let (keep, stale): (Vec<RouteOp>, Vec<RouteOp>) =
+            installed.drain(..).partition(|op| wanted_ops.contains(op));
         let mut changed = !stale.is_empty();
         self.withdraw(&stale, table);
-        stored.installed = keep;
+        *installed = keep;
         let fresh;
         let table = if changed {
             fresh = self.probe.routes();
@@ -367,18 +517,16 @@ impl IntentExecutor {
             table
         };
         for (route, op) in wanted.iter().zip(&wanted_ops) {
-            let ours = stored.installed.contains(op);
+            let ours = installed.contains(op);
             match judge(route, ours, table) {
                 RouteState::Present => {}
                 RouteState::Missing => {
                     changed = true;
                     if op.add(&*self.runner).is_ok() && !ours {
-                        stored.installed.push(op.clone());
+                        installed.push(op.clone());
                     }
                 }
-                // Someone else holds the destination now: forget our claim
-                // without deleting what is there.
-                RouteState::Conflicted(_) => stored.installed.retain(|installed| installed != op),
+                RouteState::Conflicted(_) => installed.retain(|existing| existing != op),
             }
         }
         changed
@@ -444,7 +592,11 @@ impl NetworkProbe for SystemProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use net_manager_core::daemon_protocol::{ExplainStatus, NetIntentPath};
+    use net_manager_core::daemon_protocol::{
+        ConditionalRouteRule, ConditionalRuleState, ExplainStatus, NetIntentPath, RouteCondition,
+    };
+    use net_manager_core::models::PolicyRoute;
+    use net_manager_core::route_conditions::MAX_RULES;
     use net_manager_core::route_intents::{Uplink, MAX_DESTINATIONS};
     use std::net::IpAddr;
     use std::sync::Arc;
@@ -917,6 +1069,245 @@ mod tests {
             )
             .unwrap();
         let _ = std::thread::spawn(move || probe.routes()).join().unwrap();
+    }
+
+    // ---- conditional rules ----------------------------------------------
+
+    fn office_rule(id: &str, prefix: &str, destination: &str) -> ConditionalRouteRule {
+        ConditionalRouteRule {
+            id: id.into(),
+            name: "Office LAN direct".into(),
+            enabled: true,
+            condition: RouteCondition::InterfaceAddressIn {
+                prefix: prefix.parse().unwrap(),
+            },
+            routes: vec![PolicyRoute {
+                destination: destination.parse().unwrap(),
+                metric: 5,
+                via: None,
+            }],
+        }
+    }
+
+    fn on_lan(world: &Arc<World>, cidr: &str) {
+        let mut view = world.view.lock().unwrap();
+        view.addresses = vec![net_manager_core::route_intents::IfaceAddr {
+            if_index: 15,
+            interface: "en7".into(),
+            address: cidr.parse().unwrap(),
+        }];
+        if !view.interfaces.iter().any(|i| i == "en7") {
+            view.interfaces.push("en7".into());
+        }
+    }
+
+    fn off_lan(world: &Arc<World>) {
+        world.view.lock().unwrap().addresses.clear();
+    }
+
+    #[test]
+    fn a_rule_installs_its_routes_while_the_condition_holds_and_withdraws_them_after() {
+        let world = World::new(&["en0"]);
+        let dir = tempfile::tempdir().unwrap();
+        let exec = executor(&world, &dir);
+        let status = exec
+            .put_rule(ME, office_rule("office", "10.228.32.0/21", "10.99.0.0/24"))
+            .unwrap();
+        assert_eq!(status.status.state, ConditionalRuleState::Inactive);
+        assert!(world.routes().is_empty());
+        on_lan(&world, "10.228.33.7/21");
+        exec.tick();
+        assert_eq!(world.routes(), [("10.99.0.0/24".into(), "en7".into())]);
+        let list = exec.list_rules(ME);
+        assert_eq!(list[0].status.state, ConditionalRuleState::Active);
+        assert_eq!(list[0].status.matched_interface.as_deref(), Some("en7"));
+        assert_eq!(list[0].status.applied_routes, 1);
+        off_lan(&world);
+        exec.tick();
+        assert!(world.routes().is_empty(), "left the office: the routes go");
+        assert_eq!(
+            exec.list_rules(ME)[0].status.state,
+            ConditionalRuleState::Inactive
+        );
+    }
+
+    #[test]
+    fn a_rule_that_holds_when_it_is_saved_applies_at_once() {
+        let world = World::new(&["en0"]);
+        on_lan(&world, "10.228.33.7/21");
+        let dir = tempfile::tempdir().unwrap();
+        let exec = executor(&world, &dir);
+        let put = exec
+            .put_rule(ME, office_rule("office", "10.228.32.0/21", "10.99.0.0/24"))
+            .unwrap();
+        assert!(put.stored);
+        assert_eq!(put.status.state, ConditionalRuleState::Active);
+        assert_eq!(world.routes(), [("10.99.0.0/24".into(), "en7".into())]);
+    }
+
+    #[test]
+    fn switching_a_rule_off_or_removing_it_withdraws_what_it_installed() {
+        let world = World::new(&["en0"]);
+        on_lan(&world, "10.228.33.7/21");
+        let dir = tempfile::tempdir().unwrap();
+        let exec = executor(&world, &dir);
+        exec.put_rule(ME, office_rule("office", "10.228.32.0/21", "10.99.0.0/24"))
+            .unwrap();
+        let mut off = office_rule("office", "10.228.32.0/21", "10.99.0.0/24");
+        off.enabled = false;
+        let status = exec.put_rule(ME, off).unwrap().status;
+        assert_eq!(status.state, ConditionalRuleState::Disabled);
+        assert!(world.routes().is_empty());
+        exec.put_rule(ME, office_rule("office", "10.228.32.0/21", "10.99.0.0/24"))
+            .unwrap();
+        assert_eq!(world.routes().len(), 1);
+        assert!(exec.remove_rule(ME, "office").removed);
+        assert!(world.routes().is_empty());
+        assert!(!exec.remove_rule(ME, "office").removed);
+    }
+
+    #[test]
+    fn rules_are_per_user_and_coexist_with_intents() {
+        let world = World::new(&["en0", "utun5"]);
+        on_lan(&world, "10.228.33.7/21");
+        let dir = tempfile::tempdir().unwrap();
+        let exec = executor(&world, &dir);
+        exec.set(ME, params("tunnel", &["172.16.0.0/12"], via("utun5")))
+            .unwrap();
+        exec.put_rule(501, office_rule("office", "10.228.32.0/21", "10.99.0.0/24"))
+            .unwrap();
+        exec.put_rule(502, office_rule("office", "10.228.32.0/21", "10.98.0.0/24"))
+            .unwrap();
+        assert_eq!(exec.list_rules(501).len(), 1);
+        assert_eq!(
+            exec.list_rules(501)[0].rule.routes[0]
+                .destination
+                .to_string(),
+            "10.99.0.0/24"
+        );
+        assert!(!exec.remove_rule(503, "office").removed);
+        assert!(exec.remove_rule(501, "office").removed);
+        assert_eq!(exec.list_rules(502).len(), 1);
+        assert_eq!(exec.list(501).len(), 1, "the intent is untouched");
+        assert!(world
+            .routes()
+            .contains(&("172.16.0.0/12".into(), "utun5".into())));
+    }
+
+    #[test]
+    fn a_foreign_route_to_a_rules_destination_is_left_alone() {
+        let world = World::new(&["en0"]);
+        on_lan(&world, "10.228.33.7/21");
+        world.foreign("10.99.0.0", 24, "en0");
+        let dir = tempfile::tempdir().unwrap();
+        let exec = executor(&world, &dir);
+        let status = exec
+            .put_rule(ME, office_rule("office", "10.228.32.0/21", "10.99.0.0/24"))
+            .unwrap()
+            .status;
+        assert_eq!(status.state, ConditionalRuleState::Error);
+        assert!(status.detail.unwrap().contains("10.99.0.0/24"));
+        assert_eq!(world.routes(), [("10.99.0.0/24".into(), "en0".into())]);
+        exec.remove_rule(ME, "office");
+        assert_eq!(world.routes().len(), 1, "never deleted");
+    }
+
+    #[test]
+    fn rules_survive_a_restart_and_follow_the_network_afterwards() {
+        let world = World::new(&["en0"]);
+        on_lan(&world, "10.228.33.7/21");
+        let dir = tempfile::tempdir().unwrap();
+        executor(&world, &dir)
+            .put_rule(ME, office_rule("office", "10.228.32.0/21", "10.99.0.0/24"))
+            .unwrap();
+        let again = executor(&world, &dir);
+        assert_eq!(
+            again.list_rules(ME)[0].status.state,
+            ConditionalRuleState::Active
+        );
+        off_lan(&world);
+        again.reconcile();
+        assert!(world.routes().is_empty());
+    }
+
+    #[test]
+    fn bad_rules_and_the_limits_are_refused_before_anything_changes() {
+        let world = World::new(&["en0"]);
+        on_lan(&world, "10.228.33.7/21");
+        let dir = tempfile::tempdir().unwrap();
+        let exec = executor(&world, &dir);
+        for bad in [
+            office_rule("-bad", "10.228.32.0/21", "10.99.0.0/24"),
+            office_rule("ok", "10.228.32.5/21", "10.99.0.0/24"),
+            office_rule("ok", "10.228.32.0/21", "127.0.0.0/8"),
+        ] {
+            assert!(matches!(exec.put_rule(ME, bad), Err(Error::Invalid(_))));
+        }
+        for n in 0..MAX_RULES {
+            exec.put_rule(
+                ME,
+                office_rule(&format!("r{n}"), "172.30.0.0/16", "10.99.0.0/24"),
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            exec.put_rule(
+                ME,
+                office_rule("one-too-many", "172.30.0.0/16", "10.99.0.0/24")
+            ),
+            Err(Error::Conflict(_))
+        ));
+        exec.put_rule(ME, office_rule("r0", "172.30.0.0/16", "10.98.0.0/24"))
+            .unwrap();
+        assert!(world.routes().is_empty());
+    }
+
+    #[test]
+    fn shutdown_withdraws_rule_routes_and_keeps_the_rules() {
+        let world = World::new(&["en0"]);
+        on_lan(&world, "10.228.33.7/21");
+        let dir = tempfile::tempdir().unwrap();
+        let exec = executor(&world, &dir);
+        exec.put_rule(ME, office_rule("office", "10.228.32.0/21", "10.99.0.0/24"))
+            .unwrap();
+        exec.shutdown();
+        assert!(world.routes().is_empty());
+        let next = executor(&world, &dir);
+        next.reconcile();
+        assert_eq!(world.routes().len(), 1);
+    }
+
+    #[test]
+    fn an_address_change_alone_triggers_the_evaluation() {
+        let world = World::new(&["en0"]);
+        let dir = tempfile::tempdir().unwrap();
+        let exec = executor(&world, &dir);
+        exec.put_rule(ME, office_rule("office", "10.228.32.0/21", "10.99.0.0/24"))
+            .unwrap();
+        exec.tick(); // nothing changed since the put
+        let before = world.commands().len();
+        on_lan(&world, "10.228.33.7/21");
+        exec.tick();
+        assert!(
+            world.commands().len() > before,
+            "the new address must be noticed"
+        );
+    }
+
+    #[test]
+    fn a_store_written_before_rules_existed_still_loads() {
+        let world = World::new(&["en0", "utun5"]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("intents.json"),
+            br#"{"version":1,"intents":[{"uid":501,"params":{"id":"old","destinations":["10.0.0.0/8"],"path":{"kind":"interface","interface":"utun5"},"metric":100,"enabled":true},"installed":[]}]}"#,
+        )
+        .unwrap();
+        let exec = executor(&world, &dir);
+        assert_eq!(exec.list(ME)[0].id, "old");
+        assert!(exec.list_rules(ME).is_empty());
+        exec.reconcile();
+        assert_eq!(world.routes(), [("10.0.0.0/8".into(), "utun5".into())]);
     }
 
     #[test]

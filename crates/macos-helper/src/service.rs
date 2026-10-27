@@ -12,12 +12,12 @@ use crate::tailscale::{self, TailscaleGuard};
 use crate::wireguard::WireGuardExecutor;
 use crate::xray::{Error, XrayExecutor};
 use net_manager_core::daemon_protocol::{
-    from_value, method, CleanupResult, ErrorCode, LinkSetStateParams, NetIntentDelParams,
-    NetIntentListResult, NetIntentSetParams, OpenVpnConnectRequest, OpenVpnProcessResource,
-    OpenVpnProfileParams, OwnedEntry, OwnedListResult, OwnedResource, OwnedState, RequestFrame,
-    ResponseFrame, TailscaleProtectParams, TailscaleReleaseResult, WireGuardConnectParams,
-    WireGuardLinkResource, WireGuardProfileParams, XrayConnectParams, XrayProcessResource,
-    XrayProfileParams,
+    from_value, method, CleanupResult, CondRulesListResult, CondRulesPutParams,
+    CondRulesRemoveParams, ErrorCode, LinkSetStateParams, NetIntentDelParams, NetIntentListResult,
+    NetIntentSetParams, OpenVpnConnectRequest, OpenVpnProcessResource, OpenVpnProfileParams,
+    OwnedEntry, OwnedListResult, OwnedResource, OwnedState, RequestFrame, ResponseFrame,
+    TailscaleProtectParams, TailscaleReleaseResult, WireGuardConnectParams, WireGuardLinkResource,
+    WireGuardProfileParams, XrayConnectParams, XrayProcessResource, XrayProfileParams,
 };
 use net_manager_core::models::TunnelRole;
 use serde::{de::DeserializeOwned, Serialize};
@@ -235,6 +235,9 @@ impl Handler for HelperService {
                 method::NET_INTENT_LIST,
                 method::NET_INTENT_SET,
                 method::NET_INTENT_DEL,
+                method::COND_RULES_LIST,
+                method::COND_RULES_PUT,
+                method::COND_RULES_REMOVE,
             ]
         }))
         .map(|name| name.to_string())
@@ -301,6 +304,27 @@ impl Handler for HelperService {
                 call(request, |params: NetIntentSetParams| {
                     let executor = self.intents.as_deref().expect("checked by the arm guard");
                     executor.set(uid, params)
+                })
+            }
+            method::COND_RULES_LIST if self.intents.is_some() => {
+                let executor = self.intents.as_deref().expect("checked by the arm guard");
+                ok(
+                    id,
+                    &CondRulesListResult {
+                        rules: executor.list_rules(uid),
+                    },
+                )
+            }
+            method::COND_RULES_PUT if self.intents.is_some() => {
+                call(request, |params: CondRulesPutParams| {
+                    let executor = self.intents.as_deref().expect("checked by the arm guard");
+                    executor.put_rule(uid, params.rule)
+                })
+            }
+            method::COND_RULES_REMOVE if self.intents.is_some() => {
+                call(request, |params: CondRulesRemoveParams| {
+                    let executor = self.intents.as_deref().expect("checked by the arm guard");
+                    Ok::<_, Error>(executor.remove_rule(uid, &params.rule_id))
                 })
             }
             method::NET_INTENT_DEL if self.intents.is_some() => {
@@ -733,6 +757,68 @@ mod tests {
             .outcome
             .unwrap_err();
         assert_eq!(missing.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn conditional_rules_are_put_listed_and_removed_through_the_protocol() {
+        let (service, _runner, _dir) = with_intents();
+        assert!(service
+            .capabilities()
+            .iter()
+            .any(|c| c == method::COND_RULES_PUT));
+        let rule = json!({"id": "office", "name": "Office", "enabled": true,
+            "condition": {"kind": "interfaceAddressIn", "prefix": "10.228.32.0/21"},
+            "routes": [{"destination": "10.99.0.0/24", "metric": 5}]});
+        let put = call(&service, method::COND_RULES_PUT, json!({"rule": rule}))
+            .outcome
+            .unwrap();
+        assert_eq!(put["stored"], true);
+        assert_eq!(put["status"]["state"], "inactive");
+        let list = call(&service, method::COND_RULES_LIST, json!({}))
+            .outcome
+            .unwrap();
+        assert_eq!(list["rules"][0]["rule"]["id"], "office");
+        let gone = call(
+            &service,
+            method::COND_RULES_REMOVE,
+            json!({"ruleId": "office"}),
+        )
+        .outcome
+        .unwrap();
+        assert_eq!(gone["removed"], true);
+        let again = call(
+            &service,
+            method::COND_RULES_REMOVE,
+            json!({"ruleId": "office"}),
+        )
+        .outcome
+        .unwrap();
+        assert_eq!(again["removed"], false);
+        let bad = call(
+            &service,
+            method::COND_RULES_PUT,
+            json!({"rule": {"id": "-x", "name": "x", "enabled": true,
+                "condition": {"kind": "interfaceAddressIn", "prefix": "10.0.0.0/8"}, "routes": []}}),
+        )
+        .outcome
+        .unwrap_err();
+        assert_eq!(bad.code, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn conditional_rules_are_unsupported_without_the_executor() {
+        let (plain, _dir) = service();
+        for name in [
+            method::COND_RULES_LIST,
+            method::COND_RULES_PUT,
+            method::COND_RULES_REMOVE,
+        ] {
+            assert!(!plain.capabilities().iter().any(|c| c == name), "{name}");
+            assert_eq!(
+                call(&plain, name, json!({})).outcome.unwrap_err().code,
+                ErrorCode::UnsupportedMethod
+            );
+        }
     }
 
     #[test]
