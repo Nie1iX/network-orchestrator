@@ -112,6 +112,26 @@ impl ProfileStore {
         Ok(document)
     }
 
+    /// Whether a static-route profile arms its routes while the interface is
+    /// absent (true) or refuses to connect (false).
+    pub fn set_wait_for_interface(&self, id: &str, enabled: bool) -> io::Result<ProfileDocument> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let mut document = self.load()?;
+        let profile = document
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("profile '{id}' not found"))
+            })?;
+        profile.wait_for_interface = enabled;
+        self.save_locked(&document)?;
+        Ok(document)
+    }
+
     pub fn delete(&self, id: &str) -> io::Result<ProfileDocument> {
         let _guard = self
             .write_lock
@@ -365,6 +385,28 @@ mod tests {
         assert!(!document.profiles[1].auto_connect);
 
         let err = store.set_auto_connect("missing", true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wait_for_interface_is_persisted_per_profile_and_unknown_ids_fail() {
+        let dir = unique_dir("wait-for-interface");
+        let store = ProfileStore::new(dir.join("profiles.json"));
+        let mut a = wg_profile();
+        a.id = "a".into();
+        let mut b = wg_profile();
+        b.id = "b".into();
+        store.upsert(a).unwrap();
+        store.upsert(b).unwrap();
+
+        let document = store.set_wait_for_interface("b", true).unwrap();
+        assert!(!document.profiles[0].wait_for_interface);
+        assert!(document.profiles[1].wait_for_interface);
+        assert!(store.load().unwrap().profiles[1].wait_for_interface);
+        let document = store.set_wait_for_interface("b", false).unwrap();
+        assert!(!document.profiles[1].wait_for_interface);
+        let err = store.set_wait_for_interface("missing", true).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         fs::remove_dir_all(dir).unwrap();
     }

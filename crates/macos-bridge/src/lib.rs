@@ -933,6 +933,20 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 document.profiles,
             ))
         }
+        "set_wait_for_interface" => {
+            let id = text_arg(args, "id")?;
+            let enabled = args["enabled"].as_str() == Some("true");
+            let document = store.set_wait_for_interface(id, enabled).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    "Profile not found".to_string()
+                } else {
+                    store_error(error)
+                }
+            })?;
+            encode(net_manager_core::subscription::public_profiles(
+                document.profiles,
+            ))
+        }
         "set_tunnel_role" => {
             let id = text_arg(args, "id")?;
             let role = match text_arg(args, "role")? {
@@ -2022,6 +2036,40 @@ mod tests {
         );
         assert_eq!(
             dispatch(dir.path(), "diagnose", &json!({"id":"missing"})).unwrap_err(),
+            "Profile not found"
+        );
+    }
+
+    #[test]
+    fn waiting_for_the_interface_is_saved_on_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"st", "name":"Static", "interfaceName":"en97", "cidrs":"192.0.2.0/24"}),
+        )
+        .unwrap();
+        let on = dispatch(
+            dir.path(),
+            "set_wait_for_interface",
+            &json!({"id":"st", "enabled":"true"}),
+        )
+        .unwrap();
+        assert_eq!(on[0]["waitForInterface"], true);
+        let off = dispatch(
+            dir.path(),
+            "set_wait_for_interface",
+            &json!({"id":"st", "enabled":"false"}),
+        )
+        .unwrap();
+        assert_eq!(off[0]["waitForInterface"], false);
+        assert_eq!(
+            dispatch(
+                dir.path(),
+                "set_wait_for_interface",
+                &json!({"id":"nope", "enabled":"true"})
+            )
+            .unwrap_err(),
             "Profile not found"
         );
     }
