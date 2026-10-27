@@ -2,6 +2,7 @@
 //! implemented; the capability list stays honest and everything else is
 //! refused as unsupported.
 
+use crate::intents::IntentExecutor;
 use crate::journal::Record;
 use crate::openvpn::OpenVpnExecutor;
 use crate::peer::Peer;
@@ -11,11 +12,12 @@ use crate::tailscale::{self, TailscaleGuard};
 use crate::wireguard::WireGuardExecutor;
 use crate::xray::{Error, XrayExecutor};
 use net_manager_core::daemon_protocol::{
-    from_value, method, CleanupResult, ErrorCode, LinkSetStateParams, OpenVpnConnectRequest,
-    OpenVpnProcessResource, OpenVpnProfileParams, OwnedEntry, OwnedListResult, OwnedResource,
-    OwnedState, RequestFrame, ResponseFrame, TailscaleProtectParams, TailscaleReleaseResult,
-    WireGuardConnectParams, WireGuardLinkResource, WireGuardProfileParams, XrayConnectParams,
-    XrayProcessResource, XrayProfileParams,
+    from_value, method, CleanupResult, ErrorCode, LinkSetStateParams, NetIntentDelParams,
+    NetIntentListResult, NetIntentSetParams, OpenVpnConnectRequest, OpenVpnProcessResource,
+    OpenVpnProfileParams, OwnedEntry, OwnedListResult, OwnedResource, OwnedState, RequestFrame,
+    ResponseFrame, TailscaleProtectParams, TailscaleReleaseResult, WireGuardConnectParams,
+    WireGuardLinkResource, WireGuardProfileParams, XrayConnectParams, XrayProcessResource,
+    XrayProfileParams,
 };
 use net_manager_core::models::TunnelRole;
 use serde::{de::DeserializeOwned, Serialize};
@@ -29,6 +31,8 @@ pub struct HelperService {
     /// Runs `ifconfig` for `link.set_state`; the method is advertised only
     /// when this is set.
     links: Option<Arc<dyn Runner>>,
+    /// Routing intents; `net.intent.*` is advertised only when this is set.
+    intents: Option<Arc<IntentExecutor>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,6 +64,7 @@ impl HelperService {
             openvpn,
             tailscale: None,
             links: None,
+            intents: None,
         }
     }
 
@@ -72,6 +77,12 @@ impl HelperService {
     /// Serve `link.set_state` with this runner.
     pub fn with_links(mut self, runner: Arc<dyn Runner>) -> Self {
         self.links = Some(runner);
+        self
+    }
+
+    /// Serve `net.intent.list/set/del` with this executor.
+    pub fn with_intents(mut self, executor: Arc<IntentExecutor>) -> Self {
+        self.intents = Some(executor);
         self
     }
 
@@ -219,6 +230,13 @@ impl Handler for HelperService {
         .into_iter()
         .chain(tailscale)
         .chain(self.links.iter().map(|_| method::LINK_SET_STATE))
+        .chain(self.intents.iter().flat_map(|_| {
+            [
+                method::NET_INTENT_LIST,
+                method::NET_INTENT_SET,
+                method::NET_INTENT_DEL,
+            ]
+        }))
         .map(|name| name.to_string())
         .collect()
     }
@@ -269,6 +287,27 @@ impl Handler for HelperService {
                     }
                 }
                 ok(id, &result)
+            }
+            method::NET_INTENT_LIST if self.intents.is_some() => {
+                let executor = self.intents.as_deref().expect("checked by the arm guard");
+                ok(
+                    id,
+                    &NetIntentListResult {
+                        intents: executor.list(uid),
+                    },
+                )
+            }
+            method::NET_INTENT_SET if self.intents.is_some() => {
+                call(request, |params: NetIntentSetParams| {
+                    let executor = self.intents.as_deref().expect("checked by the arm guard");
+                    executor.set(uid, params)
+                })
+            }
+            method::NET_INTENT_DEL if self.intents.is_some() => {
+                call(request, |params: NetIntentDelParams| {
+                    let executor = self.intents.as_deref().expect("checked by the arm guard");
+                    executor.delete(uid, &params.id)
+                })
             }
             method::LINK_SET_STATE if self.links.is_some() => {
                 call(request, |params: LinkSetStateParams| {
@@ -611,6 +650,105 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::Conflict);
         assert!(!runner.calls().iter().any(|c| c.contains("down")));
+    }
+
+    struct FixedNetwork;
+    impl crate::intents::NetworkProbe for FixedNetwork {
+        fn view(&self) -> net_manager_core::route_intents::NetworkView {
+            net_manager_core::route_intents::NetworkView {
+                uplink: None,
+                interfaces: vec!["utun5".into()],
+            }
+        }
+        fn routes(&self) -> Vec<net_manager_core::models::RouteEntry> {
+            Vec::new()
+        }
+    }
+
+    fn with_intents() -> (HelperService, Arc<FakeRunner>, tempfile::TempDir) {
+        let runner = Arc::new(FakeRunner::default());
+        let (service, dir) = service();
+        let executor = IntentExecutor::new(
+            Box::new(Shared(runner.clone())),
+            Box::new(FixedNetwork),
+            dir.path().join("intents.json"),
+        )
+        .unwrap();
+        (service.with_intents(Arc::new(executor)), runner, dir)
+    }
+
+    #[test]
+    fn intents_are_advertised_only_when_the_executor_is_set() {
+        let (plain, _dir) = service();
+        for name in [
+            method::NET_INTENT_LIST,
+            method::NET_INTENT_SET,
+            method::NET_INTENT_DEL,
+        ] {
+            assert!(!plain.capabilities().iter().any(|c| c == name), "{name}");
+            let error = call(&plain, name, json!({})).outcome.unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedMethod, "{name}");
+        }
+        let (enabled, _runner, _dir) = with_intents();
+        for name in [
+            method::NET_INTENT_LIST,
+            method::NET_INTENT_SET,
+            method::NET_INTENT_DEL,
+        ] {
+            assert!(enabled.capabilities().iter().any(|c| c == name), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_intent_is_set_listed_and_deleted_through_the_protocol() {
+        let (service, runner, _dir) = with_intents();
+        let set = call(
+            &service,
+            method::NET_INTENT_SET,
+            json!({"id": "office", "destinations": ["10.0.0.0/8"],
+                   "path": {"kind": "interface", "interface": "utun5"}}),
+        );
+        assert_eq!(set.outcome.unwrap()["id"], "office");
+        assert!(
+            runner
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("route -n add -net 10.0.0.0")),
+            "{:?}",
+            runner.calls()
+        );
+        let list = call(&service, method::NET_INTENT_LIST, json!({}))
+            .outcome
+            .unwrap();
+        assert_eq!(list["intents"][0]["id"], "office");
+        assert_eq!(list["intents"][0]["destinations"][0], "10.0.0.0/8");
+        let gone = call(&service, method::NET_INTENT_DEL, json!({"id": "office"}));
+        assert_eq!(gone.outcome.unwrap()["id"], "office");
+        let list = call(&service, method::NET_INTENT_LIST, json!({}))
+            .outcome
+            .unwrap();
+        assert_eq!(list["intents"], json!([]));
+        let missing = call(&service, method::NET_INTENT_DEL, json!({"id": "office"}))
+            .outcome
+            .unwrap_err();
+        assert_eq!(missing.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn a_bad_intent_is_refused_with_invalid_params_and_changes_nothing() {
+        let (service, runner, _dir) = with_intents();
+        for bad in [
+            json!({"id": "Bad Id", "destinations": ["10.0.0.0/8"], "path": {"kind": "direct"}}),
+            json!({"id": "x", "destinations": ["127.0.0.1"], "path": {"kind": "direct"}}),
+            json!({"id": "x", "destinations": ["10.0.0.0/8"], "path": {"kind": "interface", "interface": "lo0"}}),
+            json!({"id": "x"}),
+        ] {
+            let error = call(&service, method::NET_INTENT_SET, bad)
+                .outcome
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidParams);
+        }
+        assert!(runner.calls().is_empty());
     }
 
     #[test]
