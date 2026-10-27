@@ -872,6 +872,42 @@ import SystemConfiguration
       intents = try await core.callConcurrently("intents")
     } catch { self.error = error.localizedDescription }
   }
+  var suggestions: [IntentSuggestion] = []
+  private var dismissedSuggestions = Set<String>()
+  /// Doctor cards the user has not dismissed in this session.
+  var visibleSuggestions: [IntentSuggestion] {
+    suggestions.filter { !dismissedSuggestions.contains($0.key) }
+  }
+  func dismissSuggestion(_ suggestion: IntentSuggestion) {
+    dismissedSuggestions.insert(suggestion.key)
+  }
+  /// Asks the doctor; a helper without intents, or any failure, means no
+  /// cards and no banner: the doctor is advice, never an error.
+  func loadSuggestions() async {
+    guard canUseIntents,
+      let list: [IntentSuggestion] = try? await core.callConcurrently("intent_doctor")
+    else {
+      suggestions = []
+      return
+    }
+    suggestions = list
+  }
+  /// Creates the intents a card proposes, then refreshes both lists.
+  func applyFix(_ suggestion: IntentSuggestion) async -> Bool {
+    for fix in suggestion.fixes {
+      do {
+        let _: [String: String] = try await core.call("set_intent", args: fix.arguments)
+        record(.info, "Saved routing intent \(fix.id) proposed by the doctor")
+      } catch {
+        self.error = error.localizedDescription
+        return false
+      }
+    }
+    dismissSuggestion(suggestion)
+    await loadIntents()
+    await loadSuggestions()
+    return true
+  }
   /// Adds or replaces an intent; the helper installs its routes at once.
   func saveIntent(_ draft: IntentDraft) async -> Bool {
     do {

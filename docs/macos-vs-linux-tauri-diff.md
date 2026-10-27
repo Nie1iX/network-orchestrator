@@ -83,7 +83,7 @@
    вкладка DNS на странице Network (`dns_status` из `scutil --dns`,
    `dns_probe`: реальный запрос к серверу, который система выбрала бы для имени,
    с путём и признаком fake-IP), плюс `user_network_settings`.
-4. **Intents (`net.intent.*`).** Linux: демон. macOS: слайсы 1–2 готовы — helper хранит правила (`intents.rs`), ставит и сверяет маршруты (`core::route_intents`), вкладка «Intents» на странице Routes; «доктор» — следующий слайс (`docs/plans/2026-10-27-20-macos-route-intents.md`).
+4. **Intents (`net.intent.*`).** Linux: демон. macOS: слайсы 1–3 готовы — helper хранит правила (`intents.rs`), ставит и сверяет маршруты (`core::route_intents`), вкладка «Intents» на странице Routes (`docs/plans/2026-10-27-20-macos-route-intents.md`).
 5. **Policy-маршрутизация и Xray routing.** macOS: редактор правил Xray
    (`RoutingRulesEditor`), `set_routing_rules`, `check_route`, разбор Happ-routing,
    командой `netorch route set`. Linux: те же правила плюс bulk CIDR,
@@ -132,7 +132,7 @@
 | Вкладка Network: интерфейсы, throughput | ✅ плюс вкл/выкл интерфейса через helper и вкладка DNS | ✅ плюс управление состоянием интерфейса |
 | Вкладка Conditions | ✅ вкладка на странице Routes | ✅ |
 | Диагностика профиля (`diagnose_profile`) | ✅ «Diagnostics» в меню подключения: helper, Xray, статус, handshake, DNS/IPv6, владение helper'а, путь до endpoint'а, анализ конфигурации | ✅ полный отчёт |
-| `IntentsPanel` | ✅ вкладка Intents (без «доктора») | ✅ |
+| `IntentsPanel` | ✅ вкладка Intents с карточками «доктора» | ✅ |
 | `SystemTables`, `NmConnectionPanel` | ❌ | ✅ |
 | Темы System/Light/Dark, RU/EN | ✅ | ✅ (общие токены и локали) |
 
@@ -209,7 +209,7 @@ macOS перед коммитом.
    управляет helper; кнопка в карточке интерфейса с подтверждением, усиленным для
    интерфейса с default route). Таблицы и правила на macOS не имеют
    аналога (один FIB), `route add/del` и explain отложены до п.8–9.
-8. Intents и Conditions — три слайса (`docs/plans/2026-10-27-20-macos-route-intents.md`): **1 ✅ движок и Intents** (helper: хранилище, маршруты, сверка каждые 2 с и полная раз в 10 с, защиты; мост `intents`/`set_intent`/`delete_intent`; вкладка в Swift), **2 ✅ Conditions** (`core::route_conditions`, правила в том же хранилище и той же сверке, `condRules.*`, мост `cond_rules`/`put_cond_rule`/`delete_cond_rule`, вкладка Conditions), 3 — «доктор» Intents.
+8. Intents и Conditions — три слайса (`docs/plans/2026-10-27-20-macos-route-intents.md`): **1 ✅ движок и Intents** (helper: хранилище, маршруты, сверка каждые 2 с и полная раз в 10 с, защиты; мост `intents`/`set_intent`/`delete_intent`; вкладка в Swift), **2 ✅ Conditions** (`core::route_conditions`, правила в том же хранилище и той же сверке, `condRules.*`, мост `cond_rules`/`put_cond_rule`/`delete_cond_rule`, вкладка Conditions), **3 ✅ «доктор» Intents** (`core::intent_doctor` — порт `intentDoctor.ts`, метод моста `intent_doctor`, карточки на вкладке Intents; на macOS конфликт — только подсказка, подавить чужой маршрут нельзя).
 9. Static routes, always-on, внешний интерфейс с bypass, geo-списки.
 
 NetworkManager-панель не переносится: на macOS аналога нет.

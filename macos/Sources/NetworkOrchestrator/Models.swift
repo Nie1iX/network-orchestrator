@@ -479,6 +479,58 @@ struct RouteIntent: Decodable, Identifiable, Sendable {
     }
   }
 }
+/// What the intent doctor noticed. A kind a newer core adds reads as `unknown`.
+enum SuggestionKind: String, Decodable, Sendable {
+  case endpointViaTunnel, uncoveredEndpoints, conflict, unknown
+  init(from decoder: Decoder) throws {
+    let text = try decoder.singleValueContainer().decode(String.self)
+    self = SuggestionKind(rawValue: text) ?? .unknown
+  }
+}
+/// A ready-made intent the doctor proposes.
+struct IntentFix: Decodable, Sendable {
+  let id: String
+  let destinations: [String]
+  let path: RouteIntent.Path
+  let metric: UInt32?
+  /// The arguments of `set_intent`.
+  var arguments: [String: String] {
+    [
+      "id": id,
+      "destinations": destinations.joined(separator: "\n"),
+      "kind": path.kind,
+      "interface": path.interface ?? "",
+      "metric": metric.map(String.init) ?? "",
+    ]
+  }
+}
+struct IntentSuggestion: Decodable, Identifiable, Sendable {
+  let key: String
+  let kind: SuggestionKind
+  let viaInterface: String?
+  let intentId: String?
+  let destination: String?
+  let endpoints: [String]
+  let foreignRoute: Route?
+  let fixes: [IntentFix]
+  var id: String { key }
+  var canFix: Bool { !fixes.isEmpty }
+  /// Catalogue keys shared with the web client.
+  var titleKey: String {
+    switch kind {
+    case .endpointViaTunnel: "intents.doctor.endpointTitle"
+    case .uncoveredEndpoints: "intents.doctor.uncoveredTitle"
+    case .conflict, .unknown: "intents.doctor.conflictTitle"
+    }
+  }
+  var detailKey: String {
+    switch kind {
+    case .endpointViaTunnel: "intents.doctor.endpointDetail"
+    case .uncoveredEndpoints: "intents.doctor.endpointDetailPlural"
+    case .conflict, .unknown: "intents.doctor.conflictDetail"
+    }
+  }
+}
 /// Whether a conditional rule currently holds. A state a newer helper adds
 /// reads as `unknown`.
 enum RuleState: String, Decodable, Sendable {

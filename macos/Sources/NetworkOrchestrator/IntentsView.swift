@@ -15,6 +15,7 @@ struct IntentsView: View {
         Button(L10n.text("intents.add")) { editing = IntentDraft() }
           .buttonStyle(TauriButtonStyle(kind: .accent)).disabled(!model.canUseIntents)
       }
+      ForEach(model.visibleSuggestions) { suggestion in card(suggestion) }
       if !model.canUseIntents {
         AppEmptyState { Text(L10n.text("native.intents.needsHelper")) }
       } else if model.intents.isEmpty {
@@ -29,12 +30,50 @@ struct IntentsView: View {
     .task {
       while !Task.isCancelled {
         await model.loadIntents()
+        await model.loadSuggestions()
         try? await Task.sleep(for: .seconds(3))
       }
     }
     .sheet(item: Binding(get: { editing.map(DraftBox.init) }, set: { editing = $0?.draft })) { box in
       IntentSheet(model: model, draft: box.draft) { editing = nil }
         .environment(\.palette, p).buttonStyle(TauriButtonStyle())
+    }
+  }
+
+  /// A doctor card: what is wrong, and a button when there is a fix.
+  private func card(_ suggestion: IntentSuggestion) -> some View {
+    let detail: String
+    switch suggestion.kind {
+    case .conflict, .unknown:
+      detail = L10n.text(
+        suggestion.detailKey,
+        [
+          "via": suggestion.foreignRoute?.interfaceName ?? "?",
+          "dest": suggestion.destination ?? "?",
+        ])
+    default:
+      detail = L10n.text(
+        suggestion.detailKey, ["ips": suggestion.endpoints.joined(separator: ", ")])
+    }
+    return AppCard {
+      HStack(alignment: .top, spacing: 10) {
+        NativeIcon(name: "AlertTriangleIcon", size: 18).foregroundStyle(p["warn"])
+        VStack(alignment: .leading, spacing: 3) {
+          Text(
+            L10n.text(
+              suggestion.titleKey,
+              ["iface": suggestion.viaInterface ?? "?", "id": suggestion.intentId ?? "?"])
+          ).font(.system(size: 12.3, weight: .semibold))
+          Text(detail).font(.system(size: 11.2)).foregroundStyle(p.secondary)
+        }
+        Spacer(minLength: 12)
+        if suggestion.canFix {
+          Button(L10n.text("intents.doctor.fix")) {
+            Task { _ = await model.applyFix(suggestion) }
+          }.buttonStyle(TauriButtonStyle(kind: .accent))
+        }
+        Button(L10n.text("intents.doctor.dismiss")) { model.dismissSuggestion(suggestion) }
+      }
     }
   }
 
