@@ -86,6 +86,8 @@ struct Profile: Decodable, Identifiable, Sendable {
   var tunnelNetworks: [String]? = nil
   var tunnelDnsDomains: [String]? = nil
   var isSecondary: Bool { tunnelRole == "secondary" }
+  /// Static-route profiles: arm the routes while the interface is absent.
+  var waitForInterface: Bool? = nil
   /// Started once when the app launches.
   var autoConnect: Bool? = nil
   var connectsOnLaunch: Bool { autoConnect == true }
@@ -117,15 +119,23 @@ struct Profile: Decodable, Identifiable, Sendable {
   var startsWithoutHelper: Bool { backend == "xray" && (xrayMode ?? "socks") == "socks" }
   /// Xray as a system-wide tunnel; the privileged helper owns it.
   var isTun: Bool { backend == "xray" && xrayMode == "tun" }
+  /// Fixed routes through a named interface, kept by the helper as an intent.
+  var isStatic: Bool { backend == "none" }
   /// Everything that creates a tunnel device runs in the privileged helper:
   /// Xray TUN, WireGuard and OpenVPN.
-  var needsHelper: Bool { isTun || backend == "wireGuard" || backend == "openVpn" }
+  var runsTunnel: Bool { isTun || backend == "wireGuard" || backend == "openVpn" }
+  /// Starting needs the helper: a tunnel's, or the route intents of a static
+  /// profile.
+  var needsHelper: Bool { runsTunnel || isStatic }
+  /// Whether routes are armed while the interface is absent.
+  var waitsForInterface: Bool { waitForInterface == true }
   /// The helper capability that serves this profile.
   var helperCapability: String? {
     switch backend {
     case "wireGuard": "wireguard.connect"
     case "openVpn": "openvpn.connect"
     case "xray": isTun ? "xray.connect" : nil
+    case "none": "net.intent.set"
     default: nil
     }
   }
@@ -466,6 +476,9 @@ struct RouteIntent: Decodable, Identifiable, Sendable {
   let detail: String
   let installed: Int
   let wanted: Int
+  /// Created for a static-route profile (`core::route_intents::STATIC_PREFIX`);
+  /// its connection switch owns it, not the Intents page.
+  var isProfileOwned: Bool { id.hasPrefix("static-") }
   var isDirect: Bool { path.kind == "direct" }
   var pathText: String { isDirect ? "direct" : (path.interface ?? "?") }
   /// All of the internet, or its halves (`0.0.0.0/1`): what a full tunnel

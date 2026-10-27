@@ -796,6 +796,8 @@
     "native.intents.interface": "Interface",
     "native.rules.needsHelper": "Conditional rules need the privileged helper. Install or update it in Settings.",
     "native.rules.routesHint": "One route per line: a network, or a network followed by \"via\" and a gateway.",
+    "native.static.wait": "Wait for the interface",
+    "native.static.waitHint": "Arm the routes now and install them when the interface appears. Off: connecting fails while it is missing.",
     "native.ms": "{ms} ms",
     "native.open": "Open",
     "native.openBrowser": "Open browser via connection",

@@ -58,7 +58,7 @@
 | Xray TUN | ✅ через helper, один за раз | ✅ управляется демоном, `xrayMode: "tun"` по умолчанию |
 | WireGuard | ✅ userspace в helper | ✅ через `wireguard-tools` и демон |
 | OpenVPN | ✅ закреплённая копия из бандла, root, без script-хуков | ✅ системный `openvpn` через демон |
-| Static routes (`none`) | ❌ executor не написан | ✅ |
+| Static routes (`none`) | ✅ через intent `static-<id>` в helper'е (маршруты со своим шлюзом пока нет) | ✅ |
 | Hysteria2, `vless://`, подписки | ✅ | ✅ |
 | NetBird | ✅ через CLI пользователя | ✅ строка в Services (общий код `core::netbird`) |
 | Tailscale | ✅ CLI плюс guard `tailscale.protect` | ✅ LocalAPI через демон, без guard'а |
@@ -210,6 +210,6 @@ macOS перед коммитом.
    интерфейса с default route). Таблицы и правила на macOS не имеют
    аналога (один FIB), `route add/del` и explain отложены до п.8–9.
 8. Intents и Conditions — три слайса (`docs/plans/2026-10-27-20-macos-route-intents.md`): **1 ✅ движок и Intents** (helper: хранилище, маршруты, сверка каждые 2 с и полная раз в 10 с, защиты; мост `intents`/`set_intent`/`delete_intent`; вкладка в Swift), **2 ✅ Conditions** (`core::route_conditions`, правила в том же хранилище и той же сверке, `condRules.*`, мост `cond_rules`/`put_cond_rule`/`delete_cond_rule`, вкладка Conditions), **3 ✅ «доктор» Intents** (`core::intent_doctor` — порт `intentDoctor.ts`, метод моста `intent_doctor`, карточки на вкладке Intents; на macOS конфликт — только подсказка, подавить чужой маршрут нельзя).
-9. Static routes, always-on, внешний интерфейс с bypass, geo-списки.
+9. Static routes ✅ (профиль `none` = intent `static-<id>`, переключатель «ждать интерфейс», подключение из приложения и `netorch up/down`); дальше: always-on, внешний интерфейс с bypass, geo-списки, маршруты со своим шлюзом.
 
 NetworkManager-панель не переносится: на macOS аналога нет.

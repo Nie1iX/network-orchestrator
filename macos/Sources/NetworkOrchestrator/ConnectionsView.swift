@@ -608,7 +608,7 @@ struct ProfileDetailView: View {
             Text(profile.name).font(.system(size: 14.7, weight: .semibold)).lineLimit(1)
             if profile.backend != "none" { AppBadge(text: "detail.managed") }
             if proxyOwner { AppBadge(text: "native.systemProxy", color: "up") }
-            if profile.needsHelper && profile.isSecondary {
+            if profile.runsTunnel && profile.isSecondary {
               AppBadge(text: "native.roleSecondary", color: "info")
             }
           }
@@ -664,7 +664,8 @@ struct ProfileDetailView: View {
       }
       if profile.backend == "xray" && model.canStartConnections { modePicker }
       if model.canTryStart(profile) { autoConnectRow }
-      if profile.needsHelper && model.canStartConnections { roleRows }
+      if profile.runsTunnel && model.canStartConnections { roleRows }
+      if profile.isStatic && model.canTryStart(profile) { waitRow }
       if profile.isTun {
         row(
           "detail.interface",
@@ -950,6 +951,23 @@ struct ProfileDetailView: View {
       model.canStart(profile) || profile.startsWithoutHelper || !model.canStartConnections
         ? L10n.text("detail.stopped") : L10n.text("native.helperRequired")
     }
+  }
+  /// Static routes: arm them while the interface is absent, or refuse.
+  private var waitRow: some View {
+    HStack {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(L10n.text("native.static.wait")).foregroundStyle(p.muted)
+        Text(L10n.text("native.static.waitHint")).font(.system(size: 10.08)).foregroundStyle(p.muted)
+      }
+      Spacer()
+      Toggle(
+        "",
+        isOn: Binding(
+          get: { profile.waitsForInterface },
+          set: { value in Task { await model.setWaitForInterface(profile, enabled: value) } })
+      ).toggleStyle(.switch).controlSize(.small).labelsHidden()
+        .disabled(model.pending.contains(profile.id))
+    }.font(.system(size: 11.9)).padding(.vertical, 5)
   }
   /// Starts this connection when the app launches.
   private var autoConnectRow: some View {

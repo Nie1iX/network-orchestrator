@@ -735,6 +735,10 @@ import SystemConfiguration
   func disconnectAll() async {
     for profile in snapshot?.profiles ?? [] where isRunning(profile) { await toggle(profile) }
   }
+  func setWaitForInterface(_ profile: Profile, enabled: Bool) async {
+    _ = await change(
+      "set_wait_for_interface", args: ["id": profile.id, "enabled": enabled ? "true" : "false"])
+  }
   func setAutoConnect(_ profile: Profile, enabled: Bool) async {
     _ = await change(
       "set_auto_connect", args: ["id": profile.id, "enabled": enabled ? "true" : "false"])
@@ -869,7 +873,9 @@ import SystemConfiguration
       return
     }
     do {
-      intents = try await core.callConcurrently("intents")
+      // Static-route profiles keep theirs here too; their own switch owns them.
+      let all: [RouteIntent] = try await core.callConcurrently("intents")
+      intents = all.filter { !$0.isProfileOwned }
     } catch { self.error = error.localizedDescription }
   }
   var suggestions: [IntentSuggestion] = []

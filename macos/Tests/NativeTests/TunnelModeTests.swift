@@ -81,8 +81,10 @@ private func helper(_ capabilities: [String], reachable: Bool = true) throws -> 
 
   let ready = try model(try helper(["xray.connect"]))
   #expect(ready.canTryStart(tun))
-  // Static routes create no tunnel and stay unavailable.
-  #expect(!ready.canTryStart(try profile("none", mode: nil)))
+  // Static routes are served by the route intents, not by a tunnel executor:
+  // pressing the switch is allowed, and starts only with a helper that offers them.
+  let staticRoutes = try profile("none", mode: nil)
+  #expect(ready.canTryStart(staticRoutes) && !ready.canStart(staticRoutes))
 }
 
 @Test func helperBuildIsNilOutsideAnAppBundle() {
