@@ -277,6 +277,7 @@ enum RouteTab: String, CaseIterable {
   case table = "Raw table"
   case lookup = "Lookup"
   case user = "My routing settings"
+  case intents = "routes.intents"
 }
 struct RoutesView: View {
   @Environment(\.palette) private var p
@@ -305,6 +306,7 @@ struct RoutesView: View {
         }
         case .lookup: RouteLookupView(model: model)
         case .user: UserRoutingView(model: model)
+        case .intents: IntentsView(model: model)
       }
     }.frame(minHeight: 300, alignment: .topLeading)
   }

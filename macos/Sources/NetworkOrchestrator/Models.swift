@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 /// The user's own NetBird daemon as the bridge summarises it (no keys, no events).
 struct NetBirdState: Decodable, Sendable, Equatable {
@@ -420,6 +421,96 @@ struct DnsProbeAnswer: Decodable, Sendable {
   let resolverIndex: UInt32?
   let resolverDomain: String?
   let path: DnsProbePath?
+}
+
+/// How an intent compares with the system, as the helper reports it. A status
+/// a newer helper adds reads as `unknown` instead of breaking the list.
+enum IntentStatus: String, Decodable, Sendable {
+  case effective, active, deferred, conflicted, missing, disabled, unknown
+  init(from decoder: Decoder) throws {
+    let text = try decoder.singleValueContainer().decode(String.self)
+    self = IntentStatus(rawValue: text) ?? .unknown
+  }
+  var badgeColor: String {
+    switch self {
+    case .effective, .active: "up"
+    case .deferred: "info"
+    case .conflicted: "down"
+    case .missing: "warn"
+    case .disabled, .unknown: "unknown"
+    }
+  }
+  var label: String {
+    switch self {
+    case .effective, .active: "native.intents.status.effective"
+    case .deferred: "native.intents.status.deferred"
+    case .conflicted: "native.intents.status.conflicted"
+    case .missing: "native.intents.status.missing"
+    case .disabled: "native.intents.status.disabled"
+    case .unknown: "native.intents.status.unknown"
+    }
+  }
+}
+/// "These networks go this way", kept and enforced by the helper.
+struct RouteIntent: Decodable, Identifiable, Sendable {
+  struct Path: Decodable, Sendable {
+    let kind: String
+    let interface: String?
+  }
+  let id: String
+  let destinations: [String]
+  let path: Path
+  let metric: UInt32
+  let enabled: Bool
+  let status: IntentStatus
+  let detail: String
+  let installed: Int
+  let wanted: Int
+  var isDirect: Bool { path.kind == "direct" }
+  var pathText: String { isDirect ? "direct" : (path.interface ?? "?") }
+  /// All of the internet, or its halves (`0.0.0.0/1`): what a full tunnel
+  /// uses. The page warns before and after such an intent exists.
+  static func capturesDefault(_ destinations: [String]) -> Bool {
+    destinations.contains { text in
+      let parts = text.trimmingCharacters(in: .whitespaces).split(separator: "/")
+      guard parts.count == 2, let prefix = Int(parts[1]), prefix <= 1 else { return false }
+      let address = String(parts[0])
+      return IPv4Address(address) != nil || IPv6Address(address) != nil
+    }
+  }
+}
+/// The add/edit form for an intent.
+struct IntentDraft: Equatable {
+  var id = ""
+  var destinations = ""
+  var useInterface = false
+  var interface = ""
+  var enabled = true
+  /// Editing keeps the name: it is the identity.
+  var editing = false
+  init() {}
+  init(editing intent: RouteIntent) {
+    id = intent.id
+    destinations = intent.destinations.joined(separator: "\n")
+    useInterface = !intent.isDirect
+    interface = intent.path.interface ?? ""
+    enabled = intent.enabled
+    editing = true
+  }
+  var isComplete: Bool {
+    !id.trimmingCharacters(in: .whitespaces).isEmpty
+      && !destinations.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      && (!useInterface || !interface.trimmingCharacters(in: .whitespaces).isEmpty)
+  }
+  var arguments: [String: String] {
+    [
+      "id": id.trimmingCharacters(in: .whitespaces),
+      "destinations": destinations,
+      "kind": useInterface ? "interface" : "direct",
+      "interface": useInterface ? interface.trimmingCharacters(in: .whitespaces) : "",
+      "enabled": enabled ? "true" : "false",
+    ]
+  }
 }
 
 struct Snapshot: Decodable, Sendable {

@@ -819,6 +819,45 @@ import SystemConfiguration
   func connectionLog(_ profile: Profile) async -> String {
     (try? await core.call("log", args: ["id": profile.id]) as String) ?? ""
   }
+  /// The helper offers all of `net.intent.*`.
+  var canUseIntents: Bool {
+    ["net.intent.list", "net.intent.set", "net.intent.del"].allSatisfy(helperOffers)
+  }
+  var intents: [RouteIntent] = []
+  /// Reads the intents from the helper; none (and no error) without it.
+  func loadIntents() async {
+    guard canUseIntents else {
+      intents = []
+      return
+    }
+    do {
+      intents = try await core.callConcurrently("intents")
+    } catch { self.error = error.localizedDescription }
+  }
+  /// Adds or replaces an intent; the helper installs its routes at once.
+  func saveIntent(_ draft: IntentDraft) async -> Bool {
+    do {
+      let _: [String: String] = try await core.call("set_intent", args: draft.arguments)
+      record(.info, "Saved routing intent \(draft.id.trimmingCharacters(in: .whitespaces))")
+      await loadIntents()
+      return true
+    } catch {
+      self.error = error.localizedDescription
+      return false
+    }
+  }
+  func deleteIntent(_ intent: RouteIntent) async {
+    do {
+      let _: [String: String] = try await core.call("delete_intent", args: ["id": intent.id])
+      record(.info, "Deleted routing intent \(intent.id)")
+      await loadIntents()
+    } catch { self.error = error.localizedDescription }
+  }
+  func setIntentEnabled(_ intent: RouteIntent, enabled: Bool) async {
+    var draft = IntentDraft(editing: intent)
+    draft.enabled = enabled
+    _ = await saveIntent(draft)
+  }
   /// The helper offers `link.set_state`, and this is not loopback or the
   /// device of a connection this app runs (those are stopped by disconnecting).
   func canSwitch(_ interface: NetworkInterface) -> Bool {
