@@ -94,6 +94,55 @@ fn intent_params(
     })
 }
 
+/// A conditional rule from the client's string arguments. `routes` has one
+/// route per line (or after `;`): `10.99.0.0/24` or `10.99.0.0/24 via 10.1.1.1`.
+fn cond_rule_params(
+    args: &Value,
+) -> Result<net_manager_core::daemon_protocol::ConditionalRouteRule, String> {
+    use net_manager_core::daemon_protocol::{ConditionalRouteRule, RouteCondition};
+    use net_manager_core::models::PolicyRoute;
+    let text = |key: &str| args[key].as_str().unwrap_or_default().trim().to_string();
+    let prefix = text("prefix")
+        .parse()
+        .map_err(|_| "The condition network must look like 10.228.32.0/21".to_string())?;
+    let mut routes = Vec::new();
+    for line in text("routes").split(['\n', ';']) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let destination = words.next().unwrap_or_default();
+        let via = match (words.next(), words.next(), words.next()) {
+            (None, ..) => None,
+            (Some("via"), Some(gateway), None) => Some(
+                gateway
+                    .parse()
+                    .map_err(|_| format!("'{gateway}' is not a gateway address"))?,
+            ),
+            _ => {
+                return Err(format!(
+                    "'{line}' must look like 10.99.0.0/24 or 10.99.0.0/24 via 10.1.1.1"
+                ))
+            }
+        };
+        routes.push(PolicyRoute {
+            destination: destination
+                .parse()
+                .map_err(|_| format!("'{destination}' must look like 10.99.0.0/24"))?,
+            metric: 100,
+            via,
+        });
+    }
+    Ok(ConditionalRouteRule {
+        id: text("id"),
+        name: text("name"),
+        enabled: args["enabled"].as_str() != Some("false"),
+        condition: RouteCondition::InterfaceAddressIn { prefix },
+        routes,
+    })
+}
+
 pub(crate) fn handle(
     root: &Path,
     store: &ProfileStore,
@@ -157,6 +206,13 @@ pub(crate) fn handle(
         "delete_intent" => engine
             .delete_intent(args["id"].as_str().unwrap_or_default())
             .map(|()| json!({})),
+        "cond_rules" => engine.cond_rules().and_then(encode),
+        "put_cond_rule" => cond_rule_params(args)
+            .and_then(|rule| engine.put_cond_rule(rule))
+            .and_then(encode),
+        "delete_cond_rule" => engine
+            .remove_cond_rule(args["id"].as_str().unwrap_or_default())
+            .map(|removed| json!({ "removed": removed })),
         "helper_log" => Ok(json!(engine.helper_log())),
         "log" => load().and_then(|profiles| {
             let profile = find(&profiles, args)?;
@@ -225,6 +281,46 @@ mod tests {
             (plain.path.interface, plain.metric, plain.enabled),
             (None, None, None)
         );
+    }
+
+    #[test]
+    fn rule_arguments_are_parsed_into_a_typed_rule() {
+        let rule = cond_rule_params(&json!({
+            "id": "office", "name": " Office LAN ", "prefix": "10.228.32.0/21", "enabled": "true",
+            "routes": "10.99.0.0/24\n10.98.0.0/16 via 10.228.32.9; 10.97.0.0/16",
+        }))
+        .unwrap();
+        assert_eq!(
+            (rule.id.as_str(), rule.name.as_str()),
+            ("office", "Office LAN")
+        );
+        assert_eq!(rule.routes.len(), 3);
+        assert_eq!(rule.routes[1].via, Some("10.228.32.9".parse().unwrap()));
+        assert_eq!(rule.routes[2].via, None);
+        assert!(rule.enabled);
+        let off = cond_rule_params(&json!({"id": "x", "name": "x", "prefix": "10.0.0.0/8", "enabled": "false", "routes": "10.1.0.0/16"})).unwrap();
+        assert!(!off.enabled);
+        for (args, why) in [
+            (
+                json!({"prefix": "nonsense", "routes": "10.1.0.0/16"}),
+                "network",
+            ),
+            (
+                json!({"prefix": "10.0.0.0/8", "routes": "10.1.0.0/16 via nope"}),
+                "gateway",
+            ),
+            (
+                json!({"prefix": "10.0.0.0/8", "routes": "10.1.0.0/16 around 10.0.0.1"}),
+                "must look like",
+            ),
+            (
+                json!({"prefix": "10.0.0.0/8", "routes": "bad"}),
+                "must look like",
+            ),
+        ] {
+            let error = cond_rule_params(&args).unwrap_err();
+            assert!(error.contains(why), "{error}");
+        }
     }
 
     #[test]

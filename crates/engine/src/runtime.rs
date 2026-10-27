@@ -10,8 +10,10 @@ use crate::vpn_backends;
 use crate::{helper_error, helper_socket};
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::daemon_protocol::{
-    method, NetIntentDelParams, NetIntentListResult, NetIntentResult, NetIntentSetParams,
-    NetIntentView, OpenVpnCredentials, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
+    method, CondRulesListResult, CondRulesPutParams, CondRulesPutResult, CondRulesRemoveParams,
+    CondRulesRemoveResult, ConditionalRouteRule, ConditionalRuleEntry, ConditionalRuleStatus,
+    NetIntentDelParams, NetIntentListResult, NetIntentResult, NetIntentSetParams, NetIntentView,
+    OpenVpnCredentials, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
     XrayProfileParams, XrayStatusResult,
 };
 use net_manager_core::helper_client::HelperClient;
@@ -736,6 +738,34 @@ impl Engine {
         .map(|_| ())
     }
 
+    /// The user's conditional rules with their live status.
+    pub fn cond_rules(&self) -> Result<Vec<ConditionalRuleEntry>, String> {
+        self.intent_call::<_, CondRulesListResult>(method::COND_RULES_LIST, json!({}))
+            .map(|list| list.rules)
+    }
+
+    /// Adds or replaces a rule; the helper evaluates it at once.
+    pub fn put_cond_rule(
+        &self,
+        rule: ConditionalRouteRule,
+    ) -> Result<ConditionalRuleStatus, String> {
+        self.intent_call::<_, CondRulesPutResult>(
+            method::COND_RULES_PUT,
+            CondRulesPutParams { rule },
+        )
+        .map(|result| result.status)
+    }
+
+    pub fn remove_cond_rule(&self, id: &str) -> Result<bool, String> {
+        self.intent_call::<_, CondRulesRemoveResult>(
+            method::COND_RULES_REMOVE,
+            CondRulesRemoveParams {
+                rule_id: id.to_string(),
+            },
+        )
+        .map(|result| result.removed)
+    }
+
     fn intent_call<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         name: &str,
@@ -1180,6 +1210,59 @@ mod tests {
                 .unwrap_err(),
             "Choose a network interface for this intent"
         );
+    }
+
+    #[test]
+    fn conditional_rules_go_through_the_helper_and_their_status_comes_back() {
+        use net_manager_core::daemon_protocol::{ConditionalRuleState, RouteCondition};
+        use net_manager_core::models::PolicyRoute;
+        let rule = ConditionalRouteRule {
+            id: "office".into(),
+            name: "Office".into(),
+            enabled: true,
+            condition: RouteCondition::InterfaceAddressIn {
+                prefix: "10.228.32.0/21".parse().unwrap(),
+            },
+            routes: vec![PolicyRoute {
+                destination: "10.99.0.0/24".parse().unwrap(),
+                metric: 5,
+                via: None,
+            }],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(dir.path(), |request| {
+            ResponseFrame::ok(
+                request.id,
+                json!({"stored": true, "status": {"state": "active", "matchedInterface": "en7", "appliedRoutes": 1}}),
+            )
+        });
+        let status = Engine::with_privileged(dir.path(), Arc::new(client))
+            .put_cond_rule(rule)
+            .unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.method, method::COND_RULES_PUT);
+        assert_eq!(request.params["rule"]["id"], "office");
+        assert_eq!(status.state, ConditionalRuleState::Active);
+        assert_eq!(status.matched_interface.as_deref(), Some("en7"));
+
+        let other = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(other.path(), |request| {
+            ResponseFrame::ok(request.id, json!({"rules": []}))
+        });
+        assert!(Engine::with_privileged(other.path(), Arc::new(client))
+            .cond_rules()
+            .unwrap()
+            .is_empty());
+        assert_eq!(seen.recv().unwrap().method, method::COND_RULES_LIST);
+
+        let third = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(third.path(), |request| {
+            ResponseFrame::ok(request.id, json!({"removed": true}))
+        });
+        assert!(Engine::with_privileged(third.path(), Arc::new(client))
+            .remove_cond_rule("office")
+            .unwrap());
+        assert_eq!(seen.recv().unwrap().params, json!({"ruleId": "office"}));
     }
 
     #[test]
