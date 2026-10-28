@@ -96,12 +96,15 @@ fn main() -> ExitCode {
 
 async fn run(options: Options) -> std::io::Result<()> {
     let listener = bind_socket(&options.socket)?;
-    let xray = Arc::new(XrayExecutor::new(
-        Box::new(RealPlatform),
-        Box::new(SystemRunner),
-        Journal::new(std::path::Path::new(STATE_DIR)),
-        std::path::Path::new(SOCKET_DIR).join("xray-tun.log"),
-    ));
+    let xray = Arc::new(
+        XrayExecutor::new(
+            Box::new(RealPlatform),
+            Box::new(SystemRunner),
+            Journal::new(std::path::Path::new(STATE_DIR)),
+            std::path::Path::new(SOCKET_DIR).join("xray-tun.log"),
+        )
+        .with_assets(std::path::Path::new(STATE_DIR).join("geo")),
+    );
     let state_dir = std::path::Path::new(STATE_DIR);
     let wireguard = Arc::new(
         WireGuardExecutor::new(

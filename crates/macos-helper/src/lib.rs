@@ -11,6 +11,7 @@ pub mod backends;
 pub mod dns;
 pub mod dnsquery;
 pub mod event_log;
+pub mod geo_stage;
 pub mod intents;
 pub mod journal;
 pub mod link;

@@ -168,8 +168,8 @@ impl Platform for RealPlatform {
             .ok_or_else(|| io::Error::other("tunnel has no descriptor"))?;
         let log = open_log(spec.log, spec.uid, account.gid)?;
         let asset_dir = spec
-            .executable
-            .parent()
+            .asset_dir
+            .or_else(|| spec.executable.parent())
             .map(Path::to_path_buf)
             .unwrap_or_default();
         let (uid, gid) = (spec.uid, account.gid);
@@ -479,6 +479,7 @@ mod tests {
                 uid,
                 config: b"{}",
                 log: &log,
+                asset_dir: None,
             },
         );
         assert!(result.is_err());

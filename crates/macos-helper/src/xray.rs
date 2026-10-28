@@ -77,6 +77,9 @@ pub struct SpawnSpec<'a> {
     pub uid: u32,
     pub config: &'a [u8],
     pub log: &'a Path,
+    /// Staged geo data for `XRAY_LOCATION_ASSET`; `None` uses the files next
+    /// to the executable.
+    pub asset_dir: Option<&'a Path>,
 }
 
 /// Everything that needs root or a real machine.
@@ -107,6 +110,8 @@ pub struct XrayExecutor {
     runner: Box<dyn Runner>,
     journal: Journal,
     log: PathBuf,
+    /// Where geo data overrides are staged (root-owned); none: unsupported.
+    assets: Option<PathBuf>,
     active: Mutex<Option<Active>>,
 }
 
@@ -126,7 +131,24 @@ impl XrayExecutor {
             runner,
             journal,
             log,
+            assets: None,
             active: Mutex::new(None),
+        }
+    }
+
+    /// Serve geo data overrides, staged under `dir`.
+    pub fn with_assets(mut self, dir: PathBuf) -> Self {
+        self.assets = Some(dir);
+        self
+    }
+
+    fn staged_assets(&self) -> Option<PathBuf> {
+        self.assets.as_ref().map(|dir| dir.join("xray"))
+    }
+
+    fn clear_assets(&self) {
+        if let Some(dir) = self.staged_assets() {
+            crate::geo_stage::clear(&dir);
         }
     }
 
@@ -175,6 +197,7 @@ impl XrayExecutor {
         };
         routes::remove(&*self.runner, &active.record.routes);
         drop(active.tun);
+        self.clear_assets();
         if dns_ok {
             self.journal.clear()
         } else {
@@ -291,7 +314,26 @@ impl XrayExecutor {
             if let (true, Some(snapshot)) = (dns_touched, &record.dns) {
                 let _ = dns::restore(&*this.runner, snapshot);
             }
+            this.clear_assets();
             let _ = this.journal.clear();
+        };
+
+        let staged = match &params.geo_assets {
+            Some(assets) => {
+                let Some(dir) = self.staged_assets() else {
+                    rollback(self, &record, false);
+                    return Err(Error::Unavailable(
+                        "This helper cannot serve custom geo data".into(),
+                    ));
+                };
+                let managed = executable.parent().unwrap_or(Path::new("/"));
+                if crate::geo_stage::stage(assets, managed, uid, &dir).is_err() {
+                    rollback(self, &record, false);
+                    return Err(Error::Invalid("The geo data could not be prepared".into()));
+                }
+                Some(dir)
+            }
+            None => None,
         };
 
         let tun = self.platform.open_tun(tun::DEFAULT_MTU).map_err(|err| {
@@ -325,6 +367,7 @@ impl XrayExecutor {
                     uid,
                     config: &config,
                     log: &self.log,
+                    asset_dir: staged.as_deref(),
                 },
             )
             .map_err(|_| {
@@ -549,6 +592,8 @@ mod tests {
         spawn_fails: AtomicBool,
         tun_fails: AtomicBool,
         dies_on_settle: AtomicBool,
+        /// The staged asset directory and its `geoip.dat` as Xray saw them.
+        staged: Mutex<Option<(PathBuf, Vec<u8>)>>,
     }
 
     struct FakeProcess(Arc<Flags>);
@@ -588,6 +633,12 @@ mod tests {
                 "en0"
             );
             self.0.alive.store(true, Ordering::SeqCst);
+            *self.0.staged.lock().unwrap() = spec.asset_dir.map(|dir| {
+                (
+                    dir.to_path_buf(),
+                    std::fs::read(dir.join("geoip.dat")).unwrap_or_default(),
+                )
+            });
             Ok(Box::new(FakeProcess(self.0.clone())))
         }
         fn resolve(&self, host: &str) -> Vec<Ipv4Addr> {
@@ -641,7 +692,8 @@ mod tests {
             Box::new(Shared(runner.clone())),
             Journal::new(dir.path()),
             dir.path().join("xray.log"),
-        );
+        )
+        .with_assets(dir.path().join("geo"));
         Fixture {
             executor,
             flags,
@@ -702,6 +754,63 @@ mod tests {
         assert!(calls.contains(&"route -n delete -net 128.0.0.0 -netmask 128.0.0.0".to_string()));
         assert!(f.executor.owned().is_none());
         assert_eq!(f.executor.status(501, "p").state, TunnelState::Stopped);
+    }
+
+    fn with_geo(id: &str) -> XrayConnectParams {
+        use base64::Engine;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        XrayConnectParams {
+            geo_assets: Some(net_manager_core::daemon_protocol::XrayGeoAssets {
+                geoip_dat_b64: Some(b64(b"custom-ip")),
+                geosite_dat_b64: Some(b64(b"custom-site")),
+            }),
+            ..params(id)
+        }
+    }
+
+    #[test]
+    fn geo_data_is_staged_for_xray_and_removed_with_the_tunnel() {
+        let f = fixture();
+        f.executor.connect(501, with_geo("work")).unwrap();
+        let (dir, geoip) = f.flags.staged.lock().unwrap().clone().expect("staged");
+        assert_eq!(dir, f.dir.path().join("geo/xray"));
+        assert_eq!(geoip, b"custom-ip");
+        assert!(dir.join("geosite.dat").is_file());
+        f.executor.disconnect(501, "work").unwrap();
+        assert!(!dir.exists(), "disconnect removes the staged files");
+        // Without overrides nothing is staged and Xray uses its own files.
+        f.executor.connect(501, params("plain")).unwrap();
+        assert!(f.flags.staged.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_start_leaves_no_staged_files() {
+        let f = fixture();
+        f.flags.spawn_fails.store(true, Ordering::SeqCst);
+        assert!(f.executor.connect(501, with_geo("work")).is_err());
+        assert!(!f.dir.path().join("geo/xray").exists());
+    }
+
+    #[test]
+    fn a_helper_without_staging_refuses_geo_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let flags = Arc::new(Flags::default());
+        let runner = Arc::new(FakeRunner::default());
+        runner.reply(
+            "route -n get default",
+            "gateway: 192.168.1.1\n interface: en0\n",
+        );
+        runner.reply("networksetup -listnetworkserviceorder", ORDER);
+        runner.reply("networksetup -getdnsservers", "1.1.1.1\n");
+        let executor = XrayExecutor::new(
+            Box::new(FakePlatform(flags.clone())),
+            Box::new(Shared(runner)),
+            Journal::new(dir.path()),
+            dir.path().join("xray.log"),
+        );
+        let error = executor.connect(501, with_geo("work")).unwrap_err();
+        assert!(matches!(error, Error::Unavailable(_)), "{error:?}");
+        assert!(!executor.active());
     }
 
     #[test]
