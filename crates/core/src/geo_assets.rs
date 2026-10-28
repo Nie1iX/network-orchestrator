@@ -252,19 +252,39 @@ pub fn protocol_geo_assets(dir: &Path) -> Result<crate::daemon_protocol::XrayGeo
     })
 }
 
-/// Downloads configured overrides into the per-profile cache and returns the
-/// directory holding them for inline transport, or `None` when the profile
-/// uses the managed geo data.
-pub async fn ensure_geo_assets(
-    notes: &mut Vec<String>,
-    root: &Path,
-    profile: &Profile,
-) -> Result<Option<PathBuf>, String> {
+/// Builds `target` for an Xray that runs as the user: each file of `cache`
+/// is laid over the managed copy in `managed` (providers ship minimal
+/// overlays), and a file the cache lacks is the managed copy as it is.
+pub fn overlay_dir(cache: &Path, managed: &Path, target: &Path) -> Result<(), String> {
+    let read = |path: PathBuf| -> Option<Vec<u8>> {
+        let bytes = std::fs::read(path).ok()?;
+        (!bytes.is_empty() && bytes.len() <= MAX_GEO_ASSET_BYTES).then_some(bytes)
+    };
+    std::fs::create_dir_all(target)
+        .map_err(|_| "geo asset directory is unavailable".to_string())?;
+    for name in ["geoip.dat", "geosite.dat"] {
+        let stock = read(managed.join(name));
+        let bytes = match (stock, read(cache.join(name))) {
+            (Some(stock), Some(overlay)) => {
+                crate::geo_list::merge_geo_list(&stock, &overlay).unwrap_or(overlay)
+            }
+            (None, Some(overlay)) => overlay,
+            (Some(stock), None) => stock,
+            (None, None) => return Err("a geo data file is unreadable".into()),
+        };
+        write_atomic(&target.join(name), &bytes)?;
+    }
+    Ok(())
+}
+
+/// The production downloader: HTTPS only (callers validate the URL), bounded
+/// in size and time, with errors that never carry the URL.
+pub fn http_fetch() -> Result<Box<Fetch>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|_| "geo asset client is unavailable".to_string())?;
-    let fetch = move |url: &str| {
+    Ok(Box::new(move |url: &str| {
         let url = url.to_string();
         let client = client.clone();
         Box::pin(async move {
@@ -295,8 +315,25 @@ pub async fn ensure_geo_assets(
             }
             Ok(bytes)
         }) as Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>
-    };
+    }))
+}
+
+/// Downloads configured overrides into the per-profile cache and returns the
+/// directory holding them for inline transport, or `None` when the profile
+/// uses the managed geo data.
+pub async fn ensure_geo_assets(
+    notes: &mut Vec<String>,
+    root: &Path,
+    profile: &Profile,
+) -> Result<Option<PathBuf>, String> {
+    let fetch = http_fetch()?;
     ensure_with_fetch(notes, root, profile, &fetch).await
+}
+
+/// Whether the profile asks for custom geo data at all.
+pub fn wants_overrides(profile: &Profile) -> bool {
+    normalized_url(profile.xray_geoip_url.as_deref()).is_some()
+        || normalized_url(profile.xray_geosite_url.as_deref()).is_some()
 }
 
 #[cfg(test)]
@@ -615,5 +652,30 @@ mod tests {
         assert!(parse_sha256_sidecar(b"short").is_none());
         assert!(parse_sha256_sidecar(b"").is_none());
         assert!(parse_sha256_sidecar(&[0xff, 0xfe]).is_none());
+    }
+
+    #[test]
+    fn overlay_dir_takes_the_cache_where_it_has_a_file_and_the_managed_copy_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cache, managed, out) = (
+            tmp.path().join("cache"),
+            tmp.path().join("managed"),
+            tmp.path().join("out"),
+        );
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join("geoip.dat"), b"stock-ip").unwrap();
+        std::fs::write(managed.join("geosite.dat"), b"stock-site").unwrap();
+        // Not parseable as a geo list, so the cached file replaces the stock one.
+        std::fs::write(cache.join("geoip.dat"), b"custom-ip").unwrap();
+        overlay_dir(&cache, &managed, &out).unwrap();
+        assert_eq!(std::fs::read(out.join("geoip.dat")).unwrap(), b"custom-ip");
+        assert_eq!(
+            std::fs::read(out.join("geosite.dat")).unwrap(),
+            b"stock-site"
+        );
+        // With nothing to build from, it says so rather than leaving a hole.
+        std::fs::remove_file(managed.join("geosite.dat")).unwrap();
+        assert!(overlay_dir(&cache, &managed, &tmp.path().join("again")).is_err());
     }
 }

@@ -333,13 +333,25 @@ fn start_tun(engine: &Engine, profile: &Profile) -> Result<(), String> {
         .ok_or("Install Xray to start this connection")?;
     let config = net_manager_core::vpn::prepare_xray_config_base(profile)
         .map_err(|_| "The Xray configuration could not be prepared".to_string())?;
+    let geo = crate::geo::prepare(&engine.root, &executable, profile)?;
     // Validated here, as the user: a tun inbound would need privileges, and
     // the helper adds it only after this passes.
     if client.validates_locally() {
-        net_manager_core::vpn::run_xray_validation(&executable, &config)
-            .map_err(|_| "The Xray configuration is invalid".to_string())?;
+        net_manager_core::vpn::run_xray_validation_with_assets(
+            &executable,
+            &config,
+            geo.as_ref().map(|geo| geo.dir.as_path()),
+        )
+        .map_err(|_| "The Xray configuration is invalid".to_string())?;
     }
-    request_tunnel(client, &engine.root, profile, config, resolver_bypass())
+    request_tunnel(
+        client,
+        &engine.root,
+        profile,
+        config,
+        resolver_bypass(),
+        geo.map(|geo| geo.inline),
+    )
 }
 
 /// The `xray.connect` request. The config carries no tun inbound: the helper
@@ -350,6 +362,7 @@ fn request_tunnel(
     profile: &Profile,
     config: Vec<u8>,
     dns_bypass: Vec<String>,
+    geo_assets: Option<net_manager_core::daemon_protocol::XrayGeoAssets>,
 ) -> Result<(), String> {
     let params = XrayConnectParams {
         profile_id: profile.id.clone(),
@@ -370,7 +383,7 @@ fn request_tunnel(
             dns_bypass
         },
         interface_name: None,
-        geo_assets: None,
+        geo_assets,
         macos_data_root: Some(root.to_string_lossy().into_owned()),
         role: profile.tunnel_role,
     };
@@ -585,10 +598,14 @@ impl Engine {
             .ok_or("Install Xray to start this connection")?;
         free_listener_ports(root, store, &mut profile);
         let profile = &profile;
+        let geo = crate::geo::prepare(root, &executable, profile)?;
         with_session(root, |session| {
             session
                 .tunnels
                 .set_executable(TunnelBackend::Xray, Some(executable));
+            session
+                .tunnels
+                .set_xray_asset_dir(&profile.id, geo.map(|geo| geo.dir));
             session.tunnels.connect(profile).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     "The connection is already running".to_string()
@@ -930,7 +947,7 @@ impl Engine {
     }
 }
 
-fn download_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+pub(crate) fn download_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
     DOWNLOAD_RUNTIME
         .get_or_init(|| {
             tokio::runtime::Builder::new_current_thread()
@@ -1025,6 +1042,7 @@ mod tests {
             &tun_profile(),
             config,
             vec!["192.168.1.1".into()],
+            None,
         )
         .unwrap();
         let request = seen.recv().unwrap();
@@ -1036,6 +1054,30 @@ mod tests {
         let sent: Value = serde_json::from_str(text).unwrap();
         assert!(!net_manager_core::xray::has_tun_inbound(&sent));
         assert!(!text.contains("autoOutboundsInterface"));
+    }
+
+    #[test]
+    fn custom_geo_data_travels_with_the_tunnel_request_and_is_otherwise_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(dir.path(), |request| {
+            ResponseFrame::ok(request.id, json!({"status": status_json("running")}))
+        });
+        let geo = net_manager_core::daemon_protocol::XrayGeoAssets {
+            geoip_dat_b64: Some("Y3VzdG9t".into()),
+            geosite_dat_b64: None,
+        };
+        request_tunnel(
+            &client,
+            Path::new("/d"),
+            &tun_profile(),
+            b"{}".to_vec(),
+            vec![],
+            Some(geo),
+        )
+        .unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.params["geoAssets"]["geoipDatB64"], "Y3VzdG9t");
+        assert!(request.params["geoAssets"].get("geositeDatB64").is_none());
     }
 
     #[test]
@@ -1054,6 +1096,7 @@ mod tests {
             &tun_profile(),
             b"{}".to_vec(),
             vec![],
+            None,
         )
         .unwrap_err();
         assert_eq!(error, "another VPN already owns the default route");
