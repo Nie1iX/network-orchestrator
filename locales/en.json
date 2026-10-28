@@ -509,6 +509,8 @@
     "form.errWgPrivKey": "WireGuard private key is required.",
     "form.externalAttach": "External interface",
     "form.geoHint": "Custom geo data (optional) — HTTPS URLs to geoip.dat / geosite.dat replacing the bundled files. Downloaded on connect, cached 24h.",
+    "native.geo.geoip": "geoip.dat address (https)",
+    "native.geo.geosite": "geosite.dat address (https)",
     "form.gwPh": "Gateway (optional)",
     "form.ifaceAddr": "Interface address",
     "form.keepalive": "Persistent keepalive (seconds, optional)",

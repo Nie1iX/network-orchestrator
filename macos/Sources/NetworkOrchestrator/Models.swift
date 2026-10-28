@@ -816,6 +816,9 @@ struct RoutingOptions: Decodable, Sendable {
   var dnsHosts = ""
   var fakeDns = false
   var queryStrategy = ""
+  /// Custom geo data (https), empty for the managed files.
+  var geoipUrl = ""
+  var geositeUrl = ""
 }
 /// Fields recovered from a pasted Happ/Incy routing export; absent fields
 /// were not mentioned and keep their current value in the editor.
@@ -831,6 +834,8 @@ struct HappRouting: Decodable, Sendable {
   let dnsHosts: String?
   let fakeDns: Bool?
   let queryStrategy: String?
+  let geoipUrl: String?
+  let geositeUrl: String?
   let warnings: [String]
 }
 struct RouteCheckResult: Decodable, Sendable {
@@ -851,6 +856,7 @@ extension RoutingOptions {
       "domainStrategy": domainStrategy, "domainMatcher": domainMatcher,
       "dnsServers": dnsServers, "dnsHosts": dnsHosts,
       "fakeDns": fakeDns ? "true" : "false", "queryStrategy": queryStrategy,
+      "geoipUrl": geoipUrl, "geositeUrl": geositeUrl,
     ]
   }
   /// Applies the fields a Happ export mentions and keeps the rest.
@@ -865,5 +871,7 @@ extension RoutingOptions {
     if let value = happ.dnsHosts { dnsHosts = value }
     if let value = happ.fakeDns { fakeDns = value }
     if let value = happ.queryStrategy { queryStrategy = value }
+    if let value = happ.geoipUrl { geoipUrl = value }
+    if let value = happ.geositeUrl { geositeUrl = value }
   }
 }

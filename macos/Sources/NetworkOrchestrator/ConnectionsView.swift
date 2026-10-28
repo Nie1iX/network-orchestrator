@@ -1495,6 +1495,10 @@ struct RoutingRulesEditor: View {
       editor($options.dnsHosts, height: 70, label: "native.staticHosts")
       Toggle(L10n.text("native.fakeDns"), isOn: $options.fakeDns).toggleStyle(.checkbox)
         .font(.system(size: 11.9))
+      Text(L10n.text("form.geoHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+        .fixedSize(horizontal: false, vertical: true)
+      AppInput(placeholder: "native.geo.geoip", text: $options.geoipUrl)
+      AppInput(placeholder: "native.geo.geosite", text: $options.geositeUrl)
     }
   }
   private var checker: some View {

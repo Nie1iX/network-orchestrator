@@ -560,6 +560,8 @@
     "form.errWgPrivKey": "Требуется приватный ключ WireGuard.",
     "form.externalAttach": "Внешний интерфейс",
     "form.geoHint": "Свои geo-данные (необязательно) — HTTPS-URL к geoip.dat / geosite.dat вместо встроенных файлов. Скачиваются при подключении, кэшируются на 24 ч.",
+    "native.geo.geoip": "Адрес geoip.dat (https)",
+    "native.geo.geosite": "Адрес geosite.dat (https)",
     "form.gwPh": "Шлюз (необязательно)",
     "form.ifaceAddr": "Адрес интерфейса",
     "form.keepalive": "Persistent keepalive (секунды, необязательно)",

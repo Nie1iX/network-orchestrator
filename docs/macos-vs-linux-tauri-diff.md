@@ -87,7 +87,7 @@
 5. **Policy-маршрутизация и Xray routing.** macOS: редактор правил Xray
    (`RoutingRulesEditor`), `set_routing_rules`, `check_route`, разбор Happ-routing,
    командой `netorch route set`. Linux: те же правила плюс bulk CIDR,
-   geo-списки (`geo_assets.rs`), `xray_test_route`.
+   geo-списки (`geo_assets.rs`), `xray_test_route`. macOS: свои `geoip.dat`/`geosite.dat` тоже (п.9: `core::geo_assets`, поля в редакторе правил Xray и при импорте Happ; helper кладёт их в root-каталог для TUN-Xray), bulk CIDR уже есть.
 6. **Восстановление после сбоя.** macOS: helper откатывает маршруты и DNS
    упавшего тоннеля при своём старте (`recovery.cleanup` вручную), UI-запроса
    нет. Linux: `RecoveryPrompt` в UI, отчёт и очистка (`get_recovery_report`,
@@ -210,6 +210,6 @@ macOS перед коммитом.
    интерфейса с default route). Таблицы и правила на macOS не имеют
    аналога (один FIB), `route add/del` и explain отложены до п.8–9.
 8. Intents и Conditions — три слайса (`docs/plans/2026-10-27-20-macos-route-intents.md`): **1 ✅ движок и Intents** (helper: хранилище, маршруты, сверка каждые 2 с и полная раз в 10 с, защиты; мост `intents`/`set_intent`/`delete_intent`; вкладка в Swift), **2 ✅ Conditions** (`core::route_conditions`, правила в том же хранилище и той же сверке, `condRules.*`, мост `cond_rules`/`put_cond_rule`/`delete_cond_rule`, вкладка Conditions), **3 ✅ «доктор» Intents** (`core::intent_doctor` — порт `intentDoctor.ts`, метод моста `intent_doctor`, карточки на вкладке Intents; на macOS конфликт — только подсказка, подавить чужой маршрут нельзя).
-9. Static routes ✅ (профиль `none` = intent `static-<id>`, переключатель «ждать интерфейс», подключение из приложения и `netorch up/down`); **внешний интерфейс с bypass** ✅ (поле «Endpoint bypass» при создании профиля; имена резолвятся при подключении, bypass ставится первым и снимается последним) и **маршруты со своим шлюзом** ✅ (`10.1.0.0/16 via 10.0.0.1` → intent `static-<id>-gwN` с путём `gateway`; ждёт, пока шлюз окажется в подключённой сети). Always-on решено не делать: профиль снимается при выходе из приложения.
+9. Static routes ✅ (профиль `none` = intent `static-<id>`, переключатель «ждать интерфейс», подключение из приложения и `netorch up/down`); **внешний интерфейс с bypass** ✅ (поле «Endpoint bypass» при создании профиля; имена резолвятся при подключении, bypass ставится первым и снимается последним) и **маршруты со своим шлюзом** ✅ (`10.1.0.0/16 via 10.0.0.1` → intent `static-<id>-gwN` с путём `gateway`; ждёт, пока шлюз окажется в подключённой сети). **Geo-списки** ✅ (свои `geoip.dat`/`geosite.dat` по https: скачивает и кэширует приложение, для loopback Xray и проверки собирается слитая копия с управляемыми файлами, для TUN файлы идут inline и helper кладёт их в root-каталог `geo/xray`, который удаляется вместе с туннелем). Always-on решено не делать: профиль снимается при выходе из приложения.
 
 NetworkManager-панель не переносится: на macOS аналога нет.

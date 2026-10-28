@@ -210,11 +210,26 @@ fn advanced_from_args(args: &Value) -> Result<Advanced, String> {
     })
 }
 
+/// A custom geo data URL: empty clears it, anything else must be HTTPS.
+fn geo_url(args: &Value, key: &str) -> Result<Option<String>, String> {
+    let url = text(args, key).trim();
+    if url.is_empty() {
+        return Ok(None);
+    }
+    net_manager_core::geo_assets::validate_geo_asset_url(url)
+        .map_err(|_| "A geo data address must start with https://".to_string())?;
+    Ok(Some(url.to_string()))
+}
+
 /// Apply the editor's draft to a profile: rule sets, LAN toggle and, when the
 /// editor sent them, the strategy and DNS options.
 pub(crate) fn apply_draft(profile: &mut Profile, args: &Value) -> Result<(), String> {
     profile.domain_policies = policies_from_args(args)?;
     profile.private_lan_direct = text(args, "privateLanDirect") == "true";
+    if args.get("geoipUrl").is_some() || args.get("geositeUrl").is_some() {
+        profile.xray_geoip_url = geo_url(args, "geoipUrl")?;
+        profile.xray_geosite_url = geo_url(args, "geositeUrl")?;
+    }
     if args.get("domainStrategy").is_some() {
         let advanced = advanced_from_args(args)?;
         profile.xray_domain_strategy = advanced.strategy;
@@ -254,6 +269,8 @@ pub(crate) fn options_json(profile: &Profile) -> Value {
     value["domainStrategy"] = json!(strategy_name(profile.xray_domain_strategy));
     value["domainMatcher"] = json!(matcher_name(profile.xray_domain_matcher));
     dns_json(&mut value, &profile.xray_dns);
+    value["geoipUrl"] = json!(profile.xray_geoip_url.clone().unwrap_or_default());
+    value["geositeUrl"] = json!(profile.xray_geosite_url.clone().unwrap_or_default());
     value
 }
 
@@ -274,11 +291,13 @@ fn happ_json(import: happ_routing::HappRoutingImport) -> Value {
         dns_json(&mut value, &import.dns);
     }
     value["name"] = json!(import.name);
-    let mut warnings = import.warnings;
-    if import.geoip_url.is_some() || import.geosite_url.is_some() {
-        warnings.push("Custom geo data URLs are not used by this client".into());
+    if let Some(url) = &import.geoip_url {
+        value["geoipUrl"] = json!(url);
     }
-    value["warnings"] = json!(warnings);
+    if let Some(url) = &import.geosite_url {
+        value["geositeUrl"] = json!(url);
+    }
+    value["warnings"] = json!(import.warnings);
     value
 }
 
@@ -381,6 +400,65 @@ mod tests {
         let result = route_check(dir.path(), &args).unwrap();
         assert_eq!(result["outbound"], "block");
         assert_eq!(result["source"], "policy");
+    }
+
+    fn draft(extra: Value) -> Value {
+        let mut args = json!({"block": "", "proxy": "", "direct": "", "privateLanDirect": "false"});
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        args
+    }
+
+    #[test]
+    fn geo_urls_are_saved_cleared_and_shown_back() {
+        let mut profile = Profile::default();
+        apply_draft(
+            &mut profile,
+            &draft(json!({"geoipUrl": " https://cdn.example/geoip.dat ", "geositeUrl": ""})),
+        )
+        .unwrap();
+        assert_eq!(
+            profile.xray_geoip_url.as_deref(),
+            Some("https://cdn.example/geoip.dat")
+        );
+        assert_eq!(profile.xray_geosite_url, None);
+        let shown = options_json(&profile);
+        assert_eq!(shown["geoipUrl"], "https://cdn.example/geoip.dat");
+        assert_eq!(shown["geositeUrl"], "");
+        // An editor that does not mention them leaves them alone.
+        apply_draft(&mut profile, &draft(json!({}))).unwrap();
+        assert!(profile.xray_geoip_url.is_some());
+        apply_draft(
+            &mut profile,
+            &draft(json!({"geoipUrl": "", "geositeUrl": ""})),
+        )
+        .unwrap();
+        assert_eq!(profile.xray_geoip_url, None);
+    }
+
+    #[test]
+    fn a_geo_url_that_is_not_https_is_refused_without_changing_the_profile() {
+        let mut profile = Profile::default();
+        for bad in ["http://cdn.example/geoip.dat", "ftp://x/y", "cdn.example"] {
+            assert!(
+                apply_draft(&mut profile, &draft(json!({"geoipUrl": bad}))).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(profile.xray_geoip_url, None);
+    }
+
+    #[test]
+    fn happ_geo_urls_reach_the_editor_instead_of_a_warning() {
+        let import = happ_routing::HappRoutingImport {
+            geoip_url: Some("https://cdn.example/geoip.dat".into()),
+            ..Default::default()
+        };
+        let value = happ_json(import);
+        assert_eq!(value["geoipUrl"], "https://cdn.example/geoip.dat");
+        assert!(value.get("geositeUrl").is_none());
+        assert!(!value["warnings"].to_string().contains("geo"));
     }
 
     #[test]
