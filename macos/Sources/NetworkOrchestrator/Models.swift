@@ -721,6 +721,24 @@ struct Inspection: Decodable, Sendable {
   let routeKnowledgeComplete: Bool
 }
 
+/// What this client may start. A UI-level filter, as on Linux: `orchestrator`
+/// never starts a managed backend (only static routes), the others start all.
+enum AppMode: String, CaseIterable, Identifiable, Sendable {
+  case combined, orchestrator, manager
+  var id: Self { self }
+  var titleKey: String {
+    switch self {
+    case .combined: "settings.modeCombined"
+    case .orchestrator: "settings.modeOrchestrator"
+    case .manager: "settings.modeManager"
+    }
+  }
+  /// Whether starting `profile` is blocked by this mode.
+  func locks(_ profile: Profile) -> Bool { self == .orchestrator && !profile.isStatic }
+  /// Unknown stored values fall back to `combined`.
+  init(stored: String?) { self = stored.flatMap(AppMode.init(rawValue:)) ?? .combined }
+}
+
 enum Section: String, CaseIterable, Identifiable {
   case home = "Home"
   case connections = "Connections"

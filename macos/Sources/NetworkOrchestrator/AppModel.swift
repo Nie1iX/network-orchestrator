@@ -173,14 +173,21 @@ import SystemConfiguration
   }
   /// Whether this client can start `profile` right now: loopback Xray always,
   /// anything that needs a tunnel device once the privileged helper serves it.
+  private static let appModeKey = "appMode"
+  var appMode = AppMode(stored: UserDefaults.standard.string(forKey: AppModel.appModeKey)) {
+    didSet { UserDefaults.standard.set(appMode.rawValue, forKey: Self.appModeKey) }
+  }
+  /// The mode forbids starting `profile`; a running one can still be stopped.
+  func modeLocks(_ profile: Profile) -> Bool { appMode.locks(profile) && !isRunning(profile) }
   func canStart(_ profile: Profile) -> Bool {
+    if modeLocks(profile) { return false }
     if profile.startsWithoutHelper { return canStartConnections }
     return profile.needsHelper && canStartConnections && helperServes(profile)
   }
   /// The switch is usable for a TUN profile even without the helper: pressing
   /// it then offers to install the helper instead of doing nothing.
   func canTryStart(_ profile: Profile) -> Bool {
-    canStart(profile) || (profile.needsHelper && canStartConnections)
+    !modeLocks(profile) && (canStart(profile) || (profile.needsHelper && canStartConnections))
   }
   /// Interfaces of tunnels this app runs itself.
   var ownTunnelInterfaces: Set<String> {

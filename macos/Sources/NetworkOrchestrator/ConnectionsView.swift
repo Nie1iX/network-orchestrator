@@ -528,7 +528,9 @@ struct ConnectionSwitch: View {
     }.buttonStyle(.plain).disabled(!enabled)
       .help(
         L10n.text(
-          !model.canStart(profile) && model.canStartConnections
+          model.modeLocks(profile)
+            ? "profiles.modeManagedOnly"
+            : !model.canStart(profile) && model.canStartConnections
             ? "native.helperRequired"
             : running ? "common.disconnect" : "common.connect")
       )

@@ -663,6 +663,18 @@ struct SettingsView: View {
             .frame(width: 150)
         }.padding(.horizontal, 14).padding(.vertical, 10.5)
       }
+      settingsGroup("settings.appMode") {
+        HStack {
+          settingText("settings.appMode", "settings.appModeSub")
+          Spacer()
+          AppSelect(
+            label: "settings.appMode",
+            selection: Binding(
+              get: { model.appMode.rawValue }, set: { model.appMode = AppMode(stored: $0) }),
+            options: AppMode.allCases.map { (value: $0.rawValue, title: $0.titleKey) }
+          ).frame(width: 150)
+        }.padding(.horizontal, 14).padding(.vertical, 10.5)
+      }
       settingsGroup("Backend & dependencies") {
         VStack(alignment: .leading, spacing: 10.5) {
           HStack {
