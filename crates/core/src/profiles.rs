@@ -217,10 +217,14 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
             && profile.xray_mode == crate::models::XrayMode::Tun));
     // Нативный клиент macOS импортирует и анализирует OpenVPN без запуска туннеля.
     let read_only_openvpn = cfg!(target_os = "macos") && profile.backend == TunnelBackend::OpenVpn;
+    // Static routes that all name their own gateway go through no interface.
+    let gateway_only = profile.backend == TunnelBackend::None
+        && profile.routes.iter().all(|route| route.via.is_some());
     if !profile.routes.is_empty()
         && profile.interface_name.trim().is_empty()
         && !daemon_assigned_interface
         && !read_only_openvpn
+        && !gateway_only
     {
         return Err(invalid_data(
             "profile interface name must not be blank when policy routes are set",
@@ -679,6 +683,21 @@ mod tests {
         }
         xray_tun.xray_mode = crate::models::XrayMode::Socks;
         assert!(validate_profile(&xray_tun).is_err());
+    }
+
+    #[test]
+    fn static_routes_that_all_name_a_gateway_need_no_interface() {
+        let mut profile = wg_profile();
+        profile.backend = TunnelBackend::None;
+        profile.interface_name.clear();
+        profile.routes = vec![PolicyRoute {
+            destination: "192.0.2.0/24".parse().unwrap(),
+            metric: 5,
+            via: Some("10.0.0.1".parse().unwrap()),
+        }];
+        assert!(validate_profile(&profile).is_ok());
+        profile.routes[0].via = None;
+        assert!(validate_profile(&profile).is_err());
     }
 
     #[test]

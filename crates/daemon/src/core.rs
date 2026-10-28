@@ -5144,11 +5144,13 @@ impl DaemonCore {
                     .collect(),
                 path: if spec.uplink {
                     NetIntentPath {
+                        gateway: None,
                         kind: "direct".into(),
                         interface: None,
                     }
                 } else {
                     NetIntentPath {
+                        gateway: None,
                         kind: "interface".into(),
                         interface: Some(spec.interface_name.clone()),
                     }
@@ -10594,6 +10596,7 @@ mod tests {
             id: id.into(),
             destinations: dests.iter().map(|d| d.to_string()).collect(),
             path: NetIntentPath {
+                gateway: None,
                 kind: "interface".into(),
                 interface: Some(iface.into()),
             },
@@ -10607,6 +10610,7 @@ mod tests {
             id: id.into(),
             destinations: dests.iter().map(|d| d.to_string()).collect(),
             path: NetIntentPath {
+                gateway: None,
                 kind: "direct".into(),
                 interface: None,
             },

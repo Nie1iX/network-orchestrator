@@ -1173,6 +1173,7 @@ mod tests {
                 id: "office".into(),
                 destinations: vec!["10.0.0.0/8".into()],
                 path: NetIntentPath {
+                    gateway: None,
                     kind: "interface".into(),
                     interface: Some("utun5".into()),
                 },

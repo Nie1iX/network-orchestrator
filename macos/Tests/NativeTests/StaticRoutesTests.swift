@@ -74,3 +74,29 @@ private func profile(_ backend: String, wait: Bool? = nil) throws -> Profile {
   #expect(try intent("static-office").isProfileOwned)
   #expect(try !intent("office").isProfileOwned)
 }
+
+@MainActor private func isolatedModel() -> AppModel {
+  AppModel(
+    dataDirectory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+}
+
+@MainActor @Test func aStaticProfileCanCarryGatewaysAndAnEndpointBypass() async throws {
+  let model = isolatedModel()
+  let saved = await model.createStatic(
+    name: "External", interface: "utun4", cidrs: "10.0.0.0/8\n192.0.2.0/24 via 10.9.0.1",
+    bypass: "203.0.113.7, vpn.example")
+  #expect(saved && model.error == nil)
+  #expect(model.snapshot?.profiles.first?.isStatic == true)
+  // Every route names its gateway: no interface is needed.
+  let gatewayOnly = await model.createStatic(
+    name: "Gateway", interface: "", cidrs: "198.51.100.0/24 via 10.9.0.1")
+  #expect(gatewayOnly)
+}
+
+@MainActor @Test func aStaticProfileThatCouldNeverConnectIsRefusedWithTheReason() async throws {
+  let model = isolatedModel()
+  let saved = await model.createStatic(name: "Bare", interface: "", cidrs: "192.0.2.0/24")
+  #expect(!saved)
+  #expect(model.error?.contains("interface") == true)
+  #expect(model.snapshot?.profiles.isEmpty ?? true)
+}

@@ -140,6 +140,7 @@ fn bypass_intent(id: String, mut ips: Vec<String>) -> NetIntentSetParams {
             })
             .collect(),
         path: NetIntentPath {
+            gateway: None,
             kind: "direct".into(),
             interface: None,
         },
@@ -341,6 +342,7 @@ mod tests {
 
     fn direct() -> NetIntentPath {
         NetIntentPath {
+            gateway: None,
             kind: "direct".into(),
             interface: None,
         }
@@ -348,6 +350,7 @@ mod tests {
 
     fn via(name: &str) -> NetIntentPath {
         NetIntentPath {
+            gateway: None,
             kind: "interface".into(),
             interface: Some(name.into()),
         }

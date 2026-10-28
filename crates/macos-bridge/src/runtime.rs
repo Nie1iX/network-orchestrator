@@ -82,6 +82,7 @@ fn intent_params(
         id: text("id"),
         destinations,
         path: NetIntentPath {
+            gateway: None,
             kind: text("kind"),
             interface: (!interface.is_empty()).then_some(interface),
         },

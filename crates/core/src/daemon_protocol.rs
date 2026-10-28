@@ -651,6 +651,9 @@ pub struct NetIntentPath {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface: Option<String>,
+    /// `gateway` paths (macOS): the next hop for the destinations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
 }
 
 /// `net.intent.set`: upsert a routing intent. `id` is a stable slug that

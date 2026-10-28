@@ -678,25 +678,34 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
             {
                 return Err("A profile with this identifier already exists".into());
             }
-            let routes = cidr_bulk::parse_bulk_cidrs(text_arg(args, "cidrs")?)
-                .map_err(|_| "Enter valid IPv4 or IPv6 CIDRs".to_string())?;
+            let routes =
+                cidr_bulk::parse_static_routes(text_arg(args, "cidrs")?, 5).map_err(|_| {
+                    "Enter valid CIDRs, optionally followed by 'via <gateway>'".to_string()
+                })?;
             if routes.is_empty() {
                 return Err("Add at least one route".into());
             }
             let profile = Profile {
                 id: id.into(),
                 name: text_arg(args, "name")?.trim().into(),
-                interface_name: text_arg(args, "interfaceName")?.trim().into(),
-                routes: routes
-                    .into_iter()
-                    .map(|destination| PolicyRoute {
-                        destination,
-                        metric: 5,
-                        via: None,
-                    })
+                interface_name: args["interfaceName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .into(),
+                routes,
+                endpoint_bypasses: args["bypass"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';'))
+                    .filter(|entry| !entry.is_empty())
+                    .map(String::from)
                     .collect(),
                 ..Profile::default()
             };
+            // The same checks the helper applies, so a profile that could
+            // never connect is refused here with the reason.
+            net_manager_core::route_intents::static_intents(&profile, &[])?;
             encode(net_manager_core::subscription::public_profiles(
                 store.upsert(profile).map_err(store_error)?.profiles,
             ))
@@ -1628,6 +1637,47 @@ mod tests {
             doc.profiles[0].routes[0].destination.to_string(),
             "10.77.0.0/24"
         );
+    }
+
+    #[test]
+    fn static_profiles_take_gateways_and_endpoint_bypasses() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"ext", "name":"External", "interfaceName":"utun4",
+                    "cidrs":"10.0.0.0/8\n192.0.2.0/24 via 10.9.0.1",
+                    "bypass":"203.0.113.7, vpn.example\n198.51.100.9"}),
+        )
+        .unwrap();
+        let profile = &created.as_array().unwrap()[0];
+        assert_eq!(profile["routes"][1]["via"], "10.9.0.1");
+        assert_eq!(
+            profile["endpointBypasses"],
+            json!(["203.0.113.7", "vpn.example", "198.51.100.9"])
+        );
+        // Every route names its gateway: no interface needed.
+        dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"gw", "name":"Gateway", "interfaceName":"", "cidrs":"192.0.2.0/24 via 10.9.0.1"}),
+        )
+        .unwrap();
+        // A route without one needs an interface, and the reason is given.
+        let error = dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"none", "name":"No interface", "interfaceName":"", "cidrs":"192.0.2.0/24"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("interface"), "{error}");
+        let error = dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"loop", "name":"Loop", "interfaceName":"en0", "cidrs":"192.0.2.0/24 via 127.0.0.1"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("gateway"), "{error}");
     }
 
     #[test]

@@ -742,12 +742,14 @@ mod tests {
     }
     fn via(name: &str) -> NetIntentPath {
         NetIntentPath {
+            gateway: None,
             kind: "interface".into(),
             interface: Some(name.into()),
         }
     }
     fn direct() -> NetIntentPath {
         NetIntentPath {
+            gateway: None,
             kind: "direct".into(),
             interface: None,
         }
@@ -788,6 +790,35 @@ mod tests {
             world.routes(),
             [("10.9.0.0/16".into(), "192.168.1.1".into())]
         );
+    }
+
+    #[test]
+    fn a_gateway_intent_waits_for_its_network_and_leaves_with_it() {
+        let world = World::new(&["en0"]);
+        let dir = tempfile::tempdir().unwrap();
+        let exec = executor(&world, &dir);
+        let gateway = NetIntentPath {
+            gateway: Some("10.0.0.1".into()),
+            kind: "gateway".into(),
+            interface: None,
+        };
+        exec.set(ME, params("lab", &["192.0.2.0/24"], gateway))
+            .unwrap();
+        assert!(world.routes().is_empty());
+        assert_eq!(exec.list(ME)[0].status, ExplainStatus::Deferred);
+        {
+            let mut view = world.view.lock().unwrap();
+            view.addresses = vec![net_manager_core::route_intents::IfaceAddr {
+                if_index: 15,
+                interface: "en0".into(),
+                address: "10.0.0.5/24".parse().unwrap(),
+            }];
+        }
+        exec.tick();
+        assert_eq!(world.routes(), [("192.0.2.0/24".into(), "10.0.0.1".into())]);
+        assert_eq!(exec.list(ME)[0].status, ExplainStatus::Effective);
+        exec.delete(ME, "lab").unwrap();
+        assert!(world.routes().is_empty());
     }
 
     #[test]

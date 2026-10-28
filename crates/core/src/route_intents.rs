@@ -11,6 +11,7 @@ use std::net::IpAddr;
 
 pub const MAX_DESTINATIONS: usize = 64;
 const DEFAULT_METRIC: u32 = 100;
+pub const MAX_ID_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntentPath {
@@ -18,6 +19,8 @@ pub enum IntentPath {
     Direct,
     /// Any device, a tunnel included; armed until it exists.
     Interface(String),
+    /// A next hop on a connected network; armed until one is connected.
+    Gateway(IpAddr),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +43,7 @@ impl Intent {
 
 fn valid_id(id: &str) -> bool {
     let mut chars = id.chars();
-    id.len() <= 48
+    id.len() <= MAX_ID_LEN
         && chars
             .next()
             .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
@@ -70,6 +73,18 @@ pub fn check_routable(net: &IpNet, text: &str) -> Result<(), String> {
         || (address.is_unspecified() && host)
     {
         return Err(format!("'{text}' cannot be routed by an intent"));
+    }
+    Ok(())
+}
+
+/// A next hop that can be reached through a connected network.
+fn check_gateway(gateway: IpAddr) -> Result<(), String> {
+    let link_local = match gateway {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    };
+    if gateway.is_unspecified() || gateway.is_loopback() || gateway.is_multicast() || link_local {
+        return Err("This address cannot be used as a gateway".into());
     }
     Ok(())
 }
@@ -114,7 +129,16 @@ pub fn normalize(params: &NetIntentSetParams) -> Result<Intent, String> {
             }
             IntentPath::Interface(name.to_string())
         }
-        _ => return Err("The path must be 'direct' or an interface".into()),
+        "gateway" => {
+            let text = params.path.gateway.as_deref().unwrap_or_default();
+            let gateway = text
+                .trim()
+                .parse::<IpAddr>()
+                .map_err(|_| "Enter the gateway as an IP address".to_string())?;
+            check_gateway(gateway)?;
+            IntentPath::Gateway(gateway)
+        }
+        _ => return Err("The path must be 'direct', an interface or a gateway".into()),
     };
     Ok(Intent {
         id: params.id.clone(),
@@ -135,7 +159,8 @@ pub fn is_static_intent_id(id: &str) -> bool {
     id.starts_with(STATIC_PREFIX)
 }
 
-/// `static-<profile id>`, lowercased with anything else turned into `-`.
+/// `static-<profile id>`, lowercased with anything else turned into `-`. Room
+/// is left for the `-bypass` and `-gwN` suffixes.
 pub fn static_intent_id(profile_id: &str) -> Result<String, String> {
     let slug: String = profile_id
         .chars()
@@ -149,68 +174,146 @@ pub fn static_intent_id(profile_id: &str) -> Result<String, String> {
         })
         .collect();
     let id = format!("{STATIC_PREFIX}{slug}");
-    if slug.is_empty() || !valid_id(&id) {
+    if slug.is_empty() || id.len() + BYPASS_SUFFIX.len() > MAX_ID_LEN || !valid_id(&id) {
         return Err("This profile's identifier is too long for static routes".into());
     }
     Ok(id)
 }
 
-/// The intent that carries a static-route profile: its routes through its
-/// interface, armed until the interface exists. A route with its own gateway
-/// is not supported on macOS yet, so such a profile is refused rather than
-/// half applied.
-pub fn static_intent(profile: &crate::models::Profile) -> Result<NetIntentSetParams, String> {
+const BYPASS_SUFFIX: &str = "-bypass";
+const GATEWAY_SUFFIX: &str = "-gw";
+
+/// Whether `intent_id` is one of the intents `static_intents` derives for
+/// the profile (its routes, its gateway groups or its endpoint bypass).
+pub fn static_belongs(profile_id: &str, intent_id: &str) -> bool {
+    let Ok(base) = static_intent_id(profile_id) else {
+        return false;
+    };
+    let Some(rest) = intent_id.strip_prefix(&base) else {
+        return false;
+    };
+    rest.is_empty()
+        || rest == BYPASS_SUFFIX
+        || rest
+            .strip_prefix(GATEWAY_SUFFIX)
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// The intents that carry a static-route profile, in the order to apply them:
+/// the endpoint bypass first (so the tunnel's own packets never loop), then
+/// the routes through the profile's interface, then one intent per distinct
+/// gateway. `bypass` holds the endpoints already resolved to addresses.
+pub fn static_intents(
+    profile: &crate::models::Profile,
+    bypass: &[IpAddr],
+) -> Result<Vec<NetIntentSetParams>, String> {
     use crate::models::TunnelBackend;
     if profile.backend != TunnelBackend::None {
         return Err("This is not a static-route profile".into());
     }
+    if profile.routes.is_empty() {
+        return Err("Add at least one route".into());
+    }
+    let base = static_intent_id(&profile.id)?;
     let interface = profile.interface_name.trim();
-    if interface.is_empty() {
+    let needs_interface = profile.routes.iter().any(|route| route.via.is_none());
+    if needs_interface && interface.is_empty() {
         return Err("Choose the interface these routes go through".into());
     }
-    if !valid_interface(interface) || interface == "lo0" {
+    if !interface.is_empty() && (!valid_interface(interface) || interface == "lo0") {
         return Err(format!(
             "'{interface}' is not a macOS interface name such as en0 or utun4"
         ));
     }
-    if profile.routes.is_empty() {
-        return Err("Add at least one route".into());
+    let mut intents = Vec::new();
+    let mut bypassed: Vec<IpNet> = Vec::new();
+    for address in bypass {
+        let net = IpNet::from(*address);
+        check_routable(&net, &net.to_string())?;
+        if !bypassed.contains(&net) {
+            bypassed.push(net);
+        }
     }
-    if profile.routes.iter().any(|route| route.via.is_some()) {
-        return Err("Static routes with their own gateway are not supported on macOS yet".into());
+    if !bypassed.is_empty() {
+        intents.push(NetIntentSetParams {
+            id: format!("{base}{BYPASS_SUFFIX}"),
+            destinations: bypassed.iter().map(ToString::to_string).collect(),
+            path: NetIntentPath {
+                gateway: None,
+                kind: "direct".into(),
+                interface: None,
+            },
+            metric: None,
+            enabled: Some(true),
+        });
     }
-    Ok(NetIntentSetParams {
-        id: static_intent_id(&profile.id)?,
-        destinations: profile
-            .routes
-            .iter()
-            .map(|route| route.destination.to_string())
-            .collect(),
-        path: NetIntentPath {
-            kind: "interface".into(),
-            interface: Some(interface.to_string()),
-        },
-        metric: profile.routes.first().map(|route| route.metric),
-        enabled: Some(true),
-    })
+    let direct: Vec<_> = profile.routes.iter().filter(|r| r.via.is_none()).collect();
+    if !direct.is_empty() {
+        intents.push(NetIntentSetParams {
+            id: base.clone(),
+            destinations: direct.iter().map(|r| r.destination.to_string()).collect(),
+            path: NetIntentPath {
+                gateway: None,
+                kind: "interface".into(),
+                interface: Some(interface.to_string()),
+            },
+            metric: direct.first().map(|route| route.metric),
+            enabled: Some(true),
+        });
+    }
+    let mut gateways: Vec<(IpAddr, Vec<&crate::models::PolicyRoute>)> = Vec::new();
+    for route in profile.routes.iter().filter(|r| r.via.is_some()) {
+        let gateway = route.via.expect("filtered");
+        check_gateway(gateway)?;
+        match gateways.iter_mut().find(|(known, _)| *known == gateway) {
+            Some((_, routes)) => routes.push(route),
+            None => gateways.push((gateway, vec![route])),
+        }
+    }
+    for (index, (gateway, routes)) in gateways.iter().enumerate() {
+        intents.push(NetIntentSetParams {
+            id: format!("{base}{GATEWAY_SUFFIX}{}", index + 1),
+            destinations: routes.iter().map(|r| r.destination.to_string()).collect(),
+            path: NetIntentPath {
+                gateway: Some(gateway.to_string()),
+                kind: "gateway".into(),
+                interface: None,
+            },
+            metric: routes.first().map(|route| route.metric),
+            enabled: Some(true),
+        });
+    }
+    Ok(intents)
 }
 
 /// What a static-route profile reports, given the helper's view of its
-/// intent (`None` when the helper has none). Waiting for the interface still
-/// counts as running: the routes are armed.
-pub fn static_state(view: Option<&NetIntentView>) -> (crate::models::TunnelState, Option<String>) {
+/// intents (none when the helper has none). Waiting for the interface still
+/// counts as running: the routes are armed. One conflicted intent fails the
+/// whole profile.
+pub fn static_state(views: &[NetIntentView]) -> (crate::models::TunnelState, Option<String>) {
     use crate::models::TunnelState;
-    let Some(view) = view else {
-        return (TunnelState::Stopped, None);
-    };
-    match view.status {
-        ExplainStatus::Disabled => (TunnelState::Stopped, None),
-        ExplainStatus::Effective | ExplainStatus::Active => (TunnelState::Running, None),
-        ExplainStatus::Deferred | ExplainStatus::Missing => {
-            (TunnelState::Running, Some(view.detail.clone()))
-        }
-        ExplainStatus::Conflicted => (TunnelState::Failed, Some(view.detail.clone())),
+    if let Some(view) = views
+        .iter()
+        .find(|view| view.status == ExplainStatus::Conflicted)
+    {
+        return (TunnelState::Failed, Some(view.detail.clone()));
     }
+    if views
+        .iter()
+        .all(|view| view.status == ExplainStatus::Disabled)
+    {
+        return (TunnelState::Stopped, None);
+    }
+    let waiting = views.iter().find(|view| {
+        matches!(
+            view.status,
+            ExplainStatus::Deferred | ExplainStatus::Missing
+        )
+    });
+    (
+        TunnelState::Running,
+        waiting.map(|view| view.detail.clone()),
+    )
 }
 
 /// The physical default route.
@@ -292,6 +395,18 @@ pub fn derive(intent: &Intent, network: &NetworkView) -> Derivation {
                 .and_then(|uplink| uplink.gateway);
             (RouteTarget::Interface(name.clone()), protect)
         }
+        IntentPath::Gateway(gateway) => {
+            if !network
+                .addresses
+                .iter()
+                .any(|local| local.address.contains(gateway))
+            {
+                return Derivation::Deferred(format!(
+                    "the gateway {gateway} is not on a connected network"
+                ));
+            }
+            (RouteTarget::Gateway(*gateway), Some(*gateway))
+        }
     };
     let mut routes = Vec::new();
     let mut skipped = Vec::new();
@@ -349,11 +464,18 @@ pub fn judge(wanted: &WantedRoute, ours: bool, table: &[RouteEntry]) -> RouteSta
 
 fn path_of(path: &IntentPath) -> NetIntentPath {
     match path {
+        IntentPath::Gateway(gateway) => NetIntentPath {
+            gateway: Some(gateway.to_string()),
+            kind: "gateway".into(),
+            interface: None,
+        },
         IntentPath::Direct => NetIntentPath {
+            gateway: None,
             kind: "direct".into(),
             interface: None,
         },
         IntentPath::Interface(name) => NetIntentPath {
+            gateway: None,
             kind: "interface".into(),
             interface: Some(name.clone()),
         },
@@ -432,6 +554,7 @@ mod tests {
 
     fn direct() -> NetIntentPath {
         NetIntentPath {
+            gateway: None,
             kind: "direct".into(),
             interface: None,
         }
@@ -439,6 +562,7 @@ mod tests {
 
     fn via(name: &str) -> NetIntentPath {
         NetIntentPath {
+            gateway: None,
             kind: "interface".into(),
             interface: Some(name.into()),
         }
@@ -499,7 +623,7 @@ mod tests {
 
     #[test]
     fn ids_must_be_short_lowercase_slugs() {
-        for good in ["a", "office", "wg-home_2", &"a".repeat(48)] {
+        for good in ["a", "office", "wg-home_2", &"a".repeat(64)] {
             assert!(
                 normalize(&params(good, &["10.0.0.0/8"], direct())).is_ok(),
                 "{good}"
@@ -512,7 +636,7 @@ mod tests {
             "has space",
             "a/b",
             "ünï",
-            &"a".repeat(49),
+            &"a".repeat(65),
             "a:b",
         ] {
             assert!(
@@ -579,17 +703,20 @@ mod tests {
             );
         }
         let no_name = NetIntentPath {
+            gateway: None,
             kind: "interface".into(),
             interface: None,
         };
         assert!(normalize(&params("x", &["10.0.0.0/8"], no_name)).is_err());
         let unknown = NetIntentPath {
+            gateway: None,
             kind: "tunnel".into(),
             interface: None,
         };
         assert!(normalize(&params("x", &["10.0.0.0/8"], unknown)).is_err());
         // A name on a direct path is ignored, not trusted.
         let sloppy = NetIntentPath {
+            gateway: None,
             kind: "direct".into(),
             interface: Some("evil".into()),
         };
@@ -880,17 +1007,35 @@ mod tests {
         }
     }
 
+    fn gateway_path(gateway: &str) -> NetIntentPath {
+        NetIntentPath {
+            gateway: Some(gateway.into()),
+            kind: "gateway".into(),
+            interface: None,
+        }
+    }
+
+    fn addr(interface: &str, cidr: &str) -> IfaceAddr {
+        IfaceAddr {
+            if_index: 1,
+            interface: interface.into(),
+            address: cidr.parse().unwrap(),
+        }
+    }
+
     #[test]
     fn a_static_profile_becomes_an_interface_intent_with_a_reserved_name() {
         let p = static_profile("office-lan", "en7", &["192.0.2.0/24", "198.51.100.0/24"]);
-        let intent = static_intent(&p).unwrap();
+        let intents = static_intents(&p, &[]).unwrap();
+        assert_eq!(intents.len(), 1);
+        let intent = &intents[0];
         assert_eq!(intent.id, "static-office-lan");
         assert_eq!(intent.destinations, ["192.0.2.0/24", "198.51.100.0/24"]);
         assert_eq!(intent.path.kind, "interface");
         assert_eq!(intent.path.interface.as_deref(), Some("en7"));
         assert_eq!(intent.metric, Some(5));
         // The helper accepts what the profile produces.
-        assert!(normalize(&intent).is_ok());
+        assert!(normalize(intent).is_ok());
         assert!(is_static_intent_id("static-office-lan"));
         assert!(!is_static_intent_id("office"));
     }
@@ -898,8 +1043,10 @@ mod tests {
     #[test]
     fn a_profile_id_is_made_a_valid_intent_id_or_refused() {
         assert_eq!(static_intent_id("Office.LAN").unwrap(), "static-office-lan");
-        assert_eq!(static_intent_id(&"a".repeat(41)).unwrap().len(), 48);
-        assert!(static_intent_id(&"a".repeat(42)).is_err());
+        // A UUID fits with room for the `-bypass` and `-gwN` suffixes.
+        assert!(static_intent_id("0b6f0c1e-8a53-4f0e-9a3e-2f1d5c7b9a10").is_ok());
+        assert_eq!(static_intent_id(&"a".repeat(50)).unwrap().len(), 57);
+        assert!(static_intent_id(&"a".repeat(51)).is_err());
         assert!(static_intent_id("").is_err());
     }
 
@@ -908,49 +1055,197 @@ mod tests {
         let ok = static_profile("s", "en7", &["192.0.2.0/24"]);
         let mut other_backend = ok.clone();
         other_backend.backend = crate::models::TunnelBackend::WireGuard;
-        assert!(static_intent(&other_backend).is_err());
+        assert!(static_intents(&other_backend, &[]).is_err());
         let mut no_interface = ok.clone();
         no_interface.interface_name = " ".into();
-        assert!(static_intent(&no_interface)
+        assert!(static_intents(&no_interface, &[])
             .unwrap_err()
             .contains("interface"));
         let mut bad_interface = ok.clone();
         bad_interface.interface_name = "Ethernet 2".into();
-        assert!(static_intent(&bad_interface).unwrap_err().contains("macOS"));
+        assert!(static_intents(&bad_interface, &[])
+            .unwrap_err()
+            .contains("macOS"));
         let none = static_profile("s", "en7", &[]);
-        assert!(static_intent(&none).unwrap_err().contains("route"));
-        let mut with_gateway = ok;
-        with_gateway.routes[0].via = Some("10.0.0.1".parse().unwrap());
-        assert!(static_intent(&with_gateway)
+        assert!(static_intents(&none, &[]).unwrap_err().contains("route"));
+        let mut loopback = ok;
+        loopback.routes[0].via = Some("127.0.0.1".parse().unwrap());
+        assert!(static_intents(&loopback, &[])
             .unwrap_err()
             .contains("gateway"));
     }
 
     #[test]
-    fn the_state_of_a_static_profile_follows_its_intent() {
-        use crate::models::TunnelState;
-        let mut view = view(
-            &intent(&["192.0.2.0/24"], via("en7")),
-            &Derivation::Routes {
-                routes: vec![wanted_if("192.0.2.0/24", "en7")],
-                skipped: vec![],
-            },
-            &[RouteState::Present],
+    fn routes_with_their_own_gateway_get_one_intent_per_gateway() {
+        let mut p = static_profile(
+            "s",
+            "",
+            &["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"],
         );
-        assert_eq!(static_state(None), (TunnelState::Stopped, None));
-        assert_eq!(static_state(Some(&view)).0, TunnelState::Running);
-        view.status = ExplainStatus::Deferred;
-        view.detail = "interface en7 is absent".into();
+        p.routes[0].via = Some("10.0.0.1".parse().unwrap());
+        p.routes[1].via = Some("10.0.0.2".parse().unwrap());
+        p.routes[2].via = Some("10.0.0.1".parse().unwrap());
+        // No interface is needed when every route names its gateway.
+        let intents = static_intents(&p, &[]).unwrap();
+        let ids: Vec<_> = intents.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["static-s-gw1", "static-s-gw2"]);
+        assert_eq!(intents[0].destinations, ["192.0.2.0/24", "203.0.113.0/24"]);
+        assert_eq!(intents[0].path, gateway_path("10.0.0.1"));
+        assert_eq!(intents[1].destinations, ["198.51.100.0/24"]);
+        for intent in &intents {
+            assert!(normalize(intent).is_ok(), "{}", intent.id);
+            assert!(static_belongs("s", &intent.id));
+        }
+        // Mixed: interface routes first, then gateways.
+        p.routes[1].via = None;
+        p.interface_name = "en7".into();
+        let ids: Vec<_> = static_intents(&p, &[])
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ids, ["static-s", "static-s-gw1"]);
+    }
+
+    #[test]
+    fn endpoint_bypasses_come_first_and_go_direct() {
+        let p = static_profile("s", "utun4", &["10.0.0.0/8"]);
+        let bypass: Vec<IpAddr> = vec![
+            "203.0.113.7".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+        ];
+        let intents = static_intents(&p, &bypass).unwrap();
+        assert_eq!(intents[0].id, "static-s-bypass");
+        assert_eq!(intents[0].path.kind, "direct");
         assert_eq!(
-            static_state(Some(&view)),
+            intents[0].destinations,
+            ["203.0.113.7/32", "2001:db8::1/128"]
+        );
+        assert_eq!(intents[1].id, "static-s");
+        assert!(intents.iter().all(|i| normalize(i).is_ok()));
+        // Unroutable endpoints are caught when the intent is normalised.
+        let bad = static_intents(&p, &["127.0.0.1".parse().unwrap()]).unwrap_err();
+        assert!(bad.contains("cannot be routed"), "{bad}");
+    }
+
+    #[test]
+    fn an_intent_belongs_to_a_profile_by_its_exact_derived_name() {
+        assert!(static_belongs("office", "static-office"));
+        assert!(static_belongs("office", "static-office-bypass"));
+        assert!(static_belongs("office", "static-office-gw12"));
+        assert!(!static_belongs("office", "static-office2"));
+        assert!(!static_belongs("office", "static-office-gw"));
+        assert!(!static_belongs("office", "static-officer-gw1"));
+        assert!(!static_belongs("office", "office"));
+    }
+
+    #[test]
+    fn the_gateway_path_is_checked() {
+        for good in ["10.0.0.1", "2001:db8::1"] {
+            let i = normalize(&params("g", &["192.0.2.0/24"], gateway_path(good))).unwrap();
+            assert_eq!(i.path, IntentPath::Gateway(good.parse().unwrap()));
+        }
+        for bad in [
+            "",
+            "host",
+            "0.0.0.0",
+            "127.0.0.1",
+            "224.0.0.1",
+            "fe80::1",
+            "::1",
+        ] {
+            assert!(
+                normalize(&params("g", &["192.0.2.0/24"], gateway_path(bad))).is_err(),
+                "{bad}"
+            );
+        }
+        let none = NetIntentPath {
+            gateway: None,
+            kind: "gateway".into(),
+            interface: None,
+        };
+        assert!(normalize(&params("g", &["192.0.2.0/24"], none)).is_err());
+    }
+
+    #[test]
+    fn a_gateway_route_waits_until_the_gateway_is_on_a_connected_network() {
+        let i = intent(&["192.0.2.0/24"], gateway_path("10.0.0.1"));
+        let mut net = network(&["en0", "en7"]);
+        assert!(
+            matches!(derive(&i, &net), Derivation::Deferred(reason) if reason.contains("10.0.0.1"))
+        );
+        net.addresses = vec![addr("en7", "10.0.0.5/24")];
+        let Derivation::Routes { routes, .. } = derive(&i, &net) else {
+            panic!("routes expected");
+        };
+        assert_eq!(
+            routes,
+            [WantedRoute {
+                destination: "192.0.2.0/24".parse().unwrap(),
+                target: RouteTarget::Gateway("10.0.0.1".parse().unwrap()),
+            }]
+        );
+        // A destination holding the gateway itself would loop.
+        let loopy = intent(&["10.0.0.0/8"], gateway_path("10.0.0.1"));
+        let Derivation::Routes { routes, skipped } = derive(&loopy, &net) else {
+            panic!("routes expected");
+        };
+        assert!(routes.is_empty() && skipped.len() == 1);
+        // The other address family does not count.
+        let v6 = intent(&["2001:db8::/32"], gateway_path("2001:db8:1::1"));
+        assert!(matches!(derive(&v6, &net), Derivation::Deferred(_)));
+        // The view reports the path back.
+        let v = view(&i, &derive(&i, &net), &[RouteState::Missing]);
+        assert_eq!(v.path, gateway_path("10.0.0.1"));
+    }
+
+    #[test]
+    fn the_state_of_a_static_profile_follows_its_intents() {
+        use crate::models::TunnelState;
+        let make = |status: ExplainStatus, detail: &str| {
+            let mut v = view(
+                &intent(&["192.0.2.0/24"], via("en7")),
+                &Derivation::Routes {
+                    routes: vec![wanted_if("192.0.2.0/24", "en7")],
+                    skipped: vec![],
+                },
+                &[RouteState::Present],
+            );
+            v.status = status;
+            v.detail = detail.into();
+            v
+        };
+        let effective = make(ExplainStatus::Effective, "1 route(s) in place");
+        assert_eq!(static_state(&[]), (TunnelState::Stopped, None));
+        assert_eq!(
+            static_state(std::slice::from_ref(&effective)).0,
+            TunnelState::Running
+        );
+        let deferred = make(ExplainStatus::Deferred, "interface en7 is absent");
+        assert_eq!(
+            static_state(std::slice::from_ref(&deferred)),
             (TunnelState::Running, Some("interface en7 is absent".into()))
         );
-        view.status = ExplainStatus::Missing;
-        assert_eq!(static_state(Some(&view)).0, TunnelState::Running);
-        view.status = ExplainStatus::Conflicted;
-        view.detail = "another route to 192.0.2.0/24 via en0 is in place".into();
-        assert_eq!(static_state(Some(&view)).0, TunnelState::Failed);
-        view.status = ExplainStatus::Disabled;
-        assert_eq!(static_state(Some(&view)), (TunnelState::Stopped, None));
+        assert_eq!(
+            static_state(&[make(ExplainStatus::Missing, "retry")]).0,
+            TunnelState::Running
+        );
+        let conflict = make(ExplainStatus::Conflicted, "another route is in place");
+        // One bad intent fails the profile, whatever the others do.
+        assert_eq!(
+            static_state(&[effective.clone(), conflict.clone()]),
+            (
+                TunnelState::Failed,
+                Some("another route is in place".into())
+            )
+        );
+        assert_eq!(
+            static_state(&[deferred, effective.clone()]).1.as_deref(),
+            Some("interface en7 is absent")
+        );
+        assert_eq!(
+            static_state(&[make(ExplainStatus::Disabled, "off")]),
+            (TunnelState::Stopped, None)
+        );
     }
 }

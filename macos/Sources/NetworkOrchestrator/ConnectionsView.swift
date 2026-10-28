@@ -1307,6 +1307,7 @@ struct StaticProfileView: View {
   @State private var name = ""
   @State private var interface = ""
   @State private var cidrs = ""
+  @State private var bypass = ""
   var body: some View {
     AppModal(title: "New connection", width: 620, onClose: onClose) {
       VStack(alignment: .leading, spacing: 10.5) {
@@ -1314,18 +1315,23 @@ struct StaticProfileView: View {
         Text(L10n.text("Name")).font(.system(size: 11.9))
         AppInput(placeholder: "Connection name", text: $name)
         Text(L10n.text("Interface")).font(.system(size: 11.9))
-        AppInput(placeholder: "Interface name, e.g. en0", text: $interface)
+        AppInput(placeholder: "native.static.interfaceHint", text: $interface)
         Text(L10n.text("Routes")).font(.system(size: 13.3, weight: .semibold))
         TextEditor(text: $cidrs).font(.system(size: 11.9, design: .monospaced))
           .scrollContentBackground(.hidden).padding(7).frame(height: 120).background(
             p.input, in: RoundedRectangle(cornerRadius: 6)
           ).overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
           .accessibilityLabel(L10n.text("Bulk CIDRs"))
-        Text(
-          L10n.text(
-            "Paste IPv4/IPv6 CIDRs. Duplicates and adjacent networks are aggregated. Routes are saved and analyzed, never applied in this native version."
-          )
-        ).font(.system(size: 10.92)).foregroundStyle(p.muted)
+        Text(L10n.text("native.static.routesHint")).font(.system(size: 10.92))
+          .foregroundStyle(p.muted)
+        Text(L10n.text("native.static.bypass")).font(.system(size: 13.3, weight: .semibold))
+        TextEditor(text: $bypass).font(.system(size: 11.9, design: .monospaced))
+          .scrollContentBackground(.hidden).padding(7).frame(height: 54).background(
+            p.input, in: RoundedRectangle(cornerRadius: 6)
+          ).overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
+          .accessibilityLabel(L10n.text("native.static.bypass"))
+        Text(L10n.text("native.static.bypassHint")).font(.system(size: 10.92))
+          .foregroundStyle(p.muted)
         if let error = model.error {
           Text(L10n.text(error)).font(.system(size: 11.9)).foregroundStyle(p["down"])
         }
@@ -1334,14 +1340,14 @@ struct StaticProfileView: View {
           Button(L10n.text("Cancel"), action: onClose)
           Button(L10n.text(model.busy ? "Saving…" : "Save")) {
             Task {
-              if await model.createStatic(name: name, interface: interface, cidrs: cidrs) {
+              if await model.createStatic(name: name, interface: interface, cidrs: cidrs, bypass: bypass) {
                 onClose()
                 model.section = .connections
               }
             }
           }.buttonStyle(TauriButtonStyle(kind: .accent)).disabled(
             model.busy
-              || [name, interface, cidrs].contains {
+              || [name, cidrs].contains {
                 $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
               })
         }

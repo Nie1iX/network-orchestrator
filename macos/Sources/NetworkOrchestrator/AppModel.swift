@@ -384,10 +384,15 @@ import SystemConfiguration
       error = nil
     } catch { self.error = error.localizedDescription }
   }
-  func createStatic(name: String, interface: String, cidrs: String) async -> Bool {
+  func createStatic(name: String, interface: String, cidrs: String, bypass: String = "") async
+    -> Bool
+  {
     await change(
       "create_static",
-      args: ["id": UUID().uuidString, "name": name, "interfaceName": interface, "cidrs": cidrs])
+      args: [
+        "id": UUID().uuidString, "name": name, "interfaceName": interface, "cidrs": cidrs,
+        "bypass": bypass,
+      ])
   }
   func importConfig(url: URL, backend: String, name: String) async -> Bool {
     let access = url.startAccessingSecurityScopedResource()
