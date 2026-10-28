@@ -29,6 +29,19 @@ unsafe fn ip(address: *const libc::sockaddr) -> Option<IpAddr> {
         _ => None,
     }
 }
+/// Byte counters of an `AF_LINK` entry; other families carry no `if_data`.
+/// The kernel keeps them 32-bit here, so they wrap at 4 GiB (a wrap reads as
+/// one zero-rate sample downstream).
+unsafe fn link_counters(entry: &libc::ifaddrs) -> Option<(u64, u64)> {
+    if entry.ifa_addr.is_null()
+        || entry.ifa_data.is_null()
+        || unsafe { (*entry.ifa_addr).sa_family as i32 } != libc::AF_LINK
+    {
+        return None;
+    }
+    let data = unsafe { &*entry.ifa_data.cast::<libc::if_data>() };
+    Some((u64::from(data.ifi_ibytes), u64::from(data.ifi_obytes)))
+}
 fn prefix(mask: Option<IpAddr>) -> u8 {
     match mask {
         Some(IpAddr::V4(mask)) => u32::from(mask).leading_ones() as u8,
@@ -105,6 +118,10 @@ pub fn list_interfaces() -> io::Result<Vec<NetworkInterface>> {
                 },
                 tunnel_type: tunnel.then(|| "utun / point-to-point".into()),
             });
+        if let Some((rx, tx)) = unsafe { link_counters(entry) } {
+            row.rx_bytes = Some(rx);
+            row.tx_bytes = Some(tx);
+        }
         if let Some(address) = unsafe { ip(entry.ifa_addr) } {
             if !row.addresses.iter().any(|a| a.address == address) {
                 row.addresses.push(InterfaceAddress {
@@ -132,5 +149,6 @@ mod tests {
         assert!(loopback.if_index > 0);
         assert!(loopback.addresses.iter().any(|a| a.address.is_loopback()));
         assert!(matches!(loopback.category, InterfaceCategory::System));
+        assert!(loopback.rx_bytes.is_some() && loopback.tx_bytes.is_some());
     }
 }
