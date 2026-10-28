@@ -10,6 +10,7 @@ pub mod dns_diag;
 pub mod dns_probe;
 pub mod exit_ip;
 pub mod explorer;
+pub mod geo_assets;
 pub mod geo_list;
 pub mod happ_routing;
 #[cfg(unix)]
