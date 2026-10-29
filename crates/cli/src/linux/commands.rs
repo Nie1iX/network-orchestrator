@@ -258,6 +258,7 @@ pub fn down(ctx: &Ctx, target: Option<&str>, all: bool) -> Result<Output, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linux::compat;
     use net_manager_core::daemon_protocol::{method, HelloResult, PROTOCOL_VERSION};
     use net_manager_core::helper_client::HelperError;
     use net_manager_core::models::{PolicyRoute, TunnelRole};
@@ -270,17 +271,22 @@ mod tests {
     struct FakeDaemon {
         replies: HashMap<&'static str, Value>,
         calls: Mutex<Vec<String>>,
+        /// What the handshake answers; a current, complete daemon by default.
+        hello: Option<HelloResult>,
     }
 
     impl Privileged for FakeDaemon {
         fn hello(&self) -> Result<HelloResult, HelperError> {
-            Ok(HelloResult {
+            Ok(self.hello.clone().unwrap_or_else(|| HelloResult {
                 protocol: PROTOCOL_VERSION,
-                daemon_version: "test".into(),
+                daemon_version: compat::CLIENT_VERSION.into(),
                 uid: 1000,
-                capabilities: Vec::new(),
+                capabilities: net_manager_engine::linux_compat::REQUIRED_METHODS
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect(),
                 tools: Default::default(),
-            })
+            }))
         }
         fn call_raw(&self, method: &str, _: Value) -> Result<Value, HelperError> {
             self.calls.lock().unwrap().push(method.into());
@@ -812,5 +818,60 @@ mod tests {
             daemon.calls.lock().unwrap().as_slice(),
             [method::WIREGUARD_STATUS]
         );
+    }
+
+    fn hello_of(version: &str, protocol: u32, drop: &[&str]) -> HelloResult {
+        HelloResult {
+            protocol,
+            daemon_version: version.into(),
+            uid: 1000,
+            capabilities: net_manager_engine::linux_compat::REQUIRED_METHODS
+                .iter()
+                .filter(|name| !drop.contains(name))
+                .map(|name| name.to_string())
+                .collect(),
+            tools: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_current_daemon_passes_the_guard_and_version_reports_it() {
+        let (_dir, ctx, _) = setup(FakeDaemon::default());
+        compat::guard(&ctx).unwrap();
+        let (value, text) = compat::version(&ctx).unwrap();
+        assert_eq!(value["netorch"], compat::CLIENT_VERSION);
+        assert_eq!(value["daemon"]["compatibility"], "compatible");
+        assert!(text.contains("compatible"));
+    }
+
+    #[test]
+    fn the_guard_refuses_a_daemon_that_cannot_serve_the_cli() {
+        let (_dir, ctx, daemon) = setup(FakeDaemon {
+            hello: Some(hello_of("0.9.1", PROTOCOL_VERSION + 1, &[])),
+            ..Default::default()
+        });
+        let error = compat::guard(&ctx).unwrap_err();
+        assert!(error.contains("Update netorch"), "{error}");
+        assert!(daemon.calls.lock().unwrap().is_empty());
+        let (value, _) = compat::version(&ctx).unwrap();
+        assert_eq!(value["daemon"]["compatibility"], "incompatible");
+
+        let (_dir, ctx, _) = setup(FakeDaemon {
+            hello: Some(hello_of("0.9.1", PROTOCOL_VERSION, &[method::XRAY_CONNECT])),
+            ..Default::default()
+        });
+        assert!(compat::guard(&ctx).unwrap_err().contains("xray.connect"));
+    }
+
+    #[test]
+    fn an_older_daemon_still_works_but_version_says_so() {
+        let (_dir, ctx, _) = setup(FakeDaemon {
+            hello: Some(hello_of("0.1.0", PROTOCOL_VERSION, &[])),
+            ..Default::default()
+        });
+        compat::guard(&ctx).unwrap();
+        let (value, text) = compat::version(&ctx).unwrap();
+        assert_eq!(value["daemon"]["compatibility"], "warning");
+        assert!(text.contains("older than netorch"));
     }
 }

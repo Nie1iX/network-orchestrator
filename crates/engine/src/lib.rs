@@ -15,6 +15,8 @@ mod geo;
 #[cfg(any(target_os = "linux", feature = "linux-engine"))]
 pub mod linux;
 #[cfg(any(target_os = "linux", feature = "linux-engine"))]
+pub mod linux_compat;
+#[cfg(any(target_os = "linux", feature = "linux-engine"))]
 pub mod linux_engine;
 #[cfg(unix)]
 pub mod privileged;

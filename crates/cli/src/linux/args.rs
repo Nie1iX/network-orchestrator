@@ -61,6 +61,8 @@ pub enum Command {
         #[arg(long, conflicts_with = "target")]
         all: bool,
     },
+    /// Show the netorch and daemon versions and whether they work together
+    Version,
     /// Print shell completions
     Completions { shell: Shell },
     /// Background process that keeps a connection up (started by `up`)

@@ -8,6 +8,7 @@
 mod args;
 mod auth;
 mod commands;
+mod compat;
 mod ctx;
 mod endpoints;
 mod hold;
@@ -59,8 +60,26 @@ fn print_output(json: bool, value: &serde_json::Value, text: &str) {
     }
 }
 
+/// Commands that call the network daemon: the daemon is checked first.
+fn needs_daemon(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Status { .. }
+            | Command::Up(_)
+            | Command::Down { .. }
+            | Command::Switch { .. }
+            | Command::Use { .. }
+            | Command::Refresh { .. }
+            | Command::Rm { .. }
+    )
+}
+
 fn run(ctx: &ctx::Ctx, command: Command, json: bool) -> Result<commands::Output, String> {
+    if needs_daemon(&command) {
+        compat::guard(ctx)?;
+    }
     match command {
+        Command::Version => compat::version(ctx),
         Command::Ls => commands::ls(ctx),
         Command::Status { target } => commands::status(ctx, target.as_deref()),
         Command::Add(args) => library::add(ctx, &args.input, args.name.as_deref()),

@@ -29,6 +29,11 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
   30 s after the last client process of the user has exited. `netorch down`
   stops the keeper, and `up --foreground` keeps the connection in the terminal
   until Ctrl+C.
+- Linux: `netorch` checks the network daemon before it calls it, because the
+  two are separate packages that can be at different versions. A different
+  wire protocol, or a daemon that lacks a method `netorch` calls, is refused
+  with what to update; a daemon from an older release line only warns.
+  `netorch version` shows both versions and the verdict.
 - Linux: when polkit refuses because the session has no authentication agent
   (SSH), `netorch up`, `down` and `switch` start a text agent (`pkttyagent`)
   on a terminal and ask for the administrator password once; without a
