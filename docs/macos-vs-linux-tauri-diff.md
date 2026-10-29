@@ -140,8 +140,10 @@
 
 1. `netorch` (`crates/cli`) есть только на macOS: профили, import, `up`/`down`,
    routing rules, `doctor`, `service install`, `test`.
-2. На Linux CLI нет. Для него в `crates/engine` нужны адаптеры `Privileged` и
-   `UserRuntime` под демон.
+2. На Linux есть `netorch` (`crates/cli/src/linux/`): профили, подписки и их
+   серверы, `up`/`down` через демон (WireGuard, OpenVPN, Xray TUN). Нет
+   Xray SOCKS, статических маршрутов, правил маршрутизации и ролей из CLI
+   (`docs/plans/2026-10-28-linux-netorch-cli.md`).
 
 ## 7. Безопасность и границы привилегий
 

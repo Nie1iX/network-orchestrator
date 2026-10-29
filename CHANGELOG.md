@@ -8,6 +8,54 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+### Added
+
+- Linux: `netorch`, a command line client of the network daemon. `ls`,
+  `status`, `up`, `down` and `completions` connect the WireGuard, OpenVPN and
+  Xray TUN profiles saved in the app; `add` (and `up <link|url|file>`) saves a
+  vless:// / hysteria2:// link, a subscription URL or a `.conf` / `.ovpn` file
+  with the same code as the app, so the CLI needs no GUI to get a profile;
+  `rm` and `rename` manage them. OpenVPN credentials come from the terminal
+  or `--auth-stdin`.
+- Linux: `netorch` works with the servers inside a subscription: `endpoints`
+  lists them, `use` picks one by number or part of its name (on a terminal
+  without an argument it asks, with a filter), `switch` changes the server of
+  a connected profile and reconnects (restoring the previous server if the new
+  one does not come up), `up --endpoint` picks and connects, `refresh` fetches
+  the list again and `test` measures every server's delay through a temporary
+  Xray, fastest first. `ls` and `status` show the active server.
+- Linux: `netorch up` leaves a background keeper process (`netorch hold`,
+  hidden) so the connection outlives the command: the daemon removes a tunnel
+  30 s after the last client process of the user has exited. `netorch down`
+  stops the keeper, and `up --foreground` keeps the connection in the terminal
+  until Ctrl+C.
+- Linux: when polkit refuses because the session has no authentication agent
+  (SSH), `netorch up`, `down` and `switch` start a text agent (`pkttyagent`)
+  on a terminal and ask for the administrator password once; without a
+  terminal they explain the options (a terminal, `sudo netorch`, or a polkit
+  rule). `sudo netorch ls|status|up|down` work from the invoking user's data;
+  commands that write data still refuse to run as root.
+
+### Changed
+
+- Profile import by file (`import_configs_into`, `detect_backend`,
+  `generate_import_id`) moved from the Tauri app into `net-manager-core`; the
+  app uses the shared code. No behavior change.
+
+### Fixed
+
+- Linux: subscriptions from panels that serve whole Xray configs (Remnawave,
+  Geodema) can run as a system-wide Xray TUN again. The daemon rejected every
+  such server ("unsupported generated Xray TUN config") because of the
+  panel's observatory, policy, DNS, extra outbounds and balancer. The server
+  itself is now reduced to the plain shape before it is sent
+  (`xray::tun_compatible_config`, used by the app and `netorch`); the
+  panel's own routing rules and DNS are not applied, the profile's are. An
+  "automatic" entry that picks from a pool of servers is refused with advice
+  to choose a specific server. 92 of the 93 servers of a real subscription
+  now pass the daemon's validation.
+- `net-manager-core` tests compile on Linux again (`spawn_xray` test call).
+
 <!-- The three sections below are a proposed split of the work since v0.9.1.
      Pick the version numbers, set the dates and move them out of here. -->
 

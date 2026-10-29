@@ -18,10 +18,14 @@ Guidance for agents/contributors working in this repository.
   (`docs/plans/2026-10-15-19-netorch-cli.md`). On Linux, `linux` holds the pure
   builders of the daemon's requests (shared with `src-tauri`) and
   `linux_engine::LinuxEngine` connects/disconnects/reads status through the
-  daemon socket for the future Linux CLI. No UI, no FFI.
-- `crates/cli` — the `netorch` command line tool (macOS): clap commands over
+  daemon socket for the Linux CLI. No UI, no FFI.
+- `crates/cli` — the `netorch` command line tool. macOS: clap commands over
   `crates/engine` and the bridge's profile/import/routing services; ships in
-  the app bundle next to the helper.
+  the app bundle next to the helper. Linux (`src/linux/`): a client of the
+  network daemon built on `LinuxEngine` and the import/subscription code of
+  `crates/core`, no GUI needed; `hold` keeps a connection up in the
+  background (the daemon drops a tunnel 30 s after the user's last client
+  process exits). Plan: `docs/plans/2026-10-28-linux-netorch-cli.md`.
 - `crates/macos-bridge` — unprivileged JSON C ABI staticlib the Swift client
   links; every macOS core operation goes through it. A thin JSON wrapper over
   `crates/engine` for runtime operations.
