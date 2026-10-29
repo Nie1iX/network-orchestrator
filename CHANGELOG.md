@@ -122,6 +122,66 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 - A route on a scoped (`ifscope`) interface is not told apart and can read as
   a conflict.
 
+## [0.9.1] - 2026-10-23
+
+### Fixed
+
+- Linux: the window no longer aborts with "Could not create GBM EGL display"
+  on GPU/driver setups where WebKitGTK's DMABUF renderer fails (seen on
+  NVIDIA); the renderer is disabled unless the user set it explicitly.
+- Dialogs keep the focused field and open drop-downs while the screen behind
+  them refreshes.
+
+## [0.9.0] - 2026-10-23
+
+### Added
+
+- Linux: a Home screen with the running connections, a one-click reconnect of
+  the last profile and a button that copies `HTTP(S)_PROXY`/`ALL_PROXY` for a
+  terminal. A connection that needs OpenVPN credentials asks for them right
+  there.
+- Linux: the system proxy for Xray SOCKS profiles on GNOME (`gsettings`) and
+  KDE Plasma (`kwriteconfig`), with the previous settings restored on
+  disconnect. Hidden on other desktops.
+- Linux: NetBird under Profiles → Services, driven through the user's own
+  `netbird` CLI (on/off, server and setup key, browser sign-in).
+- Linux: connection roles. A secondary WireGuard, OpenVPN or Xray TUN
+  connection carries only the networks listed for it (pushed routes and
+  gateway redirects are ignored) and, optionally, split-DNS domains through
+  `systemd-resolved`; the primary keeps taking all traffic. The daemon rejects
+  a secondary request that would take all traffic, and Profiles shows a role
+  switch, a networks dialog and a Secondary badge.
+- Linux: `LinuxEngine` in `net-manager-engine`, a typed connect/disconnect/
+  status API over the daemon socket, as the groundwork for a Linux `netorch`.
+- The import dialog lists the chosen files and lets you pick the backend (or
+  detect it from the file) before importing, accepts a pasted subscription URL
+  in the Link tab and submits on Enter, with one button and one error line for
+  every tab.
+
+### Changed
+
+- The decisions behind connecting a profile (conflict checks, route and
+  interface derivation, auto-connect selection) live in
+  `net-manager-core::connect_plan`; the requests the app sends to the Linux
+  daemon are built by `net_manager_engine::linux`. No behavior change.
+- The NetBird driver moved from the macOS bridge into `net-manager-core` and
+  is shared by both clients; the macOS bridge parses secondary networks and
+  DNS domains with the shared helpers.
+- The OpenVPN credentials dialog is a shared component used by Home and
+  Profiles.
+- The add-connection icon is round and tinted with the accent colour.
+
+### Documentation
+
+- The versioning policy defines a breaking change by what users depend on and
+  adds the breaking-change commit footer; `CLAUDE.md` points Claude Code at
+  `AGENTS.md` and the versioning policy.
+
+### Tests
+
+- End-to-end coverage of a secondary WireGuard tunnel with split DNS in the
+  Linux Docker harness (not run yet: it needs Docker).
+
 ## [0.8.7] - 2026-10-20
 
 ### Added
