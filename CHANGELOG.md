@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
+**This file is the history up to 0.10.0**, when the project had one version for
+everything. From 0.10.0 on the core and each operating system have their own
+version and their own changelog: [`changelog/core.md`](changelog/core.md),
+[`changelog/macos.md`](changelog/macos.md),
+[`changelog/linux.md`](changelog/linux.md) and
+[`changelog/windows.md`](changelog/windows.md). All four lines start at 0.10.0.
+
 ## [Unreleased]
 
 ## [0.10.0] - 2026-10-29

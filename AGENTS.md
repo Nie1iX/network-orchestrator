@@ -67,6 +67,8 @@ script aborts without SDK 27.
 ## Quality gate (run before reporting done)
 
 ```bash
+python3 scripts/versions.py check
+python3 -m unittest scripts/test_versions.py
 cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
@@ -172,15 +174,20 @@ mirrors this gate on Windows.
   `L10n.text("Add a connection")` in Swift); `t("dotted.key")` is the legacy
   compat path still used across the web UI. Never delete an English-text key
   that only appears in Swift sources; add new messages to `en.json` first.
-- App version has one source of truth: `[workspace.package].version` in the
-  root `Cargo.toml`; do not duplicate it in `package.json` or
-  `tauri.conf.json` (neither has a version field).
+- Versions are per release line (`core`, `macos`, `linux`, `windows`), not one
+  for the app: `versions.toml` is the only source of truth, and
+  `python3 scripts/versions.py set <line> X.Y.Z` / `sync` write it into the
+  crates and `src-tauri/tauri.<linux|windows>.conf.json`. Never edit a crate or
+  Tauri version by hand; `crates/cli` and `src-tauri` say `0.0.0` and take the
+  version of the target OS from `versions.toml` at build time
+  (`NETORCH_VERSION`).
 - Versioning, commit messages and releases follow `docs/versioning.md`
-  (SemVer, Conventional Commits in English, `CHANGELOG.md`); read it before
-  committing or bumping the version. Every commit needs a `type(scope):`
+  (SemVer per line, Conventional Commits in English, `changelog/<line>.md`;
+  `CHANGELOG.md` is the history up to 0.10.0); read it before committing or
+  bumping a version. Every commit needs a `type(scope):`
   prefix, one type per commit (never mix `feat` and `fix`), breaking changes
-  carry `!` or a `BREAKING CHANGE:` footer. Bump the version in a separate
-  `chore(release): X.Y.Z` commit after each group of changes.
+  carry `!` or a `BREAKING CHANGE:` footer. Bump a line's version in a separate
+  `chore(release): <line> X.Y.Z` commit after each group of changes.
 - Store files are versioned documents written atomically (temp + rename)
   and ACL-protected via `config_security::protect_path`.
 
