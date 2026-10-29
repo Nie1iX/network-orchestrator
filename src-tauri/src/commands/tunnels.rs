@@ -1,13 +1,27 @@
 use crate::commands::profiles::loopback_port_available;
 use crate::state::{find_profile, AppState, RuntimeState};
 use net_manager_core::analysis;
+use net_manager_core::connect_plan::{
+    active_profile_conflicts, derive_installable_routes, has_target_interface,
+    resolve_install_interface, wait_for_openvpn_pushed_routes, wait_for_tcp_listener,
+};
 use net_manager_core::explorer;
 use net_manager_core::models::*;
-use net_manager_core::vpn::TunnelManager;
 use std::io::ErrorKind;
-use std::net::{Ipv4Addr, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::{Emitter, State};
+
+#[cfg(target_os = "linux")]
+use crate::openvpn_credentials::OpenVpnCredentialStore;
+#[cfg(target_os = "linux")]
+use net_manager_core::daemon_protocol::{
+    method, OpenVpnConnectResult, OpenVpnCredentials, OpenVpnDisconnectResult, OpenVpnProbeResult,
+    OpenVpnProfileParams, OpenVpnStatusResult, WireGuardConnectResult, WireGuardDisconnectResult,
+    WireGuardProfileParams, WireGuardStatusResult, XrayConnectResult, XrayDisconnectResult,
+    XrayProfileParams, XrayStatusResult,
+};
+#[cfg(target_os = "linux")]
+pub(crate) use net_manager_engine::linux::*;
 
 #[cfg(test)]
 fn select_connect_ports(
@@ -32,288 +46,6 @@ fn prepare_xray_listener_ports(
         loopback_port_available,
     )
     .map_err(|err| err.to_string())
-}
-
-#[cfg(target_os = "linux")]
-use net_manager_core::daemon_protocol::{
-    method, OpenVpnConnectParams, OpenVpnConnectRequest, OpenVpnConnectResult,
-    OpenVpnConnectionState, OpenVpnCredentials, OpenVpnDisconnectResult, OpenVpnProbeResult,
-    OpenVpnProfileParams, OpenVpnStatusResult, OpenVpnWarning, WireGuardConnectParams,
-    WireGuardConnectResult, WireGuardDisconnectResult, WireGuardProfileParams,
-    WireGuardStatusResult, WireGuardWarning, XrayConnectParams, XrayConnectResult,
-    XrayDisconnectResult, XrayProfileParams, XrayStatusResult,
-};
-
-#[cfg(target_os = "linux")]
-use crate::openvpn_credentials::OpenVpnCredentialStore;
-#[cfg(target_os = "linux")]
-use base64::Engine;
-
-#[cfg(target_os = "linux")]
-struct OpenVpnCredentialRequirements {
-    user_pass: bool,
-    key_passphrase: bool,
-}
-
-#[cfg(target_os = "linux")]
-fn openvpn_encrypted_key(bytes: &[u8]) -> bool {
-    bytes
-        .windows(b"-----BEGIN ENCRYPTED PRIVATE KEY-----".len())
-        .any(|part| part == b"-----BEGIN ENCRYPTED PRIVATE KEY-----")
-        || bytes
-            .windows(b"Proc-Type: 4,ENCRYPTED".len())
-            .any(|part| part == b"Proc-Type: 4,ENCRYPTED")
-}
-
-#[cfg(target_os = "linux")]
-fn openvpn_credential_requirements(
-    config: &str,
-    assets: &std::collections::BTreeMap<String, Vec<u8>>,
-) -> OpenVpnCredentialRequirements {
-    let mut user_pass = false;
-    let mut askpass_prompt = false;
-    let mut askpass_file = false;
-    // Inline block contents are not directives; a credential line inside an
-    // inline block must not be mistaken for a prompt request.
-    let mut in_block = false;
-    for line in config.lines() {
-        let trimmed = line.trim();
-        if in_block {
-            if trimmed.starts_with("</") {
-                in_block = false;
-            }
-            continue;
-        }
-        if trimmed.starts_with('<') && !trimmed.starts_with("</") {
-            in_block = true;
-            continue;
-        }
-        let mut tokens = line.split_whitespace();
-        let Some(word) = tokens.next() else { continue };
-        let word = word.trim_start_matches('-');
-        if word.eq_ignore_ascii_case("auth-user-pass") {
-            // `username-only` still prompts; a file argument does not.
-            match tokens.next().map(|arg| arg.trim_matches('"')) {
-                None | Some("username-only") => user_pass = true,
-                Some(_) => {}
-            }
-        } else if word.eq_ignore_ascii_case("askpass") {
-            if tokens.next().is_none() {
-                askpass_prompt = true;
-            } else {
-                askpass_file = true;
-            }
-        }
-    }
-    let encrypted_key = openvpn_encrypted_key(config.as_bytes())
-        || assets.values().any(|asset| openvpn_encrypted_key(asset));
-    OpenVpnCredentialRequirements {
-        user_pass,
-        // A passphrase file supplies the answer; only a bare `askpass` or
-        // an encrypted key without a file still prompts via management.
-        key_passphrase: (askpass_prompt || encrypted_key) && !askpass_file,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn openvpn_credentials_path(
-    vault: &net_manager_core::config_vault::ConfigVault,
-    profile: &Profile,
-) -> Result<std::path::PathBuf, String> {
-    if !vault.is_managed_profile_path(&profile.id, &profile.config_path) {
-        return Err("OpenVPN credentials require an own managed profile".into());
-    }
-    let profile_dir = profile
-        .config_path
-        .parent()
-        .and_then(std::path::Path::parent)
-        .ok_or_else(|| "OpenVPN credentials require an own managed profile".to_string())?;
-    if profile_dir != vault.root().join(&profile.id) {
-        return Err("OpenVPN credentials require an own managed profile".into());
-    }
-    for directory in [
-        vault.root(),
-        profile_dir,
-        profile.config_path.parent().unwrap(),
-    ] {
-        if !std::fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.file_type().is_dir())
-        {
-            return Err("OpenVPN credential vault directory is invalid".into());
-        }
-    }
-    if !std::fs::symlink_metadata(&profile.config_path)
-        .is_ok_and(|metadata| metadata.file_type().is_file())
-    {
-        return Err("managed OpenVPN config is invalid".into());
-    }
-    Ok(profile_dir.join("openvpn-credentials.json"))
-}
-
-#[cfg(target_os = "linux")]
-fn prepare_linux_xray_tun_params(
-    vault: &net_manager_core::config_vault::ConfigVault,
-    profile: &Profile,
-) -> Result<XrayConnectParams, String> {
-    if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Tun {
-        return Err("profile is not an Xray TUN profile".into());
-    }
-    if !vault.is_managed_profile_path(&profile.id, &profile.config_path)
-        || profile.config_path.to_string_lossy().ends_with(".dpapi")
-    {
-        return Err("Xray TUN requires its own managed generated config".into());
-    }
-    if !std::fs::symlink_metadata(&profile.config_path)
-        .map_err(|_| "cannot inspect managed Xray config".to_string())?
-        .file_type()
-        .is_file()
-    {
-        return Err("managed Xray config is invalid".into());
-    }
-    let (Some(socks_port), Some(http_port)) = (profile.xray_socks_port, profile.xray_http_port)
-    else {
-        return Err("Xray TUN requires a generated share-link profile".into());
-    };
-    if socks_port == http_port {
-        return Err("Xray generated listener ports are invalid".into());
-    }
-    let raw =
-        net_manager_core::config_security::read_xray_config(&profile.config_path, &profile.id)
-            .map_err(|_| "cannot read managed Xray config".to_string())?;
-    let base: serde_json::Value =
-        serde_json::from_slice(&raw).map_err(|_| "managed Xray config is invalid".to_string())?;
-    let inbounds = base["inbounds"]
-        .as_array()
-        .ok_or_else(|| "unsupported Xray TUN config".to_string())?;
-    if inbounds.len() != 2
-        || inbounds[0]["tag"] != "socks-in"
-        || inbounds[0]["protocol"] != "socks"
-        || inbounds[0]["listen"] != "127.0.0.1"
-        || inbounds[0]["port"] != socks_port
-        || inbounds[0]["settings"]["udp"] != true
-        || inbounds[1]["tag"] != "http-in"
-        || inbounds[1]["protocol"] != "http"
-        || inbounds[1]["listen"] != "127.0.0.1"
-        || inbounds[1]["port"] != http_port
-    {
-        return Err("unsupported Xray TUN config".into());
-    }
-    let config = net_manager_core::xray::apply_profile_routing(
-        &base,
-        &profile.domain_policies,
-        &net_manager_core::xray::ProfileRoutingOptions {
-            private_lan_direct: profile.private_lan_direct,
-            domain_strategy: profile.xray_domain_strategy,
-            domain_matcher: profile.xray_domain_matcher,
-            dns: profile.xray_dns.clone(),
-        },
-    )
-    .map_err(|_| "invalid Xray routing rules".to_string())?;
-    let default_route = profile.routes.is_empty();
-    let route = |destination: &str| PolicyRoute {
-        destination: destination.parse().unwrap(),
-        metric: 5,
-        via: None,
-    };
-    let routes = if default_route {
-        // Split-default installs the two def1 halves instead of one /0 —
-        // same full coverage, but coexisting tunnel managers that use the
-        // halves see a consistent picture.
-        if profile.xray_split_default {
-            vec![route("0.0.0.0/1"), route("128.0.0.0/1")]
-        } else {
-            vec![route("0.0.0.0/0")]
-        }
-    } else {
-        profile.routes.clone()
-    };
-    let mut dns_bypass = net_manager_core::xray::dns_bypass_hosts(&profile.xray_dns);
-    if default_route {
-        for ip in ["1.1.1.1", "8.8.8.8", "9.9.9.9"] {
-            dns_bypass.push(ip.to_string());
-        }
-    }
-    dns_bypass.sort();
-    dns_bypass.dedup();
-    let params = XrayConnectParams {
-        profile_id: profile.id.clone(),
-        config: serde_json::to_string(&config)
-            .map_err(|_| "cannot encode Xray TUN config".to_string())?,
-        routes,
-        dns_servers: if default_route {
-            vec!["1.1.1.1".parse().unwrap()]
-        } else {
-            Vec::new()
-        },
-        dns_domains: Vec::new(),
-        dns_bypass,
-        interface_name: link_name_hint(profile),
-        geo_assets: None,
-        macos_data_root: None,
-        role: Default::default(),
-    };
-    check_xray_frame_size(&params)?;
-    Ok(params)
-}
-
-/// Rejects `xray.connect` payloads that would exceed the daemon frame cap.
-/// Runs once in `prepare_linux_xray_tun_params` (config-only) and again in
-/// `linux_xray_connect` after inline geo assets are attached.
-#[cfg(target_os = "linux")]
-fn check_xray_frame_size(params: &XrayConnectParams) -> Result<(), String> {
-    let frame = net_manager_core::daemon_protocol::RequestFrame {
-        id: 2,
-        method: method::XRAY_CONNECT.into(),
-        params: serde_json::to_value(params)
-            .map_err(|_| "cannot encode Xray TUN config".to_string())?,
-    };
-    if net_manager_core::daemon_protocol::encode_line(&frame)
-        .map_err(|_| "cannot encode Xray TUN config".to_string())?
-        .len()
-        > net_manager_core::daemon_protocol::MAX_FRAME_BYTES
-    {
-        return Err("Xray TUN config is too large for daemon protocol".into());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn linux_xray_tunnel_status(
-    status: XrayStatusResult,
-    profile: &Profile,
-) -> TunnelStatus {
-    let mut notices = Vec::new();
-    if status.state == TunnelState::Running && profile.routes.is_empty() {
-        if !status.dns_applied {
-            notices.push("Xray TUN DNS was not applied");
-        }
-        if !status.ipv4_covered {
-            notices.push("IPv4 is not covered by this tunnel");
-        }
-        if !status.ipv6_covered {
-            notices.push("IPv6 is not covered by this tunnel");
-        }
-    } else if status.state == TunnelState::Failed {
-        notices.push("Xray TUN failed in network daemon");
-    }
-    TunnelStatus {
-        profile_id: status.profile_id,
-        state: status.state,
-        message: (!notices.is_empty()).then(|| notices.join("; ")),
-        interface_name: status.interface_name,
-    }
-}
-
-/// Kernel interface-name hint for daemon-managed tunnels: an explicit
-/// per-profile `interface_name` wins, otherwise the display name is offered
-/// (the daemon sanitizes it and falls back to its deterministic name).
-#[cfg(target_os = "linux")]
-pub(crate) fn link_name_hint(profile: &Profile) -> Option<String> {
-    let hint = if profile.interface_name.trim().is_empty() {
-        &profile.name
-    } else {
-        &profile.interface_name
-    };
-    (!hint.trim().is_empty()).then(|| hint.trim().to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -414,82 +146,6 @@ async fn linux_xray_disconnect(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn linux_openvpn_tunnel_status(status: OpenVpnStatusResult) -> TunnelStatus {
-    let state = match status.state {
-        OpenVpnConnectionState::Stopped => TunnelState::Stopped,
-        OpenVpnConnectionState::Connecting
-        | OpenVpnConnectionState::Connected
-        | OpenVpnConnectionState::Reconnecting => TunnelState::Running,
-        OpenVpnConnectionState::Failed => TunnelState::Failed,
-    };
-    let mut notices = Vec::new();
-    match status.state {
-        OpenVpnConnectionState::Connecting => notices.push("OpenVPN is connecting"),
-        OpenVpnConnectionState::Reconnecting => notices.push("OpenVPN is reconnecting"),
-        OpenVpnConnectionState::Failed => {
-            use net_manager_core::daemon_protocol::OpenVpnFailure as F;
-            notices.push(match status.failure_reason {
-                Some(F::AuthenticationFailure) => {
-                    "OpenVPN authentication failed; check username, password, or private key passphrase"
-                }
-                Some(F::CredentialsRequired) => {
-                    "OpenVPN server requested credentials that are not stored for this profile"
-                }
-                Some(F::ResolveError) => "OpenVPN could not resolve the server address",
-                Some(F::ConnectError) => {
-                    "OpenVPN could not reach the server (connection refused or timed out)"
-                }
-                Some(F::TlsError) => {
-                    "OpenVPN TLS handshake failed; check CA, certificate, or tls-auth settings"
-                }
-                Some(F::ConnectionLost) => {
-                    "OpenVPN connection was lost (timeout or connection reset)"
-                }
-                Some(F::ExitNotification) => {
-                    "OpenVPN server asked the client to disconnect"
-                }
-                Some(F::Terminated) => "OpenVPN process was terminated",
-                Some(F::ExitWithError) | None => {
-                    if status
-                        .warnings
-                        .contains(&OpenVpnWarning::AuthenticationFailed)
-                    {
-                        "OpenVPN authentication failed; check username, password, or private key passphrase"
-                    } else {
-                        "OpenVPN connection failed; check credentials or server settings"
-                    }
-                }
-            });
-        }
-        _ => {}
-    }
-    if status.warnings.contains(&OpenVpnWarning::DnsNotApplied) {
-        notices.push("OpenVPN DNS was not applied");
-    }
-    if status.warnings.contains(&OpenVpnWarning::Ipv6NotCovered) {
-        notices.push("IPv6 is not covered by this tunnel");
-    }
-    TunnelStatus {
-        profile_id: status.profile_id,
-        state,
-        message: (!notices.is_empty()).then(|| notices.join("; ")),
-        interface_name: status.interface_name,
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn finish_openvpn_connect(status: OpenVpnStatusResult, notice: Option<&str>) -> TunnelStatus {
-    let mut status = linux_openvpn_tunnel_status(status);
-    if let Some(notice) = notice {
-        status.message = Some(match status.message {
-            Some(existing) => format!("{existing}; {notice}"),
-            None => notice.to_string(),
-        });
-    }
-    status
-}
-
-#[cfg(target_os = "linux")]
 async fn linux_openvpn_connect(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
@@ -515,7 +171,7 @@ async fn linux_openvpn_connect_with_credentials(
         credential_store,
         profile,
         supplied_credentials,
-        profile.routes.clone(),
+        profile.effective_routes(),
         method::OPENVPN_CONNECT,
     )?;
     let credentials = request.credentials.clone();
@@ -535,131 +191,6 @@ async fn linux_openvpn_connect_with_credentials(
             .map(|_| "OpenVPN started, but old remembered credentials could not be removed")
     };
     Ok(finish_openvpn_connect(result.status, notice))
-}
-
-#[cfg(target_os = "linux")]
-/// Builds the daemon request; the notice reports a credential migration.
-fn prepare_linux_openvpn_request(
-    vault: &net_manager_core::config_vault::ConfigVault,
-    credential_store: &OpenVpnCredentialStore,
-    profile: &Profile,
-    supplied_credentials: Option<OpenVpnCredentials>,
-    routes: Vec<PolicyRoute>,
-    method_name: &str,
-) -> Result<(OpenVpnConnectRequest, Option<&'static str>), String> {
-    if !vault.is_managed_profile_path(&profile.id, &profile.config_path) {
-        return Err("OpenVPN profile must use its own managed config on Linux".into());
-    }
-    if !std::fs::symlink_metadata(&profile.config_path)
-        .map_err(|_| "cannot inspect managed OpenVPN config".to_string())?
-        .file_type()
-        .is_file()
-    {
-        return Err("managed OpenVPN config is invalid".into());
-    }
-    let config = std::fs::read_to_string(&profile.config_path)
-        .map_err(|_| "cannot read OpenVPN profile config".to_string())?;
-    let mut raw_assets = std::collections::BTreeMap::new();
-    let asset_dir = profile.config_path.parent().unwrap().join("assets");
-    if asset_dir.exists() {
-        if !std::fs::symlink_metadata(&asset_dir)
-            .map_err(|_| "cannot inspect managed OpenVPN assets".to_string())?
-            .file_type()
-            .is_dir()
-        {
-            return Err("managed OpenVPN assets directory is invalid".into());
-        }
-        for entry in std::fs::read_dir(&asset_dir)
-            .map_err(|_| "cannot read managed OpenVPN assets".to_string())?
-        {
-            let entry = entry.map_err(|_| "cannot read managed OpenVPN assets".to_string())?;
-            let path = entry.path();
-            if !vault.is_managed_profile_path(&profile.id, &path)
-                || !entry
-                    .file_type()
-                    .map_err(|_| "cannot inspect managed OpenVPN asset".to_string())?
-                    .is_file()
-            {
-                return Err("managed OpenVPN asset is invalid".into());
-            }
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| "managed OpenVPN asset name is invalid".to_string())?;
-            let bytes = std::fs::read(&path)
-                .map_err(|_| "cannot read managed OpenVPN asset".to_string())?;
-            raw_assets.insert(format!("assets/{name}"), bytes);
-        }
-    }
-    let requirements = openvpn_credential_requirements(&config, &raw_assets);
-    let mut notice = None;
-    let credentials = if supplied_credentials.is_some() {
-        supplied_credentials
-    } else if requirements.user_pass || requirements.key_passphrase {
-        let (remembered, load_notice) = credential_store
-            .load(&profile.id, &openvpn_credentials_path(vault, profile)?)
-            .map_err(|_| "OpenVPN credentials required".to_string())?;
-        notice = load_notice;
-        remembered
-    } else {
-        None
-    };
-    if requirements.user_pass
-        && credentials
-            .as_ref()
-            .is_none_or(|value| value.auth_user_pass.is_none())
-        || requirements.key_passphrase
-            && credentials
-                .as_ref()
-                .is_none_or(|value| value.private_key_passphrase.is_none())
-    {
-        return Err("OpenVPN credentials required".into());
-    }
-    if let Some(credentials) = &credentials {
-        if requirements.user_pass != credentials.auth_user_pass.is_some()
-            || (!requirements.key_passphrase && credentials.private_key_passphrase.is_some())
-            || net_manager_core::openvpn_management::validate_openvpn_credentials(credentials)
-                .is_err()
-        {
-            return Err("OpenVPN credentials are invalid for this profile".into());
-        }
-    }
-    let assets = raw_assets
-        .into_iter()
-        .map(|(name, bytes)| {
-            (
-                name,
-                base64::engine::general_purpose::STANDARD.encode(bytes),
-            )
-        })
-        .collect();
-    let params = OpenVpnConnectParams {
-        profile_id: profile.id.clone(),
-        config,
-        assets,
-        routes,
-        interface_name: link_name_hint(profile),
-        role: Default::default(),
-        dns_domains: Vec::new(),
-    };
-    let request = OpenVpnConnectRequest {
-        profile: params,
-        credentials: credentials.clone(),
-    };
-    let frame = net_manager_core::daemon_protocol::RequestFrame {
-        id: 2,
-        method: method_name.into(),
-        params: serde_json::to_value(&request)
-            .map_err(|_| "cannot encode OpenVPN config for daemon".to_string())?,
-    };
-    if net_manager_core::daemon_protocol::encode_line(&frame)
-        .map_err(|_| "cannot encode OpenVPN config for daemon".to_string())?
-        .len()
-        > net_manager_core::daemon_protocol::MAX_FRAME_BYTES
-    {
-        return Err("OpenVPN config too large for daemon protocol".into());
-    }
-    Ok((request, notice))
 }
 
 #[cfg(target_os = "linux")]
@@ -736,57 +267,14 @@ async fn linux_openvpn_disconnect(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn linux_wireguard_tunnel_status(status: WireGuardStatusResult) -> TunnelStatus {
-    let mut notices = Vec::new();
-    if status.warnings.contains(&WireGuardWarning::IgnoredHook) {
-        notices.push("WireGuard hooks were ignored");
-    }
-    if status
-        .warnings
-        .contains(&WireGuardWarning::IgnoredSaveConfig)
-    {
-        notices.push("WireGuard SaveConfig was ignored");
-    }
-    if status.warnings.contains(&WireGuardWarning::DnsNotApplied) {
-        notices.push("WireGuard DNS was not applied");
-    }
-    if status.warnings.contains(&WireGuardWarning::Ipv6NotCovered) {
-        notices.push("IPv6 is not covered by this tunnel");
-    }
-    TunnelStatus {
-        profile_id: status.profile_id,
-        state: status.state,
-        message: (!notices.is_empty()).then(|| notices.join("; ")),
-        interface_name: status.interface_name,
-    }
-}
-
-#[cfg(target_os = "linux")]
 async fn linux_wireguard_connect(
     client: &crate::daemon_client::DaemonClient,
     vault: &net_manager_core::config_vault::ConfigVault,
     profile: &Profile,
 ) -> Result<TunnelStatus, String> {
-    if !vault.is_managed_profile_path(&profile.id, &profile.config_path) {
-        return Err("WireGuard profile must use its own managed config on Linux".into());
-    }
-    if profile.config_path.to_string_lossy().ends_with(".dpapi") {
-        return Err("DPAPI WireGuard configs are only supported on Windows".into());
-    }
-    let config = std::fs::read_to_string(&profile.config_path)
-        .map_err(|_| "cannot read WireGuard profile config".to_string())?;
+    let params = wireguard_connect_params(vault, profile)?;
     let result: WireGuardConnectResult = client
-        .request(
-            method::WIREGUARD_CONNECT,
-            WireGuardConnectParams {
-                profile_id: profile.id.clone(),
-                config,
-                routes: profile.routes.clone(),
-                interface_name: link_name_hint(profile),
-                role: Default::default(),
-                dns_domains: Vec::new(),
-            },
-        )
+        .request(method::WIREGUARD_CONNECT, params)
         .await
         .map_err(|err| crate::daemon_client::user_message(&err))?;
     Ok(linux_wireguard_tunnel_status(result.status))
@@ -844,14 +332,6 @@ async fn linux_wireguard_disconnect(
     })
 }
 
-fn has_target_interface(profile: &Profile, interfaces: &[NetworkInterface]) -> bool {
-    interfaces.iter().any(|iface| {
-        matches!(iface.state, InterfaceState::Up)
-            && (iface.friendly_name == profile.interface_name
-                || iface.name == profile.interface_name)
-    })
-}
-
 async fn cleanup_stale_routes_before_connect(
     runtime: &mut RuntimeState,
     profile: &Profile,
@@ -869,160 +349,6 @@ async fn cleanup_stale_routes_before_connect(
             .map_err(|err| format!("failed to clean previously applied routes: {err}"))?;
     }
     Ok(())
-}
-
-fn unknown_route_conflicts(
-    candidate: &ConfigAnalysis,
-    other: &Profile,
-    other_analysis: &ConfigAnalysis,
-) -> Vec<ProfileConflict> {
-    let mut conflicts = Vec::new();
-    if !other_analysis.route_knowledge_complete
-        && (!candidate.os_routes.is_empty() || !candidate.route_knowledge_complete)
-    {
-        conflicts.push(ProfileConflict {
-            kind: ConflictKind::RouteOverlap,
-            message: format!(
-                "cannot verify route conflicts with active profile '{}' because its effective routes are not fully known",
-                other.name
-            ),
-            other_profile_id: Some(other.id.clone()),
-            blocking: true,
-        });
-    } else if !candidate.route_knowledge_complete && !other_analysis.os_routes.is_empty() {
-        conflicts.push(ProfileConflict {
-            kind: ConflictKind::RouteOverlap,
-            message: format!(
-                "candidate routes are not fully known and may conflict with routes of active profile '{}'",
-                other.name
-            ),
-            other_profile_id: Some(other.id.clone()),
-            blocking: true,
-        });
-    }
-    conflicts
-}
-
-fn active_profile_conflicts(
-    tunnels: &mut TunnelManager,
-    candidate_id: &str,
-    candidate: &ConfigAnalysis,
-    profiles: &[Profile],
-) -> Result<Vec<ProfileConflict>, String> {
-    let mut conflicts = Vec::new();
-    for other in profiles {
-        if other.id == candidate_id {
-            continue;
-        }
-        if tunnels.status(other).state != TunnelState::Running {
-            continue;
-        }
-        let other_analysis = analysis::analyze_profile(other).map_err(|_| {
-            format!(
-                "cannot verify conflicts with active profile '{}'",
-                other.name
-            )
-        })?;
-        conflicts.extend(unknown_route_conflicts(candidate, other, &other_analysis));
-        conflicts.extend(analysis::conflicts_between(
-            candidate,
-            &other_analysis,
-            true,
-        ));
-    }
-    Ok(conflicts)
-}
-
-async fn wait_for_tcp_listener(port: u16, timeout: Duration, interval: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-/// Wait for OpenVPN to log `PUSH_REPLY` (or `Initialization Sequence Completed`)
-/// after connect, then return the server-pushed routes parsed from the log.
-/// Returns an empty vec if the deadline passes without a PUSH_REPLY.
-async fn wait_for_openvpn_pushed_routes(
-    tunnels: &mut TunnelManager,
-    profile: &Profile,
-    timeout: Duration,
-    interval: Duration,
-) -> Vec<AnalyzedRoute> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let routes = tunnels.openvpn_pushed_routes(&profile.id);
-        if !routes.is_empty() {
-            return routes;
-        }
-        if Instant::now() >= deadline {
-            return Vec::new();
-        }
-        tokio::time::sleep(interval).await;
-    }
-}
-
-/// Derive the routes to install for a profile when `profile.routes` is empty.
-/// The app is the sole route installer, so when the user has not specified
-/// explicit policy routes, we derive them from the backend's own route
-/// information:
-/// - WireGuard: AllowedIPs (static, known pre-connect from analysis).
-/// - OpenVPN: server-pushed routes (dynamic, read from log post-connect).
-/// - Xray SOCKS: no OS routes (proxy-based, no interface routes).
-/// - None: no derivation (static-routes profiles require explicit routes).
-fn derive_installable_routes(
-    analysis: &ConfigAnalysis,
-    pushed: &[AnalyzedRoute],
-    backend: TunnelBackend,
-) -> Vec<PolicyRoute> {
-    match backend {
-        TunnelBackend::WireGuard => analysis
-            .os_routes
-            .iter()
-            .filter(|r| r.source.contains("WireGuard"))
-            .map(|r| PolicyRoute {
-                destination: r.destination,
-                metric: 5,
-                via: None,
-            })
-            .collect(),
-        TunnelBackend::OpenVpn => pushed
-            .iter()
-            .chain(
-                analysis
-                    .os_routes
-                    .iter()
-                    .filter(|r| r.source.contains("OpenVPN") && !r.source.contains("pushed")),
-            )
-            .map(|r| PolicyRoute {
-                destination: r.destination,
-                metric: 5,
-                via: None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Resolve the interface name for route installation. For WireGuard, if the
-/// profile has no explicit interface name, derive it from the config file name
-/// (the tunnel service creates an interface named after the config stem).
-fn resolve_install_interface(profile: &Profile) -> Option<String> {
-    if !profile.interface_name.trim().is_empty() {
-        return Some(profile.interface_name.clone());
-    }
-    match profile.backend {
-        TunnelBackend::WireGuard => {
-            net_manager_core::vpn::wireguard_tunnel_name(&profile.config_path).ok()
-        }
-        _ => None,
-    }
 }
 
 #[tauri::command]
@@ -1043,6 +369,7 @@ async fn connect_profile_inner(
     app: &tauri::AppHandle,
 ) -> Result<TunnelStatus, String> {
     let mut profile = find_profile(&state.profiles, &id)?;
+    profile.check_role()?;
     #[cfg(target_os = "linux")]
     if profile.backend == TunnelBackend::WireGuard {
         let status = linux_wireguard_connect(
@@ -1105,9 +432,9 @@ async fn connect_profile_inner(
             profile.use_system_proxy = false;
         }
     }
-    // The system proxy exists only on Windows; a profile imported from there
-    // must still connect elsewhere, just without touching proxy settings.
-    if !cfg!(windows) {
+    // A profile imported from another platform must still connect where the
+    // system proxy is unavailable, just without touching proxy settings.
+    if !super::system::system_proxy_supported() {
         profile.use_system_proxy = false;
     }
     let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
@@ -1514,7 +841,7 @@ pub(crate) async fn openvpn_plan(
             &state.openvpn_credentials,
             &profile,
             None,
-            profile.routes.clone(),
+            profile.effective_routes(),
             method::OPENVPN_PLAN,
         )?;
         crate::daemon_client::DaemonClient::system()
@@ -1730,6 +1057,8 @@ pub(crate) async fn probe_openvpn_routes(
 mod tests {
     use super::*;
     use crate::test_support::*;
+    #[cfg(target_os = "linux")]
+    use net_manager_core::daemon_protocol::{OpenVpnConnectionState, OpenVpnWarning};
 
     #[cfg(target_os = "linux")]
     fn test_credential_store() -> OpenVpnCredentialStore {
@@ -2835,67 +2164,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn target_interface_matches_exact_friendly_or_raw_name() {
-        let p = profile("wg-work");
-        let interfaces = vec![
-            iface("if0", "wg-work", InterfaceState::Up),
-            iface("if1", "other", InterfaceState::Up),
-        ];
-        assert!(has_target_interface(&p, &interfaces));
-
-        let p_raw = profile("if1");
-        assert!(has_target_interface(&p_raw, &interfaces));
-    }
-
-    #[test]
-    fn target_interface_rejects_down_state() {
-        let p = profile("wg-work");
-        let interfaces = vec![iface("if0", "wg-work", InterfaceState::Down)];
-        assert!(!has_target_interface(&p, &interfaces));
-    }
-
-    #[test]
-    fn target_interface_rejects_substring_matches() {
-        let p = profile("wg-work");
-        let interfaces = vec![
-            iface("wg-work-extra", "wg", InterfaceState::Up),
-            iface("xwg-work", "my-wg-work-tunnel", InterfaceState::Up),
-        ];
-        assert!(!has_target_interface(&p, &interfaces));
-    }
-
-    #[test]
-    fn active_profile_conflicts_skips_non_running_profiles() {
-        let mut tunnels = TunnelManager::new();
-        let candidate = ConfigAnalysis {
-            profile_id: "a".into(),
-            os_routes: vec![AnalyzedRoute {
-                metric: None,
-                destination: "10.0.0.0/8".parse().unwrap(),
-                source: "test".into(),
-            }],
-            internal_routes: vec![],
-            listeners: vec![],
-            endpoints: vec![],
-            domain_patterns: vec![],
-            warnings: vec![],
-            route_knowledge_complete: true,
-            peers: Vec::new(),
-            interface_details: Vec::new(),
-        };
-        let mut other = profile("wg-b");
-        other.id = "b".into();
-        other.config_path = std::path::PathBuf::from("nonexistent.conf");
-
-        let conflicts = active_profile_conflicts(&mut tunnels, "a", &candidate, &[other]).unwrap();
-        assert!(conflicts.is_empty());
-
-        let same = active_profile_conflicts(&mut tunnels, "a", &candidate, &[candidate_profile()])
-            .unwrap();
-        assert!(same.is_empty());
-    }
-
     #[tokio::test]
     #[cfg_attr(not(target_os = "linux"), allow(irrefutable_let_patterns))]
     async fn cleanup_stale_clears_tracked_routes_and_persists_registry() {
@@ -2927,99 +2195,12 @@ mod tests {
                 .unwrap();
         assert!(loaded.profiles.is_empty());
     }
-
-    #[test]
-    fn unknown_route_conflicts_cover_uncertainty_both_directions() {
-        let mut other = profile("ovpn-b");
-        other.id = "b".into();
-        other.name = "B".into();
-
-        let mut complete_with_route = blank_analysis("a");
-        complete_with_route.os_routes.push(AnalyzedRoute {
-            metric: None,
-            destination: "10.0.0.0/8".parse().unwrap(),
-            source: "test".into(),
-        });
-        let mut incomplete_other = blank_analysis("b");
-        incomplete_other.route_knowledge_complete = false;
-
-        let conflicts = unknown_route_conflicts(&complete_with_route, &other, &incomplete_other);
-        assert_eq!(conflicts.len(), 1);
-        assert!(conflicts[0].blocking);
-        assert!(conflicts[0].message.contains("'B'"));
-        assert!(conflicts[0]
-            .message
-            .contains("effective routes are not fully known"));
-
-        let mut incomplete_candidate = blank_analysis("a");
-        incomplete_candidate.route_knowledge_complete = false;
-        let mut known_other = blank_analysis("b");
-        known_other.os_routes.push(AnalyzedRoute {
-            metric: None,
-            destination: "10.0.0.0/8".parse().unwrap(),
-            source: "test".into(),
-        });
-        let conflicts = unknown_route_conflicts(&incomplete_candidate, &other, &known_other);
-        assert_eq!(conflicts.len(), 1);
-        assert!(conflicts[0].message.contains("not fully known"));
-        assert!(conflicts[0].message.contains("'B'"));
-
-        let mut both_incomplete_other = blank_analysis("b");
-        both_incomplete_other.route_knowledge_complete = false;
-        both_incomplete_other.os_routes.push(AnalyzedRoute {
-            metric: None,
-            destination: "10.0.0.0/8".parse().unwrap(),
-            source: "test".into(),
-        });
-        let conflicts =
-            unknown_route_conflicts(&incomplete_candidate, &other, &both_incomplete_other);
-        assert_eq!(conflicts.len(), 1);
-        assert!(conflicts[0]
-            .message
-            .contains("effective routes are not fully known"));
-    }
-
-    #[test]
-    fn unknown_route_conflicts_skip_complete_candidate_without_routes() {
-        let mut other = profile("ovpn-b");
-        other.id = "b".into();
-        other.name = "B".into();
-        let candidate = blank_analysis("a");
-        let mut incomplete_other = blank_analysis("b");
-        incomplete_other.route_knowledge_complete = false;
-
-        assert!(unknown_route_conflicts(&candidate, &other, &incomplete_other).is_empty());
-
-        let mut known_other = blank_analysis("b");
-        known_other.os_routes.push(AnalyzedRoute {
-            metric: None,
-            destination: "10.0.0.0/8".parse().unwrap(),
-            source: "test".into(),
-        });
-        assert!(unknown_route_conflicts(&candidate, &other, &known_other).is_empty());
-    }
 }
 
 #[cfg(test)]
 mod proxy_tests {
     use super::*;
     use crate::test_support::profile;
-    use std::net::TcpListener;
-
-    #[tokio::test]
-    async fn wait_for_tcp_listener_detects_live_and_dead_ports() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        assert!(
-            wait_for_tcp_listener(port, Duration::from_millis(500), Duration::from_millis(50))
-                .await
-        );
-        drop(listener);
-        assert!(
-            !wait_for_tcp_listener(port, Duration::from_millis(200), Duration::from_millis(50))
-                .await
-        );
-    }
 
     #[test]
     fn connect_port_reallocation_skips_own_http_port_and_other_listeners() {

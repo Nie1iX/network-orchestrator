@@ -11,13 +11,22 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub(crate) const DEFAULT_SOCKET: &str = "/var/run/netbird.sock";
+pub const DEFAULT_SOCKET: &str = "/var/run/netbird.sock";
 /// Where the CLI lives when NetBird was installed by Homebrew or the package.
+#[cfg(target_os = "macos")]
 const CLI_CANDIDATES: [&str; 4] = [
     "/opt/homebrew/bin/netbird",
     "/usr/local/bin/netbird",
     "/usr/local/sbin/netbird",
     "/Applications/NetBird.app/Contents/MacOS/netbird",
+];
+/// The distribution packages put it in `/usr/bin`; a manual install script in
+/// `/usr/local/bin`.
+#[cfg(not(target_os = "macos"))]
+const CLI_CANDIDATES: [&str; 3] = [
+    "/usr/bin/netbird",
+    "/usr/local/bin/netbird",
+    "/usr/local/sbin/netbird",
 ];
 const STATUS_TIMEOUT: Duration = Duration::from_secs(6);
 const DOWN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -30,7 +39,7 @@ struct Pending {
 
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 
-pub(crate) struct NetBird {
+pub struct NetBird {
     pub cli: Option<PathBuf>,
     pub socket: PathBuf,
 }
@@ -43,7 +52,7 @@ fn executable(path: &Path) -> bool {
 impl NetBird {
     /// The installed CLI and the daemon socket; both can be pointed elsewhere
     /// for tests and unusual installs.
-    pub(crate) fn detect() -> Self {
+    pub fn detect() -> Self {
         let cli = std::env::var_os("NETORCH_NETBIRD_CLI")
             .map(PathBuf::from)
             .into_iter()
@@ -118,7 +127,7 @@ fn first_str<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
 
 /// The compact, UI-facing view of `netbird status --json`. No keys, no event
 /// log, no peer details beyond counts and the networks they route.
-pub(crate) fn summarize(raw: &Value, pending: bool) -> Value {
+pub fn summarize(raw: &Value, pending: bool) -> Value {
     let daemon = raw["daemonStatus"].as_str().unwrap_or("");
     let state = match daemon {
         "Connected" => "connected",
@@ -189,7 +198,7 @@ fn cancel_pending() {
 }
 
 impl NetBird {
-    pub(crate) fn status(&self) -> Value {
+    pub fn status(&self) -> Value {
         let Some(cli) = &self.cli else {
             return json!({"installed": false, "state": "notInstalled"});
         };
@@ -210,7 +219,7 @@ impl NetBird {
 
     /// Starts `netbird up` and returns at once; the status shows how it goes.
     /// A browser login (SSO) is handled by the CLI itself.
-    pub(crate) fn up(
+    pub fn up(
         &self,
         runtime: &Path,
         management_url: Option<&str>,
@@ -264,7 +273,7 @@ impl NetBird {
         Ok(self.status())
     }
 
-    pub(crate) fn down(&self) -> Result<Value, String> {
+    pub fn down(&self) -> Result<Value, String> {
         let cli = self.cli.clone().ok_or("NetBird is not installed")?;
         cancel_pending();
         if !self.socket.exists() {
@@ -328,7 +337,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// The tail of what `netbird up` printed (a login URL, an error).
-pub(crate) fn log_tail(runtime: &Path) -> String {
+pub fn log_tail(runtime: &Path) -> String {
     let text = std::fs::read_to_string(runtime.join("netbird/up.log")).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(40)..].join("\n")

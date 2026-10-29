@@ -553,8 +553,25 @@ fn prepare_xray_config(profile: &Profile) -> io::Result<Vec<u8>> {
 
 /// `xray run -test` on `config` (stdin); the error carries Xray's own message.
 pub fn run_xray_validation(exe: &Path, config: &[u8]) -> io::Result<()> {
+    run_xray_validation_with_assets(exe, config, None)
+}
+
+/// Points Xray at a directory holding its `geoip.dat`/`geosite.dat`.
+fn use_asset_dir(command: &mut Command, asset_dir: Option<&Path>) {
+    if let Some(dir) = asset_dir {
+        command.env("XRAY_LOCATION_ASSET", dir);
+    }
+}
+
+/// [`run_xray_validation`] with the geo data the connection will run with.
+pub fn run_xray_validation_with_assets(
+    exe: &Path,
+    config: &[u8],
+    asset_dir: Option<&Path>,
+) -> io::Result<()> {
     let spec = xray_command_spec(exe, true);
     let mut command = Command::new(&spec.program);
+    use_asset_dir(&mut command, asset_dir);
     command
         .args(&spec.args)
         .stdin(Stdio::piped())
@@ -602,9 +619,16 @@ fn terminate_with_parent(command: &mut Command) {
     }
 }
 
-fn spawn_xray(exe: &Path, config: &[u8], stdout: Stdio, stderr: Stdio) -> io::Result<Child> {
+fn spawn_xray(
+    exe: &Path,
+    config: &[u8],
+    asset_dir: Option<&Path>,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> io::Result<Child> {
     let spec = xray_command_spec(exe, false);
     let mut command = Command::new(&spec.program);
+    use_asset_dir(&mut command, asset_dir);
     command
         .args(&spec.args)
         .stdin(Stdio::piped())
@@ -972,6 +996,8 @@ pub struct TunnelManager {
     static_route_profiles: HashSet<String>,
     openvpn_children: HashMap<String, Child>,
     xray_children: HashMap<String, Child>,
+    /// Per-profile geo data directories (`XRAY_LOCATION_ASSET`).
+    xray_asset_dirs: HashMap<String, PathBuf>,
     failures: HashMap<String, String>,
     child_job: Option<ChildJob>,
 }
@@ -1024,9 +1050,19 @@ impl TunnelManager {
             static_route_profiles: HashSet::new(),
             openvpn_children: HashMap::new(),
             xray_children: HashMap::new(),
+            xray_asset_dirs: HashMap::new(),
             failures: HashMap::new(),
             child_job: None,
         }
+    }
+
+    /// Run `profile_id`'s Xray with the geo data in `dir` (`None`: the files
+    /// next to the executable). Takes effect at the next connect.
+    pub fn set_xray_asset_dir(&mut self, profile_id: &str, dir: Option<PathBuf>) {
+        match dir {
+            Some(dir) => self.xray_asset_dirs.insert(profile_id.to_string(), dir),
+            None => self.xray_asset_dirs.remove(profile_id),
+        };
     }
 
     fn child_log_stdio(&self, profile_id: &str, tag: &str) -> io::Result<(Stdio, Stdio)> {
@@ -1333,9 +1369,10 @@ impl TunnelManager {
             TunnelBackend::Xray => {
                 let exe = resolve_xray_executable(self.xray_exe.as_deref())?;
                 let config = prepare_xray_config(profile)?;
-                run_xray_validation(&exe, &config)?;
+                let assets = self.xray_asset_dirs.get(&profile.id).cloned();
+                run_xray_validation_with_assets(&exe, &config, assets.as_deref())?;
                 let (out, err) = self.child_log_stdio(&profile.id, "xray")?;
-                let mut child = spawn_xray(&exe, &config, out, err)?;
+                let mut child = spawn_xray(&exe, &config, assets.as_deref(), out, err)?;
                 if let Err(err) = self.ensure_child_job().and_then(|job| job.assign(&child)) {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1526,7 +1563,7 @@ mod tests {
 
         let spawner = exe.clone();
         let mut child = std::thread::spawn(move || {
-            spawn_xray(&spawner, b"{}", Stdio::null(), Stdio::null()).unwrap()
+            spawn_xray(&spawner, b"{}", None, Stdio::null(), Stdio::null()).unwrap()
         })
         .join()
         .unwrap();
@@ -1861,6 +1898,35 @@ mod tests {
         assert_eq!(second.state, TunnelState::Failed);
         assert_eq!(second.message, first.message);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn xray_asset_dir_is_set_only_when_given() {
+        let mut plain = Command::new("xray");
+        use_asset_dir(&mut plain, None);
+        assert!(plain.get_envs().next().is_none());
+        let mut custom = Command::new("xray");
+        use_asset_dir(&mut custom, Some(Path::new("/geo")));
+        let envs: Vec<_> = custom.get_envs().collect();
+        assert_eq!(
+            envs,
+            [(
+                std::ffi::OsStr::new("XRAY_LOCATION_ASSET"),
+                Some(std::ffi::OsStr::new("/geo"))
+            )]
+        );
+    }
+
+    #[test]
+    fn a_profiles_asset_dir_can_be_set_and_cleared() {
+        let mut manager = TunnelManager::new();
+        manager.set_xray_asset_dir("a", Some(PathBuf::from("/geo")));
+        assert_eq!(
+            manager.xray_asset_dirs.get("a"),
+            Some(&PathBuf::from("/geo"))
+        );
+        manager.set_xray_asset_dir("a", None);
+        assert!(manager.xray_asset_dirs.is_empty());
     }
 
     #[test]

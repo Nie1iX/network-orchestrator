@@ -113,6 +113,11 @@ export default function ProfileRow({
       {serverName && !profile.name.includes(serverName) && (
         <span className="profile-row-server">· {serverName}</span>
       )}
+      {profile.tunnelRole === "secondary" && (
+        <span className="badge badge-armed" title={t("native.roleHint")}>
+          {t("native.roleSecondary")}
+        </span>
+      )}
       {status.state === "running" &&
         (profile.waitForInterface ||
           (profile.endpointBypasses?.length ?? 0) > 0) && (

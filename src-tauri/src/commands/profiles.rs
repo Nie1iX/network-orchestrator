@@ -5,9 +5,12 @@ use net_manager_core::config_security;
 use net_manager_core::config_vault::{ConfigImport, ConfigVault};
 use net_manager_core::models::*;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 
@@ -547,124 +550,9 @@ pub(crate) async fn save_wireguard_profile(
     Ok(redact_profiles_for_ipc(doc.profiles))
 }
 
-/// Detect a tunnel backend for `path` by extension, with a small content sniff
-/// for the ambiguous `.conf` case (WireGuard and OpenVPN both use it).
-/// Returns `None` when the extension is unrecognized and no `default` hint is
-/// given.
-pub(crate) fn detect_backend(path: &Path, default: Option<TunnelBackend>) -> Option<TunnelBackend> {
-    let lower = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    if lower.ends_with(".ovpn") {
-        return Some(TunnelBackend::OpenVpn);
-    }
-    if lower.ends_with(".json") {
-        return Some(TunnelBackend::Xray);
-    }
-    if lower.ends_with(".conf.dpapi") {
-        return Some(TunnelBackend::WireGuard);
-    }
-    if lower.ends_with(".conf") {
-        if let Ok(bytes) = fs::read(path) {
-            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
-            if head.contains("[Interface]") {
-                return Some(TunnelBackend::WireGuard);
-            }
-            for line in head.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("dev ")
-                    || trimmed.starts_with("proto ")
-                    || trimmed == "client"
-                    || trimmed.starts_with("remote ")
-                {
-                    return Some(TunnelBackend::OpenVpn);
-                }
-            }
-        }
-        return default;
-    }
-    default
-}
-
-fn backend_label(backend: TunnelBackend) -> &'static str {
-    match backend {
-        TunnelBackend::None => "Static routes",
-        TunnelBackend::WireGuard => "WireGuard",
-        TunnelBackend::OpenVpn => "OpenVPN",
-        TunnelBackend::Xray => "Xray",
-    }
-}
-
-fn generate_import_id(index: usize) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("import-{nanos:x}-{index}")
-}
-
-/// Pure, testable core of `import_configs_batch`: imports each path into the
-/// vault and upserts a profile, collecting per-file errors instead of aborting.
-pub(crate) fn import_configs_into(
-    vault: &ConfigVault,
-    store: &net_manager_core::profiles::ProfileStore,
-    paths: &[String],
-    default_backend: Option<TunnelBackend>,
-) -> std::io::Result<BatchImportResult> {
-    let mut errors: Vec<BatchImportError> = Vec::new();
-    for (index, raw) in paths.iter().enumerate() {
-        let path = PathBuf::from(raw);
-        let backend = match detect_backend(&path, default_backend) {
-            Some(b) => b,
-            None => {
-                errors.push(BatchImportError {
-                    path: raw.clone(),
-                    error: "could not determine backend from extension; set a default backend"
-                        .into(),
-                });
-                continue;
-            }
-        };
-        let id = generate_import_id(index);
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("{} {}", backend_label(backend), index + 1));
-        let import = match vault.import(&id, backend, &path) {
-            Ok(import) => import,
-            Err(err) => {
-                errors.push(BatchImportError {
-                    path: raw.clone(),
-                    error: err.to_string(),
-                });
-                continue;
-            }
-        };
-        let config_path = import.config_path.clone();
-        let profile = Profile {
-            id: id.clone(),
-            name,
-            backend,
-            config_path,
-            routes: import.routes,
-            xray_mode: XrayMode::platform_default(),
-            ..Default::default()
-        };
-        if let Err(err) = store.upsert(profile) {
-            let _ = vault.remove_revision_for_config(&import.config_path);
-            errors.push(BatchImportError {
-                path: raw.clone(),
-                error: err.to_string(),
-            });
-        }
-    }
-    let profiles = store.load()?.profiles;
-    Ok(BatchImportResult { profiles, errors })
-}
+#[cfg(test)]
+pub(crate) use net_manager_core::profile_import::detect_backend;
+pub(crate) use net_manager_core::profile_import::{generate_import_id, import_configs_into};
 
 #[tauri::command]
 pub(crate) async fn import_share_link(
@@ -964,6 +852,79 @@ fn set_subscription_refresh_interval_into(
         net_manager_core::subscription::set_refresh_interval(store, id, interval_minutes, now)
             .map_err(|_| "failed to store subscription refresh interval".to_string())?;
     Ok(redact_profiles_for_ipc(document.profiles))
+}
+
+/// The profile a role change applies to: static routes create no tunnel.
+fn tunnel_profile(
+    store: &net_manager_core::profiles::ProfileStore,
+    id: &str,
+) -> Result<Profile, String> {
+    let profile = store
+        .load()
+        .map_err(|_| "failed to load profiles".to_string())?
+        .profiles
+        .into_iter()
+        .find(|profile| profile.id == id)
+        .ok_or_else(|| "profile not found".to_string())?;
+    if profile.backend == TunnelBackend::None {
+        return Err("Static routes do not create a tunnel".into());
+    }
+    Ok(profile)
+}
+
+fn set_tunnel_role_into(
+    store: &net_manager_core::profiles::ProfileStore,
+    id: &str,
+    role: net_manager_core::models::TunnelRole,
+) -> Result<Vec<Profile>, String> {
+    let mut profile = tunnel_profile(store, id)?;
+    profile.tunnel_role = role;
+    let document = store
+        .upsert(profile)
+        .map_err(|_| "failed to store the connection role".to_string())?;
+    Ok(redact_profiles_for_ipc(document.profiles))
+}
+
+fn set_tunnel_networks_into(
+    store: &net_manager_core::profiles::ProfileStore,
+    id: &str,
+    networks: &str,
+    dns_domains: &str,
+) -> Result<Vec<Profile>, String> {
+    let mut profile = tunnel_profile(store, id)?;
+    profile.tunnel_networks = net_manager_core::models::parse_networks(networks)?;
+    profile.tunnel_dns_domains = net_manager_core::models::parse_dns_domains(dns_domains)?;
+    let document = store
+        .upsert(profile)
+        .map_err(|_| "failed to store the connection networks".to_string())?;
+    Ok(redact_profiles_for_ipc(document.profiles))
+}
+
+/// Primary takes all traffic; secondary only its own networks. A running
+/// connection is stopped first so the role applies to a fresh start.
+#[tauri::command]
+pub(crate) async fn set_tunnel_role(
+    id: String,
+    role: net_manager_core::models::TunnelRole,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let profile = tunnel_profile(&state.profiles, &id)?;
+    ensure_profile_stopped(&state, &profile, "changing the connection role").await?;
+    set_tunnel_role_into(&state.profiles, &id, role)
+}
+
+/// Networks (CIDR or single addresses) and split-DNS domains of a secondary
+/// connection, typed as text; validated here, never trusted by the daemon.
+#[tauri::command]
+pub(crate) async fn set_tunnel_networks(
+    id: String,
+    networks: String,
+    dns_domains: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    let profile = tunnel_profile(&state.profiles, &id)?;
+    ensure_profile_stopped(&state, &profile, "changing the connection networks").await?;
+    set_tunnel_networks_into(&state.profiles, &id, &networks, &dns_domains)
 }
 
 #[tauri::command]
@@ -1863,6 +1824,53 @@ mod tests {
         assert!(subscription_refresh_due(&meta, 1900));
         meta.refresh_interval_minutes = None;
         assert!(!subscription_refresh_due(&meta, 10_000));
+    }
+
+    #[test]
+    fn tunnel_role_and_networks_are_validated_and_persisted() {
+        use net_manager_core::models::TunnelRole;
+        let dir = unique_dir("tunnel-role");
+        let store = net_manager_core::profiles::ProfileStore::new(dir.join("profiles.json"));
+        store
+            .upsert(Profile {
+                id: "wg1".into(),
+                name: "Office".into(),
+                backend: TunnelBackend::WireGuard,
+                config_path: dir.join("wg1.conf"),
+                interface_name: "wg1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .upsert(Profile {
+                id: "static".into(),
+                name: "Static".into(),
+                backend: TunnelBackend::None,
+                interface_name: "eth9".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let profiles = set_tunnel_role_into(&store, "wg1", TunnelRole::Secondary).unwrap();
+        assert_eq!(profiles[0].tunnel_role, TunnelRole::Secondary);
+        let profiles = set_tunnel_networks_into(
+            &store,
+            "wg1",
+            "10.10.4.7/16, 192.168.5.0/24",
+            "Corp.Example",
+        )
+        .unwrap();
+        assert_eq!(profiles[0].tunnel_networks.len(), 2);
+        assert_eq!(profiles[0].tunnel_dns_domains, vec!["corp.example"]);
+        let stored = store.load().unwrap().profiles.remove(0);
+        assert_eq!(stored.effective_routes().len(), 2);
+
+        assert!(set_tunnel_networks_into(&store, "wg1", "0.0.0.0/0", "").is_err());
+        assert!(set_tunnel_networks_into(&store, "wg1", "10.0.0.0/8", "a/b").is_err());
+        assert!(set_tunnel_role_into(&store, "static", TunnelRole::Secondary).is_err());
+        assert!(set_tunnel_role_into(&store, "missing", TunnelRole::Primary).is_err());
+        // Rejected input leaves the stored networks alone.
+        assert_eq!(store.load().unwrap().profiles[0].tunnel_networks.len(), 2);
     }
 
     #[test]

@@ -25,13 +25,13 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 
 | Feature | Windows | Linux | macOS | Notes |
 |---|---|---|---|---|
-| Several tunnels at once (primary + secondary by network) | — | — | ✅ Xray, WireGuard, OpenVPN | macOS: one primary connection, secondary ones carry only listed networks — `docs/plans/2026-10-14-18-macos-multi-tunnel.md` |
-| NetBird | — | — | ✅ via the user's own daemon | macOS: status/up/down through the NetBird CLI, SSO or setup key — `docs/plans/2026-10-14-18-macos-multi-tunnel.md` |
+| Several tunnels at once (primary + secondary by network) | — | ✅ WireGuard, OpenVPN, Xray TUN (daemon-enforced; split DNS via systemd-resolved) | ✅ Xray, WireGuard, OpenVPN | macOS: one primary connection, secondary ones carry only listed networks — `docs/plans/2026-10-14-18-macos-multi-tunnel.md` |
+| NetBird | — | ✅ via the user's own daemon (unverified against a live daemon) | ✅ via the user's own daemon | `net_manager_core::netbird` shared by both clients; Linux: Profiles → Services row; macOS: status/up/down through the NetBird CLI, SSO or setup key — `docs/plans/2026-10-14-18-macos-multi-tunnel.md` |
 | WireGuard profile | ✅ | ✅ | ✅ helper, arm64 | Win: embedded tunnel lib + service install; Linux: `wireguard-tools` + daemon; macOS: userspace engine (`boringtun`) inside the privileged helper — `docs/plans/2026-10-14-17-macos-wireguard-openvpn.md` |
 | OpenVPN profile | ✅ | ✅ | ✅ helper, arm64 | Win/Linux as before; macOS: pinned self-contained OpenVPN from the app bundle run by the helper, routes/DNS installed by the helper, credentials in the Keychain |
 | Xray — SOCKS mode | ✅ | ✅ | ✅ native, arm64 | macOS: native client runs managed Xray via `TunnelManager` in `crates/macos-bridge/src/runtime.rs` |
 | Xray — TUN mode | ✅ manual | ✅ managed | ✅ helper, arm64 | Win: user sets iface name/IP; Linux: daemon generates config (`xrayMode: "tun"` default); macOS: the launchd helper creates the `utun`, hands its fd to Xray (`XRAY_TUN_FD`, Xray runs as the console user) and owns routes + DNS — `docs/plans/2026-10-14-16-macos-xray-tun.md`; one tunnel at a time |
-| Static routes (`none`) | ✅ | ✅ | ❌ helper | Policy routes only, no tunnel; route mutation is IP Helper / netlink |
+| Static routes (`none`) | ✅ | ✅ | ✅ helper | Policy routes only, no tunnel; route mutation is IP Helper / netlink; macOS: the profile's routes are a routing intent `static-<id>` kept by the helper (armed while the interface is absent when "wait for the interface" is on); routes with their own gateway are not supported yet |
 | Managed Xray install | ✅ x86_64 only | ✅ x86_64 only | ✅ arm64, download or local zip | `managedXrayInstall`; fixed-version, hash-pinned download. Win: app-local store; Linux: archive goes to the daemon (`xray.install`), which re-verifies hashes and installs root-owned files under `/usr/lib/network-orchestrator/xray`; macOS: per-user managed root |
 | WireGuard standard `.conf` import | ✅ | — | — | `wireguardStandardImport` |
 
@@ -39,7 +39,7 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 
 | Feature | Windows | Linux | macOS | Notes |
 |---|---|---|---|---|
-| Privileged ops | ✅ elevated relaunch | ✅ daemon | ✅ Xray TUN, WireGuard, OpenVPN | Win: `elevationRelaunch` respawn; Linux: `net-manager-daemon` (systemd + polkit + Unix socket); macOS: launchd helper (`SMAppService.daemon`) verifies the app and runs the Xray TUN, WireGuard and OpenVPN executors (utun, routes, DNS, journal); a static-route executor is not written yet — see the helper plans |
+| Privileged ops | ✅ elevated relaunch | ✅ daemon | ✅ Xray TUN, WireGuard, OpenVPN | Win: `elevationRelaunch` respawn; Linux: `net-manager-daemon` (systemd + polkit + Unix socket); macOS: launchd helper (`SMAppService.daemon`) verifies the app and runs the Xray TUN, WireGuard and OpenVPN executors (utun, routes, DNS, journal); static-route profiles and routing intents run as intents in the helper (`docs/plans/2026-10-27-20-macos-route-intents.md`) |
 | Ask for admin password (polkit policy) | — | ✅ | — | `get/set_vpn_auth_mode`; Settings → System |
 | Always-on before sign-in | — | ✅ | — | WG + static routes only; daemon journal; OVPN/Xray unsupported |
 | Start at login | — | ✅ | — | `get/set_login_autostart` |
@@ -48,17 +48,22 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 | NetworkManager VPN inventory | — | ✅ | ❌ | `nm.list`/`nm.setActive` via the daemon over system D-Bus; NM owns credentials, lifecycle and pushed DNS |
 | Kernel route/rule inventory | — | ✅ | ❌ | `net.tables` via the daemon's rtnetlink: every table + all policy rules (`ip route`/`ip rule` equivalent); read-only, daemon-owned rows flagged by RTPROT |
 | Tailscale service row | — | ✅ | ✅ via the user's own daemon | `tailscaled` proxied through the daemon's LocalAPI client; surfaced under Profiles → Services; macOS: status/up/down through the Tailscale CLI plus the helper's `tailscale.protect` guard (tailnet prefix pins and bypass routes for Tailscale's own traffic next to a primary tunnel) — `docs/plans/2026-10-20-macos-tailscale.md` |
-| System proxy toggle | ✅ | — | ✅ `networksetup`, hardware services; ignored while a packet-tunnel VPN is primary | Win: registry; macOS: `system_proxy::macos::MacProxyAdapter`; `UnsupportedProxyAdapter` on Linux |
+| System proxy toggle | ✅ | ⚠️ GNOME via `gsettings`, KDE via `kwriteconfig`; other desktops hidden | ✅ `networksetup`, hardware services; ignored while a packet-tunnel VPN is primary | Win: registry; macOS: `system_proxy::macos::MacProxyAdapter`; Linux: `system_proxy::linux` — `GnomeProxyAdapter` (`org.gnome.system.proxy`) or `KdeProxyAdapter` (`kioslaverc`), offered only when one is usable |
 | Command line (`netorch`) | ❌ | ❌ | ✅ `crates/cli` | Bundle tool: profiles, import, `up`/`down`, routing rules, diagnostics. Shares the app's data; privileged work through the helper, or `sudo netorch up` with the helper's executors in its own process — `docs/plans/2026-10-15-19-netorch-cli.md`. Windows/Linux need `Privileged`/`UserRuntime` adapters for `crates/engine` |
 | In-app updater | ✅ | — | ❌ | `appUpdates` is `windows`-only; Linux ships `.deb`/`.rpm`/AUR → package manager |
 | Per-link DNS | — | ✅ | — | `crates/daemon/src/dns.rs`, systemd-resolved; Windows relies on pushed/adapter DNS |
-| Recovery prompt (leftover resources) | ✅ | ✅ | ⚠️ | Win: orphaned adapters/routes; Linux: stale daemon owners; macOS: the helper undoes a dead tunnel's routes/DNS on its own start (`recovery.cleanup` is the manual trigger), no UI prompt |
+| Recovery prompt (leftover resources) | ✅ | ✅ | ✅ | Win: orphaned adapters/routes; Linux: stale daemon owners; macOS: the helper undoes a dead tunnel's routes/DNS on its own start; at launch the app lists what it still records for a tunnel that is not running (or a stale system proxy) and `recovery.cleanup` clears it on request, a running tunnel is never touched |
 | App mode (orchestrator/manager/combined) | ✅ | ✅ | ❌ | UI capability filter in Settings → Profiles; `orchestrator` hides managed backend creation/connect, `manager` hides NM/external orchestration; the native macOS app has no mode switch yet |
 
-## Observability (identical on both)
+## Observability
 
-On macOS these have no backend: interface/route data flows through the
-Linux daemon or win32-specific enumeration — nothing generic exists.
+Windows and Linux share these tabs. The native macOS client reads
+interfaces and routes through `getifaddrs`/`net-route` (read-only) and has
+its own route lookup and exit-IP check on Home, and a Monitor page (tunnel
+throughput chart and per-tunnel rates from the interface byte counters); a Logs
+page (app events, per-connection, helper, NetBird and import logs with level/text filters) a
+per-connection Diagnostics report (`core::diagnostics`) and a DNS tab on Network
+(system resolvers from `scutil --dns`, a one-off query with its route).
 
 | Feature | Where |
 |---|---|
@@ -75,13 +80,15 @@ Linux daemon or win32-specific enumeration — nothing generic exists.
   (localStorage `netmanager.connections.snippets`).
 - Subscription profiles: multi-endpoint list, per-endpoint delay,
   refresh interval, traffic quota display.
-- Import: URI/file batch import (`ImportModal`); WireGuard `.conf` import
-  additionally on Windows only.
+- Import: URI/file batch import (`ImportModal`); standard WireGuard `.conf`
+  import on all three clients.
+- Home (Linux Tauri and macOS): last-profile reconnect, running connections,
+  copy `HTTP(S)_PROXY`/`ALL_PROXY` for the terminal. Opening a browser
+  through a connection is macOS-only and is deliberately not ported.
 - Domain/IP policies per profile (`block`/`proxy`/`direct`) — both OSes;
   conditional rules are Linux-only (see above).
-- On macOS profile CRUD, sets and import are the only plausibly-working
-  pieces (plain on-disk store, `protect_path` has a `cfg(not(windows))`
-  fallback) — unverified.
+- On macOS profile CRUD, subscriptions, sets and import are implemented and
+  covered by the Swift/Rust tests.
 
 ## Deliberately absent
 

@@ -247,6 +247,16 @@ impl SecretServiceStore {
     }
 }
 
+impl net_manager_engine::linux::CredentialSource for OpenVpnCredentialStore {
+    fn load(
+        &self,
+        profile_id: &str,
+        legacy: &Path,
+    ) -> Result<(Option<OpenVpnCredentials>, Option<&'static str>), String> {
+        OpenVpnCredentialStore::load(self, profile_id, legacy)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

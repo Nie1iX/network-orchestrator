@@ -643,6 +643,27 @@ async fn handle<A: Authorizer>(
             let mut plan = parse_wireguard_config(&params.config, &params.routes)
                 .map_err(|err| invalid(err.to_string()))?;
             plan.interface_name = params.interface_name.clone();
+            net_manager_core::models::validate_secondary(
+                params.role,
+                &params.routes,
+                &params.dns_domains,
+            )
+            .map_err(|message| invalid(message.into()))?;
+            if params.role == net_manager_core::models::TunnelRole::Secondary {
+                if plan.full_ipv4 || plan.full_ipv6 {
+                    return Err(invalid(
+                        "A secondary connection cannot take all traffic".into(),
+                    ));
+                }
+                // Names under the listed suffixes resolve through the
+                // tunnel's own servers; the config's search domains are not
+                // trusted to scope a secondary tunnel.
+                plan.dns_domains = if plan.dns_servers.is_empty() {
+                    Vec::new()
+                } else {
+                    params.dns_domains.clone()
+                };
+            }
             let broad = plan.full_ipv4 || plan.full_ipv6;
             authorize(ctx, peer, connect_action(ctx.vpn_auth_mode(), broad)).await?;
             let profile_id = params.profile_id.clone();
@@ -749,6 +770,12 @@ async fn handle<A: Authorizer>(
                 .map_err(|_| invalid("invalid Xray connect parameters".into()))?;
             prepare_xray(uid, params.clone(), 1)
                 .map_err(|_| invalid("unsupported generated Xray TUN config".into()))?;
+            net_manager_core::models::validate_secondary(
+                params.role,
+                &params.routes,
+                &params.dns_domains,
+            )
+            .map_err(|message| invalid(message.into()))?;
             let broad = params
                 .routes
                 .iter()
@@ -791,6 +818,12 @@ async fn handle<A: Authorizer>(
                 .map_err(|_| invalid("invalid Xray reload parameters".into()))?;
             prepare_xray(uid, params.clone(), 1)
                 .map_err(|_| invalid("unsupported generated Xray TUN config".into()))?;
+            net_manager_core::models::validate_secondary(
+                params.role,
+                &params.routes,
+                &params.dns_domains,
+            )
+            .map_err(|message| invalid(message.into()))?;
             let broad = params
                 .routes
                 .iter()
@@ -1873,6 +1906,45 @@ mod tests {
                 .await;
             assert_eq!(*harness.ctx.authorizer.actions.lock().unwrap(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn secondary_wireguard_is_validated_before_authorization() {
+        let harness = Harness::new(AuthDecision::Denied);
+        let mut client = harness.hello(1000).await;
+
+        // No networks to carry.
+        let mut params = wg_params("");
+        params["role"] = json!("secondary");
+        let reply = client.call(2, method::WIREGUARD_CONNECT, params).await;
+        assert_eq!(error_code(&reply), "invalidParams", "{reply}");
+
+        // A secondary tunnel never takes the default route.
+        let mut params = wg_full_params();
+        params["role"] = json!("secondary");
+        params["routes"] = json!([{ "destination": "0.0.0.0/0", "metric": 5 }]);
+        let reply = client.call(3, method::WIREGUARD_CONNECT, params).await;
+        assert_eq!(error_code(&reply), "invalidParams", "{reply}");
+
+        // A bad split-DNS suffix.
+        let mut params = wg_params("");
+        params["role"] = json!("secondary");
+        params["routes"] = json!([{ "destination": "10.77.0.0/24", "metric": 5 }]);
+        params["dnsDomains"] = json!(["not a domain"]);
+        let reply = client.call(4, method::WIREGUARD_CONNECT, params).await;
+        assert_eq!(error_code(&reply), "invalidParams", "{reply}");
+
+        assert!(harness.ctx.authorizer.actions.lock().unwrap().is_empty());
+
+        // A valid secondary reaches authorization as a split (non-admin) connect.
+        let mut params = wg_params("");
+        params["role"] = json!("secondary");
+        params["routes"] = json!([{ "destination": "10.77.0.0/24", "metric": 5 }]);
+        client.call(5, method::WIREGUARD_CONNECT, params).await;
+        assert_eq!(
+            *harness.ctx.authorizer.actions.lock().unwrap(),
+            [Action::ConnectProfile]
+        );
     }
 
     #[tokio::test]

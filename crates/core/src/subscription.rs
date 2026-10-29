@@ -956,6 +956,27 @@ impl Drop for TemporaryXray {
 /// the share link.
 pub async fn measure_delay_with_command(
     uri: &str,
+    command: tokio::process::Command,
+    probe_url: &str,
+    timeout: std::time::Duration,
+) -> Result<u64, String> {
+    measure_delay_with_config(
+        |socks_port| {
+            xray::generate_share_link_config(uri, socks_port)
+                .map_err(|_| "invalid subscription endpoint".to_string())
+        },
+        command,
+        probe_url,
+        timeout,
+    )
+    .await
+}
+
+/// Like [`measure_delay_with_command`], with the probe's config built by the
+/// caller for the reserved SOCKS port, so the probe can run the very config a
+/// connection will use.
+pub async fn measure_delay_with_config(
+    build_config: impl FnOnce(u16) -> Result<serde_json::Value, String>,
     mut command: tokio::process::Command,
     probe_url: &str,
     timeout: std::time::Duration,
@@ -968,8 +989,7 @@ pub async fn measure_delay_with_command(
         .local_addr()
         .map_err(|_| "failed to reserve delay probe port".to_string())?
         .port();
-    let config = xray::generate_share_link_config(uri, socks_port)
-        .map_err(|_| "invalid subscription endpoint".to_string())?;
+    let config = build_config(socks_port)?;
     let config = serde_json::to_vec(&config)
         .map_err(|_| "failed to encode delay probe config".to_string())?;
     drop(listener);

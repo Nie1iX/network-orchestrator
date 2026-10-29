@@ -2844,13 +2844,14 @@ dependencies = [
 
 [[package]]
 name = "net-manager-app"
-version = "0.8.7"
+version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "dbus-secret-service",
  "futures-util",
  "libc",
  "net-manager-core",
+ "net-manager-engine",
  "reqwest",
  "serde",
  "serde_json",
@@ -2870,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-cli"
-version = "0.8.7"
+version = "0.0.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2888,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-core"
-version = "0.8.7"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -2908,7 +2909,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-engine"
-version = "0.8.7"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "net-manager-core",
@@ -2920,7 +2921,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-macos-bridge"
-version = "0.8.7"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "ipnet",
@@ -3016,7 +3017,7 @@ dependencies = [
 
 [[package]]
 name = "network-orchestrator-daemon"
-version = "0.8.7"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -3035,7 +3036,7 @@ dependencies = [
 
 [[package]]
 name = "network-orchestrator-macos-helper"
-version = "0.8.7"
+version = "0.10.0"
 dependencies = [
  "base64 0.22.1",
  "boringtun",

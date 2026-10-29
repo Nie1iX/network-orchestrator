@@ -6,7 +6,12 @@ use crate::{
     profiles::{ProfileDocument, ProfileStore},
     xray,
 };
-use std::{collections::HashSet, io};
+use std::{
+    collections::HashSet,
+    io,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const AUTO_SOCKS_PORT_START: u16 = 10808;
 const AUTO_SOCKS_PORT_END: u16 = 10999;
@@ -248,6 +253,125 @@ pub fn import_share_link(
         let _ = vault.remove_revision_for_config(&imported.config_path);
     }
     result
+}
+
+/// Detect a tunnel backend for `path` by extension, with a small content sniff
+/// for the ambiguous `.conf` case (WireGuard and OpenVPN both use it).
+/// Returns `None` when the extension is unrecognized and no `default` hint is
+/// given.
+pub fn detect_backend(path: &Path, default: Option<TunnelBackend>) -> Option<TunnelBackend> {
+    let lower = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if lower.ends_with(".ovpn") {
+        return Some(TunnelBackend::OpenVpn);
+    }
+    if lower.ends_with(".json") {
+        return Some(TunnelBackend::Xray);
+    }
+    if lower.ends_with(".conf.dpapi") {
+        return Some(TunnelBackend::WireGuard);
+    }
+    if lower.ends_with(".conf") {
+        if let Ok(bytes) = std::fs::read(path) {
+            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
+            if head.contains("[Interface]") {
+                return Some(TunnelBackend::WireGuard);
+            }
+            for line in head.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("dev ")
+                    || trimmed.starts_with("proto ")
+                    || trimmed == "client"
+                    || trimmed.starts_with("remote ")
+                {
+                    return Some(TunnelBackend::OpenVpn);
+                }
+            }
+        }
+        return default;
+    }
+    default
+}
+
+fn backend_label(backend: TunnelBackend) -> &'static str {
+    match backend {
+        TunnelBackend::None => "Static routes",
+        TunnelBackend::WireGuard => "WireGuard",
+        TunnelBackend::OpenVpn => "OpenVPN",
+        TunnelBackend::Xray => "Xray",
+    }
+}
+
+pub fn generate_import_id(index: usize) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("import-{nanos:x}-{index}")
+}
+
+/// Pure, testable core of `import_configs_batch`: imports each path into the
+/// vault and upserts a profile, collecting per-file errors instead of aborting.
+pub fn import_configs_into(
+    vault: &ConfigVault,
+    store: &ProfileStore,
+    paths: &[String],
+    default_backend: Option<TunnelBackend>,
+) -> std::io::Result<BatchImportResult> {
+    let mut errors: Vec<BatchImportError> = Vec::new();
+    for (index, raw) in paths.iter().enumerate() {
+        let path = PathBuf::from(raw);
+        let backend = match detect_backend(&path, default_backend) {
+            Some(b) => b,
+            None => {
+                errors.push(BatchImportError {
+                    path: raw.clone(),
+                    error: "could not determine backend from extension; set a default backend"
+                        .into(),
+                });
+                continue;
+            }
+        };
+        let id = generate_import_id(index);
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{} {}", backend_label(backend), index + 1));
+        let import = match vault.import(&id, backend, &path) {
+            Ok(import) => import,
+            Err(err) => {
+                errors.push(BatchImportError {
+                    path: raw.clone(),
+                    error: err.to_string(),
+                });
+                continue;
+            }
+        };
+        let config_path = import.config_path.clone();
+        let profile = Profile {
+            id: id.clone(),
+            name,
+            backend,
+            config_path,
+            routes: import.routes,
+            xray_mode: XrayMode::platform_default(),
+            ..Default::default()
+        };
+        if let Err(err) = store.upsert(profile) {
+            let _ = vault.remove_revision_for_config(&import.config_path);
+            errors.push(BatchImportError {
+                path: raw.clone(),
+                error: err.to_string(),
+            });
+        }
+    }
+    let profiles = store.load()?.profiles;
+    Ok(BatchImportResult { profiles, errors })
 }
 
 #[cfg(test)]

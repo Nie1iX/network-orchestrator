@@ -8,15 +8,31 @@
 //! Privileged work stays in the launchd helper; this crate only asks it.
 use std::path::PathBuf;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod diagnose;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod geo;
+#[cfg(any(target_os = "linux", feature = "linux-engine"))]
+pub mod linux;
+#[cfg(any(target_os = "linux", feature = "linux-engine"))]
+pub mod linux_compat;
+#[cfg(any(target_os = "linux", feature = "linux-engine"))]
+pub mod linux_engine;
 #[cfg(unix)]
 pub mod privileged;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod recovery;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod static_routes;
 #[cfg(unix)]
 pub mod tailscale;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vpn_backends;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use diagnose::DiagnosticsContext;
 #[cfg(unix)]
 pub use privileged::Privileged;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

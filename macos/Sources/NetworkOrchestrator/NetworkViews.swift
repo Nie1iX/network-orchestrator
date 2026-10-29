@@ -32,6 +32,7 @@ struct NetworkView: View {
   @State private var preset = "Main adapters"
   @State private var collapsed = Set<String>()
   @State private var selected: NetworkInterface?
+  @State private var confirmingOff = false
   private var interfaces: [NetworkInterface] { model.snapshot?.interfaces ?? [] }
   private var filtered: [NetworkInterface] {
     interfaces.filter {
@@ -40,9 +41,16 @@ struct NetworkView: View {
           || $0.addresses.contains { $0.address.contains(search) })
     }
   }
+  @State private var tab = "Adapters"
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       AppHeading(title: "Network")
+      AppTabs(titles: ["Adapters", "DNS"], selected: $tab)
+      if tab == "DNS" { DnsView(model: model) } else { adapters }
+    }
+  }
+  @ViewBuilder private var adapters: some View {
+    VStack(alignment: .leading, spacing: 0) {
       HStack(spacing: 7) {
         AppInput(placeholder: "Search by name, MAC, address…", text: $search)
         AppSelect(
@@ -139,7 +147,8 @@ struct NetworkView: View {
           }.padding(.bottom, 14)
         }
       }
-    }.sheet(item: $selected) { interface in
+    }
+    .sheet(item: $selected) { interface in
       AppModal(
         title: interface.friendlyName, width: 620, onClose: { selected = nil },
         translatesTitle: false
@@ -147,6 +156,20 @@ struct NetworkView: View {
         ScrollView {
           VStack(alignment: .leading, spacing: 14) {
             InterfaceCard(interface: interface)
+            if model.canSwitch(interface) {
+              HStack {
+                Spacer()
+                Button(
+                  L10n.text(interface.state == "up" ? "native.link.turnOff" : "native.link.turnOn")
+                ) {
+                  if interface.state == "up" {
+                    confirmingOff = true
+                  } else {
+                    Task { await switchInterface(interface, up: true) }
+                  }
+                }.disabled(model.switchingInterface)
+              }
+            }
             AppHeading(title: "Routes")
             Text(
               L10n.text(
@@ -164,7 +187,25 @@ struct NetworkView: View {
           }.padding(14)
         }.frame(height: 520)
       }.environment(\.palette, p)
+        // On the sheet itself: an alert of the parent would sit behind it.
+        .alert(
+          L10n.text("native.link.offTitle"), isPresented: $confirmingOff, presenting: selected
+        ) { interface in
+          Button(L10n.text("native.link.turnOff"), role: .destructive) {
+            Task { await switchInterface(interface, up: false) }
+          }
+          Button(L10n.text("common.cancel"), role: .cancel) {}
+        } message: { interface in
+          Text(L10n.text(model.switchOffWarning(interface), ["name": interface.friendlyName]))
+        }
     }
+  }
+}
+extension NetworkView {
+  /// Switches the interface and shows its new state in the open sheet.
+  fileprivate func switchInterface(_ interface: NetworkInterface, up: Bool) async {
+    guard await model.setInterfaceState(interface, up: up) else { return }
+    selected = model.snapshot?.interfaces.first { $0.ifIndex == interface.ifIndex }
   }
 }
 struct InterfaceCard: View {
@@ -236,6 +277,8 @@ enum RouteTab: String, CaseIterable {
   case table = "Raw table"
   case lookup = "Lookup"
   case user = "My routing settings"
+  case intents = "routes.intents"
+  case conditions = "cond.title"
 }
 struct RoutesView: View {
   @Environment(\.palette) private var p
@@ -264,6 +307,8 @@ struct RoutesView: View {
         }
         case .lookup: RouteLookupView(model: model)
         case .user: UserRoutingView(model: model)
+        case .intents: IntentsView(model: model)
+        case .conditions: ConditionsView(model: model)
       }
     }.frame(minHeight: 300, alignment: .topLeading)
   }
@@ -595,6 +640,7 @@ struct SettingsView: View {
   @Bindable var model: AppModel
   @State private var showingImportLog = false
   @State private var loginItemEnabled = false
+  @AppStorage("showMenuBar") private var showMenuBar = true
   @AppStorage("appearance") private var appearance = "system"
   @Bindable private var localizer = L10n.shared
   var body: some View {
@@ -615,6 +661,18 @@ struct SettingsView: View {
           Spacer()
           AppSelect(label: "Language", selection: $localizer.preference, options: localizer.options)
             .frame(width: 150)
+        }.padding(.horizontal, 14).padding(.vertical, 10.5)
+      }
+      settingsGroup("settings.appMode") {
+        HStack {
+          settingText("settings.appMode", "settings.appModeSub")
+          Spacer()
+          AppSelect(
+            label: "settings.appMode",
+            selection: Binding(
+              get: { model.appMode.rawValue }, set: { model.appMode = AppMode(stored: $0) }),
+            options: AppMode.allCases.map { (value: $0.rawValue, title: $0.titleKey) }
+          ).frame(width: 150)
         }.padding(.horizontal, 14).padding(.vertical, 10.5)
       }
       settingsGroup("Backend & dependencies") {
@@ -687,6 +745,12 @@ struct SettingsView: View {
                 loginItemEnabled = SMAppService.mainApp.status == .enabled
               })
           ).toggleStyle(.switch).controlSize(.small).labelsHidden()
+        }.padding(.horizontal, 14).padding(.vertical, 10.5)
+        Rectangle().fill(p.border).frame(height: 1)
+        HStack {
+          settingText("native.menuBar.setting", "native.menuBar.settingSub")
+          Spacer()
+          Toggle("", isOn: $showMenuBar).toggleStyle(.switch).controlSize(.small).labelsHidden()
         }.padding(.horizontal, 14).padding(.vertical, 10.5)
       }
       .onAppear { loginItemEnabled = SMAppService.mainApp.status == .enabled }

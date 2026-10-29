@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(
     name = "netorch",
-    version,
+    version = env!("NETORCH_VERSION"),
     about = "One command for VPN profiles, tunnels and routing",
     long_about = "Import a link, subscription or config and connect with one command.\n\
                   Profiles and settings are shared with the Network Orchestrator app."

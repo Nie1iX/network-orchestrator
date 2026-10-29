@@ -4,8 +4,9 @@ Guidance for agents/contributors working in this repository.
 
 ## Layout
 
-- `crates/core` — pure Rust library: models, static analysis, config vault,
-  DPAPI, policy routes, tunnel manager, route plan, system proxy, explorer,
+- `crates/core` — pure Rust library: models, static analysis, profile diagnostics checks, config vault,
+  DPAPI, policy routes, tunnel manager, route plan, connect plan (conflict
+  checks, route/interface derivation), system proxy, explorer,
   backend executable settings, managed Xray verification. Also hosts the
   opt-in `windows_e2e` integration tests (see Safety rules).
 - `crates/daemon` — Linux privileged system service: Unix socket protocol,
@@ -13,11 +14,18 @@ Guidance for agents/contributors working in this repository.
   Hard-learned netlink quirks live in `MEMORY.md`.
 - `crates/engine` — typed connection engine (`Engine`): connect/disconnect/
   status/system proxy/Xray install and the requests to the privileged helper.
-  macOS (aarch64) only for now; shared by the bridge and the planned `netorch`
-  CLI (`docs/plans/2026-10-15-19-netorch-cli.md`). No UI, no FFI.
-- `crates/cli` — the `netorch` command line tool (macOS): clap commands over
+  macOS (aarch64) `Engine` is shared by the bridge and the `netorch` CLI
+  (`docs/plans/2026-10-15-19-netorch-cli.md`). On Linux, `linux` holds the pure
+  builders of the daemon's requests (shared with `src-tauri`) and
+  `linux_engine::LinuxEngine` connects/disconnects/reads status through the
+  daemon socket for the Linux CLI. No UI, no FFI.
+- `crates/cli` — the `netorch` command line tool. macOS: clap commands over
   `crates/engine` and the bridge's profile/import/routing services; ships in
-  the app bundle next to the helper.
+  the app bundle next to the helper. Linux (`src/linux/`): a client of the
+  network daemon built on `LinuxEngine` and the import/subscription code of
+  `crates/core`, no GUI needed; `hold` keeps a connection up in the
+  background (the daemon drops a tunnel 30 s after the user's last client
+  process exits). Plan: `docs/plans/2026-10-28-linux-netorch-cli.md`.
 - `crates/macos-bridge` — unprivileged JSON C ABI staticlib the Swift client
   links; every macOS core operation goes through it. A thin JSON wrapper over
   `crates/engine` for runtime operations.
@@ -59,6 +67,8 @@ script aborts without SDK 27.
 ## Quality gate (run before reporting done)
 
 ```bash
+python3 scripts/versions.py check
+python3 -m unittest scripts/test_versions.py
 cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
@@ -164,12 +174,20 @@ mirrors this gate on Windows.
   `L10n.text("Add a connection")` in Swift); `t("dotted.key")` is the legacy
   compat path still used across the web UI. Never delete an English-text key
   that only appears in Swift sources; add new messages to `en.json` first.
-- App version has one source of truth: `[workspace.package].version` in the
-  root `Cargo.toml`; do not duplicate it in `package.json` or
-  `tauri.conf.json` (neither has a version field).
+- Versions are per release line (`core`, `macos`, `linux`, `windows`), not one
+  for the app: `versions.toml` is the only source of truth, and
+  `python3 scripts/versions.py set <line> X.Y.Z` / `sync` write it into the
+  crates and `src-tauri/tauri.<linux|windows>.conf.json`. Never edit a crate or
+  Tauri version by hand; `crates/cli` and `src-tauri` say `0.0.0` and take the
+  version of the target OS from `versions.toml` at build time
+  (`NETORCH_VERSION`).
 - Versioning, commit messages and releases follow `docs/versioning.md`
-  (SemVer, Conventional Commits in English, `CHANGELOG.md`); bump the version
-  in a separate `chore(release): X.Y.Z` commit after each group of changes.
+  (SemVer per line, Conventional Commits in English, `changelog/<line>.md`;
+  `CHANGELOG.md` is the history up to 0.10.0); read it before committing or
+  bumping a version. Every commit needs a `type(scope):`
+  prefix, one type per commit (never mix `feat` and `fix`), breaking changes
+  carry `!` or a `BREAKING CHANGE:` footer. Bump a line's version in a separate
+  `chore(release): <line> X.Y.Z` commit after each group of changes.
 - Store files are versioned documents written atomically (temp + rename)
   and ACL-protected via `config_security::protect_path`.
 

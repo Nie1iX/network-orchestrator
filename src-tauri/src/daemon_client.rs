@@ -75,7 +75,7 @@ impl DaemonClient {
             method: method::HELLO.into(),
             params: serde_json::to_value(HelloParams {
                 protocol: PROTOCOL_VERSION,
-                client: format!("net-manager-app/{}", env!("CARGO_PKG_VERSION")),
+                client: format!("net-manager-app/{}", env!("NETORCH_VERSION")),
             })
             .map_err(|e| ClientError::Protocol(e.to_string()))?,
         };

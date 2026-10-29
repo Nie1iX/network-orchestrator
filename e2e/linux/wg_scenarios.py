@@ -401,6 +401,56 @@ docker_exec(client_name, "ip", "-4", "route", "replace", *original_default)
 assert rpc("wireguard.status", {"profileId": "wg-dns"})["state"] == "stopped"
 print("ok   DNS tunnel disconnect removed ownership", flush=True)
 
+print("\n=== WireGuard secondary role: listed networks and split DNS only", flush=True)
+secondary_params = {
+    "profileId": "wg-secondary",
+    "config": dns_config,
+    "routes": [{"destination": "10.77.0.0/24", "metric": 5}],
+    "role": "secondary",
+    "dnsDomains": ["test"],
+}
+try:
+    rpc("wireguard.connect", {**secondary_params, "routes": []})
+except RuntimeError:
+    print("ok   secondary without networks is refused", flush=True)
+else:
+    raise RuntimeError("daemon accepted a secondary tunnel with no networks")
+try:
+    rpc(
+        "wireguard.connect",
+        {**secondary_params, "routes": [{"destination": "0.0.0.0/0", "metric": 5}]},
+    )
+except RuntimeError:
+    print("ok   secondary cannot take the default route", flush=True)
+else:
+    raise RuntimeError("daemon accepted a secondary tunnel with a default route")
+
+secondary = rpc("wireguard.connect", secondary_params)["status"]
+assert secondary["state"] == "running", "secondary WireGuard did not reach running"
+secondary_interface = secondary["interfaceName"]
+route = docker_exec(client_name, "ip", "-4", "route", "get", "10.77.0.1")
+assert f"dev {secondary_interface}" in route, "listed network bypasses the secondary tunnel"
+default = docker_exec(client_name, "ip", "-4", "route", "get", "198.51.100.7")
+assert secondary_interface not in default, "secondary tunnel captured unrelated traffic"
+print("ok   only the listed network uses the secondary tunnel", flush=True)
+
+resolved = docker_exec(client_name, "resolvectl", "status", secondary_interface)
+assert "10.77.0.1" in resolved and "~test" in resolved, resolved
+assert "~." not in resolved, "secondary tunnel became the default DNS route"
+before = int(docker_exec(server_name, "cat", "/run/wg-e2e-dns-count"))
+answer = docker_exec(client_name, "resolvectl", "query", "wg-e2e.test")
+assert "10.76.0.1" in answer, "split DNS did not answer through the tunnel"
+after = int(docker_exec(server_name, "cat", "/run/wg-e2e-dns-count"))
+assert after > before, "split DNS query did not reach the secondary peer"
+print("ok   split DNS scoped to the listed domain", flush=True)
+
+assert rpc("wireguard.disconnect", {"profileId": "wg-secondary"}) == {"stopped": True}
+assert rpc("wireguard.status", {"profileId": "wg-secondary"})["state"] == "stopped"
+assert not any(
+    entry["owner"] == "wg:wg-secondary" for entry in rpc("owned.list", None)["owners"]
+)
+print("ok   secondary disconnect removed ownership", flush=True)
+
 docker_exec(
     client_name,
     "systemctl",
@@ -528,4 +578,4 @@ assert result["removed"] and result["disconnected"]
 route = docker_exec(client_name, "ip", "-4", "route", "show", "10.77.0.0/24")
 assert "wg-" not in route, "WireGuard always-on route survived disable"
 print("ok   disable removed definition, link and route", flush=True)
-print("ALL 28 WIREGUARD CHECKS PASSED", flush=True)
+print("ALL 32 WIREGUARD CHECKS PASSED", flush=True)

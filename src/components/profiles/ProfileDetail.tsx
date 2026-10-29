@@ -18,6 +18,7 @@ import {
 import OverflowMenu from "../ui/OverflowMenu";
 import RateText from "../ui/RateText";
 import ToggleSwitch from "../ui/ToggleSwitch";
+import TunnelRoleSection, { supportsRole } from "./TunnelRoleSection";
 
 const CONFIG_FIELD_LABEL_KEYS: Record<string, TranslationKey> = {
   address: "detail.cfg.address",
@@ -99,6 +100,7 @@ interface ProfileDetailProps {
   onMeasureAllEndpoints: () => void;
   onSetRefreshInterval: (minutes: number | null) => void;
   onCopyTerminalProxy: () => void;
+  onRoleChanged: () => void;
 }
 
 export default function ProfileDetail({
@@ -135,6 +137,7 @@ export default function ProfileDetail({
   onMeasureAllEndpoints,
   onSetRefreshInterval,
   onCopyTerminalProxy,
+  onRoleChanged,
 }: ProfileDetailProps) {
   const t = useT();
   const alwaysOnKind: AlwaysOnKind | null =
@@ -328,6 +331,13 @@ export default function ProfileDetail({
             {profile.interfaceName || t("detail.notAssigned")}
           </span>
         </div>
+        {os === "linux" && supportsRole(profile) && (
+          <TunnelRoleSection
+            profile={profile}
+            disabled={isBusy || status.state === "running"}
+            onChanged={onRoleChanged}
+          />
+        )}
         {rate && (
           <div className="interface-row">
             <span className="row-label">{t("detail.rate")}</span>

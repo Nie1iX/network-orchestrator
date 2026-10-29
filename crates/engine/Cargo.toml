@@ -1,7 +1,11 @@
 [package]
 name = "net-manager-engine"
-version.workspace = true
+version = "0.10.0"
 edition.workspace = true
+
+[features]
+# Builds the Linux daemon client on other hosts so its callers can be tested there.
+linux-engine = []
 
 [dependencies]
 base64 = "0.22"

@@ -93,6 +93,45 @@ impl ProfileStore {
         Ok(document)
     }
 
+    /// Flags whether the app starts this profile when it launches.
+    pub fn set_auto_connect(&self, id: &str, enabled: bool) -> io::Result<ProfileDocument> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let mut document = self.load()?;
+        let profile = document
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("profile '{id}' not found"))
+            })?;
+        profile.auto_connect = enabled;
+        self.save_locked(&document)?;
+        Ok(document)
+    }
+
+    /// Whether a static-route profile arms its routes while the interface is
+    /// absent (true) or refuses to connect (false).
+    pub fn set_wait_for_interface(&self, id: &str, enabled: bool) -> io::Result<ProfileDocument> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("profile store lock poisoned"))?;
+        let mut document = self.load()?;
+        let profile = document
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("profile '{id}' not found"))
+            })?;
+        profile.wait_for_interface = enabled;
+        self.save_locked(&document)?;
+        Ok(document)
+    }
+
     pub fn delete(&self, id: &str) -> io::Result<ProfileDocument> {
         let _guard = self
             .write_lock
@@ -178,10 +217,14 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
             && profile.xray_mode == crate::models::XrayMode::Tun));
     // Нативный клиент macOS импортирует и анализирует OpenVPN без запуска туннеля.
     let read_only_openvpn = cfg!(target_os = "macos") && profile.backend == TunnelBackend::OpenVpn;
+    // Static routes that all name their own gateway go through no interface.
+    let gateway_only = profile.backend == TunnelBackend::None
+        && profile.routes.iter().all(|route| route.via.is_some());
     if !profile.routes.is_empty()
         && profile.interface_name.trim().is_empty()
         && !daemon_assigned_interface
         && !read_only_openvpn
+        && !gateway_only
     {
         return Err(invalid_data(
             "profile interface name must not be blank when policy routes are set",
@@ -322,6 +365,54 @@ mod tests {
             auto_connect: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn auto_connect_flag_is_persisted_per_profile_and_unknown_ids_fail() {
+        let dir = unique_dir("auto-connect-flag");
+        let store = ProfileStore::new(dir.join("profiles.json"));
+        let mut a = wg_profile();
+        a.id = "a".into();
+        a.auto_connect = false;
+        let mut b = wg_profile();
+        b.id = "b".into();
+        b.auto_connect = false;
+        store.upsert(a).unwrap();
+        store.upsert(b).unwrap();
+
+        let document = store.set_auto_connect("b", true).unwrap();
+        assert!(!document.profiles[0].auto_connect);
+        assert!(document.profiles[1].auto_connect);
+        assert!(store.load().unwrap().profiles[1].auto_connect);
+
+        let document = store.set_auto_connect("b", false).unwrap();
+        assert!(!document.profiles[1].auto_connect);
+
+        let err = store.set_auto_connect("missing", true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wait_for_interface_is_persisted_per_profile_and_unknown_ids_fail() {
+        let dir = unique_dir("wait-for-interface");
+        let store = ProfileStore::new(dir.join("profiles.json"));
+        let mut a = wg_profile();
+        a.id = "a".into();
+        let mut b = wg_profile();
+        b.id = "b".into();
+        store.upsert(a).unwrap();
+        store.upsert(b).unwrap();
+
+        let document = store.set_wait_for_interface("b", true).unwrap();
+        assert!(!document.profiles[0].wait_for_interface);
+        assert!(document.profiles[1].wait_for_interface);
+        assert!(store.load().unwrap().profiles[1].wait_for_interface);
+        let document = store.set_wait_for_interface("b", false).unwrap();
+        assert!(!document.profiles[1].wait_for_interface);
+        let err = store.set_wait_for_interface("missing", true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -592,6 +683,21 @@ mod tests {
         }
         xray_tun.xray_mode = crate::models::XrayMode::Socks;
         assert!(validate_profile(&xray_tun).is_err());
+    }
+
+    #[test]
+    fn static_routes_that_all_name_a_gateway_need_no_interface() {
+        let mut profile = wg_profile();
+        profile.backend = TunnelBackend::None;
+        profile.interface_name.clear();
+        profile.routes = vec![PolicyRoute {
+            destination: "192.0.2.0/24".parse().unwrap(),
+            metric: 5,
+            via: Some("10.0.0.1".parse().unwrap()),
+        }];
+        assert!(validate_profile(&profile).is_ok());
+        profile.routes[0].via = None;
+        assert!(validate_profile(&profile).is_err());
     }
 
     #[test]

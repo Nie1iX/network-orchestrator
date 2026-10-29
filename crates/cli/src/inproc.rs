@@ -151,7 +151,7 @@ impl Privileged for InProcess {
     fn hello(&self) -> Result<HelloResult, HelperError> {
         Ok(HelloResult {
             protocol: PROTOCOL_VERSION,
-            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            daemon_version: env!("NETORCH_VERSION").into(),
             uid: self.uid,
             capabilities: self.service.capabilities(),
             tools: self.service.tools(),

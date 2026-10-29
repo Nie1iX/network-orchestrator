@@ -9,7 +9,7 @@ case "${1:-}" in
     *) printf 'usage: %s [--verifysource]\n' "$0" >&2; exit 2 ;;
 esac
 PKGNAME=network-orchestrator
-PKGVER="$(python3 -c 'import pathlib,tomllib,sys; print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text())["workspace"]["package"]["version"])' "$REPO_ROOT/Cargo.toml")"
+PKGVER="$(python3 "$REPO_ROOT/scripts/versions.py" get linux)"
 PKGREL="$(python3 -c 'import pathlib,re,sys; print(re.search(r"(?m)^pkgrel=(\d+)$", pathlib.Path(sys.argv[1]).read_text()).group(1))' "$REPO_ROOT/packaging/arch/PKGBUILD")"
 BUILD_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$BUILD_ROOT"' EXIT

@@ -1,3 +1,5 @@
+use network_orchestrator_macos_helper::event_log::EventLog;
+use network_orchestrator_macos_helper::intents::{IntentExecutor, SystemProbe};
 use network_orchestrator_macos_helper::journal::Journal;
 use network_orchestrator_macos_helper::openvpn::OpenVpnExecutor;
 use network_orchestrator_macos_helper::peer::{sibling_clients, AppClientPolicy};
@@ -94,19 +96,27 @@ fn main() -> ExitCode {
 
 async fn run(options: Options) -> std::io::Result<()> {
     let listener = bind_socket(&options.socket)?;
-    let xray = Arc::new(XrayExecutor::new(
-        Box::new(RealPlatform),
-        Box::new(SystemRunner),
-        Journal::new(std::path::Path::new(STATE_DIR)),
-        std::path::Path::new(SOCKET_DIR).join("xray-tun.log"),
-    ));
+    let xray = Arc::new(
+        XrayExecutor::new(
+            Box::new(RealPlatform),
+            Box::new(SystemRunner),
+            Journal::new(std::path::Path::new(STATE_DIR)),
+            std::path::Path::new(SOCKET_DIR).join("xray-tun.log"),
+        )
+        .with_assets(std::path::Path::new(STATE_DIR).join("geo")),
+    );
     let state_dir = std::path::Path::new(STATE_DIR);
-    let wireguard = Arc::new(WireGuardExecutor::new(
-        Box::new(RealWgPlatform),
-        Box::new(SystemRunner),
-        Journal::named(state_dir, "wireguard.json"),
-        std::path::PathBuf::from(network_orchestrator_macos_helper::resolver::DIR),
-    ));
+    let wireguard = Arc::new(
+        WireGuardExecutor::new(
+            Box::new(RealWgPlatform),
+            Box::new(SystemRunner),
+            Journal::named(state_dir, "wireguard.json"),
+            std::path::PathBuf::from(network_orchestrator_macos_helper::resolver::DIR),
+        )
+        .with_log(EventLog::at(
+            std::path::Path::new(SOCKET_DIR).join("wireguard.log"),
+        )),
+    );
     let openvpn = Arc::new(OpenVpnExecutor::new(
         Box::new(RealOvpnPlatform {
             stage_dir: state_dir.join("backends"),
@@ -133,20 +143,51 @@ async fn run(options: Options) -> std::io::Result<()> {
             eprintln!("network-orchestrator-helper: {name} recovery failed: {err}");
         }
     }
+    // Intents come back after the tunnels' recovery so a route they own is not
+    // mistaken for a leftover; an unreadable store stops nothing else.
+    let intents = match IntentExecutor::new(
+        Box::new(SystemRunner),
+        Box::new(SystemProbe::new(
+            Box::new(SystemRunner),
+            tokio::runtime::Handle::current(),
+        )),
+        state_dir.join("intents.json"),
+    ) {
+        Ok(executor) => {
+            let executor = Arc::new(executor);
+            // Off the async worker: it runs `route` and reads the table.
+            let first = executor.clone();
+            let _ = tokio::task::spawn_blocking(move || first.reconcile()).await;
+            Some(executor)
+        }
+        Err(err) => {
+            eprintln!("network-orchestrator-helper: intents unavailable: {err}");
+            None
+        }
+    };
     // A tunnel dying on its own is noticed within seconds and cleaned up.
     let (watch_xray, watch_wg, watch_ovpn) = (xray.clone(), wireguard.clone(), openvpn.clone());
+    let watch_intents = intents.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(2));
         watch_xray.reap();
         watch_wg.reap();
         watch_ovpn.reap();
+        if let Some(intents) = &watch_intents {
+            intents.tick();
+        }
     });
     let ctx = Arc::new(ServerContext::new(
         Box::new(AppClientPolicy::new(options.clients)),
-        Arc::new(
-            HelperService::new(xray.clone(), wireguard.clone(), openvpn.clone())
-                .with_tailscale(tailscale.clone()),
-        ),
+        Arc::new({
+            let service = HelperService::new(xray.clone(), wireguard.clone(), openvpn.clone())
+                .with_tailscale(tailscale.clone())
+                .with_links(Arc::new(SystemRunner));
+            match &intents {
+                Some(executor) => service.with_intents(executor.clone()),
+                None => service,
+            }
+        }),
         env!("CARGO_PKG_VERSION"),
     ));
     let mut terminate = signal(SignalKind::terminate())?;
@@ -159,6 +200,9 @@ async fn run(options: Options) -> std::io::Result<()> {
     xray.shutdown();
     wireguard.shutdown();
     openvpn.shutdown();
+    if let Some(intents) = &intents {
+        intents.shutdown();
+    }
     let _ = tailscale.release();
     let _ = std::fs::remove_file(&options.socket);
     Ok(())

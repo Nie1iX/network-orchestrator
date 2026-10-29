@@ -1640,6 +1640,9 @@ pub struct DaemonCore {
 
 struct OpenVpnRuntime {
     explicit_routes: Vec<net_manager_core::models::PolicyRoute>,
+    role: net_manager_core::models::TunnelRole,
+    /// Split-DNS domains of a secondary tunnel; the pushed ones are ignored.
+    dns_domains: Vec<String>,
     snapshot: ManagementSnapshot,
 }
 
@@ -1657,9 +1660,12 @@ impl OpenVpnNetworkPlan {
         let mut dns_servers = Vec::new();
         let mut dns_domains = Vec::new();
         let mut redirect_def1 = false;
+        let secondary = runtime.role == net_manager_core::models::TunnelRole::Secondary;
         if let Some(push) = &runtime.snapshot.active_push {
-            redirect_def1 = push.redirect_gateway_def1;
-            for destination in &push.routes {
+            // A secondary tunnel keeps to its own networks: the server cannot
+            // add routes or take the default route.
+            redirect_def1 = push.redirect_gateway_def1 && !secondary;
+            for destination in push.routes.iter().filter(|_| !secondary) {
                 if !routes.iter().any(|route| route.destination == *destination) {
                     routes.push(net_manager_core::models::PolicyRoute {
                         destination: *destination,
@@ -1677,15 +1683,26 @@ impl OpenVpnNetworkPlan {
                     dns_servers.push(*server);
                 }
             }
-            for domain in push.search_domains.iter().chain(
+            let pushed_domains = push.search_domains.iter().chain(
                 push.dns_servers
                     .iter()
                     .flat_map(|server| server.resolve_domains.iter()),
-            ) {
+            );
+            let own_domains = runtime.dns_domains.iter();
+            let domains: Box<dyn Iterator<Item = &String>> = if secondary {
+                Box::new(own_domains)
+            } else {
+                Box::new(pushed_domains)
+            };
+            for domain in domains {
                 if !dns_domains.contains(domain) {
                     dns_domains.push(domain.clone());
                 }
             }
+        }
+        if secondary && dns_servers.is_empty() {
+            // Nothing to scope: the server pushed no resolver.
+            dns_domains.clear();
         }
         if dns_servers.len() > 8 || dns_domains.len() > 16 {
             return Err(io::Error::new(
@@ -2669,6 +2686,8 @@ impl DaemonCore {
             (uid, owner.clone()),
             OpenVpnRuntime {
                 explicit_routes: plan.routes,
+                role: plan.role,
+                dns_domains: plan.dns_domains,
                 snapshot: ManagementSnapshot::default(),
             },
         );
@@ -5125,11 +5144,13 @@ impl DaemonCore {
                     .collect(),
                 path: if spec.uplink {
                     NetIntentPath {
+                        gateway: None,
                         kind: "direct".into(),
                         interface: None,
                     }
                 } else {
                     NetIntentPath {
+                        gateway: None,
                         kind: "interface".into(),
                         interface: Some(spec.interface_name.clone()),
                     }
@@ -10575,6 +10596,7 @@ mod tests {
             id: id.into(),
             destinations: dests.iter().map(|d| d.to_string()).collect(),
             path: NetIntentPath {
+                gateway: None,
                 kind: "interface".into(),
                 interface: Some(iface.into()),
             },
@@ -10588,6 +10610,7 @@ mod tests {
             id: id.into(),
             destinations: dests.iter().map(|d| d.to_string()).collect(),
             path: NetIntentPath {
+                gateway: None,
                 kind: "direct".into(),
                 interface: None,
             },
@@ -11222,5 +11245,54 @@ mod tests {
         assert!(!result.available);
         assert!(result.entries.is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn secondary_openvpn_ignores_pushed_routes_gateway_and_domains() {
+        use net_manager_core::openvpn_management::{
+            ManagementSnapshot, PushedDnsServer, PushedNetworkConfig,
+        };
+        let snapshot = || {
+            let mut snapshot = ManagementSnapshot::default();
+            snapshot.active_push = Some(PushedNetworkConfig {
+                routes: vec!["172.16.0.0/12".parse().unwrap()],
+                redirect_gateway_def1: true,
+                legacy_dns_servers: Vec::new(),
+                search_domains: vec!["pushed.example".into()],
+                dns_servers: vec![PushedDnsServer {
+                    id: 0,
+                    addresses: vec!["10.8.0.1".parse().unwrap()],
+                    resolve_domains: Vec::new(),
+                }],
+                more_follows: false,
+            });
+            snapshot
+        };
+        let route = net_manager_core::models::PolicyRoute {
+            destination: "10.0.0.0/8".parse().unwrap(),
+            metric: 5,
+            via: None,
+        };
+        let runtime = |role| OpenVpnRuntime {
+            explicit_routes: vec![route.clone()],
+            role,
+            dns_domains: vec!["corp.example".into()],
+            snapshot: snapshot(),
+        };
+        let primary = OpenVpnNetworkPlan::from_runtime(&runtime(
+            net_manager_core::models::TunnelRole::Primary,
+        ))
+        .unwrap();
+        assert!(primary.full_ipv4);
+        assert_eq!(primary.dns_domains, vec!["pushed.example"]);
+
+        let secondary = OpenVpnNetworkPlan::from_runtime(&runtime(
+            net_manager_core::models::TunnelRole::Secondary,
+        ))
+        .unwrap();
+        assert!(!secondary.full_ipv4);
+        assert_eq!(secondary.routes, vec![route.clone()]);
+        assert_eq!(secondary.dns_servers.len(), 1);
+        assert_eq!(secondary.dns_domains, vec!["corp.example"]);
     }
 }

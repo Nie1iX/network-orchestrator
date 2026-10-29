@@ -353,6 +353,218 @@ pub fn generate_share_link_config(uri: &str, socks_port: u16) -> io::Result<Valu
     }
 }
 
+/// Top-level sections of a config the Linux daemon runs as a system tunnel.
+const TUN_TOP_LEVEL: [&str; 6] = ["log", "inbounds", "outbounds", "routing", "dns", "fakedns"];
+
+/// A config already in the shape the daemon accepts: the generated one from
+/// a share link (`proxy` first, `freedom` second, plain routing).
+fn is_tun_shaped(object: &Map<String, Value>) -> bool {
+    let outbounds = object.get("outbounds").and_then(Value::as_array);
+    let routing = object.get("routing").and_then(Value::as_object);
+    object
+        .keys()
+        .all(|key| TUN_TOP_LEVEL.contains(&key.as_str()))
+        && outbounds.is_some_and(|list| {
+            list.len() == 2 && list[0]["tag"] == "proxy" && list[1]["protocol"] == "freedom"
+        })
+        && routing.is_none_or(|routing| {
+            routing
+                .keys()
+                .all(|key| matches!(key.as_str(), "domainStrategy" | "domainMatcher" | "rules"))
+        })
+}
+
+/// Copies the listed keys of an object, dropping everything else.
+fn keep_keys(value: &Value, keys: &[&str]) -> Value {
+    let mut out = Map::new();
+    if let Some(object) = value.as_object() {
+        for key in keys {
+            if let Some(item) = object.get(*key) {
+                out.insert((*key).into(), item.clone());
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// Hysteria2 masking reduced to Salamander obfuscation and port hopping, the
+/// only parts the daemon runs; `None` when nothing of it is left.
+fn tun_finalmask(mask: &Value) -> Option<Value> {
+    let mut out = Map::new();
+    if let Some(item) = mask["udp"].as_array().and_then(|list| list.first()) {
+        if item["type"] == "salamander" {
+            out.insert(
+                "udp".into(),
+                json!([{
+                    "type": "salamander",
+                    "settings": keep_keys(&item["settings"], &["password"]),
+                }]),
+            );
+        }
+    }
+    if let Some(ports) = mask["quicParams"]["udpHop"]["ports"].as_str() {
+        out.insert("quicParams".into(), json!({"udpHop": {"ports": ports}}));
+    }
+    (!out.is_empty()).then_some(Value::Object(out))
+}
+
+/// Mux limited to the fields and ranges the daemon accepts. Panels write
+/// `concurrency: -1` for "off"; out-of-range counts are dropped.
+fn tun_mux(mux: &Value) -> Value {
+    let mut out = keep_keys(
+        mux,
+        &[
+            "enabled",
+            "concurrency",
+            "xudpConcurrency",
+            "xudpProxyUDP443",
+        ],
+    );
+    for key in ["concurrency", "xudpConcurrency"] {
+        if !out[key].as_i64().is_some_and(|n| (1..=1024).contains(&n)) {
+            out.as_object_mut().map(|map| map.remove(key));
+        }
+    }
+    out
+}
+
+/// `streamSettings` reduced to the fields the daemon's validator accepts.
+/// Anything else a panel adds (`sockopt`, `show`, `extra`, ...) is dropped:
+/// it can only make the connection stricter or fail, never open anything up.
+fn tun_stream_settings(stream: &Value, hysteria: bool) -> Value {
+    if hysteria {
+        let mut out = keep_keys(
+            stream,
+            &["network", "security", "tlsSettings", "hysteriaSettings"],
+        );
+        out["tlsSettings"] = keep_keys(
+            &stream["tlsSettings"],
+            &["serverName", "pinnedPeerCertSha256"],
+        );
+        out["hysteriaSettings"] = keep_keys(&stream["hysteriaSettings"], &["version", "auth"]);
+        if let Some(mask) = tun_finalmask(&stream["finalmask"]) {
+            out["finalmask"] = mask;
+        }
+        return out;
+    }
+    let mut out = keep_keys(
+        stream,
+        &[
+            "network",
+            "security",
+            "wsSettings",
+            "grpcSettings",
+            "xhttpSettings",
+            "httpupgradeSettings",
+            "tlsSettings",
+            "realitySettings",
+            "tcpSettings",
+        ],
+    );
+    for (key, allowed) in [
+        ("wsSettings", &["path", "headers"][..]),
+        ("grpcSettings", &["serviceName"][..]),
+        ("xhttpSettings", &["path", "host"][..]),
+        ("httpupgradeSettings", &["path", "host"][..]),
+        ("tlsSettings", &["serverName", "fingerprint", "alpn"][..]),
+        (
+            "realitySettings",
+            &[
+                "serverName",
+                "fingerprint",
+                "publicKey",
+                "shortId",
+                "spiderX",
+            ][..],
+        ),
+        ("tcpSettings", &["header"][..]),
+    ] {
+        if stream.get(key).is_some() {
+            out[key] = keep_keys(&stream[key], allowed);
+        }
+    }
+    if let Some(header) = stream["tcpSettings"].get("header") {
+        out["tcpSettings"]["header"] = keep_keys(header, &["type"]);
+    }
+    out
+}
+
+/// Turns a complete Xray config from a subscription panel (see
+/// [`xray_json_entry`]) into the plain shape the Linux daemon runs as a
+/// system-wide tunnel: the panel's main VLESS or Hysteria2 server, a direct
+/// outbound and nothing else. The panel's own routing rules, DNS section,
+/// observatory and policy are left out; the profile's routing settings are
+/// applied on top afterwards. Configs already in the daemon's shape are
+/// returned unchanged. When a balancer only chooses between the server and a
+/// fallback relay, the server itself is used; an entry that is a pool of many
+/// servers ("automatic") cannot be reduced to one and is refused.
+pub fn tun_compatible_config(base: &Value) -> Result<Value, &'static str> {
+    let object = base.as_object().ok_or("The Xray config is invalid")?;
+    if is_tun_shaped(object) {
+        return Ok(base.clone());
+    }
+    let outbounds = object
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .ok_or("The Xray config has no outbounds")?;
+    let supported =
+        |outbound: &&Value| matches!(outbound["protocol"].as_str(), Some("vless" | "hysteria"));
+    // "proxy", "proxy-2", ...: several of them form a pool the panel picks
+    // from with a balancer (its "automatic" entry), which has no single server.
+    let pool = outbounds
+        .iter()
+        .filter(|outbound| {
+            supported(outbound)
+                && outbound["tag"]
+                    .as_str()
+                    .is_some_and(|tag| tag == "proxy" || tag.starts_with("proxy-"))
+        })
+        .count();
+    if pool > 1 {
+        return Err(
+            "This is an automatic entry that chooses between many servers, which a system-wide \
+             tunnel does not support. Choose a specific server.",
+        );
+    }
+    let proxy = outbounds
+        .iter()
+        .find(|outbound| outbound["tag"] == "proxy" && supported(outbound))
+        .or_else(|| outbounds.iter().find(supported))
+        .ok_or("The server uses a protocol a system-wide tunnel does not support")?;
+    let hysteria = proxy["protocol"] == "hysteria";
+    let settings = if hysteria {
+        keep_keys(&proxy["settings"], &["version", "address", "port"])
+    } else {
+        let server = proxy["settings"]["vnext"]
+            .as_array()
+            .and_then(|list| list.first())
+            .ok_or("The server has no address")?;
+        let user = server["users"]
+            .as_array()
+            .and_then(|list| list.first())
+            .ok_or("The server has no user")?;
+        json!({
+            "vnext": [{
+                "address": server["address"],
+                "port": server["port"],
+                "users": [keep_keys(user, &["id", "encryption", "flow"])],
+            }],
+        })
+    };
+    let mut clean = json!({
+        "tag": "proxy",
+        "protocol": proxy["protocol"],
+        "settings": settings,
+        "streamSettings": tun_stream_settings(&proxy["streamSettings"], hysteria),
+    });
+    if let Some(mux) = proxy.get("mux") {
+        clean["mux"] = tun_mux(mux);
+    }
+    let mut config = config_with_proxy(clean, 1);
+    config["inbounds"] = object.get("inbounds").cloned().unwrap_or(json!([]));
+    Ok(config)
+}
+
 pub fn generate_share_link_config_with_http(
     uri: &str,
     socks_port: u16,
@@ -3238,5 +3450,125 @@ mod tests {
         };
         assert_eq!(dns_bypass_hosts(&dns), ["9.9.9.9", "dns.resolver.test"]);
         assert!(dns_bypass_hosts(&XrayDnsConfig::default()).is_empty());
+    }
+
+    fn panel_vless() -> Value {
+        json!({
+            "burstObservatory": {"subjectSelector": ["proxy"]},
+            "dns": {"servers": ["1.1.1.1"]},
+            "remarks": "x",
+            "inbounds": [{"tag": "socks-in", "listen": "127.0.0.1", "port": 10808,
+                "protocol": "socks", "settings": {"udp": true}}],
+            "outbounds": [
+                {"tag": "proxy", "protocol": "vless",
+                 "settings": {"vnext": [{"address": "node.test", "port": 443, "level": 0,
+                    "users": [{"id": "uuid-1", "encryption": "none", "flow": "xtls-rprx-vision",
+                        "level": 0}]}]},
+                 "streamSettings": {"network": "tcp", "security": "reality",
+                    "realitySettings": {"serverName": "sni.test", "fingerprint": "chrome",
+                        "publicKey": "pk", "shortId": "ab", "show": false},
+                    "sockopt": {"mark": 99}},
+                 "mux": {"enabled": false, "concurrency": -1}},
+                {"tag": "other", "protocol": "vless", "settings": {}},
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "block", "protocol": "blackhole"},
+            ],
+            "routing": {"domainStrategy": "IPIfNonMatch",
+                "rules": [{"type": "field", "outboundTag": "direct", "domain": ["geosite:ru"]}]},
+        })
+    }
+
+    #[test]
+    fn a_panel_vless_config_is_reduced_to_the_servers_plain_shape() {
+        let config = tun_compatible_config(&panel_vless()).unwrap();
+        let keys: Vec<&String> = config.as_object().unwrap().keys().collect();
+        assert!(
+            keys.iter().all(|key| TUN_TOP_LEVEL.contains(&key.as_str())),
+            "{keys:?}"
+        );
+        let outbounds = config["outbounds"].as_array().unwrap();
+        assert_eq!(outbounds.len(), 2);
+        assert_eq!(outbounds[0]["tag"], "proxy");
+        assert_eq!(outbounds[1]["protocol"], "freedom");
+        let server = &outbounds[0]["settings"]["vnext"][0];
+        assert_eq!(server["address"], "node.test");
+        assert!(server.get("level").is_none() && server["users"][0].get("level").is_none());
+        assert_eq!(server["users"][0]["flow"], "xtls-rprx-vision");
+        let stream = &outbounds[0]["streamSettings"];
+        assert_eq!(stream["realitySettings"]["publicKey"], "pk");
+        assert!(stream["realitySettings"].get("show").is_none());
+        assert!(stream.get("sockopt").is_none());
+        // The listeners the caller set up survive.
+        assert_eq!(config["inbounds"], panel_vless()["inbounds"]);
+        assert!(config["routing"]["rules"].as_array().unwrap().is_empty());
+        assert!(config.get("dns").is_none() && config.get("burstObservatory").is_none());
+    }
+
+    #[test]
+    fn a_hysteria_entry_keeps_its_auth_and_masking() {
+        let mut panel = panel_vless();
+        panel["outbounds"][0] = json!({
+            "tag": "proxy", "protocol": "hysteria",
+            "settings": {"version": 2, "address": "h.test", "port": 443},
+            "streamSettings": {"network": "hysteria", "security": "tls",
+                "tlsSettings": {"serverName": "h.test", "alpn": ["h3"]},
+                "hysteriaSettings": {"version": 2, "auth": "secret", "udpIdleTimeout": 60},
+                "finalmask": {"udp": [{"type": "salamander", "settings": {"password": "p"}}]}}
+        });
+        let config = tun_compatible_config(&panel).unwrap();
+        let stream = &config["outbounds"][0]["streamSettings"];
+        assert_eq!(
+            stream["hysteriaSettings"],
+            json!({"version": 2, "auth": "secret"})
+        );
+        assert_eq!(stream["tlsSettings"], json!({"serverName": "h.test"}));
+        assert_eq!(stream["finalmask"]["udp"][0]["type"], "salamander");
+    }
+
+    #[test]
+    fn a_pool_of_servers_is_refused_with_advice() {
+        let mut panel = panel_vless();
+        let second = panel["outbounds"][0].clone();
+        panel["outbounds"].as_array_mut().unwrap().push(second);
+        panel["outbounds"][4]["tag"] = json!("proxy-2");
+        let error = tun_compatible_config(&panel).unwrap_err();
+        assert!(error.contains("Choose a specific server"), "{error}");
+    }
+
+    #[test]
+    fn a_balancer_between_a_server_and_its_fallback_uses_the_server() {
+        let mut panel = panel_vless();
+        panel["routing"]["balancers"] =
+            json!([{"tag": "auto", "selector": ["proxy", "bridge"], "fallbackTag": "bridge"}]);
+        let config = tun_compatible_config(&panel).unwrap();
+        assert_eq!(
+            config["outbounds"][0]["settings"]["vnext"][0]["address"],
+            "node.test"
+        );
+        assert!(config["routing"].get("balancers").is_none());
+    }
+
+    #[test]
+    fn mux_counts_outside_the_daemons_range_are_dropped() {
+        let config = tun_compatible_config(&panel_vless()).unwrap();
+        assert_eq!(config["outbounds"][0]["mux"], json!({"enabled": false}));
+    }
+
+    #[test]
+    fn a_share_link_config_passes_through_unchanged() {
+        let config = generate_share_link_config_with_http(
+            "vless://id@node.test:443?security=tls#Lab",
+            10808,
+            10809,
+        )
+        .unwrap();
+        assert_eq!(tun_compatible_config(&config).unwrap(), config);
+    }
+
+    #[test]
+    fn an_unsupported_protocol_is_refused() {
+        let mut panel = panel_vless();
+        panel["outbounds"] = json!([{"tag": "proxy", "protocol": "trojan", "settings": {}}]);
+        assert!(tun_compatible_config(&panel).is_err());
     }
 }

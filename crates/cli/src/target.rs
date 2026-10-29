@@ -1,5 +1,10 @@
 //! What the user typed after `netorch up` / `netorch add`: a share link, a
 //! subscription URL, a config file or the name of a saved profile.
+// The Linux client resolves saved profiles only until it can import.
+#![cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 use net_manager_core::models::{Profile, TunnelBackend};
 use std::path::{Path, PathBuf};
 

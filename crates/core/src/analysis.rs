@@ -37,6 +37,19 @@ pub fn analyze_profile(profile: &Profile) -> io::Result<ConfigAnalysis> {
         TunnelBackend::OpenVpn => analyze_openvpn(&profile.config_path, &mut analysis)?,
         TunnelBackend::Xray => analyze_xray(profile, &mut analysis)?,
     }
+    if profile.tunnel_role == crate::models::TunnelRole::Secondary {
+        // The privileged side installs exactly the listed networks and ignores
+        // what the config would route, so that is what can conflict.
+        analysis.os_routes = profile
+            .secondary_routes()
+            .into_iter()
+            .map(|route| AnalyzedRoute {
+                metric: Some(route.metric),
+                destination: route.destination,
+                source: "secondary tunnel".to_string(),
+            })
+            .collect();
+    }
     for policy in &profile.domain_policies {
         analysis
             .domain_patterns
@@ -736,6 +749,26 @@ mod tests {
             source: source.into(),
         });
         a
+    }
+
+    #[test]
+    fn secondary_profile_reports_only_its_networks() {
+        let dir = unique_dir("secondary");
+        let path = dir.join("wg.conf");
+        fs::write(
+            &path,
+            "[Interface]\nAddress=10.9.0.2/32\n[Peer]\nAllowedIPs=0.0.0.0/0\n",
+        )
+        .unwrap();
+        let mut secondary = profile(TunnelBackend::WireGuard, &path);
+        secondary.tunnel_role = crate::models::TunnelRole::Secondary;
+        secondary.tunnel_networks = vec![net("10.20.0.0/16")];
+        let analysis = analyze_profile(&secondary).unwrap();
+        assert_eq!(destinations(&analysis.os_routes), vec![net("10.20.0.0/16")]);
+
+        let primary = profile(TunnelBackend::WireGuard, &path);
+        let analysis = analyze_profile(&primary).unwrap();
+        assert!(destinations(&analysis.os_routes).contains(&net("0.0.0.0/0")));
     }
 
     #[test]

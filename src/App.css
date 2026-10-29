@@ -1790,6 +1790,34 @@ a:focus-visible,
   justify-content: flex-end;
 }
 
+.import-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  font-size: var(--fs-sm);
+}
+
+.import-file-list {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-3);
+  list-style: none;
+  max-height: 120px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-input);
+  font-size: var(--fs-xs);
+  color: var(--text-secondary);
+}
+
+.import-file-list li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 0;
+}
+
 .profile-help {
   display: block;
   margin-top: var(--sp-1);
@@ -3015,9 +3043,9 @@ a:focus-visible,
   width: 36px;
   height: 36px;
   flex-shrink: 0;
-  border-radius: var(--r-md);
-  background: var(--bg-elev);
-  color: var(--text-secondary);
+  border-radius: var(--r-full);
+  background: var(--accent-dim);
+  color: var(--accent);
 }
 
 .add-connection-text {
@@ -4199,4 +4227,19 @@ a:focus-visible,
   align-items: center;
   gap: var(--sp-2);
   font-weight: var(--fw-strong);
+}
+
+.home-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.segmented {
+  display: inline-flex;
+  gap: var(--sp-1);
+}
+
+.row-value.warn {
+  color: var(--warn);
 }

@@ -36,8 +36,15 @@ import SystemConfiguration
   /// User-facing error. Bridge errors are secret-free by design, so they are
   /// also mirrored to the unified log (Xcode console, Console.app).
   var error: String? {
-    didSet { if let error { Self.log.error("\(error, privacy: .public)") } }
+    didSet {
+      guard let error else { return }
+      Self.log.error("\(error, privacy: .public)")
+      if error != oldValue { appLog.add(.error, error) }
+    }
   }
+  /// The app's own events, shown on the Logs page.
+  private(set) var appLog = AppLog()
+  func record(_ level: LogLevel, _ message: String) { appLog.add(level, message) }
   private static let log = Logger(subsystem: "com.netmanager.app.macos", category: "app")
   var busy = false
   var subscriptionEndpoints: [String: [SubscriptionEndpoint]] = [:]
@@ -166,14 +173,21 @@ import SystemConfiguration
   }
   /// Whether this client can start `profile` right now: loopback Xray always,
   /// anything that needs a tunnel device once the privileged helper serves it.
+  private static let appModeKey = "appMode"
+  var appMode = AppMode(stored: UserDefaults.standard.string(forKey: AppModel.appModeKey)) {
+    didSet { UserDefaults.standard.set(appMode.rawValue, forKey: Self.appModeKey) }
+  }
+  /// The mode forbids starting `profile`; a running one can still be stopped.
+  func modeLocks(_ profile: Profile) -> Bool { appMode.locks(profile) && !isRunning(profile) }
   func canStart(_ profile: Profile) -> Bool {
+    if modeLocks(profile) { return false }
     if profile.startsWithoutHelper { return canStartConnections }
     return profile.needsHelper && canStartConnections && helperServes(profile)
   }
   /// The switch is usable for a TUN profile even without the helper: pressing
   /// it then offers to install the helper instead of doing nothing.
   func canTryStart(_ profile: Profile) -> Bool {
-    canStart(profile) || (profile.needsHelper && canStartConnections)
+    !modeLocks(profile) && (canStart(profile) || (profile.needsHelper && canStartConnections))
   }
   /// Interfaces of tunnels this app runs itself.
   var ownTunnelInterfaces: Set<String> {
@@ -256,12 +270,14 @@ import SystemConfiguration
     do {
       if isRunning(profile) {
         runtime = try await core.call("disconnect", args: ["id": profile.id])
+        record(.info, "Disconnected \(profile.name)")
       } else {
         // OpenVPN may need a login; nil means the sign-in sheet is showing.
         guard let extra = try await credentialArguments(profile) else { return }
         runtime = try await core.call("connect", args: ["id": profile.id].merging(extra) { $1 })
         await rememberAfterConnect(profile)
         lastProfileID = profile.id
+        record(.info, "Connected \(profile.name)")
       }
       error = nil
     } catch {
@@ -368,10 +384,15 @@ import SystemConfiguration
       error = nil
     } catch { self.error = error.localizedDescription }
   }
-  func createStatic(name: String, interface: String, cidrs: String) async -> Bool {
+  func createStatic(name: String, interface: String, cidrs: String, bypass: String = "") async
+    -> Bool
+  {
     await change(
       "create_static",
-      args: ["id": UUID().uuidString, "name": name, "interfaceName": interface, "cidrs": cidrs])
+      args: [
+        "id": UUID().uuidString, "name": name, "interfaceName": interface, "cidrs": cidrs,
+        "bypass": bypass,
+      ])
   }
   func importConfig(url: URL, backend: String, name: String) async -> Bool {
     let access = url.startAccessingSecurityScopedResource()
@@ -624,6 +645,116 @@ import SystemConfiguration
     } catch { self.error = error.localizedDescription }
     await refreshRuntime()
   }
+  /// Live rates for the Monitor page, fed only while that page is open.
+  var throughput = ThroughputSampler()
+  private var interfaceIDs: [String: UInt32] = [:]
+  func pollThroughput() async {
+    guard !isDuplicate,
+      let list: [NetworkInterface] = try? await core.callConcurrently("interfaces")
+    else { return }
+    let tracked = Set(
+      runtime?.statuses.compactMap { $0.state == "running" ? $0.interfaceName : nil } ?? [])
+    interfaceIDs = Dictionary(
+      list.flatMap { item in [item.name, item.friendlyName].map { ($0, item.ifIndex) } },
+      uniquingKeysWith: { first, _ in first })
+    throughput.ingest(
+      list.map {
+        CounterReading(
+          id: $0.ifIndex, names: [$0.name, $0.friendlyName], rx: $0.rxBytes, tx: $0.txBytes)
+      }, tracked: tracked, now: Date())
+  }
+  /// The tunnel interface's current rate; nil for a loopback proxy, which has none.
+  func rate(of profile: Profile) -> RateSample? {
+    status(profile)?.interfaceName.flatMap { interfaceIDs[$0] }.flatMap { throughput.rates[$0] }
+  }
+  /// Leftovers of a previous session, offered for cleanup once per launch.
+  /// Runs before auto-connect so a start never races a cleanup. An answer that
+  /// cannot be read (no helper) is not an error: the helper banner covers it.
+  var recoveryReport: RecoveryReport?
+  var showingRecovery = false
+  private var recoveryChecked = false
+  func checkRecovery() async {
+    guard !recoveryChecked, !isDuplicate else { return }
+    recoveryChecked = true
+    guard let report: RecoveryReport = try? await core.call("recovery_report"),
+      !report.issues.isEmpty
+    else { return }
+    recoveryReport = report
+    showingRecovery = true
+    record(.warn, "Found \(report.issues.count) leftover item(s) from a previous session")
+  }
+  /// Asks the helper to undo the leftovers; what remains stays listed.
+  func cleanUpRecovery() async {
+    do {
+      let report: RecoveryReport = try await core.call("recovery_cleanup")
+      recoveryReport = report.issues.isEmpty ? nil : report
+      showingRecovery = !report.issues.isEmpty
+      record(
+        report.issues.isEmpty ? .info : .warn,
+        report.issues.isEmpty
+          ? "Cleaned up the leftovers of a previous session"
+          : "\(report.issues.count) leftover item(s) remain after cleanup")
+      error = nil
+    } catch {
+      self.error = error.localizedDescription
+      recoveryReport = nil
+    }
+    await refreshRuntime()
+  }
+  /// Starts the connections flagged "connect when the app starts", once per
+  /// launch and in saved order. One that fails does not stop the others; the
+  /// count is reported in a notice. A flagged connection that needs the
+  /// privileged helper is skipped when it is not serving, never prompting.
+  private var autoConnectDone = false
+  func autoConnectOnLaunch() async {
+    guard !autoConnectDone, !isDuplicate else { return }
+    autoConnectDone = true
+    var failed = 0
+    for profile in snapshot?.profiles ?? [] where profile.connectsOnLaunch && !isRunning(profile) {
+      guard canStart(profile) else {
+        failed += 1
+        continue
+      }
+      await toggle(profile)
+      if !isRunning(profile) { failed += 1 }
+    }
+    if failed > 0 {
+      record(.warn, "\(failed) connection(s) flagged to start with the app did not start")
+      error = nil
+      notice = failed == 1 ? "events.autoConnectFailed" : "events.autoConnectPartial"
+      autoConnectFailures = failed
+    }
+  }
+  var autoConnectFailures = 0
+  private var monitoring: Task<Void, Never>?
+  /// Keeps the runtime state fresh for as long as the app runs, window open
+  /// or not: Xray can exit on its own (bad server, port taken), and the menu
+  /// bar shows these states. Idempotent.
+  func startMonitoring() {
+    guard monitoring == nil, !isDuplicate else { return }
+    monitoring = Task { [weak self] in
+      var tick = 0
+      while !Task.isCancelled {
+        try? await Task.sleep(for: .seconds(3))
+        guard let self else { return }
+        await self.refreshRuntime()
+        tick += 1
+        if tick % 20 == 0 { await self.autoRefreshDue() }
+      }
+    }
+  }
+  /// Disconnects every running connection (the menu bar's "Disconnect all").
+  func disconnectAll() async {
+    for profile in snapshot?.profiles ?? [] where isRunning(profile) { await toggle(profile) }
+  }
+  func setWaitForInterface(_ profile: Profile, enabled: Bool) async {
+    _ = await change(
+      "set_wait_for_interface", args: ["id": profile.id, "enabled": enabled ? "true" : "false"])
+  }
+  func setAutoConnect(_ profile: Profile, enabled: Bool) async {
+    _ = await change(
+      "set_auto_connect", args: ["id": profile.id, "enabled": enabled ? "true" : "false"])
+  }
   /// Primary connections take all traffic; secondary ones only their networks.
   func setTunnelRole(_ profile: Profile, role: String) async {
     guard !pending.contains(profile.id) else { return }
@@ -703,6 +834,190 @@ import SystemConfiguration
   }
   func connectionLog(_ profile: Profile) async -> String {
     (try? await core.call("log", args: ["id": profile.id]) as String) ?? ""
+  }
+  /// The helper offers all of `net.intent.*`.
+  var canUseIntents: Bool {
+    ["net.intent.list", "net.intent.set", "net.intent.del"].allSatisfy(helperOffers)
+  }
+  /// The helper offers all of `condRules.*`.
+  var canUseRules: Bool {
+    ["condRules.list", "condRules.put", "condRules.remove"].allSatisfy(helperOffers)
+  }
+  var rules: [ConditionalRuleEntry] = []
+  func loadRules() async {
+    guard canUseRules else {
+      rules = []
+      return
+    }
+    do {
+      rules = try await core.callConcurrently("cond_rules")
+    } catch { self.error = error.localizedDescription }
+  }
+  /// Adds or replaces a rule; the helper evaluates it at once.
+  func saveRule(_ draft: RuleDraft) async -> Bool {
+    do {
+      let _: RuleStatus = try await core.call("put_cond_rule", args: draft.arguments)
+      record(.info, "Saved conditional rule \(draft.id.trimmingCharacters(in: .whitespaces))")
+      await loadRules()
+      return true
+    } catch {
+      self.error = error.localizedDescription
+      return false
+    }
+  }
+  func deleteRule(_ entry: ConditionalRuleEntry) async {
+    do {
+      let _: [String: Bool] = try await core.call("delete_cond_rule", args: ["id": entry.id])
+      record(.info, "Deleted conditional rule \(entry.id)")
+      await loadRules()
+    } catch { self.error = error.localizedDescription }
+  }
+  func setRuleEnabled(_ entry: ConditionalRuleEntry, enabled: Bool) async {
+    var draft = RuleDraft(editing: entry)
+    draft.enabled = enabled
+    _ = await saveRule(draft)
+  }
+  var intents: [RouteIntent] = []
+  /// Reads the intents from the helper; none (and no error) without it.
+  func loadIntents() async {
+    guard canUseIntents else {
+      intents = []
+      return
+    }
+    do {
+      // Static-route profiles keep theirs here too; their own switch owns them.
+      let all: [RouteIntent] = try await core.callConcurrently("intents")
+      intents = all.filter { !$0.isProfileOwned }
+    } catch { self.error = error.localizedDescription }
+  }
+  var suggestions: [IntentSuggestion] = []
+  private var dismissedSuggestions = Set<String>()
+  /// Doctor cards the user has not dismissed in this session.
+  var visibleSuggestions: [IntentSuggestion] {
+    suggestions.filter { !dismissedSuggestions.contains($0.key) }
+  }
+  func dismissSuggestion(_ suggestion: IntentSuggestion) {
+    dismissedSuggestions.insert(suggestion.key)
+  }
+  /// Asks the doctor; a helper without intents, or any failure, means no
+  /// cards and no banner: the doctor is advice, never an error.
+  func loadSuggestions() async {
+    guard canUseIntents,
+      let list: [IntentSuggestion] = try? await core.callConcurrently("intent_doctor")
+    else {
+      suggestions = []
+      return
+    }
+    suggestions = list
+  }
+  /// Creates the intents a card proposes, then refreshes both lists.
+  func applyFix(_ suggestion: IntentSuggestion) async -> Bool {
+    for fix in suggestion.fixes {
+      do {
+        let _: [String: String] = try await core.call("set_intent", args: fix.arguments)
+        record(.info, "Saved routing intent \(fix.id) proposed by the doctor")
+      } catch {
+        self.error = error.localizedDescription
+        return false
+      }
+    }
+    dismissSuggestion(suggestion)
+    await loadIntents()
+    await loadSuggestions()
+    return true
+  }
+  /// Adds or replaces an intent; the helper installs its routes at once.
+  func saveIntent(_ draft: IntentDraft) async -> Bool {
+    do {
+      let _: [String: String] = try await core.call("set_intent", args: draft.arguments)
+      record(.info, "Saved routing intent \(draft.id.trimmingCharacters(in: .whitespaces))")
+      await loadIntents()
+      return true
+    } catch {
+      self.error = error.localizedDescription
+      return false
+    }
+  }
+  func deleteIntent(_ intent: RouteIntent) async {
+    do {
+      let _: [String: String] = try await core.call("delete_intent", args: ["id": intent.id])
+      record(.info, "Deleted routing intent \(intent.id)")
+      await loadIntents()
+    } catch { self.error = error.localizedDescription }
+  }
+  func setIntentEnabled(_ intent: RouteIntent, enabled: Bool) async {
+    var draft = IntentDraft(editing: intent)
+    draft.enabled = enabled
+    _ = await saveIntent(draft)
+  }
+  /// The helper offers `link.set_state`, and this is not loopback or the
+  /// device of a connection this app runs (those are stopped by disconnecting).
+  func canSwitch(_ interface: NetworkInterface) -> Bool {
+    helperOffers("link.set_state") && interface.name != "lo0"
+      && !ownTunnelInterfaces.contains(interface.name)
+  }
+  /// What the confirmation says before an interface is turned off.
+  func switchOffWarning(_ interface: NetworkInterface) -> String {
+    interface.name == primaryInterface ? "native.link.offDefault" : "native.link.off"
+  }
+  var switchingInterface = false
+  /// Turns an interface on or off through the helper, then reloads the lists.
+  func setInterfaceState(_ interface: NetworkInterface, up: Bool) async -> Bool {
+    switchingInterface = true
+    defer { switchingInterface = false }
+    do {
+      let _: [String: String] = try await core.call(
+        "set_interface_state", args: ["name": interface.name, "up": up ? "true" : "false"])
+      record(.info, "\(up ? "Turned on" : "Turned off") \(interface.name)")
+      await refresh()
+      return true
+    } catch {
+      self.error = error.localizedDescription
+      return false
+    }
+  }
+  /// The system's DNS resolvers (`scutil --dns`), read-only.
+  var dnsConfig: DnsConfig?
+  func loadDns() async {
+    do {
+      dnsConfig = try await core.callConcurrently("dns_status")
+    } catch { self.error = error.localizedDescription }
+  }
+  /// One real DNS query; with no `server` it goes where the system would send
+  /// that name. Nil with `error` set when it cannot be done.
+  func probeDns(host: String, server: String, ipv6: Bool) async -> DnsProbeAnswer? {
+    do {
+      return try await core.callConcurrently(
+        "dns_probe", args: ["hostname": host, "server": server, "family": ipv6 ? "aaaa" : "a"])
+    } catch {
+      self.error = error.localizedDescription
+      return nil
+    }
+  }
+  /// Runs every check for one connection (the helper's and the app's view,
+  /// static analysis, routes); nil with `error` set when it cannot be done.
+  func diagnose(_ profile: Profile) async -> ProfileDiagnostics? {
+    do {
+      return try await core.call("diagnose", args: ["id": profile.id])
+    } catch {
+      self.error = error.localizedDescription
+      return nil
+    }
+  }
+  /// The text behind one entry of the Logs page.
+  func logText(for source: LogSource) async -> String {
+    switch source {
+    case .app: appLog.text
+    case .importer: await importLog()
+    case .helper: (try? await core.call("helper_log") as String) ?? ""
+    case .netbird: (try? await core.call("netbird_log") as String) ?? ""
+    case .connection(let id):
+      if let profile = snapshot?.profiles.first(where: { $0.id == id }) {
+        await connectionLog(profile)
+      } else {
+        ""
+      }
+    }
   }
   func importLog() async -> String {
     (try? await core.call("import_log") as String) ?? ""

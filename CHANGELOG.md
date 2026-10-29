@@ -6,7 +6,216 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
+**This file is the history up to 0.10.0**, when the project had one version for
+everything. From 0.10.0 on the core and each operating system have their own
+version and their own changelog: [`changelog/core.md`](changelog/core.md),
+[`changelog/macos.md`](changelog/macos.md),
+[`changelog/linux.md`](changelog/linux.md) and
+[`changelog/windows.md`](changelog/windows.md). All four lines start at 0.10.0.
+
 ## [Unreleased]
+
+## [0.10.0] - 2026-10-29
+
+### Added
+
+- macOS: "Connect when the app starts" per connection. The flagged connections
+  start once at launch, in saved order; a failure is reported without
+  blocking the others.
+- macOS: a menu bar item with the number of active connections, a switch per
+  connection, "Disconnect all" and a shortcut to the window; it can be hidden
+  in Settings. The state keeps updating with the window closed.
+- macOS: at launch the app reports what a crashed session left behind
+  (routes, DNS, a leftover tunnel) and offers a cleanup.
+- macOS: a Monitor page (throughput per interface) and a Logs page (app events,
+  each connection's log, the helper log, NetBird, import). WireGuard now
+  writes a log through the helper.
+- macOS: a Diagnostics sheet for a connection (path to the endpoint, static
+  analysis, listeners, system proxy, helper, tunnel state), with checks shared
+  in `net-manager-core::diagnostics`.
+- macOS: routing intents. The helper keeps "these networks go this way" (via
+  a named interface, or direct through the physical uplink) in a root-only
+  store, installs the routes, checks them every 2 seconds on a network change
+  and in full every 10 seconds, and deletes only routes it installed that
+  still match. A route someone else owns is reported as a conflict, never
+  replaced. Limits per user: 64 intents, 32 rules, 256 networks in total.
+  New "Intents" tab on the Routes page; routes that capture the whole
+  default route are allowed with a warning, as on Linux.
+- macOS: conditional routes. A rule turns its routes on while a network
+  condition holds (an interface address inside a given network) and off
+  afterwards. "Conditions" tab on the Routes page.
+- macOS: the intent doctor (a port of the Linux one): suggestions for
+  endpoints a tunnel would loop back into and for destinations that skip the
+  intended path, shown as cards on the Intents tab. On macOS a foreign
+  conflicting route is only reported.
+- macOS: static-route profiles (the `none` backend) connect. Connecting
+  creates the profile's intents; disconnecting or quitting the app removes
+  them. By default connecting fails while the interface is missing; "Wait for
+  the interface" arms the routes in advance. Works from the app and from
+  `netorch up` / `down`.
+- macOS: app modes (Combined, Orchestrator, Manager) in Settings. Orchestrator
+  does not start managed backends; static routes stay available and a running
+  tunnel can be stopped.
+- macOS: a network interface can be turned on or off from its card, through
+  the helper, with a confirmation that is stricter for the interface carrying
+  the default route. Loopback and tunnel devices owned by the helper are
+  refused.
+- macOS: the Network page gets a DNS tab: the resolvers the system uses, the
+  server a name would go to (and whether it is a fake IP), and a real
+  A/AAAA query to that server.
+- `net-manager-core`: `route_intents`, `route_conditions`, `intent_doctor`,
+  `dns_diag`, `dns_probe`.
+- macOS: static-route profiles can send a route through its own gateway
+  (`10.1.0.0/16 via 10.0.0.1`). Each gateway is kept by the helper as its own
+  routing intent and waits until the gateway is on a connected network. A
+  profile whose routes all name a gateway needs no interface.
+- macOS: "Endpoint bypass" on a static-route profile (IP addresses or host
+  names). They stay on the physical uplink while the routes through another
+  client's tunnel are active; names are resolved when connecting, the bypass
+  is applied first and removed last, and a failure part way leaves nothing
+  behind.
+- macOS: custom `geoip.dat` / `geosite.dat` for Xray, by https address in the
+  routing rules editor or from a Happ/Incy export (which used to warn that
+  they were ignored). The app downloads and caches them (https only, size
+  limit, sha256 sidecar check, stale copy kept if a refresh fails) and lays
+  them over the managed Xray's files. A tunnel receives them inline and the
+  helper serves them from a root-owned directory that is removed with the
+  tunnel; it never follows a symlink to read the managed files.
+- `net-manager-core`: `geo_assets` (the download cache, shared with the
+  clients; `src-tauri` keeps its own copy for now).
+- Linux: `netorch`, a command line client of the network daemon. `ls`,
+  `status`, `up`, `down` and `completions` connect the WireGuard, OpenVPN and
+  Xray TUN profiles saved in the app; `add` (and `up <link|url|file>`) saves a
+  vless:// / hysteria2:// link, a subscription URL or a `.conf` / `.ovpn` file
+  with the same code as the app, so the CLI needs no GUI to get a profile;
+  `rm` and `rename` manage them. OpenVPN credentials come from the terminal
+  or `--auth-stdin`.
+- Linux: `netorch` works with the servers inside a subscription: `endpoints`
+  lists them, `use` picks one by number or part of its name (on a terminal
+  without an argument it asks, with a filter), `switch` changes the server of
+  a connected profile and reconnects (restoring the previous server if the new
+  one does not come up), `up --endpoint` picks and connects, `refresh` fetches
+  the list again and `test` measures every server's delay through a temporary
+  Xray, fastest first. `ls` and `status` show the active server.
+- Linux: `netorch up` leaves a background keeper process (`netorch hold`,
+  hidden) so the connection outlives the command: the daemon removes a tunnel
+  30 s after the last client process of the user has exited. `netorch down`
+  stops the keeper, and `up --foreground` keeps the connection in the terminal
+  until Ctrl+C.
+- Linux: `netorch` checks the network daemon before it calls it, because the
+  two are separate packages that can be at different versions. A different
+  wire protocol, or a daemon that lacks a method `netorch` calls, is refused
+  with what to update; a daemon from an older release line only warns.
+  `netorch version` shows both versions and the verdict.
+- Linux: when polkit refuses because the session has no authentication agent
+  (SSH), `netorch up`, `down` and `switch` start a text agent (`pkttyagent`)
+  on a terminal and ask for the administrator password once; without a
+  terminal they explain the options (a terminal, `sudo netorch`, or a polkit
+  rule). `sudo netorch ls|status|up|down` work from the invoking user's data;
+  commands that write data still refuse to run as root.
+
+### Changed
+
+- The privileged helper advertises intent and interface capabilities only when
+  they are configured, and the app asks the user to update an older helper.
+- Intent identifiers may be up to 64 characters (was 48) so a profile's
+  identifier fits with the `-bypass` and `-gwN` suffixes. Static profiles
+  now own several intents: a profile's routes, one per gateway, and its bypass.
+- The `net.intent.set` path accepts `kind: "gateway"` with a `gateway`
+  address. Existing intents and the Linux daemon are unaffected.
+- Profile import by file (`import_configs_into`, `detect_backend`,
+  `generate_import_id`) moved from the Tauri app into `net-manager-core`; the
+  app uses the shared code. No behavior change.
+
+### Fixed
+
+- macOS: the recovery cleanup no longer stops a tunnel that is running;
+  Xray, WireGuard and OpenVPN leave a live session alone.
+- Linux: subscriptions from panels that serve whole Xray configs (Remnawave,
+  Geodema) can run as a system-wide Xray TUN again. The daemon rejected every
+  such server ("unsupported generated Xray TUN config") because of the
+  panel's observatory, policy, DNS, extra outbounds and balancer. The server
+  itself is now reduced to the plain shape before it is sent
+  (`xray::tun_compatible_config`, used by the app and `netorch`); the
+  panel's own routing rules and DNS are not applied, the profile's are. An
+  "automatic" entry that picks from a pool of servers is refused with advice
+  to choose a specific server. 92 of the 93 servers of a real subscription
+  now pass the daemon's validation.
+- `net-manager-core` tests compile on Linux again (`spawn_xray` test call).
+
+### Documentation
+
+- A macOS-vs-Linux difference list with the order in which the remaining
+  Linux features move to macOS, and a platform matrix in line with the code.
+- Plan for route intents, conditions and the intent doctor on macOS.
+
+### Known limitations (macOS)
+
+- Routes, the helper, geo data and the interface switch were verified with
+  fakes and simulated route tables only, not on a live system; the helper
+  must be updated for any of the new helper features.
+- A route on a scoped (`ifscope`) interface is not told apart and can read as
+  a conflict.
+
+## [0.9.1] - 2026-10-23
+
+### Fixed
+
+- Linux: the window no longer aborts with "Could not create GBM EGL display"
+  on GPU/driver setups where WebKitGTK's DMABUF renderer fails (seen on
+  NVIDIA); the renderer is disabled unless the user set it explicitly.
+- Dialogs keep the focused field and open drop-downs while the screen behind
+  them refreshes.
+
+## [0.9.0] - 2026-10-23
+
+### Added
+
+- Linux: a Home screen with the running connections, a one-click reconnect of
+  the last profile and a button that copies `HTTP(S)_PROXY`/`ALL_PROXY` for a
+  terminal. A connection that needs OpenVPN credentials asks for them right
+  there.
+- Linux: the system proxy for Xray SOCKS profiles on GNOME (`gsettings`) and
+  KDE Plasma (`kwriteconfig`), with the previous settings restored on
+  disconnect. Hidden on other desktops.
+- Linux: NetBird under Profiles → Services, driven through the user's own
+  `netbird` CLI (on/off, server and setup key, browser sign-in).
+- Linux: connection roles. A secondary WireGuard, OpenVPN or Xray TUN
+  connection carries only the networks listed for it (pushed routes and
+  gateway redirects are ignored) and, optionally, split-DNS domains through
+  `systemd-resolved`; the primary keeps taking all traffic. The daemon rejects
+  a secondary request that would take all traffic, and Profiles shows a role
+  switch, a networks dialog and a Secondary badge.
+- Linux: `LinuxEngine` in `net-manager-engine`, a typed connect/disconnect/
+  status API over the daemon socket, as the groundwork for a Linux `netorch`.
+- The import dialog lists the chosen files and lets you pick the backend (or
+  detect it from the file) before importing, accepts a pasted subscription URL
+  in the Link tab and submits on Enter, with one button and one error line for
+  every tab.
+
+### Changed
+
+- The decisions behind connecting a profile (conflict checks, route and
+  interface derivation, auto-connect selection) live in
+  `net-manager-core::connect_plan`; the requests the app sends to the Linux
+  daemon are built by `net_manager_engine::linux`. No behavior change.
+- The NetBird driver moved from the macOS bridge into `net-manager-core` and
+  is shared by both clients; the macOS bridge parses secondary networks and
+  DNS domains with the shared helpers.
+- The OpenVPN credentials dialog is a shared component used by Home and
+  Profiles.
+- The add-connection icon is round and tinted with the accent colour.
+
+### Documentation
+
+- The versioning policy defines a breaking change by what users depend on and
+  adds the breaking-change commit footer; `CLAUDE.md` points Claude Code at
+  `AGENTS.md` and the versioning policy.
+
+### Tests
+
+- End-to-end coverage of a secondary WireGuard tunnel with split DNS in the
+  Linux Docker harness (not run yet: it needs Docker).
 
 ## [0.8.7] - 2026-10-20
 

@@ -181,8 +181,14 @@ struct ConnectionsView: View {
       }
     }
     if let notice = model.notice {
-      NoticeBar(color: notice == "native.proxyOverridden" ? "warn" : "up") {
-        Text(L10n.text(notice, ["iface": model.primaryInterface ?? ""]))
+      NoticeBar(color: notice == "native.proxyOverridden" || notice.hasPrefix("events.autoConnect") ? "warn" : "up") {
+        Text(
+          L10n.text(
+            notice,
+            [
+              "iface": model.primaryInterface ?? "",
+              "n": String(model.autoConnectFailures),
+            ]))
         Spacer()
         Button(L10n.text("common.dismiss")) { model.notice = nil }.buttonStyle(
           TauriButtonStyle(compact: true))
@@ -522,7 +528,9 @@ struct ConnectionSwitch: View {
     }.buttonStyle(.plain).disabled(!enabled)
       .help(
         L10n.text(
-          !model.canStart(profile) && model.canStartConnections
+          model.modeLocks(profile)
+            ? "profiles.modeManagedOnly"
+            : !model.canStart(profile) && model.canStartConnections
             ? "native.helperRequired"
             : running ? "common.disconnect" : "common.connect")
       )
@@ -583,6 +591,7 @@ struct ProfileDetailView: View {
   @Bindable var model: AppModel
   @State private var editingRules = false
   @State private var showingLog = false
+  @State private var showingDiagnostics = false
   @State private var editingNetworks = false
   let profile: Profile
   let onRename: () -> Void
@@ -601,7 +610,7 @@ struct ProfileDetailView: View {
             Text(profile.name).font(.system(size: 14.7, weight: .semibold)).lineLimit(1)
             if profile.backend != "none" { AppBadge(text: "detail.managed") }
             if proxyOwner { AppBadge(text: "native.systemProxy", color: "up") }
-            if profile.needsHelper && profile.isSecondary {
+            if profile.runsTunnel && profile.isSecondary {
               AppBadge(text: "native.roleSecondary", color: "info")
             }
           }
@@ -614,6 +623,7 @@ struct ProfileDetailView: View {
         Menu {
           Button(L10n.text("Rename"), action: onRename)
           Button(L10n.text("Inspect configuration")) { Task { await model.inspect(profile) } }
+          Button(L10n.text("detail.diagnostics")) { showingDiagnostics = true }
           if profile.backend == "xray" || profile.backend == "openVpn" {
             Button(L10n.text("native.connectionLog")) { showingLog = true }
           }
@@ -655,7 +665,9 @@ struct ProfileDetailView: View {
             ? L10n.text("detail.notAssigned") : profile.interfaceName))
       }
       if profile.backend == "xray" && model.canStartConnections { modePicker }
-      if profile.needsHelper && model.canStartConnections { roleRows }
+      if model.canTryStart(profile) { autoConnectRow }
+      if profile.runsTunnel && model.canStartConnections { roleRows }
+      if profile.isStatic && model.canTryStart(profile) { waitRow }
       if profile.isTun {
         row(
           "detail.interface",
@@ -710,6 +722,10 @@ struct ProfileDetailView: View {
     }
     .frame(maxWidth: .infinity, alignment: .leading)
     .task(id: profile.id) { await model.loadInspection(profile) }
+    .sheet(isPresented: $showingDiagnostics) {
+      DiagnosticsSheet(model: model, profile: profile) { showingDiagnostics = false }
+        .environment(\.palette, p).buttonStyle(TauriButtonStyle())
+    }
     .sheet(isPresented: $showingLog) {
       LogSheet(
         title: L10n.text("diag.title", ["name": profile.groupName]),
@@ -937,6 +953,37 @@ struct ProfileDetailView: View {
       model.canStart(profile) || profile.startsWithoutHelper || !model.canStartConnections
         ? L10n.text("detail.stopped") : L10n.text("native.helperRequired")
     }
+  }
+  /// Static routes: arm them while the interface is absent, or refuse.
+  private var waitRow: some View {
+    HStack {
+      VStack(alignment: .leading, spacing: 2) {
+        Text(L10n.text("native.static.wait")).foregroundStyle(p.muted)
+        Text(L10n.text("native.static.waitHint")).font(.system(size: 10.08)).foregroundStyle(p.muted)
+      }
+      Spacer()
+      Toggle(
+        "",
+        isOn: Binding(
+          get: { profile.waitsForInterface },
+          set: { value in Task { await model.setWaitForInterface(profile, enabled: value) } })
+      ).toggleStyle(.switch).controlSize(.small).labelsHidden()
+        .disabled(model.pending.contains(profile.id))
+    }.font(.system(size: 11.9)).padding(.vertical, 5)
+  }
+  /// Starts this connection when the app launches.
+  private var autoConnectRow: some View {
+    HStack {
+      Text(L10n.text("form.autoConnect")).foregroundStyle(p.muted)
+      Spacer()
+      Toggle(
+        "",
+        isOn: Binding(
+          get: { profile.connectsOnLaunch },
+          set: { value in Task { await model.setAutoConnect(profile, enabled: value) } })
+      ).toggleStyle(.switch).controlSize(.small).labelsHidden()
+        .disabled(model.pending.contains(profile.id))
+    }.font(.system(size: 11.9)).padding(.vertical, 5)
   }
   /// Primary or secondary, and for a secondary one its networks.
   @ViewBuilder private var roleRows: some View {
@@ -1260,6 +1307,7 @@ struct StaticProfileView: View {
   @State private var name = ""
   @State private var interface = ""
   @State private var cidrs = ""
+  @State private var bypass = ""
   var body: some View {
     AppModal(title: "New connection", width: 620, onClose: onClose) {
       VStack(alignment: .leading, spacing: 10.5) {
@@ -1267,18 +1315,23 @@ struct StaticProfileView: View {
         Text(L10n.text("Name")).font(.system(size: 11.9))
         AppInput(placeholder: "Connection name", text: $name)
         Text(L10n.text("Interface")).font(.system(size: 11.9))
-        AppInput(placeholder: "Interface name, e.g. en0", text: $interface)
+        AppInput(placeholder: "native.static.interfaceHint", text: $interface)
         Text(L10n.text("Routes")).font(.system(size: 13.3, weight: .semibold))
         TextEditor(text: $cidrs).font(.system(size: 11.9, design: .monospaced))
           .scrollContentBackground(.hidden).padding(7).frame(height: 120).background(
             p.input, in: RoundedRectangle(cornerRadius: 6)
           ).overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
           .accessibilityLabel(L10n.text("Bulk CIDRs"))
-        Text(
-          L10n.text(
-            "Paste IPv4/IPv6 CIDRs. Duplicates and adjacent networks are aggregated. Routes are saved and analyzed, never applied in this native version."
-          )
-        ).font(.system(size: 10.92)).foregroundStyle(p.muted)
+        Text(L10n.text("native.static.routesHint")).font(.system(size: 10.92))
+          .foregroundStyle(p.muted)
+        Text(L10n.text("native.static.bypass")).font(.system(size: 13.3, weight: .semibold))
+        TextEditor(text: $bypass).font(.system(size: 11.9, design: .monospaced))
+          .scrollContentBackground(.hidden).padding(7).frame(height: 54).background(
+            p.input, in: RoundedRectangle(cornerRadius: 6)
+          ).overlay(RoundedRectangle(cornerRadius: 6).stroke(p.border, lineWidth: 1))
+          .accessibilityLabel(L10n.text("native.static.bypass"))
+        Text(L10n.text("native.static.bypassHint")).font(.system(size: 10.92))
+          .foregroundStyle(p.muted)
         if let error = model.error {
           Text(L10n.text(error)).font(.system(size: 11.9)).foregroundStyle(p["down"])
         }
@@ -1287,14 +1340,14 @@ struct StaticProfileView: View {
           Button(L10n.text("Cancel"), action: onClose)
           Button(L10n.text(model.busy ? "Saving…" : "Save")) {
             Task {
-              if await model.createStatic(name: name, interface: interface, cidrs: cidrs) {
+              if await model.createStatic(name: name, interface: interface, cidrs: cidrs, bypass: bypass) {
                 onClose()
                 model.section = .connections
               }
             }
           }.buttonStyle(TauriButtonStyle(kind: .accent)).disabled(
             model.busy
-              || [name, interface, cidrs].contains {
+              || [name, cidrs].contains {
                 $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
               })
         }
@@ -1442,6 +1495,10 @@ struct RoutingRulesEditor: View {
       editor($options.dnsHosts, height: 70, label: "native.staticHosts")
       Toggle(L10n.text("native.fakeDns"), isOn: $options.fakeDns).toggleStyle(.checkbox)
         .font(.system(size: 11.9))
+      Text(L10n.text("form.geoHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
+        .fixedSize(horizontal: false, vertical: true)
+      AppInput(placeholder: "native.geo.geoip", text: $options.geoipUrl)
+      AppInput(placeholder: "native.geo.geosite", text: $options.geositeUrl)
     }
   }
   private var checker: some View {

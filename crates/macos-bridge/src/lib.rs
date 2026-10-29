@@ -1,4 +1,5 @@
 //! Bounded JSON C ABI for the native SwiftUI client. No privileged mutations.
+use net_manager_core::netbird;
 use net_manager_core::{
     analysis, cidr_bulk, config_vault::ConfigVault, explorer, models::*, profiles::ProfileStore,
     route_plan,
@@ -9,7 +10,6 @@ use std::ffi::{c_char, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-mod netbird;
 mod routing;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runtime;
@@ -44,6 +44,98 @@ mod runtime {
     ) -> Option<Result<Value, String>> {
         None
     }
+}
+
+/// The literal server addresses of the user's connections: the endpoint
+/// bypasses they name and the IPs their configs connect to. Host names are not
+/// resolved here, so they are not listed.
+fn known_endpoints(profiles: &[Profile]) -> Vec<net_manager_core::intent_doctor::KnownEndpoint> {
+    use net_manager_core::intent_doctor::KnownEndpoint;
+    let mut found = Vec::new();
+    for profile in profiles {
+        let label = if profile.name.is_empty() {
+            &profile.id
+        } else {
+            &profile.name
+        };
+        let mut add = |text: &str| {
+            if let Ok(ip) = text.trim().parse::<std::net::IpAddr>() {
+                found.push(KnownEndpoint {
+                    ip,
+                    profile: label.clone(),
+                });
+            }
+        };
+        profile.endpoint_bypasses.iter().for_each(|text| add(text));
+        if let Ok(analysis) = analysis::analyze_profile(profile) {
+            analysis
+                .endpoints
+                .iter()
+                .for_each(|endpoint| add(&endpoint.address));
+        }
+    }
+    found
+}
+
+/// Intent doctor needs the macOS engine.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn intent_doctor(_: &Path, _: &ProfileStore) -> Result<Value, String> {
+    Err("The intent doctor needs the macOS engine".into())
+}
+
+/// Suggestions about the user's routing intents; see `core::intent_doctor`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn intent_doctor(root: &Path, store: &ProfileStore) -> Result<Value, String> {
+    let profiles = store.load().map_err(store_error)?.profiles;
+    let routes = runtime_executor()?
+        .block_on(explorer::list_routes())
+        .map_err(|_| "the route table could not be read".to_string())?;
+    let interfaces = explorer::list_interfaces().unwrap_or_default();
+    let intents = net_manager_engine::Engine::new(root).intents()?;
+    encode(net_manager_core::intent_doctor::analyze(
+        &intents,
+        &routes,
+        &interfaces,
+        &known_endpoints(&profiles),
+    ))
+}
+
+/// Profile diagnostics need the macOS engine.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn diagnose_profile(_: &Path, _: &ProfileStore, _: &Value) -> Result<Value, String> {
+    Err("Diagnostics need the macOS engine".into())
+}
+
+/// Every check for the profile in `args["id"]`: static analysis against the
+/// other profiles and the OS routes, then the helper's and the session's view.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn diagnose_profile(root: &Path, store: &ProfileStore, args: &Value) -> Result<Value, String> {
+    let profiles = store.load().map_err(store_error)?.profiles;
+    let profile = profiles
+        .iter()
+        .find(|p| Some(p.id.as_str()) == args["id"].as_str())
+        .cloned()
+        .ok_or("Profile not found")?;
+    let others: Vec<Profile> = profiles
+        .into_iter()
+        .filter(|p| p.id != profile.id)
+        .collect();
+    let os_routes = runtime_executor()?
+        .block_on(explorer::list_routes())
+        .map_err(|_| "the route table could not be read".to_string());
+    let interfaces = explorer::list_interfaces()
+        .map_err(|_| "the network interfaces could not be read".to_string());
+    let vault = ConfigVault::new(root.join("configs"));
+    runtime::diagnose(
+        root,
+        &profile,
+        net_manager_engine::DiagnosticsContext {
+            others: &others,
+            os_routes,
+            interfaces,
+            vault: &vault,
+        },
+    )
 }
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -92,53 +184,6 @@ fn tunnel_profile(
     Ok(profile)
 }
 
-/// Networks typed as CIDR or single addresses, separated by space, comma,
-/// semicolon or newline. Empty input clears the list.
-fn parse_networks(text: &str) -> Result<Vec<ipnet::IpNet>, String> {
-    let mut networks = Vec::new();
-    for token in text
-        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-        .filter(|token| !token.is_empty())
-    {
-        let network = token
-            .parse::<ipnet::IpNet>()
-            .or_else(|_| token.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
-            .map_err(|_| format!("\"{token}\" is not a valid network"))?;
-        networks.push(network);
-    }
-    if networks.is_empty() {
-        return Ok(networks);
-    }
-    let routes: Vec<net_manager_core::models::PolicyRoute> = networks
-        .iter()
-        .map(|network| net_manager_core::models::PolicyRoute {
-            destination: *network,
-            metric: 5,
-            via: None,
-        })
-        .collect();
-    net_manager_core::models::secondary_networks(&routes).map_err(str::to_string)
-}
-
-fn parse_dns_domains(text: &str) -> Result<Vec<String>, String> {
-    let mut domains: Vec<String> = Vec::new();
-    for token in text
-        .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-        .filter(|token| !token.is_empty())
-    {
-        let domain = token.trim_start_matches("*.").to_ascii_lowercase();
-        if !net_manager_core::models::valid_dns_suffix(&domain) {
-            return Err(format!("\"{token}\" is not a valid DNS domain"));
-        }
-        if !domains.contains(&domain) {
-            domains.push(domain);
-        }
-    }
-    if domains.len() > 16 {
-        return Err("At most 16 DNS domains can be set".into());
-    }
-    Ok(domains)
-}
 fn store_error(_: std::io::Error) -> String {
     "The profile operation could not be completed. Check the input and file permissions.".into()
 }
@@ -449,6 +494,69 @@ fn tailscale_sync(root: &Path) -> Value {
     *last = Some((Instant::now(), value.clone()));
     value
 }
+/// `scutil --dns` as data. Needs no privileges.
+fn read_dns_config() -> Result<net_manager_core::dns_diag::DnsConfig, String> {
+    let output = std::process::Command::new("/usr/sbin/scutil")
+        .arg("--dns")
+        .output()
+        .map_err(|_| "The DNS configuration could not be read".to_string())?;
+    if !output.status.success() {
+        return Err("The DNS configuration could not be read".into());
+    }
+    Ok(net_manager_core::dns_diag::parse_scutil_dns(
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
+/// One DNS query to `args["server"]`, or to the server the system would use
+/// for `args["hostname"]`, with the route that traffic takes.
+fn dns_probe(args: &Value) -> Result<Value, String> {
+    use net_manager_core::dns_diag::{choose_target, path_to};
+    use net_manager_core::dns_probe::{probe, DnsFamily};
+    let hostname = text_arg(args, "hostname")?;
+    let server = match args["server"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(text) => Some(
+            text.parse::<std::net::IpAddr>()
+                .map_err(|_| "Enter an IPv4 or IPv6 address as the server".to_string())?,
+        ),
+        None => None,
+    };
+    let family = if args["family"].as_str() == Some("aaaa") {
+        DnsFamily::Aaaa
+    } else {
+        DnsFamily::A
+    };
+    let config = if server.is_some() {
+        Default::default()
+    } else {
+        read_dns_config()?
+    };
+    let target = choose_target(&config, hostname, server).ok_or("No DNS server is configured")?;
+    let result = probe(
+        hostname,
+        std::net::SocketAddr::new(target.server, target.port),
+        family,
+        std::time::Duration::from_secs(3),
+    )
+    .map_err(|error| match error.kind() {
+        std::io::ErrorKind::InvalidInput => "Enter a valid host name".to_string(),
+        std::io::ErrorKind::TimedOut => "The DNS server did not answer in time".to_string(),
+        _ => "The DNS query could not be sent".to_string(),
+    })?;
+    let routes = runtime_executor()?
+        .block_on(explorer::list_routes())
+        .unwrap_or_default();
+    Ok(json!({
+        "probe": result,
+        "resolverIndex": target.resolver_index,
+        "resolverDomain": target.resolver_domain,
+        "path": path_to(target.server, &routes),
+    }))
+}
 fn encode(value: impl serde::Serialize) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|_| "Could not encode the result".into())
 }
@@ -483,6 +591,17 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
         "tailscale_down" => return net_manager_engine::tailscale::Tailscale::detect().down(),
         "tailscale_sync" => return Ok(tailscale_sync(root)),
         "user_network_settings" => return encode(user_network::read()),
+        // The system resolvers (`scutil --dns`) and one real DNS query; read-only.
+        "dns_status" => return encode(read_dns_config()?),
+        "dns_probe" => return dns_probe(args),
+        // Interfaces with their byte counters, without the routes `snapshot`
+        // adds: cheap enough for the Monitor page to poll every second.
+        "interfaces" => {
+            return encode(
+                explorer::list_interfaces()
+                    .map_err(|_| "Network interfaces could not be read. Try refreshing.")?,
+            )
+        }
         _ => {}
     }
     let _lock = TRANSACTION
@@ -559,25 +678,34 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
             {
                 return Err("A profile with this identifier already exists".into());
             }
-            let routes = cidr_bulk::parse_bulk_cidrs(text_arg(args, "cidrs")?)
-                .map_err(|_| "Enter valid IPv4 or IPv6 CIDRs".to_string())?;
+            let routes =
+                cidr_bulk::parse_static_routes(text_arg(args, "cidrs")?, 5).map_err(|_| {
+                    "Enter valid CIDRs, optionally followed by 'via <gateway>'".to_string()
+                })?;
             if routes.is_empty() {
                 return Err("Add at least one route".into());
             }
             let profile = Profile {
                 id: id.into(),
                 name: text_arg(args, "name")?.trim().into(),
-                interface_name: text_arg(args, "interfaceName")?.trim().into(),
-                routes: routes
-                    .into_iter()
-                    .map(|destination| PolicyRoute {
-                        destination,
-                        metric: 5,
-                        via: None,
-                    })
+                interface_name: args["interfaceName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .into(),
+                routes,
+                endpoint_bypasses: args["bypass"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .split(|c: char| c.is_whitespace() || matches!(c, ',' | ';'))
+                    .filter(|entry| !entry.is_empty())
+                    .map(String::from)
                     .collect(),
                 ..Profile::default()
             };
+            // The same checks the helper applies, so a profile that could
+            // never connect is refused here with the reason.
+            net_manager_core::route_intents::static_intents(&profile, &[])?;
             encode(net_manager_core::subscription::public_profiles(
                 store.upsert(profile).map_err(store_error)?.profiles,
             ))
@@ -800,6 +928,34 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 ))
             })
         }
+        "set_auto_connect" => {
+            let id = text_arg(args, "id")?;
+            let enabled = args["enabled"].as_str() == Some("true");
+            let document = store.set_auto_connect(id, enabled).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    "Profile not found".to_string()
+                } else {
+                    store_error(error)
+                }
+            })?;
+            encode(net_manager_core::subscription::public_profiles(
+                document.profiles,
+            ))
+        }
+        "set_wait_for_interface" => {
+            let id = text_arg(args, "id")?;
+            let enabled = args["enabled"].as_str() == Some("true");
+            let document = store.set_wait_for_interface(id, enabled).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    "Profile not found".to_string()
+                } else {
+                    store_error(error)
+                }
+            })?;
+            encode(net_manager_core::subscription::public_profiles(
+                document.profiles,
+            ))
+        }
         "set_tunnel_role" => {
             let id = text_arg(args, "id")?;
             let role = match text_arg(args, "role")? {
@@ -820,9 +976,11 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
         "set_tunnel_networks" => {
             let id = text_arg(args, "id")?;
             let mut profile = tunnel_profile(&store, id)?;
-            profile.tunnel_networks = parse_networks(args["networks"].as_str().unwrap_or(""))?;
-            profile.tunnel_dns_domains =
-                parse_dns_domains(args["dnsDomains"].as_str().unwrap_or(""))?;
+            profile.tunnel_networks =
+                net_manager_core::models::parse_networks(args["networks"].as_str().unwrap_or(""))?;
+            profile.tunnel_dns_domains = net_manager_core::models::parse_dns_domains(
+                args["dnsDomains"].as_str().unwrap_or(""),
+            )?;
             runtime::restart_around(root, &store, id, || {
                 let document = store.upsert(profile).map_err(store_error)?;
                 encode(net_manager_core::subscription::public_profiles(
@@ -924,6 +1082,8 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
                 }
             }
         }
+        "diagnose" => diagnose_profile(root, &store, args),
+        "intent_doctor" => intent_doctor(root, &store),
         "inspect" => {
             let p = store
                 .load()
@@ -1480,6 +1640,47 @@ mod tests {
     }
 
     #[test]
+    fn static_profiles_take_gateways_and_endpoint_bypasses() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"ext", "name":"External", "interfaceName":"utun4",
+                    "cidrs":"10.0.0.0/8\n192.0.2.0/24 via 10.9.0.1",
+                    "bypass":"203.0.113.7, vpn.example\n198.51.100.9"}),
+        )
+        .unwrap();
+        let profile = &created.as_array().unwrap()[0];
+        assert_eq!(profile["routes"][1]["via"], "10.9.0.1");
+        assert_eq!(
+            profile["endpointBypasses"],
+            json!(["203.0.113.7", "vpn.example", "198.51.100.9"])
+        );
+        // Every route names its gateway: no interface needed.
+        dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"gw", "name":"Gateway", "interfaceName":"", "cidrs":"192.0.2.0/24 via 10.9.0.1"}),
+        )
+        .unwrap();
+        // A route without one needs an interface, and the reason is given.
+        let error = dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"none", "name":"No interface", "interfaceName":"", "cidrs":"192.0.2.0/24"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("interface"), "{error}");
+        let error = dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"loop", "name":"Loop", "interfaceName":"en0", "cidrs":"192.0.2.0/24 via 127.0.0.1"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("gateway"), "{error}");
+    }
+
+    #[test]
     fn invalid_static_routes_do_not_write_a_document() {
         let dir = tempfile::tempdir().unwrap();
         assert!(dispatch(
@@ -1711,14 +1912,19 @@ mod tests {
         import_link(dir.path(), "rt");
         let error = dispatch(dir.path(), "connect", &json!({"id":"rt"})).unwrap_err();
         assert_eq!(error, "Install Xray to start this connection");
+        // A static-route profile on an interface this machine does not have:
+        // refused before the helper is asked, so the test never touches routes.
         dispatch(
             dir.path(),
             "create_static",
-            &json!({"id":"st", "name":"Static", "interfaceName":"en0", "cidrs":"192.0.2.0/24"}),
+            &json!({"id":"st", "name":"Static", "interfaceName":"en97", "cidrs":"192.0.2.0/24"}),
         )
         .unwrap();
         let error = dispatch(dir.path(), "connect", &json!({"id":"st"})).unwrap_err();
-        assert!(error.contains("privileged helper"), "{error}");
+        assert!(
+            error.contains("en97") && error.contains("not present"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1740,12 +1946,17 @@ mod tests {
 
     #[test]
     fn typed_networks_and_domains_are_parsed_and_checked() {
-        let nets = parse_networks("10.10.4.7/16, 192.168.5.9\n fd00::/8;10.10.0.0/16").unwrap();
+        let nets = net_manager_core::models::parse_networks(
+            "10.10.4.7/16, 192.168.5.9\n fd00::/8;10.10.0.0/16",
+        )
+        .unwrap();
         assert_eq!(
             nets.iter().map(ToString::to_string).collect::<Vec<_>>(),
             ["10.10.0.0/16", "192.168.5.9/32", "fd00::/8"]
         );
-        assert!(parse_networks("  \n").unwrap().is_empty());
+        assert!(net_manager_core::models::parse_networks("  \n")
+            .unwrap()
+            .is_empty());
         for bad in [
             "10.10.0.0/33",
             "not-a-net",
@@ -1753,17 +1964,191 @@ mod tests {
             "::/0",
             "224.0.0.0/4",
         ] {
-            assert!(parse_networks(bad).is_err(), "{bad}");
+            assert!(
+                net_manager_core::models::parse_networks(bad).is_err(),
+                "{bad}"
+            );
         }
-        let error = parse_networks("10.0.0.0/8 oops").unwrap_err();
+        let error = net_manager_core::models::parse_networks("10.0.0.0/8 oops").unwrap_err();
         assert!(error.contains("oops"), "{error}");
         assert_eq!(
-            parse_dns_domains("Corp.Example, *.lab.local corp.example").unwrap(),
+            net_manager_core::models::parse_dns_domains("Corp.Example, *.lab.local corp.example")
+                .unwrap(),
             ["corp.example", "lab.local"]
         );
         for bad in ["a/b", "../x", "-", "a b?c"] {
-            assert!(parse_dns_domains(bad).is_err(), "{bad}");
+            assert!(
+                net_manager_core::models::parse_dns_domains(bad).is_err(),
+                "{bad}"
+            );
         }
+    }
+
+    #[test]
+    fn dns_probe_refuses_bad_input_before_any_packet_is_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_name = dispatch(
+            dir.path(),
+            "dns_probe",
+            &json!({"hostname":"not a name","server":"127.0.0.1"}),
+        );
+        assert_eq!(bad_name.unwrap_err(), "Enter a valid host name");
+        let bad_server = dispatch(
+            dir.path(),
+            "dns_probe",
+            &json!({"hostname":"example.com","server":"dns.example"}),
+        );
+        assert_eq!(
+            bad_server.unwrap_err(),
+            "Enter an IPv4 or IPv6 address as the server"
+        );
+        assert!(dispatch(dir.path(), "dns_probe", &json!({})).is_err());
+        assert!(!dir.path().join("profiles.json").exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dns_status_reads_the_system_resolvers_without_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dispatch(dir.path(), "dns_status", &json!({})).unwrap();
+        assert!(status["resolvers"].is_array() && status["scoped"].is_array());
+        assert!(!dir.path().join("profiles.json").exists());
+    }
+
+    #[test]
+    fn the_doctor_knows_literal_server_addresses_only() {
+        let dir = tempfile::tempdir().unwrap();
+        // `one.test` is a name; the second connection connects to an IP.
+        import_link(dir.path(), "named");
+        dispatch(
+            dir.path(),
+            "import_share_link",
+            &json!({"id":"literal", "name":"Literal", "link":"vless://00000000-0000-4000-8000-000000000000@203.0.113.7:443?security=tls#Lit"}),
+        )
+        .unwrap();
+        let profiles: Vec<Profile> = ProfileStore::new(dir.path().join("profiles.json"))
+            .load()
+            .unwrap()
+            .profiles;
+        let mut with_bypass = profiles.clone();
+        with_bypass[0].endpoint_bypasses = vec![" 198.51.100.9 ".into(), "vpn.example.com".into()];
+        let found: Vec<String> = known_endpoints(&with_bypass)
+            .iter()
+            .map(|e| format!("{} {}", e.ip, e.profile))
+            .collect();
+        assert!(
+            found.contains(&"198.51.100.9 Runtime".to_string()),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().any(|e| e.starts_with("203.0.113.7 ")),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().all(|e| !e.contains("example")),
+            "names are not resolved: {found:?}"
+        );
+        assert!(known_endpoints(&[]).is_empty());
+    }
+
+    #[test]
+    fn interfaces_are_listed_without_touching_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let interfaces = dispatch(dir.path(), "interfaces", &json!({})).unwrap();
+        assert!(interfaces.is_array());
+        assert!(interfaces
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["name"].is_string()));
+        assert!(!dir.path().join("profiles.json").exists());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn diagnostics_cover_a_loopback_profile_without_asking_the_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "dg");
+        let report = dispatch(dir.path(), "diagnose", &json!({"id":"dg"})).unwrap();
+        assert_eq!(report["profileId"], "dg");
+        assert_eq!(report["status"]["state"], "stopped");
+        let checks = report["checks"].as_array().unwrap();
+        let named = |name: &str| checks.iter().find(|c| c["name"] == name).unwrap();
+        assert_eq!(named("Configuration")["level"], "healthy");
+        // No Xray is installed in a fresh data directory.
+        assert_eq!(named("Backend executable")["level"], "error");
+        assert_eq!(named("Tunnel status")["level"], "warning");
+        assert!(checks.iter().all(|c| c["name"] != "Privileged helper"));
+        let text = report.to_string();
+        assert!(
+            !text.contains(dir.path().to_str().unwrap()),
+            "a path leaked"
+        );
+        assert_eq!(
+            dispatch(dir.path(), "diagnose", &json!({"id":"missing"})).unwrap_err(),
+            "Profile not found"
+        );
+    }
+
+    #[test]
+    fn waiting_for_the_interface_is_saved_on_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        dispatch(
+            dir.path(),
+            "create_static",
+            &json!({"id":"st", "name":"Static", "interfaceName":"en97", "cidrs":"192.0.2.0/24"}),
+        )
+        .unwrap();
+        let on = dispatch(
+            dir.path(),
+            "set_wait_for_interface",
+            &json!({"id":"st", "enabled":"true"}),
+        )
+        .unwrap();
+        assert_eq!(on[0]["waitForInterface"], true);
+        let off = dispatch(
+            dir.path(),
+            "set_wait_for_interface",
+            &json!({"id":"st", "enabled":"false"}),
+        )
+        .unwrap();
+        assert_eq!(off[0]["waitForInterface"], false);
+        assert_eq!(
+            dispatch(
+                dir.path(),
+                "set_wait_for_interface",
+                &json!({"id":"nope", "enabled":"true"})
+            )
+            .unwrap_err(),
+            "Profile not found"
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn auto_connect_is_saved_on_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        import_link(dir.path(), "a1");
+        let profiles = dispatch(
+            dir.path(),
+            "set_auto_connect",
+            &json!({"id":"a1", "enabled":"true"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["autoConnect"], true);
+        let profiles = dispatch(
+            dir.path(),
+            "set_auto_connect",
+            &json!({"id":"a1", "enabled":"false"}),
+        )
+        .unwrap();
+        assert_eq!(profiles[0]["autoConnect"], false);
+        assert!(dispatch(
+            dir.path(),
+            "set_auto_connect",
+            &json!({"id":"missing", "enabled":"true"}),
+        )
+        .is_err());
     }
 
     #[test]

@@ -418,7 +418,8 @@ export type RecoveryIssueKind =
   | "missingOwnedRoutes"
   | "orphanRouteOwnership"
   | "statusCheckFailed"
-  | "proxyOwnership";
+  | "proxyOwnership"
+  | "leftoverTunnel";
 
 export interface RecoveryIssue {
   kind: RecoveryIssueKind;
@@ -839,4 +840,19 @@ export interface NetDnsProbeResult {
   /** `NOERROR` | `NXDOMAIN` | `SERVFAIL` | … */
   status: string;
   rttMs: number;
+}
+
+/** The user's own NetBird daemon as the backend summarises it (no keys, no events). */
+export interface NetBirdState {
+  installed: boolean;
+  /** connected, connecting, disconnected, needsLogin, daemonStopped, notInstalled or unavailable. */
+  state: string;
+  ip?: string | null;
+  fqdn?: string | null;
+  version?: string | null;
+  managementUrl?: string | null;
+  peersConnected?: number;
+  peersTotal?: number;
+  sessionExpiresAt?: string | null;
+  networks?: string[];
 }

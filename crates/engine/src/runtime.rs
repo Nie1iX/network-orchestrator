@@ -4,18 +4,24 @@
 //! OpenVPN profiles are delegated to that helper over `daemon_protocol`; this
 //! crate only asks.
 use crate::privileged::Privileged;
+use crate::recovery;
+use crate::static_routes;
 use crate::tailscale::{self, Tailscale};
 use crate::vpn_backends;
 use crate::{helper_error, helper_socket};
 use net_manager_core::config_vault::ConfigVault;
 use net_manager_core::daemon_protocol::{
-    method, OpenVpnCredentials, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
+    method, CondRulesListResult, CondRulesPutParams, CondRulesPutResult, CondRulesRemoveParams,
+    CondRulesRemoveResult, ConditionalRouteRule, ConditionalRuleEntry, ConditionalRuleStatus,
+    NetIntentDelParams, NetIntentListResult, NetIntentResult, NetIntentSetParams, NetIntentView,
+    OpenVpnCredentials, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
     XrayProfileParams, XrayStatusResult,
 };
 use net_manager_core::helper_client::HelperClient;
 use net_manager_core::managed_xray;
 use net_manager_core::models::{
-    Profile, TunnelBackend, TunnelRole, TunnelState, TunnelStatus, XrayMode,
+    Profile, ProtocolHealth, RecoveryReport, TunnelBackend, TunnelRole, TunnelState, TunnelStatus,
+    XrayMode,
 };
 use net_manager_core::openvpn_config::CredentialRequirements;
 use net_manager_core::profile_import;
@@ -23,6 +29,7 @@ use net_manager_core::profiles::ProfileStore;
 use net_manager_core::system_proxy::SystemProxyManager;
 use net_manager_core::vpn::TunnelManager;
 use serde::Serialize;
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -147,6 +154,22 @@ fn openvpn_log_tail(privileged: &dyn Privileged) -> Option<String> {
     tail_of(&privileged.log_dir().join("openvpn.log"))
 }
 
+/// WireGuard runs inside the helper, which writes its events here.
+fn wireguard_log_tail(privileged: &dyn Privileged) -> Option<String> {
+    tail_of(&privileged.log_dir().join("wireguard.log"))
+}
+
+/// Where launchd collects the helper's own stderr.
+const HELPER_LOG: &str = "/var/log/network-orchestrator-helper.log";
+
+/// The helper's own log with public addresses masked; empty when the file is
+/// missing or unreadable.
+pub fn helper_log_text(path: &Path) -> String {
+    tail_of(path)
+        .map(|text| net_manager_core::log_sanitize::sanitize_log_text(&text))
+        .unwrap_or_default()
+}
+
 fn tail_of(path: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
@@ -195,7 +218,10 @@ fn tun_status(client: &dyn Privileged, profile: &Profile) -> TunnelStatus {
 
 /// Whether the privileged side, not this process, runs the profile.
 fn is_remote(profile: &Profile) -> bool {
-    is_tun(profile) || vpn_backends::is_wireguard(profile) || vpn_backends::is_openvpn(profile)
+    is_tun(profile)
+        || vpn_backends::is_wireguard(profile)
+        || vpn_backends::is_openvpn(profile)
+        || static_routes::is_static(profile)
 }
 
 /// State of a profile the privileged side runs; `None` for loopback Xray,
@@ -207,6 +233,8 @@ fn remote_status(privileged: &dyn Privileged, profile: &Profile) -> Option<Tunne
         Some(vpn_backends::wireguard_status(privileged, profile))
     } else if vpn_backends::is_openvpn(profile) {
         Some(vpn_backends::openvpn_status(privileged, profile))
+    } else if static_routes::is_static(profile) {
+        Some(static_routes::status(privileged, profile))
     } else {
         None
     }
@@ -226,6 +254,9 @@ fn running(session: &mut Session, privileged: &dyn Privileged, profile: &Profile
 
 /// Stop a profile the privileged side runs.
 fn stop_remote(privileged: &dyn Privileged, profile: &Profile) -> Result<(), String> {
+    if static_routes::is_static(profile) {
+        return static_routes::stop(privileged, profile);
+    }
     if vpn_backends::is_wireguard(profile) || vpn_backends::is_openvpn(profile) {
         return vpn_backends::stop(privileged, profile, helper_error);
     }
@@ -302,13 +333,25 @@ fn start_tun(engine: &Engine, profile: &Profile) -> Result<(), String> {
         .ok_or("Install Xray to start this connection")?;
     let config = net_manager_core::vpn::prepare_xray_config_base(profile)
         .map_err(|_| "The Xray configuration could not be prepared".to_string())?;
+    let geo = crate::geo::prepare(&engine.root, &executable, profile)?;
     // Validated here, as the user: a tun inbound would need privileges, and
     // the helper adds it only after this passes.
     if client.validates_locally() {
-        net_manager_core::vpn::run_xray_validation(&executable, &config)
-            .map_err(|_| "The Xray configuration is invalid".to_string())?;
+        net_manager_core::vpn::run_xray_validation_with_assets(
+            &executable,
+            &config,
+            geo.as_ref().map(|geo| geo.dir.as_path()),
+        )
+        .map_err(|_| "The Xray configuration is invalid".to_string())?;
     }
-    request_tunnel(client, &engine.root, profile, config, resolver_bypass())
+    request_tunnel(
+        client,
+        &engine.root,
+        profile,
+        config,
+        resolver_bypass(),
+        geo.map(|geo| geo.inline),
+    )
 }
 
 /// The `xray.connect` request. The config carries no tun inbound: the helper
@@ -319,6 +362,7 @@ fn request_tunnel(
     profile: &Profile,
     config: Vec<u8>,
     dns_bypass: Vec<String>,
+    geo_assets: Option<net_manager_core::daemon_protocol::XrayGeoAssets>,
 ) -> Result<(), String> {
     let params = XrayConnectParams {
         profile_id: profile.id.clone(),
@@ -339,7 +383,7 @@ fn request_tunnel(
             dns_bypass
         },
         interface_name: None,
-        geo_assets: None,
+        geo_assets,
         macos_data_root: Some(root.to_string_lossy().into_owned()),
         role: profile.tunnel_role,
     };
@@ -347,6 +391,20 @@ fn request_tunnel(
         .call::<_, XrayConnectResult>(method::XRAY_CONNECT, params)
         .map(|_| ())
         .map_err(helper_error)
+}
+
+/// The profile owning the system proxy when that connection is not running.
+fn stale_proxy_owner(
+    session: &mut Session,
+    privileged: &dyn Privileged,
+    profiles: &[Profile],
+) -> Option<String> {
+    let owner = session.proxy.ownership()?.profile_id.clone();
+    let live = profiles
+        .iter()
+        .find(|profile| profile.id == owner)
+        .is_some_and(|profile| running(session, privileged, profile));
+    (!live).then_some(owner)
 }
 
 fn snapshot_of(engine: &Engine, session: &mut Session, profiles: &[Profile]) -> Snapshot {
@@ -519,6 +577,8 @@ impl Engine {
             }
             let started = if is_tun(&profile) {
                 start_tun(self, &profile)
+            } else if static_routes::is_static(&profile) {
+                static_routes::start(privileged, &profile)
             } else if vpn_backends::is_wireguard(&profile) {
                 vpn_backends::start_wireguard(root, privileged, &profile)
             } else {
@@ -538,10 +598,14 @@ impl Engine {
             .ok_or("Install Xray to start this connection")?;
         free_listener_ports(root, store, &mut profile);
         let profile = &profile;
+        let geo = crate::geo::prepare(root, &executable, profile)?;
         with_session(root, |session| {
             session
                 .tunnels
                 .set_executable(TunnelBackend::Xray, Some(executable));
+            session
+                .tunnels
+                .set_xray_asset_dir(&profile.id, geo.map(|geo| geo.dir));
             session.tunnels.connect(profile).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     "The connection is already running".to_string()
@@ -631,6 +695,149 @@ impl Engine {
         })
     }
 
+    /// The profile that owns the per-user system proxy, if any.
+    pub fn system_proxy_owner(&self) -> Result<Option<String>, String> {
+        with_session(&self.root, |session| {
+            Ok(session
+                .proxy
+                .ownership()
+                .map(|owner| owner.profile_id.clone()))
+        })
+    }
+
+    /// Status, protocol health and system-proxy owner of a profile this
+    /// process runs itself (loopback Xray), for diagnostics.
+    pub fn loopback_state(
+        &self,
+        profile: &Profile,
+    ) -> Result<(TunnelStatus, ProtocolHealth, Option<String>), String> {
+        with_session(&self.root, |session| {
+            Ok((
+                session.tunnels.status(profile),
+                session.tunnels.protocol_health(profile),
+                session
+                    .proxy
+                    .ownership()
+                    .map(|owner| owner.profile_id.clone()),
+            ))
+        })
+    }
+
+    /// Turn a network interface on or off through the helper. The helper
+    /// refuses loopback and the devices of the connections it runs.
+    pub fn set_interface_state(&self, name: &str, up: bool) -> Result<(), String> {
+        use net_manager_core::daemon_protocol::{ErrorCode, LinkSetStateParams};
+        use net_manager_core::helper_client::HelperError;
+        self.privileged()
+            .call::<_, serde_json::Value>(
+                method::LINK_SET_STATE,
+                LinkSetStateParams {
+                    name: name.to_string(),
+                    up,
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| match error {
+                HelperError::Rejected(body) if body.code == ErrorCode::UnsupportedMethod => {
+                    "The installed helper is too old to turn interfaces on or off. Update it in Settings."
+                        .to_string()
+                }
+                other => helper_error(other),
+            })
+    }
+
+    /// The user's routing intents with their live status.
+    pub fn intents(&self) -> Result<Vec<NetIntentView>, String> {
+        self.intent_call::<_, NetIntentListResult>(method::NET_INTENT_LIST, json!({}))
+            .map(|list| list.intents)
+    }
+
+    /// Adds or replaces an intent; the helper applies it at once.
+    pub fn set_intent(&self, params: NetIntentSetParams) -> Result<(), String> {
+        self.intent_call::<_, NetIntentResult>(method::NET_INTENT_SET, params)
+            .map(|_| ())
+    }
+
+    pub fn delete_intent(&self, id: &str) -> Result<(), String> {
+        self.intent_call::<_, NetIntentResult>(
+            method::NET_INTENT_DEL,
+            NetIntentDelParams { id: id.to_string() },
+        )
+        .map(|_| ())
+    }
+
+    /// The user's conditional rules with their live status.
+    pub fn cond_rules(&self) -> Result<Vec<ConditionalRuleEntry>, String> {
+        self.intent_call::<_, CondRulesListResult>(method::COND_RULES_LIST, json!({}))
+            .map(|list| list.rules)
+    }
+
+    /// Adds or replaces a rule; the helper evaluates it at once.
+    pub fn put_cond_rule(
+        &self,
+        rule: ConditionalRouteRule,
+    ) -> Result<ConditionalRuleStatus, String> {
+        self.intent_call::<_, CondRulesPutResult>(
+            method::COND_RULES_PUT,
+            CondRulesPutParams { rule },
+        )
+        .map(|result| result.status)
+    }
+
+    pub fn remove_cond_rule(&self, id: &str) -> Result<bool, String> {
+        self.intent_call::<_, CondRulesRemoveResult>(
+            method::COND_RULES_REMOVE,
+            CondRulesRemoveParams {
+                rule_id: id.to_string(),
+            },
+        )
+        .map(|result| result.removed)
+    }
+
+    fn intent_call<P: serde::Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+        params: P,
+    ) -> Result<R, String> {
+        use net_manager_core::daemon_protocol::ErrorCode;
+        use net_manager_core::helper_client::HelperError;
+        self.privileged()
+            .call::<_, R>(name, params)
+            .map_err(|error| match error {
+                HelperError::Rejected(body) if body.code == ErrorCode::UnsupportedMethod => {
+                    "The installed helper is too old for routing intents. Update it in Settings."
+                        .to_string()
+                }
+                other => helper_error(other),
+            })
+    }
+
+    /// What a crashed session left behind: tunnels the helper still records
+    /// that no longer run, and a system proxy for a connection that is gone.
+    pub fn recovery_report(&self, profiles: &[Profile]) -> Result<RecoveryReport, String> {
+        with_session(&self.root, |session| {
+            let stale = stale_proxy_owner(session, self.privileged(), profiles);
+            Ok(recovery::report(self.privileged(), stale.as_deref()))
+        })
+    }
+
+    /// Undo what [`Engine::recovery_report`] lists and report what remains.
+    /// Running connections are never touched.
+    pub fn recovery_cleanup(&self, profiles: &[Profile]) -> Result<RecoveryReport, String> {
+        with_session(&self.root, |session| {
+            let helper = recovery::cleanup(self.privileged());
+            if let Some(owner) = stale_proxy_owner(session, self.privileged(), profiles) {
+                session
+                    .proxy
+                    .restore(&owner)
+                    .map_err(|_| "The previous system proxy could not be restored".to_string())?;
+            }
+            helper?;
+            let stale = stale_proxy_owner(session, self.privileged(), profiles);
+            Ok(recovery::report(self.privileged(), stale.as_deref()))
+        })
+    }
+
     /// Give the system proxy back and stop everything this app started.
     pub fn shutdown(&self, profiles: &[Profile]) -> Result<(), String> {
         with_session(&self.root, |session| {
@@ -645,6 +852,12 @@ impl Engine {
         })
     }
 
+    /// Tail of the privileged helper's own log (start-up recovery, device and
+    /// route errors).
+    pub fn helper_log(&self) -> String {
+        helper_log_text(Path::new(HELPER_LOG))
+    }
+
     /// Tail of the connection's log, empty when it has none.
     pub fn log(&self, profile: &Profile) -> Result<String, String> {
         if is_tun(profile) {
@@ -654,8 +867,7 @@ impl Engine {
             return Ok(openvpn_log_tail(self.privileged()).unwrap_or_default());
         }
         if vpn_backends::is_wireguard(profile) {
-            // The engine keeps no text log; the status carries its notices.
-            return Ok(String::new());
+            return Ok(wireguard_log_tail(self.privileged()).unwrap_or_default());
         }
         with_session(&self.root, |session| {
             Ok(session
@@ -735,7 +947,7 @@ impl Engine {
     }
 }
 
-fn download_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+pub(crate) fn download_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
     DOWNLOAD_RUNTIME
         .get_or_init(|| {
             tokio::runtime::Builder::new_current_thread()
@@ -830,6 +1042,7 @@ mod tests {
             &tun_profile(),
             config,
             vec!["192.168.1.1".into()],
+            None,
         )
         .unwrap();
         let request = seen.recv().unwrap();
@@ -841,6 +1054,30 @@ mod tests {
         let sent: Value = serde_json::from_str(text).unwrap();
         assert!(!net_manager_core::xray::has_tun_inbound(&sent));
         assert!(!text.contains("autoOutboundsInterface"));
+    }
+
+    #[test]
+    fn custom_geo_data_travels_with_the_tunnel_request_and_is_otherwise_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(dir.path(), |request| {
+            ResponseFrame::ok(request.id, json!({"status": status_json("running")}))
+        });
+        let geo = net_manager_core::daemon_protocol::XrayGeoAssets {
+            geoip_dat_b64: Some("Y3VzdG9t".into()),
+            geosite_dat_b64: None,
+        };
+        request_tunnel(
+            &client,
+            Path::new("/d"),
+            &tun_profile(),
+            b"{}".to_vec(),
+            vec![],
+            Some(geo),
+        )
+        .unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.params["geoAssets"]["geoipDatB64"], "Y3VzdG9t");
+        assert!(request.params["geoAssets"].get("geositeDatB64").is_none());
     }
 
     #[test]
@@ -859,6 +1096,7 @@ mod tests {
             &tun_profile(),
             b"{}".to_vec(),
             vec![],
+            None,
         )
         .unwrap_err();
         assert_eq!(error, "another VPN already owns the default route");
@@ -878,6 +1116,208 @@ mod tests {
             tun_status(&missing, &tun_profile()).state,
             TunnelState::Stopped
         );
+    }
+
+    #[test]
+    fn the_wireguard_log_is_read_from_the_helpers_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("wireguard.log"),
+            "2026/10/23 12:00:00 [Info] connected on utun5\n",
+        )
+        .unwrap();
+        let client = HelperClient::new(dir.path().join("h.sock"));
+        assert_eq!(
+            wireguard_log_tail(&client).as_deref(),
+            Some("2026/10/23 12:00:00 [Info] connected on utun5\n")
+        );
+        let empty = tempfile::tempdir().unwrap();
+        let none = HelperClient::new(empty.path().join("h.sock"));
+        assert!(wireguard_log_tail(&none).is_none());
+    }
+
+    #[test]
+    fn the_helper_log_masks_public_addresses_and_may_be_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("helper.log");
+        std::fs::write(&path, "dial 203.0.113.7:443 failed\nlocal 192.168.1.5 ok\n").unwrap();
+        let text = helper_log_text(&path);
+        assert!(
+            text.contains("203.0.x.x:443") && !text.contains("203.0.113.7"),
+            "{text}"
+        );
+        assert!(text.contains("192.168.1.5"));
+        assert_eq!(helper_log_text(&dir.path().join("missing.log")), "");
+    }
+
+    #[test]
+    fn switching_an_interface_sends_the_request_and_explains_an_old_helper() {
+        use net_manager_core::daemon_protocol::ErrorCode;
+        let dir = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(dir.path(), |request| {
+            ResponseFrame::ok(request.id, Value::Null)
+        });
+        let engine = Engine::with_privileged(dir.path(), Arc::new(client));
+        engine.set_interface_state("en7", false).unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.method, method::LINK_SET_STATE);
+        assert_eq!(request.params, json!({"name": "en7", "up": false}));
+
+        let other = tempfile::tempdir().unwrap();
+        let (old, _) = fake_helper(other.path(), |request| {
+            ResponseFrame::error(request.id, ErrorCode::UnsupportedMethod, "unsupported")
+        });
+        let engine = Engine::with_privileged(other.path(), Arc::new(old));
+        let error = engine.set_interface_state("en7", true).unwrap_err();
+        assert!(
+            error.contains("too old") && error.contains("Settings"),
+            "{error}"
+        );
+
+        let third = tempfile::tempdir().unwrap();
+        let (refusing, _) = fake_helper(third.path(), |request| {
+            ResponseFrame::error(request.id, ErrorCode::Conflict, "disconnect it instead")
+        });
+        let engine = Engine::with_privileged(third.path(), Arc::new(refusing));
+        assert_eq!(
+            engine.set_interface_state("utun9", false).unwrap_err(),
+            "disconnect it instead"
+        );
+    }
+
+    #[test]
+    fn intents_are_listed_set_and_deleted_through_the_helper() {
+        use net_manager_core::daemon_protocol::{ErrorCode, NetIntentPath};
+        let dir = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(dir.path(), |request| {
+            ResponseFrame::ok(
+                request.id,
+                json!({"intents": [{
+                    "id": "office", "destinations": ["10.0.0.0/8"],
+                    "path": {"kind": "direct"}, "metric": 100, "enabled": true,
+                    "status": "effective", "detail": "1 route(s) in place",
+                    "installed": 1, "wanted": 1
+                }]}),
+            )
+        });
+        let engine = Engine::with_privileged(dir.path(), Arc::new(client));
+        let list = engine.intents().unwrap();
+        assert_eq!(seen.recv().unwrap().method, method::NET_INTENT_LIST);
+        assert_eq!(list[0].id, "office");
+        assert_eq!((list[0].installed, list[0].wanted), (1, 1));
+
+        let other = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(other.path(), |request| {
+            ResponseFrame::ok(request.id, json!({"id": "office"}))
+        });
+        let engine = Engine::with_privileged(other.path(), Arc::new(client));
+        engine
+            .set_intent(NetIntentSetParams {
+                id: "office".into(),
+                destinations: vec!["10.0.0.0/8".into()],
+                path: NetIntentPath {
+                    gateway: None,
+                    kind: "interface".into(),
+                    interface: Some("utun5".into()),
+                },
+                metric: None,
+                enabled: None,
+            })
+            .unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.method, method::NET_INTENT_SET);
+        assert_eq!(request.params["id"], "office");
+        assert_eq!(request.params["path"]["interface"], "utun5");
+
+        let third = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(third.path(), |request| {
+            ResponseFrame::ok(request.id, json!({"id": "office"}))
+        });
+        Engine::with_privileged(third.path(), Arc::new(client))
+            .delete_intent("office")
+            .unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.method, method::NET_INTENT_DEL);
+        assert_eq!(request.params, json!({"id": "office"}));
+
+        let old = tempfile::tempdir().unwrap();
+        let (client, _) = fake_helper(old.path(), |request| {
+            ResponseFrame::error(request.id, ErrorCode::UnsupportedMethod, "unsupported")
+        });
+        let error = Engine::with_privileged(old.path(), Arc::new(client))
+            .intents()
+            .unwrap_err();
+        assert!(
+            error.contains("too old") && error.contains("Settings"),
+            "{error}"
+        );
+        let refused = tempfile::tempdir().unwrap();
+        let (client, _) = fake_helper(refused.path(), |request| {
+            ResponseFrame::error(
+                request.id,
+                ErrorCode::InvalidParams,
+                "Choose a network interface for this intent",
+            )
+        });
+        assert_eq!(
+            Engine::with_privileged(refused.path(), Arc::new(client))
+                .delete_intent("x")
+                .unwrap_err(),
+            "Choose a network interface for this intent"
+        );
+    }
+
+    #[test]
+    fn conditional_rules_go_through_the_helper_and_their_status_comes_back() {
+        use net_manager_core::daemon_protocol::{ConditionalRuleState, RouteCondition};
+        use net_manager_core::models::PolicyRoute;
+        let rule = ConditionalRouteRule {
+            id: "office".into(),
+            name: "Office".into(),
+            enabled: true,
+            condition: RouteCondition::InterfaceAddressIn {
+                prefix: "10.228.32.0/21".parse().unwrap(),
+            },
+            routes: vec![PolicyRoute {
+                destination: "10.99.0.0/24".parse().unwrap(),
+                metric: 5,
+                via: None,
+            }],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(dir.path(), |request| {
+            ResponseFrame::ok(
+                request.id,
+                json!({"stored": true, "status": {"state": "active", "matchedInterface": "en7", "appliedRoutes": 1}}),
+            )
+        });
+        let status = Engine::with_privileged(dir.path(), Arc::new(client))
+            .put_cond_rule(rule)
+            .unwrap();
+        let request = seen.recv().unwrap();
+        assert_eq!(request.method, method::COND_RULES_PUT);
+        assert_eq!(request.params["rule"]["id"], "office");
+        assert_eq!(status.state, ConditionalRuleState::Active);
+        assert_eq!(status.matched_interface.as_deref(), Some("en7"));
+
+        let other = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(other.path(), |request| {
+            ResponseFrame::ok(request.id, json!({"rules": []}))
+        });
+        assert!(Engine::with_privileged(other.path(), Arc::new(client))
+            .cond_rules()
+            .unwrap()
+            .is_empty());
+        assert_eq!(seen.recv().unwrap().method, method::COND_RULES_LIST);
+
+        let third = tempfile::tempdir().unwrap();
+        let (client, seen) = fake_helper(third.path(), |request| {
+            ResponseFrame::ok(request.id, json!({"removed": true}))
+        });
+        assert!(Engine::with_privileged(third.path(), Arc::new(client))
+            .remove_cond_rule("office")
+            .unwrap());
+        assert_eq!(seen.recv().unwrap().params, json!({"ruleId": "office"}));
     }
 
     #[test]

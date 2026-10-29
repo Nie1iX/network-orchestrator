@@ -22,16 +22,28 @@ export default function Modal({
   const dialogRef = useRef<HTMLDivElement>(null);
   const t = useT();
 
+  // Callers pass inline closures; keeping the latest one in a ref stops the
+  // effects below from re-running on every parent render, which used to
+  // re-focus the dialog and drop the focused input / open <select>.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onCloseRef.current();
     };
     window.addEventListener("keydown", onKey);
-    // Move focus into the dialog so keyboard users aren't stranded behind it.
-    dialogRef.current?.focus();
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    // Move focus into the dialog so keyboard users aren't stranded behind it,
+    // unless an autoFocus field inside already took it.
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.contains(document.activeElement)) dialog.focus();
+  }, [open]);
 
   if (!open) return null;
   return (

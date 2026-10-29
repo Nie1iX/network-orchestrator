@@ -41,6 +41,10 @@ pub struct OpenVpnPlan {
     asset_bytes: BTreeMap<String, Vec<u8>>,
     pub credentials: Option<OpenVpnCredentials>,
     pub routes: Vec<PolicyRoute>,
+    /// A secondary tunnel carries only `routes`: pushed routes and gateway
+    /// redirects are ignored, and DNS is scoped to `dns_domains`.
+    pub role: net_manager_core::models::TunnelRole,
+    pub dns_domains: Vec<String>,
 }
 
 impl OpenVpnPlan {
@@ -90,6 +94,8 @@ pub fn prepare_openvpn(
     {
         return Err(rejected());
     }
+    net_manager_core::models::validate_secondary(params.role, &params.routes, &params.dns_domains)
+        .map_err(|_| rejected())?;
     let (name, fallback_name) = crate::link_names::tunnel_link_names(
         "ovpn-",
         uid,
@@ -146,6 +152,8 @@ pub fn prepare_openvpn(
         asset_bytes,
         credentials,
         routes: params.routes,
+        role: params.role,
+        dns_domains: params.dns_domains,
     })
 }
 
@@ -209,6 +217,29 @@ mod tests {
                 .unwrap()
                 .name
         );
+    }
+
+    #[test]
+    fn secondary_connections_need_their_own_networks_and_never_take_all_traffic() {
+        use net_manager_core::models::TunnelRole;
+        let route = |destination: &str| PolicyRoute {
+            destination: destination.parse().unwrap(),
+            metric: 5,
+            via: None,
+        };
+        let secondary = |routes: Vec<PolicyRoute>, domains: Vec<String>| {
+            let mut input = params("client\nremote vpn.example 1194\n");
+            input.role = TunnelRole::Secondary;
+            input.routes = routes;
+            input.dns_domains = domains;
+            prepare_openvpn(1000, input)
+        };
+        assert!(secondary(vec![], vec![]).is_err());
+        assert!(secondary(vec![route("0.0.0.0/1")], vec![]).is_err());
+        assert!(secondary(vec![route("10.0.0.0/8")], vec!["bad..name".into()]).is_err());
+        let plan = secondary(vec![route("10.0.0.0/8")], vec!["corp.example".into()]).unwrap();
+        assert_eq!(plan.role, TunnelRole::Secondary);
+        assert_eq!(plan.dns_domains, vec!["corp.example"]);
     }
 
     #[test]
