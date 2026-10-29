@@ -12,9 +12,9 @@ use std::path::PathBuf;
 mod diagnose;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod geo;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", feature = "linux-engine"))]
 pub mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", feature = "linux-engine"))]
 pub mod linux_engine;
 #[cfg(unix)]
 pub mod privileged;

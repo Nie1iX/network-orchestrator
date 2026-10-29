@@ -3,6 +3,10 @@ name = "net-manager-engine"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Builds the Linux daemon client on other hosts so its callers can be tested there.
+linux-engine = []
+
 [dependencies]
 base64 = "0.22"
 net-manager-core = { path = "../core" }

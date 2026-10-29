@@ -1,11 +1,39 @@
 //! `netorch`: one command for VPN profiles, tunnels and routing.
-//! Plan: docs/plans/2026-10-15-19-netorch-cli.md.
+//! Plans: docs/plans/2026-10-15-19-netorch-cli.md (macOS),
+//! docs/plans/2026-10-28-linux-netorch-cli.md (Linux).
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(any(all(target_os = "macos", target_arch = "aarch64"), target_os = "linux")))]
 fn main() {
-    eprintln!("netorch currently runs on macOS (Apple Silicon) only");
+    eprintln!("netorch runs on macOS (Apple Silicon) and Linux only");
     std::process::exit(1);
 }
+
+#[cfg(target_os = "linux")]
+fn main() -> std::process::ExitCode {
+    linux::main()
+}
+
+#[cfg(any(target_os = "linux", all(target_os = "macos", test)))]
+mod linux;
+// Used by both clients.
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    target_os = "linux",
+    all(target_os = "macos", test)
+))]
+mod prompt;
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    target_os = "linux",
+    all(target_os = "macos", test)
+))]
+mod render;
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    target_os = "linux",
+    all(target_os = "macos", test)
+))]
+mod target;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod args;
@@ -20,10 +48,6 @@ mod library;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod lock;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod prompt;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod render;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod route;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runstate;
@@ -31,8 +55,6 @@ mod runstate;
 mod service;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod system;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod target;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() -> std::process::ExitCode {

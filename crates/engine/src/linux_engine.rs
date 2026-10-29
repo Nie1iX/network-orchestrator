@@ -35,6 +35,15 @@ pub fn daemon_socket() -> PathBuf {
         .unwrap_or_else(|| DEFAULT_SOCKET_PATH.into())
 }
 
+/// What a user sees when polkit refuses because no agent can ask them.
+pub const POLKIT_DENIED: &str =
+    "Authorization was denied by polkit. Check that a polkit authentication agent is running.";
+
+/// Whether a message from [`daemon_error`] means "no polkit agent answered".
+pub fn is_polkit_denied(message: &str) -> bool {
+    message.contains(POLKIT_DENIED)
+}
+
 /// The message a user sees for a daemon failure.
 pub fn daemon_error(error: HelperError) -> String {
     match error {
@@ -43,10 +52,7 @@ pub fn daemon_error(error: HelperError) -> String {
                 .into()
         }
         HelperError::Rejected(body) => match body.code {
-            ErrorCode::NotAuthorized => {
-                "Authorization was denied by polkit. Check that a polkit authentication agent is running."
-                    .into()
-            }
+            ErrorCode::NotAuthorized => POLKIT_DENIED.into(),
             ErrorCode::AuthorizationDismissed => {
                 "The polkit authorization dialog was dismissed.".into()
             }

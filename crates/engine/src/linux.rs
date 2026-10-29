@@ -381,15 +381,12 @@ pub fn finish_openvpn_connect(status: OpenVpnStatusResult, notice: Option<&str>)
     status
 }
 
-/// Builds the daemon request; the notice reports a credential migration.
-pub fn prepare_linux_openvpn_request(
+/// The managed OpenVPN config and its assets, checked to be the profile's own
+/// regular files.
+fn read_openvpn_inputs(
     vault: &net_manager_core::config_vault::ConfigVault,
-    credential_store: &dyn CredentialSource,
     profile: &Profile,
-    supplied_credentials: Option<OpenVpnCredentials>,
-    routes: Vec<PolicyRoute>,
-    method_name: &str,
-) -> Result<(OpenVpnConnectRequest, Option<&'static str>), String> {
+) -> Result<(String, std::collections::BTreeMap<String, Vec<u8>>), String> {
     if !vault.is_managed_profile_path(&profile.id, &profile.config_path) {
         return Err("OpenVPN profile must use its own managed config on Linux".into());
     }
@@ -434,6 +431,28 @@ pub fn prepare_linux_openvpn_request(
             raw_assets.insert(format!("assets/{name}"), bytes);
         }
     }
+    Ok((config, raw_assets))
+}
+
+/// What the profile's OpenVPN config asks the user for.
+pub fn openvpn_requirements(
+    vault: &net_manager_core::config_vault::ConfigVault,
+    profile: &Profile,
+) -> Result<OpenVpnCredentialRequirements, String> {
+    let (config, assets) = read_openvpn_inputs(vault, profile)?;
+    Ok(openvpn_credential_requirements(&config, &assets))
+}
+
+/// Builds the daemon request; the notice reports a credential migration.
+pub fn prepare_linux_openvpn_request(
+    vault: &net_manager_core::config_vault::ConfigVault,
+    credential_store: &dyn CredentialSource,
+    profile: &Profile,
+    supplied_credentials: Option<OpenVpnCredentials>,
+    routes: Vec<PolicyRoute>,
+    method_name: &str,
+) -> Result<(OpenVpnConnectRequest, Option<&'static str>), String> {
+    let (config, raw_assets) = read_openvpn_inputs(vault, profile)?;
     let requirements = openvpn_credential_requirements(&config, &raw_assets);
     let mut notice = None;
     let credentials = if supplied_credentials.is_some() {

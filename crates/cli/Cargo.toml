@@ -12,14 +12,17 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 libc = "0.2"
-plist = "1"
 net-manager-core = { path = "../core" }
 net-manager-engine = { path = "../engine" }
-net-manager-macos-bridge = { path = "../macos-bridge" }
-network-orchestrator-macos-helper = { path = "../macos-helper" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+net-manager-macos-bridge = { path = "../macos-bridge" }
+network-orchestrator-macos-helper = { path = "../macos-helper" }
 
 [dev-dependencies]
+net-manager-engine = { path = "../engine", features = ["linux-engine"] }
 tempfile = "3"
