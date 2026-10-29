@@ -1563,7 +1563,7 @@ mod tests {
 
         let spawner = exe.clone();
         let mut child = std::thread::spawn(move || {
-            spawn_xray(&spawner, b"{}", Stdio::null(), Stdio::null()).unwrap()
+            spawn_xray(&spawner, b"{}", None, Stdio::null(), Stdio::null()).unwrap()
         })
         .join()
         .unwrap();
