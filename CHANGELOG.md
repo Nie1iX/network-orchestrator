@@ -8,8 +8,74 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-29
+
 ### Added
 
+- macOS: "Connect when the app starts" per connection. The flagged connections
+  start once at launch, in saved order; a failure is reported without
+  blocking the others.
+- macOS: a menu bar item with the number of active connections, a switch per
+  connection, "Disconnect all" and a shortcut to the window; it can be hidden
+  in Settings. The state keeps updating with the window closed.
+- macOS: at launch the app reports what a crashed session left behind
+  (routes, DNS, a leftover tunnel) and offers a cleanup.
+- macOS: a Monitor page (throughput per interface) and a Logs page (app events,
+  each connection's log, the helper log, NetBird, import). WireGuard now
+  writes a log through the helper.
+- macOS: a Diagnostics sheet for a connection (path to the endpoint, static
+  analysis, listeners, system proxy, helper, tunnel state), with checks shared
+  in `net-manager-core::diagnostics`.
+- macOS: routing intents. The helper keeps "these networks go this way" (via
+  a named interface, or direct through the physical uplink) in a root-only
+  store, installs the routes, checks them every 2 seconds on a network change
+  and in full every 10 seconds, and deletes only routes it installed that
+  still match. A route someone else owns is reported as a conflict, never
+  replaced. Limits per user: 64 intents, 32 rules, 256 networks in total.
+  New "Intents" tab on the Routes page; routes that capture the whole
+  default route are allowed with a warning, as on Linux.
+- macOS: conditional routes. A rule turns its routes on while a network
+  condition holds (an interface address inside a given network) and off
+  afterwards. "Conditions" tab on the Routes page.
+- macOS: the intent doctor (a port of the Linux one): suggestions for
+  endpoints a tunnel would loop back into and for destinations that skip the
+  intended path, shown as cards on the Intents tab. On macOS a foreign
+  conflicting route is only reported.
+- macOS: static-route profiles (the `none` backend) connect. Connecting
+  creates the profile's intents; disconnecting or quitting the app removes
+  them. By default connecting fails while the interface is missing; "Wait for
+  the interface" arms the routes in advance. Works from the app and from
+  `netorch up` / `down`.
+- macOS: app modes (Combined, Orchestrator, Manager) in Settings. Orchestrator
+  does not start managed backends; static routes stay available and a running
+  tunnel can be stopped.
+- macOS: a network interface can be turned on or off from its card, through
+  the helper, with a confirmation that is stricter for the interface carrying
+  the default route. Loopback and tunnel devices owned by the helper are
+  refused.
+- macOS: the Network page gets a DNS tab: the resolvers the system uses, the
+  server a name would go to (and whether it is a fake IP), and a real
+  A/AAAA query to that server.
+- `net-manager-core`: `route_intents`, `route_conditions`, `intent_doctor`,
+  `dns_diag`, `dns_probe`.
+- macOS: static-route profiles can send a route through its own gateway
+  (`10.1.0.0/16 via 10.0.0.1`). Each gateway is kept by the helper as its own
+  routing intent and waits until the gateway is on a connected network. A
+  profile whose routes all name a gateway needs no interface.
+- macOS: "Endpoint bypass" on a static-route profile (IP addresses or host
+  names). They stay on the physical uplink while the routes through another
+  client's tunnel are active; names are resolved when connecting, the bypass
+  is applied first and removed last, and a failure part way leaves nothing
+  behind.
+- macOS: custom `geoip.dat` / `geosite.dat` for Xray, by https address in the
+  routing rules editor or from a Happ/Incy export (which used to warn that
+  they were ignored). The app downloads and caches them (https only, size
+  limit, sha256 sidecar check, stale copy kept if a refresh fails) and lays
+  them over the managed Xray's files. A tunnel receives them inline and the
+  helper serves them from a root-owned directory that is removed with the
+  tunnel; it never follows a symlink to read the managed files.
+- `net-manager-core`: `geo_assets` (the download cache, shared with the
+  clients; `src-tauri` keeps its own copy for now).
 - Linux: `netorch`, a command line client of the network daemon. `ls`,
   `status`, `up`, `down` and `completions` connect the WireGuard, OpenVPN and
   Xray TUN profiles saved in the app; `add` (and `up <link|url|file>`) saves a
@@ -43,12 +109,21 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
 
 ### Changed
 
+- The privileged helper advertises intent and interface capabilities only when
+  they are configured, and the app asks the user to update an older helper.
+- Intent identifiers may be up to 64 characters (was 48) so a profile's
+  identifier fits with the `-bypass` and `-gwN` suffixes. Static profiles
+  now own several intents: a profile's routes, one per gateway, and its bypass.
+- The `net.intent.set` path accepts `kind: "gateway"` with a `gateway`
+  address. Existing intents and the Linux daemon are unaffected.
 - Profile import by file (`import_configs_into`, `detect_backend`,
   `generate_import_id`) moved from the Tauri app into `net-manager-core`; the
   app uses the shared code. No behavior change.
 
 ### Fixed
 
+- macOS: the recovery cleanup no longer stops a tunnel that is running;
+  Xray, WireGuard and OpenVPN leave a live session alone.
 - Linux: subscriptions from panels that serve whole Xray configs (Remnawave,
   Geodema) can run as a system-wide Xray TUN again. The daemon rejected every
   such server ("unsupported generated Xray TUN config") because of the
@@ -60,106 +135,6 @@ See [`docs/versioning.md`](docs/versioning.md) for the release policy.
   to choose a specific server. 92 of the 93 servers of a real subscription
   now pass the daemon's validation.
 - `net-manager-core` tests compile on Linux again (`spawn_xray` test call).
-
-<!-- The three sections below are a proposed split of the work since v0.9.1.
-     Pick the version numbers, set the dates and move them out of here. -->
-
-## [0.12.0] - Proposed
-
-### Added
-
-- macOS: static-route profiles can send a route through its own gateway
-  (`10.1.0.0/16 via 10.0.0.1`). Each gateway is kept by the helper as its own
-  routing intent and waits until the gateway is on a connected network. A
-  profile whose routes all name a gateway needs no interface.
-- macOS: "Endpoint bypass" on a static-route profile (IP addresses or host
-  names). They stay on the physical uplink while the routes through another
-  client's tunnel are active; names are resolved when connecting, the bypass
-  is applied first and removed last, and a failure part way leaves nothing
-  behind.
-- macOS: custom `geoip.dat` / `geosite.dat` for Xray, by https address in the
-  routing rules editor or from a Happ/Incy export (which used to warn that
-  they were ignored). The app downloads and caches them (https only, size
-  limit, sha256 sidecar check, stale copy kept if a refresh fails) and lays
-  them over the managed Xray's files. A tunnel receives them inline and the
-  helper serves them from a root-owned directory that is removed with the
-  tunnel; it never follows a symlink to read the managed files.
-- `net-manager-core`: `geo_assets` (the download cache, shared with the
-  clients; `src-tauri` keeps its own copy for now).
-
-### Changed
-
-- Intent identifiers may be up to 64 characters (was 48) so a profile's
-  identifier fits with the `-bypass` and `-gwN` suffixes. Static profiles
-  now own several intents: a profile's routes, one per gateway, and its bypass.
-- The `net.intent.set` path accepts `kind: "gateway"` with a `gateway`
-  address. Existing intents and the Linux daemon are unaffected.
-
-## [0.11.0] - Proposed
-
-### Added
-
-- macOS: routing intents. The helper keeps "these networks go this way" (via
-  a named interface, or direct through the physical uplink) in a root-only
-  store, installs the routes, checks them every 2 seconds on a network change
-  and in full every 10 seconds, and deletes only routes it installed that
-  still match. A route someone else owns is reported as a conflict, never
-  replaced. Limits per user: 64 intents, 32 rules, 256 networks in total.
-  New "Intents" tab on the Routes page; routes that capture the whole
-  default route are allowed with a warning, as on Linux.
-- macOS: conditional routes. A rule turns its routes on while a network
-  condition holds (an interface address inside a given network) and off
-  afterwards. "Conditions" tab on the Routes page.
-- macOS: the intent doctor (a port of the Linux one): suggestions for
-  endpoints a tunnel would loop back into and for destinations that skip the
-  intended path, shown as cards on the Intents tab. On macOS a foreign
-  conflicting route is only reported.
-- macOS: static-route profiles (the `none` backend) connect. Connecting
-  creates the profile's intents; disconnecting or quitting the app removes
-  them. By default connecting fails while the interface is missing; "Wait for
-  the interface" arms the routes in advance. Works from the app and from
-  `netorch up` / `down`.
-- macOS: app modes (Combined, Orchestrator, Manager) in Settings. Orchestrator
-  does not start managed backends; static routes stay available and a running
-  tunnel can be stopped.
-- macOS: a network interface can be turned on or off from its card, through
-  the helper, with a confirmation that is stricter for the interface carrying
-  the default route. Loopback and tunnel devices owned by the helper are
-  refused.
-- macOS: the Network page gets a DNS tab: the resolvers the system uses, the
-  server a name would go to (and whether it is a fake IP), and a real
-  A/AAAA query to that server.
-- `net-manager-core`: `route_intents`, `route_conditions`, `intent_doctor`,
-  `dns_diag`, `dns_probe`.
-
-### Changed
-
-- The privileged helper advertises intent and interface capabilities only when
-  they are configured, and the app asks the user to update an older helper.
-
-## [0.10.0] - Proposed
-
-### Added
-
-- macOS: "Connect when the app starts" per connection. The flagged connections
-  start once at launch, in saved order; a failure is reported without
-  blocking the others.
-- macOS: a menu bar item with the number of active connections, a switch per
-  connection, "Disconnect all" and a shortcut to the window; it can be hidden
-  in Settings. The state keeps updating with the window closed.
-- macOS: at launch the app reports what a crashed session left behind
-  (routes, DNS, a leftover tunnel) and offers a cleanup.
-- macOS: a Monitor page (throughput per interface) and a Logs page (app events,
-  each connection's log, the helper log, NetBird, import). WireGuard now
-  writes a log through the helper.
-- macOS: a Diagnostics sheet for a connection (path to the endpoint, static
-  analysis, listeners, system proxy, helper, tunnel state), with checks shared
-  in `net-manager-core::diagnostics`.
-
-### Fixed
-
-- macOS: the recovery cleanup no longer stops a tunnel that is running;
-  Xray, WireGuard and OpenVPN leave a live session alone.
 
 ### Documentation
 
