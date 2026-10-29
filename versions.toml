@@ -1,0 +1,19 @@
+# Release lines. One version per line; `python3 scripts/versions.py sync`
+# writes them into the crates and the Tauri configs, `check` finds drift.
+# Rules and the meaning of each line: docs/versioning.md.
+
+[core]
+# net-manager-core, net-manager-engine: the logic every product shares.
+version = "0.10.0"
+
+[macos]
+# The macOS app, its helper and bridge, and netorch for macOS.
+version = "0.10.0"
+
+[linux]
+# The Linux app, the network daemon and netorch for Linux.
+version = "0.10.0"
+
+[windows]
+# The Windows app.
+version = "0.10.0"

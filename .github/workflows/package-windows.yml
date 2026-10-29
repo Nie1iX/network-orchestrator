@@ -30,6 +30,8 @@ jobs:
           rustup component add clippy rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: npm ci
+      - run: python scripts/versions.py check
+      - run: python -m unittest scripts/test_versions.py
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace
       - run: cargo check --workspace --all-targets

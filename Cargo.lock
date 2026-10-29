@@ -2844,7 +2844,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-app"
-version = "0.10.0"
+version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "dbus-secret-service",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-cli"
-version = "0.10.0"
+version = "0.0.0"
 dependencies = [
  "clap",
  "clap_complete",

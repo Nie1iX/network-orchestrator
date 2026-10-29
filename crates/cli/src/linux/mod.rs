@@ -35,7 +35,15 @@ pub fn main() -> ExitCode {
         .clone()
         .map(Ok)
         .unwrap_or_else(ctx::default_root)
-        .and_then(|root| ctx::Ctx::new(root, net_manager_engine::linux_engine::LinuxEngine::new()))
+        .and_then(|root| {
+            ctx::Ctx::new(
+                root,
+                net_manager_engine::linux_engine::LinuxEngine::new(format!(
+                    "netorch/{}",
+                    compat::CLIENT_VERSION
+                )),
+            )
+        })
         .and_then(|ctx| run(&ctx, cli.command, json));
     match result {
         Ok((value, text)) => {

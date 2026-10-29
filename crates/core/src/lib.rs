@@ -1,3 +1,6 @@
+/// Version of the shared core (its own release line, see `versions.toml`).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod analysis;
 pub mod backend_settings;
 pub mod cidr_bulk;

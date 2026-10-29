@@ -67,17 +67,11 @@ pub struct LinuxEngine {
     privileged: Arc<dyn Privileged>,
 }
 
-impl Default for LinuxEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl LinuxEngine {
-    /// Engine that talks to the system daemon over its socket.
-    pub fn new() -> Self {
-        let client = HelperClient::new(daemon_socket())
-            .with_client_name(format!("netorch/{}", env!("CARGO_PKG_VERSION")));
+    /// Engine that talks to the system daemon over its socket; `client_name`
+    /// (for example `netorch/0.10.0`) is what the daemon logs for this client.
+    pub fn new(client_name: impl Into<String>) -> Self {
+        let client = HelperClient::new(daemon_socket()).with_client_name(client_name);
         Self::with_privileged(Arc::new(client))
     }
 

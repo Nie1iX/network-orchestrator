@@ -8,7 +8,7 @@ use net_manager_engine::linux_engine::daemon_error;
 use serde_json::json;
 
 /// The version of this netorch.
-pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const CLIENT_VERSION: &str = env!("NETORCH_VERSION");
 
 /// Refuses an incompatible daemon; prints a warning once for an older one.
 pub fn guard(ctx: &Ctx) -> Result<(), String> {
@@ -26,11 +26,13 @@ pub fn guard(ctx: &Ctx) -> Result<(), String> {
 pub fn version(ctx: &Ctx) -> Result<Output, String> {
     let mut value = json!({
         "netorch": CLIENT_VERSION,
+        "core": net_manager_core::VERSION,
         "protocol": net_manager_core::daemon_protocol::PROTOCOL_VERSION,
         "daemon": null,
     });
     let mut text = format!(
-        "netorch {CLIENT_VERSION} (daemon protocol {})",
+        "netorch {CLIENT_VERSION} (core {}, daemon protocol {})",
+        net_manager_core::VERSION,
         net_manager_core::daemon_protocol::PROTOCOL_VERSION
     );
     match ctx.engine.privileged().hello() {
