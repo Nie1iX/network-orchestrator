@@ -174,6 +174,9 @@ pub fn prepare_linux_xray_tun_params(
             .map_err(|_| "cannot read managed Xray config".to_string())?;
     let base: serde_json::Value =
         serde_json::from_slice(&raw).map_err(|_| "managed Xray config is invalid".to_string())?;
+    // Subscription panels that serve whole Xray configs carry sections the
+    // daemon does not run; reduce them to the server itself.
+    let base = net_manager_core::xray::tun_compatible_config(&base).map_err(str::to_string)?;
     let inbounds = base["inbounds"]
         .as_array()
         .ok_or_else(|| "unsupported Xray TUN config".to_string())?;
