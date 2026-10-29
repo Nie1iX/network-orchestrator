@@ -5,9 +5,12 @@ use net_manager_core::config_security;
 use net_manager_core::config_vault::{ConfigImport, ConfigVault};
 use net_manager_core::models::*;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
 
@@ -547,124 +550,9 @@ pub(crate) async fn save_wireguard_profile(
     Ok(redact_profiles_for_ipc(doc.profiles))
 }
 
-/// Detect a tunnel backend for `path` by extension, with a small content sniff
-/// for the ambiguous `.conf` case (WireGuard and OpenVPN both use it).
-/// Returns `None` when the extension is unrecognized and no `default` hint is
-/// given.
-pub(crate) fn detect_backend(path: &Path, default: Option<TunnelBackend>) -> Option<TunnelBackend> {
-    let lower = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    if lower.ends_with(".ovpn") {
-        return Some(TunnelBackend::OpenVpn);
-    }
-    if lower.ends_with(".json") {
-        return Some(TunnelBackend::Xray);
-    }
-    if lower.ends_with(".conf.dpapi") {
-        return Some(TunnelBackend::WireGuard);
-    }
-    if lower.ends_with(".conf") {
-        if let Ok(bytes) = fs::read(path) {
-            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
-            if head.contains("[Interface]") {
-                return Some(TunnelBackend::WireGuard);
-            }
-            for line in head.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("dev ")
-                    || trimmed.starts_with("proto ")
-                    || trimmed == "client"
-                    || trimmed.starts_with("remote ")
-                {
-                    return Some(TunnelBackend::OpenVpn);
-                }
-            }
-        }
-        return default;
-    }
-    default
-}
-
-fn backend_label(backend: TunnelBackend) -> &'static str {
-    match backend {
-        TunnelBackend::None => "Static routes",
-        TunnelBackend::WireGuard => "WireGuard",
-        TunnelBackend::OpenVpn => "OpenVPN",
-        TunnelBackend::Xray => "Xray",
-    }
-}
-
-fn generate_import_id(index: usize) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("import-{nanos:x}-{index}")
-}
-
-/// Pure, testable core of `import_configs_batch`: imports each path into the
-/// vault and upserts a profile, collecting per-file errors instead of aborting.
-pub(crate) fn import_configs_into(
-    vault: &ConfigVault,
-    store: &net_manager_core::profiles::ProfileStore,
-    paths: &[String],
-    default_backend: Option<TunnelBackend>,
-) -> std::io::Result<BatchImportResult> {
-    let mut errors: Vec<BatchImportError> = Vec::new();
-    for (index, raw) in paths.iter().enumerate() {
-        let path = PathBuf::from(raw);
-        let backend = match detect_backend(&path, default_backend) {
-            Some(b) => b,
-            None => {
-                errors.push(BatchImportError {
-                    path: raw.clone(),
-                    error: "could not determine backend from extension; set a default backend"
-                        .into(),
-                });
-                continue;
-            }
-        };
-        let id = generate_import_id(index);
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("{} {}", backend_label(backend), index + 1));
-        let import = match vault.import(&id, backend, &path) {
-            Ok(import) => import,
-            Err(err) => {
-                errors.push(BatchImportError {
-                    path: raw.clone(),
-                    error: err.to_string(),
-                });
-                continue;
-            }
-        };
-        let config_path = import.config_path.clone();
-        let profile = Profile {
-            id: id.clone(),
-            name,
-            backend,
-            config_path,
-            routes: import.routes,
-            xray_mode: XrayMode::platform_default(),
-            ..Default::default()
-        };
-        if let Err(err) = store.upsert(profile) {
-            let _ = vault.remove_revision_for_config(&import.config_path);
-            errors.push(BatchImportError {
-                path: raw.clone(),
-                error: err.to_string(),
-            });
-        }
-    }
-    let profiles = store.load()?.profiles;
-    Ok(BatchImportResult { profiles, errors })
-}
+#[cfg(test)]
+pub(crate) use net_manager_core::profile_import::detect_backend;
+pub(crate) use net_manager_core::profile_import::{generate_import_id, import_configs_into};
 
 #[tauri::command]
 pub(crate) async fn import_share_link(
