@@ -154,12 +154,38 @@ Build local Linux packages without installing them on the host:
 
 ```bash
 scripts/build-linux-deb.sh
+scripts/build-linux-deb.sh cli  # CLI installer only; no GUI/WebKit build
 scripts/build-linux-deb.sh rpm
 scripts/build-linux-arch.sh
 ```
 
-The unsigned `.deb` and `.rpm` are under `target/release/bundle/{deb,rpm}/`;
-the Arch package is under `target/arch/`. The Arch build uses a disposable Docker container.
+For Debian/Ubuntu, distribute the single-file installers under
+`target/release/installers/`: `netorch-<version>-amd64.run` for the CLI and
+`network-orchestrator-<version>-amd64.run` for the GUI. Each contains its client
+and the shared daemon; users do not download a daemon package separately.
+
+```bash
+sh ./netorch-0.10.1-amd64.run --check  # preview installed versions and planned actions
+sudo sh ./netorch-0.10.1-amd64.run    # install CLI or update an older installation
+# Later, add the GUI using the same daemon:
+sudo sh ./network-orchestrator-0.10.1-amd64.run
+```
+
+Run the installer from a newer release to update. It compares installed Debian
+package versions, skips equal versions, updates older packages and refuses client
+downgrades. A newer daemon patch from the same release line is preserved; a daemon
+from a newer release line requires a newer client installer. Updating the daemon
+restarts its service and can interrupt connections. Adding another client with an
+up-to-date daemon does not restart it. `--yes` accepts the APT plan without prompting.
+The client and daemon are bundled; missing distribution dependencies may need
+internet access and current APT indexes. No application repository is required.
+When migrating from the former combined GUI package (0.10.0 or earlier), run the
+new GUI installer first to transfer the daemon files, then add the CLI.
+
+The CLI and daemon `.deb` files remain under `target/release/packages/`, the GUI
+`.deb` and `.rpm` under `target/release/bundle/{deb,rpm}/`, and the Arch package
+under `target/arch/`. RPM and Arch still use their existing packaging. The Arch
+build uses a disposable Docker container.
 
 ## Development
 

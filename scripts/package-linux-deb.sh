@@ -17,6 +17,7 @@
 #   CLI_BIN    [target/release/netorch]
 #   XRAY_DIR   [target/release/xray-package/v26.3.27]
 #   OUT_DIR    [target/release/packages]
+#   INSTALLER_OUT_DIR [target/release/installers]
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -109,5 +110,10 @@ control netorch "network-orchestrator-daemon (>= ${LINE}.0)" "" "" \
  Xray) from a terminal or a script, without the graphical app. It talks to the
  network daemon, which is installed as a dependency."
 dpkg-deb --root-owner-group --build "$C" "$OUT_DIR/netorch_${DEB_VERSION}_${ARCH}.deb" >/dev/null
+
+python3 scripts/package-linux-installers.py \
+    --daemon "$OUT_DIR/network-orchestrator-daemon_${DEB_VERSION}_${ARCH}.deb" \
+    --cli "$OUT_DIR/netorch_${DEB_VERSION}_${ARCH}.deb" \
+    --output-dir "${INSTALLER_OUT_DIR:-target/release/installers}"
 
 ls -l "$OUT_DIR"/*.deb

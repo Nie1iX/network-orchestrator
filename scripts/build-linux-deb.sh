@@ -1,20 +1,22 @@
 #!/bin/sh
 # Build local packages without installing or starting any host service.
 #
-#   deb (default): three packages in target/release/packages and the app's
-#                  bundle in target/release/bundle/deb:
-#                    network-orchestrator-daemon  the daemon, systemd unit, polkit, Xray
-#                    netorch                      the command line client
-#                    network-orchestrator         the app (depends on the daemon)
-#                  Install them together with
-#                    apt install ./network-orchestrator-daemon_*.deb ./netorch_*.deb ./network-orchestrator_*.deb
-#                  or only the daemon and netorch on a server without a desktop.
+#   deb (default): CLI and GUI .run installers in target/release/installers.
+#                  Each includes its client and the shared daemon package.
+#                  The underlying .debs remain available separately.
+#   cli:           only the CLI installer/packages; no GUI or WebKit build.
 #   rpm:           the former single package (app and daemon); the split into
 #                  separate rpm packages is not done yet.
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
+KIND="${1:-deb}"
+case "$KIND" in
+    deb|cli|rpm) ;;
+    *) echo "usage: $0 [deb|cli|rpm]" >&2; exit 2 ;;
+esac
+[ "$#" -le 1 ] || { echo "usage: $0 [deb|cli|rpm]" >&2; exit 2; }
 # The rpm bundler copies file modes from disk (the deb one normalizes them),
 # so build outputs must not inherit a group-writable umask.
 umask 022
@@ -51,15 +53,23 @@ chmod 0644 target/release/xray-package/v26.3.27/*.dat \
 test -x target/release/network-orchestrator-daemon
 # An up-to-date app binary is not relinked, so fix a mode left by an old umask.
 if [ -f target/release/net-manager-app ]; then chmod 0755 target/release/net-manager-app; fi
-if [ "${1:-deb}" = deb ]; then
+if [ "$KIND" != rpm ]; then
     cargo build --release -p net-manager-cli
     chmod 0755 target/release/netorch
     sh scripts/package-linux-deb.sh
+    [ "$KIND" != cli ] || exit 0
     # The app needs the daemon of its own major.minor line or newer. Tauri
     # replaces an array from a --config override, so the whole list is given.
     LINE="$(python3 scripts/versions.py get linux | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')"
     npm run tauri build -- --bundles deb --no-sign --config \
         "{\"bundle\":{\"linux\":{\"deb\":{\"depends\":[\"network-orchestrator-daemon (>= ${LINE}.0)\"]}}}}"
+    SEMVER="$(python3 scripts/versions.py get linux)"
+    DEB_VERSION="$(printf '%s' "$SEMVER" | sed 's/-/~/')"
+    ARCH="$(dpkg --print-architecture)"
+    python3 scripts/package-linux-installers.py \
+        --daemon "${OUT_DIR:-target/release/packages}/network-orchestrator-daemon_${DEB_VERSION}_${ARCH}.deb" \
+        --gui "target/release/bundle/deb/Network Orchestrator_${SEMVER}_${ARCH}.deb" \
+        --output-dir "${INSTALLER_OUT_DIR:-target/release/installers}"
 else
-    npm run tauri build -- --bundles "$1" --no-sign
+    npm run tauri build -- --bundles rpm --no-sign
 fi
