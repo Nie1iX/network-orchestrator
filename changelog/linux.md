@@ -32,3 +32,16 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   the server no longer has to be looked up, the DNS servers are not routed
   around the tunnel any more: on networks that drop DNS to outside resolvers
   the profile's DNS now works through the tunnel.
+
+### Added
+
+- `netorch route` manages the routing rules of Xray profiles from the terminal:
+  `show` lists them, `add` and `rm` change single selectors, `set` replaces
+  all of them, and `check <host or IP> --profile <profile>` tells which rule
+  decides it. Selectors are `domain:`, `full:`, `geosite:`, `geoip:`, an address
+  or a CIDR network. A bare name such as `ru` is a substring match in Xray, and
+  the command says so. A connected profile applies the change when it
+  reconnects.
+- `netorch version` also shows the core version the build includes.
+
+Core 0.10.0.

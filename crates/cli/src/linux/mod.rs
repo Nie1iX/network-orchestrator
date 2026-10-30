@@ -13,6 +13,7 @@ mod ctx;
 mod endpoints;
 mod hold;
 mod library;
+mod route;
 
 use args::{Cli, Command};
 use clap::{CommandFactory, Parser};
@@ -105,6 +106,7 @@ fn run(ctx: &ctx::Ctx, command: Command, json: bool) -> Result<commands::Output,
             }
             Ok((value, text))
         }
+        Command::Route(command) => route::run(ctx, command),
         Command::Refresh { target } => endpoints::refresh(ctx, &target),
         Command::Test(args) => endpoints::test(
             ctx,

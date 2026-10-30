@@ -26,6 +26,9 @@ pub struct Cli {
 pub enum Command {
     /// List saved profiles
     Ls,
+    /// Routing rules of Xray profiles: what goes direct, through the tunnel or nowhere
+    #[command(subcommand)]
+    Route(RouteCommand),
     /// Show which connections are running
     Status { target: Option<String> },
     /// Save a profile from a share link, subscription URL or config file
@@ -68,6 +71,55 @@ pub enum Command {
     /// Background process that keeps a connection up (started by `up`)
     #[command(hide = true)]
     Hold { target: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RouteCommand {
+    /// Show the rules of a profile (every Xray profile when none is given)
+    Show { profile: Option<String> },
+    /// Replace all of a profile's rules
+    Set {
+        profile: String,
+        #[command(flatten)]
+        rules: RuleArgs,
+        /// Send private LAN ranges direct
+        #[arg(long)]
+        lan_direct: bool,
+    },
+    /// Add selectors to a profile's rules, keeping the others
+    Add {
+        profile: String,
+        #[command(flatten)]
+        rules: RuleArgs,
+    },
+    /// Remove selectors from a profile's rules
+    Rm {
+        profile: String,
+        #[command(flatten)]
+        rules: RuleArgs,
+    },
+    /// Which rule of a profile decides a host or address
+    Check {
+        target: String,
+        /// Profile whose rules are replayed
+        #[arg(long)]
+        profile: String,
+    },
+}
+
+/// Selectors are `domain:example.com`, `full:host.example.com`,
+/// `geosite:category-ads`, `geoip:ru`, an address or a CIDR network.
+#[derive(Args, Debug, Default)]
+pub struct RuleArgs {
+    /// Selector to drop (repeat the flag for several)
+    #[arg(long, value_name = "SELECTOR")]
+    pub block: Vec<String>,
+    /// Selector to send through the tunnel
+    #[arg(long, value_name = "SELECTOR")]
+    pub proxy: Vec<String>,
+    /// Selector to send around the tunnel, directly
+    #[arg(long, value_name = "SELECTOR")]
+    pub direct: Vec<String>,
 }
 
 #[derive(Args, Debug)]
