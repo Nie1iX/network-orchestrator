@@ -10,6 +10,14 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Single-file Debian/Ubuntu installers for CLI and GUI, each bundling its client
+  and the shared daemon package. They install missing packages, update older
+  versions, preserve a newer daemon patch from the same release line, and refuse
+  client downgrades. `--check` previews the version plan without root or changes;
+  `--yes` accepts the APT plan. A CLI-only build avoids the GUI/WebKit toolchain.
+
 ## [0.10.1] - 2026-10-30
 
 Core 0.10.0.
