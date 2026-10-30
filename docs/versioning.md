@@ -127,6 +127,8 @@ body.
 
 Rules:
 
+- Agents never add themselves as co-authors: no `Co-Authored-By` trailer and no
+  "Generated with" line in commits or PR descriptions.
 - Every commit has a type prefix. Messages like `fix`, `last commit` or
   `Edit foo.rs` are not allowed: tooling that builds the changelog and
   decides the version skips them, so the work would never reach a release.

@@ -5,8 +5,6 @@ use net_manager_core::config_security;
 use net_manager_core::config_vault::{ConfigImport, ConfigVault};
 use net_manager_core::models::*;
 use std::collections::HashSet;
-#[cfg(test)]
-use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::Path;
 #[cfg(test)]

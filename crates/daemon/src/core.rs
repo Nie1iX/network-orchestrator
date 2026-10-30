@@ -2011,7 +2011,8 @@ impl DaemonCore {
             ));
         }
         let mark = self.allocate_openvpn_mark()?;
-        let plan = prepare_xray(uid, params, mark)?;
+        let mut plan = prepare_xray(uid, params, mark)?;
+        crate::xray::pin_server_address(&mut plan, |host| resolve_host_addrs(Some(host)));
         let runner = self.xray.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
         })?;
@@ -2135,7 +2136,8 @@ impl DaemonCore {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing Xray process marker")
             })?;
-        let plan = prepare_xray(uid, params, process.transport_mark)?;
+        let mut plan = prepare_xray(uid, params, process.transport_mark)?;
+        crate::xray::pin_server_address(&mut plan, |host| resolve_host_addrs(Some(host)));
         self.ensure_xray_reload_compatible(index, &plan, &process)?;
         let runner = self.xray.as_mut().ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
@@ -2252,7 +2254,7 @@ impl DaemonCore {
             .collect();
         bypassed.sort();
         let mut targets = resolve_host_addrs(plan.server_host.as_deref());
-        for ip in crate::xray::dns_bypass_addrs(&plan.dns_servers, plan.full_ipv4, plan.full_ipv6) {
+        for ip in plan.dns_server_bypass() {
             if !targets.contains(&ip) {
                 targets.push(ip);
             }
@@ -2437,7 +2439,7 @@ impl DaemonCore {
         plan: &crate::xray::XrayPlan,
     ) -> io::Result<()> {
         let mut targets = resolve_host_addrs(plan.server_host.as_deref());
-        for ip in crate::xray::dns_bypass_addrs(&plan.dns_servers, plan.full_ipv4, plan.full_ipv6) {
+        for ip in plan.dns_server_bypass() {
             if !targets.contains(&ip) {
                 targets.push(ip);
             }

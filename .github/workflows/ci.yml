@@ -12,6 +12,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  linux-installers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest scripts/test_linux_installers.py
+      - run: e2e/linux/run_installers.sh
+
   test:
     runs-on: windows-latest
     timeout-minutes: 45

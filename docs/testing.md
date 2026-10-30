@@ -1,5 +1,28 @@
 # E2E testing
 
+## Debian/Ubuntu installers and updates
+
+```bash
+python3 -m unittest scripts/test_linux_installers.py
+e2e/linux/run_installers.sh
+```
+
+The unit tests generate synthetic Debian archives and execute both generated
+`.run` installers with fake package and service commands. They cover fresh CLI
+and GUI installs in both orders, updates, equal versions, newer daemon patches,
+downgrade refusal, incomplete installs, prereleases, architecture checks, corrupt
+payloads, legacy combined GUI migration, APT errors and `--check` without root.
+They never install host packages or start services.
+
+`run_installers.sh` uses a disposable Debian-based Python container with
+`--network none`. APT/dpkg are real; package payloads contain only synthetic text
+files and `systemctl` is faked. It verifies CLI → GUI, updates, daemon reuse,
+downgrade refusal, auto/manual dependency tracking and removing GUI while keeping
+CLI and daemon. The image must be available or downloaded before the run. Never
+run `test_installers.py` directly on the host. The manual CI workflow runs both
+checks in its Linux installer job. These checks do not validate real VPNs or the
+Tauri GUI package build.
+
 ## Browser sandbox on macOS
 
 ```bash

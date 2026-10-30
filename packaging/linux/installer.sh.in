@@ -1,0 +1,155 @@
+#!/bin/sh
+# Self-contained Debian/Ubuntu installer. The compressed payload follows this script.
+set -eu
+CLIENT=@CLIENT@
+VERSION=@VERSION@
+ARCH=@ARCH@
+DAEMON=network-orchestrator-daemon
+PAYLOAD_SHA256=@PAYLOAD_SHA256@
+PAYLOAD_LINE=@PAYLOAD_LINE@
+
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+check_only=no
+assume_yes=no
+for arg in "$@"; do
+    case "$arg" in
+        --check) check_only=yes ;;
+        --yes) assume_yes=yes ;;
+        --version) printf '%s %s (%s)\n' "$CLIENT" "$VERSION" "$ARCH"; exit 0 ;;
+        --help)
+            printf 'Usage: sudo sh %s [--yes]\n       sh %s --check\n' "$0" "$0"
+            printf 'Install or update %s and its shared network daemon.\n' "$CLIENT"
+            printf '  --check    Show installed versions and the plan without making changes\n'
+            printf '  --yes      Accept the APT installation plan without prompting\n'
+            printf '  --version  Show the version included in this installer\n'
+            exit 0 ;;
+        *) fail "Unknown option: $arg. Use --help." ;;
+    esac
+done
+
+[ "$(uname -s)" = Linux ] || fail 'This installer supports Debian/Ubuntu Linux only.'
+for tool in dpkg dpkg-query apt-get apt-mark systemctl sha256sum tar tail mktemp; do
+    command -v "$tool" >/dev/null 2>&1 || fail "Required command is missing: $tool"
+done
+[ "$(dpkg --print-architecture)" = "$ARCH" ] || fail "This installer requires architecture $ARCH."
+if [ "$check_only" = no ] && [ "$(id -u)" != 0 ]; then
+    fail "Run with sudo sh \"$0\", or use --check to preview without root."
+fi
+
+work=$(mktemp -d /tmp/netorch-install.XXXXXXXX)
+trap 'rm -rf -- "$work"' 0
+trap 'exit 130' 2
+trap 'exit 143' 1 15
+# Snapshot once: verify and install the same bytes even if the downloaded file changes.
+tail -n +"$PAYLOAD_LINE" "$0" >"$work/payload.tar.gz"
+actual=$(sha256sum "$work/payload.tar.gz")
+[ "${actual%% *}" = "$PAYLOAD_SHA256" ] || fail 'Installer checksum failed. Download the installer again.'
+
+# dpkg-query exit 1 means absent; database/usage errors must not look like a fresh install.
+query_package() {
+    query_status=0
+    query=$(dpkg-query -W -f='${db:Status-Status}\t${Version}\t${Architecture}\n' "$1" 2>/dev/null) || query_status=$?
+    case "$query_status" in
+        0) ;;
+        1) query= ;;
+        *) fail 'Cannot read the installed package database.' ;;
+    esac
+    old_status=not-installed
+    old_version=
+    old_arch=
+    if [ -n "$query" ]; then
+        tab=$(printf '\t')
+        IFS="$tab" read -r old_status old_version old_arch <<EOF
+$query
+EOF
+    fi
+    case "$old_status" in
+        not-installed|config-files) old_version= ;;
+        *)
+            [ -n "$old_version" ] || fail "Cannot determine the version of $1."
+            [ "$old_arch" = "$ARCH" ] || fail "Installed $1 has a different architecture." ;;
+    esac
+}
+
+printf '%s installer: %s (%s)\n' "$CLIENT" "$VERSION" "$ARCH"
+query_package "$CLIENT"
+install_client=yes
+if [ -z "$old_version" ]; then
+    printf '%s: not installed -> install %s\n' "$CLIENT" "$VERSION"
+elif dpkg --compare-versions "$old_version" gt "$VERSION"; then
+    fail "$CLIENT $old_version is newer than this installer ($VERSION). Downgrades are refused."
+elif dpkg --compare-versions "$old_version" eq "$VERSION" && [ "$old_status" = installed ]; then
+    install_client=no
+    printf '%s: %s -> keep\n' "$CLIENT" "$old_version"
+else
+    printf '%s: %s -> update/repair to %s\n' "$CLIENT" "$old_version" "$VERSION"
+fi
+
+query_package "$DAEMON"
+if [ "$CLIENT" = netorch ] && [ -z "$old_version" ]; then
+    # Before 0.10.1 the GUI package owned the daemon's files itself.
+    query_package network-orchestrator
+    if [ -n "$old_version" ] && dpkg --compare-versions "$old_version" lt 0.10.1; then
+        fail 'The older GUI package includes the daemon. Update it with the GUI installer first, then run the CLI installer.'
+    fi
+    query_package "$DAEMON"
+fi
+install_daemon=yes
+new_daemon=no
+if [ -z "$old_version" ]; then
+    new_daemon=yes
+    printf '%s: not installed -> install %s\n' "$DAEMON" "$VERSION"
+elif dpkg --compare-versions "$old_version" ge "$VERSION" && [ "$old_status" = installed ]; then
+    # A newer patch from this release line can be shared without a downgrade.
+    version_base=${VERSION%%~*}
+    line=${version_base%.*}
+    case "$old_version" in
+        "$line".*) ;;
+        *) fail "The daemon belongs to a newer release line ($old_version). Use a newer client installer." ;;
+    esac
+    install_daemon=no
+    printf '%s: %s -> keep shared service\n' "$DAEMON" "$old_version"
+elif dpkg --compare-versions "$old_version" gt "$VERSION"; then
+    fail "The incomplete daemon installation is newer ($old_version). Repair it with its matching installer."
+else
+    printf '%s: %s -> update/repair to %s\n' "$DAEMON" "$old_version" "$VERSION"
+fi
+
+if [ "$install_daemon" = yes ] && [ "$new_daemon" = no ]; then
+    printf 'Updating the daemon will restart its service and may interrupt active connections.\n'
+fi
+if [ "$check_only" = yes ]; then
+    printf 'Check complete. No changes made; APT will resolve system dependencies during installation.\n'
+    exit 0
+fi
+
+if [ "$install_client" = yes ] || [ "$install_daemon" = yes ]; then
+    tar -xzf "$work/payload.tar.gz" -C "$work" client.deb daemon.deb
+    # APT's _apt user needs read/traverse access to these public package files.
+    chmod 0755 "$work"
+    chmod 0644 "$work/client.deb" "$work/daemon.deb"
+    set -- --no-remove install
+    [ "$assume_yes" = no ] || set -- "$@" --yes
+    [ "$install_daemon" = no ] || set -- "$@" "$work/daemon.deb"
+    [ "$install_client" = no ] || set -- "$@" "$work/client.deb"
+    if ! apt-get "$@"; then
+        fail 'APT did not complete the installation. Resolve its reported dependency, hold or package-state error, then run this installer again.'
+    fi
+    # An existing daemon keeps its original manual/auto mark.
+    if [ "$new_daemon" = yes ]; then
+        apt-mark auto "$DAEMON"
+    fi
+else
+    printf 'All packages are already up to date.\n'
+fi
+
+# enable --now starts a stopped service but does not restart an already running one.
+# Package postinst also enables the service when building an offline system image.
+if systemctl show --property=Version --value >/dev/null 2>&1; then
+    systemctl enable --now network-orchestrator.service
+else
+    printf 'Packages installed. The daemon will start on boot with systemd.\n'
+fi
+printf 'Done. %s and the shared daemon are ready.\n' "$CLIENT"
+exit 0
+__NETORCH_PAYLOAD__

@@ -126,7 +126,9 @@ GUI (Tauri `app_data_dir`, идентификатор `com.netmanager.app`):
    `wireguard-tools`/`openvpn`/`systemd-resolved`, установленный Xray.
 2. `sudo netorch service status|restart` (тонкая обёртка над `systemctl`).
    Установку демона выполняют пакеты, не CLI.
-3. `netorch route lookup|check`, правила маршрутов, `logs`, `backend`.
+3. `netorch route show|set|add|rm|check` — правила маршрутов Xray-профилей
+   (сделано 2026-10-29, `crates/cli/src/linux/route.rs`); `route lookup`,
+   `logs`, `backend` — позже.
 4. Пакеты: `/usr/bin/netorch` в `.deb` (Ubuntu), `.rpm` (Fedora), Arch;
    completions для bash/zsh/fish; man-страница.
 
