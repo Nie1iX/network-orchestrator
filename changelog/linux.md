@@ -10,28 +10,9 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
-### Changed
+## [0.10.1] - 2026-10-30
 
-- The Linux `.deb` is split into three packages that share this line's
-  version: `network-orchestrator-daemon` (the daemon, its systemd unit, the
-  polkit policy and the pinned Xray), `netorch` (the command line client, with
-  bash, zsh and fish completions) and `network-orchestrator` (the app). The
-  app and `netorch` depend on a daemon of their own `major.minor` or newer, so
-  installing either keeps a suitable daemon as it is and installs or upgrades
-  an unsuitable one; the former single package is replaced
-  (`Replaces`/`Breaks`). A server needs only the daemon and `netorch`:
-  `apt install ./network-orchestrator-daemon_*.deb ./netorch_*.deb`.
-  `.rpm` and Arch packages are still one package.
-
-### Fixed
-
-- A system-wide Xray tunnel no longer stops carrying traffic when its server is
-  given by name. The daemon now resolves the name before the tunnel comes up
-  and has Xray dial the IP (the name stays the TLS/Reality server name), so a
-  reconnect no longer needs the resolver that points into the tunnel. Because
-  the server no longer has to be looked up, the DNS servers are not routed
-  around the tunnel any more: on networks that drop DNS to outside resolvers
-  the profile's DNS now works through the tunnel.
+Core 0.10.0.
 
 ### Added
 
@@ -44,4 +25,27 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   reconnects.
 - `netorch version` also shows the core version the build includes.
 
-Core 0.10.0.
+### Changed
+
+- The Linux `.deb` is split into three packages that share this line's
+  version: `network-orchestrator-daemon` (the daemon, its systemd unit, the
+  polkit policy and the pinned Xray), `netorch` (the command line client, with
+  bash, zsh and fish completions) and `network-orchestrator` (the app). The
+  app and `netorch` depend on a daemon of their own `major.minor` or newer, so
+  installing either keeps a suitable daemon as it is and installs or upgrades
+  an unsuitable one; the former single package is replaced
+  (`Replaces`/`Breaks`, including version 0.10.0). A server needs only the
+  daemon and `netorch`:
+  `apt install ./network-orchestrator-daemon_*.deb ./netorch_*.deb`.
+  `.rpm` and Arch packages are still one package.
+
+### Fixed
+
+- For supported TCP/raw, Hysteria and KCP transports, a system-wide Xray tunnel
+  no longer stops carrying traffic when its server is given by name. The daemon
+  now resolves the name before the tunnel comes up and has Xray dial the IP
+  (the name stays the TLS/Reality server name), so a
+  reconnect no longer needs the resolver that points into the tunnel. Because
+  the server no longer has to be looked up, the DNS servers are not routed
+  around the tunnel any more: on networks that drop DNS to outside resolvers
+  the profile's DNS now works through the tunnel.
