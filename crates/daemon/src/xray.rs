@@ -30,6 +30,9 @@ pub struct XrayPlan {
     /// must keep a direct route to it outside the tunnel, otherwise the
     /// tunnel would try to carry its own server traffic.
     pub server_host: Option<String>,
+    /// The first outbound dials a literal IP (see [`pin_server_address`]), so
+    /// nothing has to resolve the server's name once the tunnel is up.
+    pub server_pinned: bool,
     /// Inline caller-provided `geoip.dat`/`geosite.dat` contents; decoded
     /// into the root-owned staging dir before spawn (the sandboxed unit
     /// cannot see caller paths).
@@ -52,6 +55,7 @@ impl std::fmt::Debug for XrayPlan {
             .field("full_ipv6", &self.full_ipv6)
             .field("mark", &self.mark)
             .field("server_host", &self.server_host)
+            .field("server_pinned", &self.server_pinned)
             .field("geo_assets", &self.geo_assets.is_some())
             .finish()
     }
@@ -1073,8 +1077,79 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         mark,
         api_port,
         server_host,
+        server_pinned: false,
         geo_assets: params.geo_assets,
     })
+}
+
+impl XrayPlan {
+    /// Resolver addresses that get a direct host route (see
+    /// [`dns_bypass_addrs`]). They only exist so the system resolver can look
+    /// up the server's name outside the tunnel; once the server is dialled by
+    /// IP the queries belong inside the tunnel, and a bypass would send them
+    /// to a resolver the uplink may not allow.
+    pub fn dns_server_bypass(&self) -> Vec<IpAddr> {
+        if self.server_pinned {
+            return Vec::new();
+        }
+        dns_bypass_addrs(&self.dns_servers, self.full_ipv4, self.full_ipv6)
+    }
+}
+
+/// Makes the first outbound dial the server by IP instead of by name.
+///
+/// Xray re-resolves a name through the system resolver whenever it reconnects,
+/// and by then the resolver points into the tunnel that is waiting for that
+/// very connection. `resolve` runs while the physical uplink is still intact.
+/// The name stays the TLS/Reality server name unless the config sets one. A
+/// name that does not resolve, or a transport that derives a Host header or
+/// authority from the address (ws, grpc, xhttp, ...), is left untouched.
+pub fn pin_server_address(plan: &mut XrayPlan, resolve: impl Fn(&str) -> Vec<IpAddr>) {
+    let Some(host) = plan.server_host.clone() else {
+        return;
+    };
+    if host.parse::<IpAddr>().is_ok() {
+        plan.server_pinned = true;
+        return;
+    }
+    let Ok(mut config) = serde_json::from_str::<Value>(&plan.config) else {
+        return;
+    };
+    let outbound = &mut config["outbounds"][0];
+    let carries_name = matches!(
+        outbound["streamSettings"]["network"].as_str(),
+        None | Some("tcp" | "raw" | "hysteria" | "kcp")
+    );
+    if !carries_name {
+        return;
+    }
+    let addresses = resolve(&host);
+    let Some(address) = addresses
+        .iter()
+        .find(|ip| ip.is_ipv4())
+        .or_else(|| addresses.first())
+    else {
+        return;
+    };
+    let slot = match outbound["protocol"].as_str() {
+        Some("vless") => &mut outbound["settings"]["vnext"][0]["address"],
+        Some("hysteria") => &mut outbound["settings"]["address"],
+        _ => return,
+    };
+    *slot = json!(address.to_string());
+    for security in ["tlsSettings", "realitySettings"] {
+        if let Some(settings) = outbound["streamSettings"][security].as_object_mut() {
+            settings
+                .entry("serverName")
+                .or_insert_with(|| json!(host.clone()));
+        }
+    }
+    let Ok(text) = serde_json::to_string(&config) else {
+        return;
+    };
+    plan.config = text;
+    plan.server_host = Some(address.to_string());
+    plan.server_pinned = true;
 }
 
 /// Loopback port of the per-tunnel `api-in` listener, derived from the
@@ -1187,6 +1262,109 @@ mod tests {
         let plan = prepare_xray(1000, hysteria, 51820).unwrap();
         assert_eq!(plan.server_host.as_deref(), Some("hy.example.test"));
         assert!(!format!("{plan:?}").contains("SECRET-PASS"));
+    }
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn pinning_replaces_the_server_name_and_keeps_the_sni() {
+        let mut plan = prepare_xray(1000, params(), 51820).unwrap();
+        // The vless fixture uses plain TCP without TLS: nothing to carry over.
+        pin_server_address(&mut plan, |_| vec![ip("203.0.113.7")]);
+        let config: Value = serde_json::from_str(&plan.config).unwrap();
+        assert_eq!(
+            config["outbounds"][0]["settings"]["vnext"][0]["address"],
+            "203.0.113.7"
+        );
+        assert_eq!(plan.server_host.as_deref(), Some("203.0.113.7"));
+        assert!(plan.server_pinned);
+
+        let mut hysteria = params();
+        hysteria.config = json!({
+            "inbounds": [{"tag":"socks-in", "protocol": "socks", "listen": "127.0.0.1", "port": 1080, "settings":{"udp":true}}],
+            "outbounds": [
+                {"tag": "proxy", "protocol": "hysteria", "settings": {"version": 2, "address": "hy.example.test", "port": 443}, "streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{},"hysteriaSettings":{"version":2,"auth":"x"}}},
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "blocked", "protocol": "blackhole"}
+            ],
+            "routing": {"rules": []}
+        })
+        .to_string();
+        let mut plan = prepare_xray(1000, hysteria, 51820).unwrap();
+        pin_server_address(&mut plan, |_| vec![ip("2001:db8::1"), ip("203.0.113.9")]);
+        let config: Value = serde_json::from_str(&plan.config).unwrap();
+        assert_eq!(config["outbounds"][0]["settings"]["address"], "203.0.113.9");
+        assert_eq!(
+            config["outbounds"][0]["streamSettings"]["tlsSettings"]["serverName"],
+            "hy.example.test"
+        );
+        assert!(plan.server_pinned);
+    }
+
+    #[test]
+    fn pinning_never_overrides_an_explicit_server_name() {
+        let mut input = params();
+        input.config = json!({
+            "inbounds": [{"tag":"socks-in", "protocol": "socks", "listen": "127.0.0.1", "port": 1080, "settings":{"udp":true}}],
+            "outbounds": [
+                {"tag": "proxy", "protocol": "vless", "settings": {"vnext": [{"address":"example.test","port":443,"users":[{"id":"u","encryption":"none"}]}]}, "streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"front.test"}}},
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "blocked", "protocol": "blackhole"}
+            ],
+            "routing": {"rules": []}
+        })
+        .to_string();
+        let mut plan = prepare_xray(1000, input, 51820).unwrap();
+        pin_server_address(&mut plan, |_| vec![ip("203.0.113.7")]);
+        let config: Value = serde_json::from_str(&plan.config).unwrap();
+        assert_eq!(
+            config["outbounds"][0]["streamSettings"]["realitySettings"]["serverName"],
+            "front.test"
+        );
+    }
+
+    #[test]
+    fn pinning_leaves_the_name_when_it_cannot_be_resolved_or_carried() {
+        let mut plan = prepare_xray(1000, params(), 51820).unwrap();
+        let before = plan.config.clone();
+        pin_server_address(&mut plan, |_| Vec::new());
+        assert_eq!(plan.config, before);
+        assert_eq!(plan.server_host.as_deref(), Some("example.test"));
+        assert!(!plan.server_pinned);
+
+        // WebSocket derives its Host header from the address.
+        let mut ws = params();
+        let mut config: Value = serde_json::from_str(&ws.config).unwrap();
+        config["outbounds"][0]["streamSettings"]["network"] = json!("ws");
+        ws.config = config.to_string();
+        let mut plan = prepare_xray(1000, ws, 51820).unwrap();
+        let before = plan.config.clone();
+        pin_server_address(&mut plan, |_| vec![ip("203.0.113.7")]);
+        assert_eq!(plan.config, before);
+        assert!(!plan.server_pinned);
+    }
+
+    #[test]
+    fn a_literal_server_address_counts_as_pinned_without_resolving() {
+        let mut input = params();
+        let mut config: Value = serde_json::from_str(&input.config).unwrap();
+        config["outbounds"][0]["settings"]["vnext"][0]["address"] = json!("203.0.113.7");
+        input.config = config.to_string();
+        let mut plan = prepare_xray(1000, input, 51820).unwrap();
+        pin_server_address(&mut plan, |_| panic!("no lookup for a literal address"));
+        assert!(plan.server_pinned);
+    }
+
+    #[test]
+    fn resolvers_are_bypassed_only_while_the_server_must_be_looked_up() {
+        let mut plan = prepare_xray(1000, params(), 51820).unwrap();
+        plan.dns_servers = vec![ip("1.1.1.1")];
+        plan.full_ipv4 = true;
+        assert_eq!(plan.dns_server_bypass(), vec![ip("1.1.1.1")]);
+        plan.server_pinned = true;
+        assert!(plan.dns_server_bypass().is_empty());
     }
 
     #[test]

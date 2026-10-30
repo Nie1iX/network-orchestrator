@@ -22,3 +22,13 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   (`Replaces`/`Breaks`). A server needs only the daemon and `netorch`:
   `apt install ./network-orchestrator-daemon_*.deb ./netorch_*.deb`.
   `.rpm` and Arch packages are still one package.
+
+### Fixed
+
+- A system-wide Xray tunnel no longer stops carrying traffic when its server is
+  given by name. The daemon now resolves the name before the tunnel comes up
+  and has Xray dial the IP (the name stays the TLS/Reality server name), so a
+  reconnect no longer needs the resolver that points into the tunnel. Because
+  the server no longer has to be looked up, the DNS servers are not routed
+  around the tunnel any more: on networks that drop DNS to outside resolvers
+  the profile's DNS now works through the tunnel.
