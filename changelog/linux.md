@@ -10,3 +10,15 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Changed
+
+- The Linux `.deb` is split into three packages that share this line's
+  version: `network-orchestrator-daemon` (the daemon, its systemd unit, the
+  polkit policy and the pinned Xray), `netorch` (the command line client, with
+  bash, zsh and fish completions) and `network-orchestrator` (the app). The
+  app and `netorch` depend on a daemon of their own `major.minor` or newer, so
+  installing either keeps a suitable daemon as it is and installs or upgrades
+  an unsuitable one; the former single package is replaced
+  (`Replaces`/`Breaks`). A server needs only the daemon and `netorch`:
+  `apt install ./network-orchestrator-daemon_*.deb ./netorch_*.deb`.
+  `.rpm` and Arch packages are still one package.

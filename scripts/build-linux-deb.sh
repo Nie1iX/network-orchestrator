@@ -1,6 +1,16 @@
 #!/bin/sh
-# Build a local .deb (default) or .rpm (`rpm` argument) without installing
-# or starting any host service.
+# Build local packages without installing or starting any host service.
+#
+#   deb (default): three packages in target/release/packages and the app's
+#                  bundle in target/release/bundle/deb:
+#                    network-orchestrator-daemon  the daemon, systemd unit, polkit, Xray
+#                    netorch                      the command line client
+#                    network-orchestrator         the app (depends on the daemon)
+#                  Install them together with
+#                    apt install ./network-orchestrator-daemon_*.deb ./netorch_*.deb ./network-orchestrator_*.deb
+#                  or only the daemon and netorch on a server without a desktop.
+#   rpm:           the former single package (app and daemon); the split into
+#                  separate rpm packages is not done yet.
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -41,4 +51,15 @@ chmod 0644 target/release/xray-package/v26.3.27/*.dat \
 test -x target/release/network-orchestrator-daemon
 # An up-to-date app binary is not relinked, so fix a mode left by an old umask.
 if [ -f target/release/net-manager-app ]; then chmod 0755 target/release/net-manager-app; fi
-npm run tauri build -- --bundles "${1:-deb}" --no-sign
+if [ "${1:-deb}" = deb ]; then
+    cargo build --release -p net-manager-cli
+    chmod 0755 target/release/netorch
+    sh scripts/package-linux-deb.sh
+    # The app needs the daemon of its own major.minor line or newer. Tauri
+    # replaces an array from a --config override, so the whole list is given.
+    LINE="$(python3 scripts/versions.py get linux | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')"
+    npm run tauri build -- --bundles deb --no-sign --config \
+        "{\"bundle\":{\"linux\":{\"deb\":{\"depends\":[\"network-orchestrator-daemon (>= ${LINE}.0)\"]}}}}"
+else
+    npm run tauri build -- --bundles "$1" --no-sign
+fi
