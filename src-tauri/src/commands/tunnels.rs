@@ -9,6 +9,8 @@ use net_manager_core::explorer;
 use net_manager_core::models::*;
 use std::io::ErrorKind;
 use std::time::Duration;
+#[cfg(not(target_os = "linux"))]
+use std::time::Instant;
 use tauri::{Emitter, State};
 
 #[cfg(target_os = "linux")]
