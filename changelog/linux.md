@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-10
+
+Core 0.18.1.
+
 ### Fixed
 
 - Run enabled subscription auto-refresh in the unprivileged `netorch serve`
