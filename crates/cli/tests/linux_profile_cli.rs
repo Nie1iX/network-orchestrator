@@ -15,14 +15,15 @@ use net_manager_core::subscription::{self, ResponseMeta, SubscriptionImport};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PROFILE_ID: &str = "saved-subscription";
 const URL: &str =
@@ -35,11 +36,32 @@ struct Sandbox {
     dir: tempfile::TempDir,
     stop: Arc<AtomicBool>,
     daemon: Option<JoinHandle<()>>,
+    runtime: Option<RuntimeChild>,
+}
+
+struct RuntimeChild(Child);
+impl Drop for RuntimeChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn wait_until(mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for the isolated user runtime"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 impl Sandbox {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
@@ -98,11 +120,37 @@ impl Sandbox {
                 }
             }
         });
-        Self {
+        let mut sandbox = Self {
             dir,
             stop,
             daemon: Some(daemon),
-        }
+            runtime: None,
+        };
+        let mut runtime = RuntimeChild(
+            sandbox
+                .command()
+                .arg("serve")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        wait_until(|| {
+            assert!(
+                runtime.0.try_wait().unwrap().is_none(),
+                "Isolated netorch serve exited"
+            );
+            fs::read_dir(sandbox.dir.path().join("netorch"))
+                .ok()
+                .is_some_and(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .any(|entry| entry.path().join("runtime.sock").exists())
+                })
+        });
+        sandbox.runtime = Some(runtime);
+        sandbox
     }
 
     fn root(&self) -> PathBuf {
@@ -124,15 +172,16 @@ impl Sandbox {
         path
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_netorch"))
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_netorch"));
+        command
             .arg("--data-dir")
             .arg(self.root())
-            .args(args)
             .env("HOME", self.dir.path())
             .env("XDG_DATA_HOME", self.dir.path().join("xdg-data"))
             .env("XDG_CONFIG_HOME", self.dir.path().join("xdg-config"))
             .env("XDG_CACHE_HOME", self.dir.path().join("xdg-cache"))
+            .env("XDG_STATE_HOME", self.dir.path().join("xdg-state"))
             .env("XDG_RUNTIME_DIR", self.dir.path())
             .env(SOCKET_ENV, self.dir.path().join("daemon.sock"))
             .env(
@@ -140,9 +189,12 @@ impl Sandbox {
                 self.dir.path().join("missing-helper.sock"),
             )
             .env_remove("SUDO_UID")
-            .env_remove("SUDO_USER")
-            .output()
-            .unwrap()
+            .env_remove("SUDO_USER");
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command().args(args).output().unwrap()
     }
 
     fn ok(&self, args: &[&str]) -> Output {
@@ -236,6 +288,7 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        drop(self.runtime.take());
         self.stop.store(true, Ordering::SeqCst);
         let _ = UnixStream::connect(self.dir.path().join("daemon.sock"));
         self.daemon.take().unwrap().join().unwrap();
@@ -473,4 +526,146 @@ fn profile_role_edits_validate_the_merged_profile_and_reject_atomically() {
             endpoints
         );
     }
+}
+
+fn pending_http(listener: &TcpListener) -> TcpStream {
+    let mut stream = None;
+    wait_until(|| match listener.accept() {
+        Ok((accepted, _)) => {
+            stream = Some(accepted);
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(error) => panic!("Local subscription fixture failed: {error}"),
+    });
+    let stream = stream.unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    loop {
+        let mut header = String::new();
+        assert_ne!(reader.read_line(&mut header).unwrap(), 0);
+        if header == "\r\n" {
+            break;
+        }
+    }
+    stream
+}
+
+#[test]
+fn serve_refreshes_without_gui_preserves_failed_catalog_and_excludes_concurrent_refresh() {
+    let sandbox = Sandbox::new();
+    let mut profile = sandbox.seed();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let meta = profile.subscription.as_mut().unwrap();
+    meta.url = format!("http://{}/subscription", listener.local_addr().unwrap());
+    meta.last_refresh_at_unix = Some(1);
+    sandbox.store().upsert(profile).unwrap();
+
+    sandbox.ok(&["subscription", "interval", PROFILE_ID, "15"]);
+    let mut pending = pending_http(&listener);
+    // Changing an interval is not a refresh attempt; only its outcome advances the clock.
+    assert_eq!(
+        sandbox
+            .profile(PROFILE_ID)
+            .subscription
+            .unwrap()
+            .last_refresh_at_unix,
+        Some(1)
+    );
+    let cached = sandbox.file("manual-nodes.txt", FIRST);
+    let concurrent = sandbox.run(&[
+        "subscription",
+        "refresh",
+        PROFILE_ID,
+        "--cache-file",
+        cached.to_str().unwrap(),
+    ]);
+    assert!(!concurrent.status.success());
+    assert!(combined(&concurrent).contains("already in progress"));
+    let body = format!("{FIRST}\n");
+    write!(
+        pending,
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    drop(pending);
+    wait_until(|| {
+        sandbox
+            .profile(PROFILE_ID)
+            .subscription
+            .unwrap()
+            .last_refresh_at_unix
+            .is_some_and(|time| time > 1)
+    });
+    let refreshed = sandbox.profile(PROFILE_ID);
+    assert_eq!(
+        sandbox
+            .vault()
+            .read_subscription_endpoints(PROFILE_ID)
+            .unwrap()
+            .iter()
+            .map(|endpoint| endpoint.url.as_str())
+            .collect::<Vec<_>>(),
+        [FIRST]
+    );
+    assert_eq!(
+        refreshed.subscription.as_ref().unwrap().last_refresh_error,
+        None
+    );
+    let config = fs::read(&refreshed.config_path).unwrap();
+
+    let mut due = refreshed.clone();
+    due.subscription.as_mut().unwrap().last_refresh_at_unix = Some(1);
+    sandbox.store().upsert(due).unwrap();
+    sandbox.ok(&["--json", "profile", "show", PROFILE_ID]);
+    let mut pending = pending_http(&listener);
+    let body = "fixture-private-provider-error";
+    write!(
+        pending,
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    drop(pending);
+    wait_until(|| {
+        sandbox
+            .profile(PROFILE_ID)
+            .subscription
+            .unwrap()
+            .last_refresh_error
+            .is_some()
+    });
+    let failed = sandbox.profile(PROFILE_ID);
+    assert!(
+        failed
+            .subscription
+            .as_ref()
+            .unwrap()
+            .last_refresh_at_unix
+            .unwrap()
+            > 1
+    );
+    assert_eq!(failed.config_path, refreshed.config_path);
+    assert_eq!(fs::read(&failed.config_path).unwrap(), config);
+    assert_eq!(
+        sandbox
+            .vault()
+            .read_subscription_endpoints(PROFILE_ID)
+            .unwrap()
+            .iter()
+            .map(|endpoint| endpoint.url.as_str())
+            .collect::<Vec<_>>(),
+        [FIRST]
+    );
+    let output = sandbox.ok(&["--json", "profile", "show", PROFILE_ID]);
+    let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(shown["subscription"]["refreshIntervalMinutes"], 15);
+    assert!(shown["subscription"]["lastRefreshAtUnix"].as_u64().unwrap() > 1);
+    assert!(shown["subscription"]["lastRefreshError"].is_string());
+    assert!(!combined(&output).contains(body));
+    assert_redacted(&output);
 }

@@ -1209,6 +1209,7 @@ pub fn refresh(ctx: &Ctx, target: &str) -> Result<Output, String> {
         &profile.id,
         &fetched.body,
         fetched.meta,
+        false,
         |port| std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok(),
     )
     .map_err(|_| "The subscription could not be saved".to_string())?;

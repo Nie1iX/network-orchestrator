@@ -816,6 +816,62 @@ mod tests {
         endpoints::active_name(ctx, &ctx.find("sub1").unwrap()).unwrap()
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refreshing_a_running_subscription_preserves_its_connection_and_missing_primary() {
+        let (_dir, ctx, daemon) = subscription_setup(FakeDaemon {
+            xray: Some(Mutex::new(XrayRuntime {
+                active: Some(("sub1".into(), "a.test".into())),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+        let before = ctx.find("sub1").unwrap();
+        let bytes = std::fs::read(&before.config_path).unwrap();
+        let identity = daemon
+            .xray
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .connection_identity;
+        let service = net_manager_engine::linux_profiles::ProfileService::new(
+            ctx.root.clone(),
+            ctx.engine.clone(),
+        );
+        let refreshed = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(service.refresh_subscription(
+                "sub1",
+                Some("vless://id2@b.test:443?security=tls#Beta%20NL\nvless://id4@d.test:443?security=tls#Delta\n"),
+            ))
+            .unwrap();
+        assert_eq!(refreshed.endpoint_count, 2);
+        assert!(!refreshed.fallback_used);
+        let after = ctx.find("sub1").unwrap();
+        assert_eq!(
+            after.subscription.as_ref().unwrap().active_key,
+            before.subscription.as_ref().unwrap().active_key
+        );
+        assert_eq!(std::fs::read(&after.config_path).unwrap(), bytes);
+        let rows = service.subscription_endpoints("sub1").unwrap();
+        let primary = rows.iter().find(|row| row.active).unwrap();
+        assert!(primary.is_missing);
+        assert_eq!(
+            primary.key,
+            before
+                .subscription
+                .as_ref()
+                .unwrap()
+                .active_key
+                .as_deref()
+                .unwrap()
+        );
+        let runtime = daemon.xray.as_ref().unwrap().lock().unwrap();
+        assert_eq!(runtime.active, Some(("sub1".into(), "a.test".into())));
+        assert_eq!(runtime.connection_identity, identity);
+    }
+
     #[test]
     fn endpoints_lists_names_and_marks_the_active_one_without_hosts() {
         let (_dir, ctx, _) = subscription_setup(FakeDaemon::default());

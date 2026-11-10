@@ -188,6 +188,22 @@ impl LinuxEngine {
         crate::linux_session::request(root, socket, request)
     }
 
+    /// Start or wake the user runtime only when subscription scheduling needs it.
+    #[cfg(target_os = "linux")]
+    pub fn sync_subscription_schedule(&self) -> Result<(), String> {
+        let root = self
+            .data_root
+            .as_deref()
+            .ok_or("The application data directory is required")?;
+        if !crate::linux_subscriptions::configured(root)
+            .map_err(|_| "Could not load subscription schedules")?
+        {
+            return Ok(());
+        }
+        self.local_request(crate::linux_session::Request::SyncSubscriptions)
+            .map(|_| ())
+    }
+
     #[cfg(target_os = "linux")]
     pub fn disconnect_local_proxies(&self) -> Result<(), String> {
         self.local_request(crate::linux_session::Request::Cleanup)

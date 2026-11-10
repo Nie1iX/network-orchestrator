@@ -73,6 +73,15 @@ references, credential/configuration preflight before teardown, retained
 rollback bytes, legacy user-runtime rejection, shared logs and cross-process
 installation cancellation. No ignored Windows network tests are needed.
 
+`crates/cli/tests/linux_profile_cli.rs` also runs real `netorch serve` processes
+against temporary stores and a loopback HTTP provider, without a GUI. It checks
+background catalog refresh, cross-process refresh exclusion, actual attempt
+timestamps, persisted/redacted failures and retention of the last valid catalog
+after provider failure. The focused CLI command regression
+`refreshing_a_running_subscription_preserves_its_connection_and_missing_primary`
+checks refresh against a running fake-daemon connection, including primary removal.
+These tests do not create a tunnel or modify host networking.
+
 `e2e/linux/run.sh` creates an IPv6-enabled disposable Docker network. Its
 `xray_tun_scenarios.py CLIENT SERVER` stage uses the pinned Xray binary and
 geodata (`XRAY_E2E_BINARY`/`XRAY_E2E_GEO_DIR` override their fixture paths).

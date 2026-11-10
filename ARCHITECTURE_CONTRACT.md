@@ -25,7 +25,7 @@ macOS and Windows must be migrated and verified on their native platforms.
 | CLI / GUI | User interaction, authorization prompts, presentation | Background tunnel lifetime or authoritative runtime state |
 | Shared Engine/services | Typed commands, plan derivation, validation, orchestration and rollback | An additional universal coordinator daemon |
 | Privileged system backend | Tunnels, routes, interfaces, DNS, resource journal, reconciliation and recovery | Root/SYSTEM execution of user-writable binaries or user desktop proxy state |
-| Unprivileged user runtime | Local Xray SOCKS/HTTP children, user proxy settings, child health and proxy rollback | Privileged route/interface/DNS mutations or a keepalive for system connections |
+| Unprivileged user runtime | Local Xray SOCKS/HTTP children, user proxy settings, child health, proxy rollback and enabled subscription refresh jobs | Privileged route/interface/DNS mutations or a keepalive for system connections |
 
 Every backend MUST validate requests at its trust boundary. Privileged requests
 MUST authenticate and authorize the actual caller. A user runtime MUST NOT become
@@ -102,8 +102,9 @@ autostart or broader privileges to hide session lifetime limitations.
    status from a new CLI process: the same connection remains running.
 2. Given that connection, open GUI, observe it, exit GUI and query CLI: no teardown.
    Explicitly disconnect from either client: owned resources are released.
-3. Given a daemon-only Linux profile and no systemd user manager or sibling
-   `netorch` executable, connect through the system backend: no user runtime starts.
+3. Given a daemon-only Linux profile, no enabled subscription refresh jobs, and no
+   systemd user manager or sibling `netorch` executable, connect through the system
+   backend: no user runtime starts.
 4. Given all originating client processes have died, wait beyond the former
    client-death grace period: daemon-owned resources remain; a later authorized
    disconnect still removes them. This does not bypass UID authorization.
@@ -122,6 +123,12 @@ Linux implements daemon-owned connection lifetime without `ObserveDaemon` /
 `retain_connection`, preserving explicit disconnect, recovery, foreground cleanup,
 peer identity and polkit. It also provides:
 
+- Linux subscription auto-refresh runs in the unprivileged user runtime, including
+  for active profiles. Enabled jobs keep it alive without GUI/CLI clients. Refresh
+  commits protected catalog/config updates without changing running snapshots,
+  and retains a missing primary instead of silently retargeting it. GUI and CLI
+  share persisted interval, last-attempt and failure status. No interval is enabled
+  implicitly; logout/reboot scheduling still requires explicit OS session policy.
 - `netorch watch [PROFILE]`: bounded daemon subscription plus snapshots on initial
   connect, event gaps and reconnect; local child/profile changes are also observed.
 - `netorch diagnose [PROFILE]`: read-only capability/configuration/status findings.

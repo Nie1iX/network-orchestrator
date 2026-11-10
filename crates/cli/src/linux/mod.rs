@@ -138,6 +138,28 @@ pub fn main() -> ExitCode {
         })
         .and_then(|ctx| {
             #[cfg(target_os = "linux")]
+            let serves_runtime = matches!(cli.command, Command::Serve);
+            #[cfg(target_os = "linux")]
+            let schedule_before = matches!(
+                &cli.command,
+                Command::Watch { .. }
+                    | Command::Proxy(_)
+                    | Command::Up(args::UpArgs {
+                        foreground: true,
+                        ..
+                    })
+            );
+            #[cfg(target_os = "linux")]
+            let sync_schedule = || {
+                ctx.engine.sync_subscription_schedule().map_err(|message| {
+                    format!("Subscription auto-refresh runtime is unavailable: {message}")
+                })
+            };
+            #[cfg(target_os = "linux")]
+            if !ctx.root_user && schedule_before {
+                sync_schedule()?;
+            }
+            #[cfg(target_os = "linux")]
             if let Some(operation) = operation.filter(|_| !ctx.root_user) {
                 let _ = net_manager_engine::linux_diagnostics::try_record_log(
                     &ctx.root,
@@ -146,6 +168,15 @@ pub fn main() -> ExitCode {
                 );
             }
             let result = run(&ctx, cli.command, json);
+            #[cfg(target_os = "linux")]
+            let result = if !ctx.root_user && !serves_runtime && !schedule_before {
+                result.and_then(|output| {
+                    sync_schedule()?;
+                    Ok(output)
+                })
+            } else {
+                result
+            };
             #[cfg(target_os = "linux")]
             if !ctx.root_user && (operation.is_some() || result.is_err()) {
                 use net_manager_engine::linux_diagnostics::{try_record_log, LogLevel};

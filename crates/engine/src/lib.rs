@@ -40,6 +40,8 @@ pub mod linux_session;
 #[cfg(target_os = "linux")]
 pub mod linux_sets;
 #[cfg(target_os = "linux")]
+mod linux_subscriptions;
+#[cfg(target_os = "linux")]
 pub mod linux_system;
 #[cfg(unix)]
 pub mod macos_credentials;

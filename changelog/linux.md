@@ -10,6 +10,19 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Run enabled subscription auto-refresh in the unprivileged `netorch serve`
+  runtime instead of the Linux GUI, including while connected. Keep running
+  connections unchanged, retain removed primary nodes as missing, and share real
+  attempt timestamps and redacted failure status with GUI and CLI.
+- Require DNS-independent HTTPS failure confirmation before the watchdog
+  restarts an Xray TUN, avoiding connection drops caused only by resolver outages.
+- Keep the profile Routing editor usable when serialized DNS settings omit empty
+  server or host collections instead of crashing the entire application window.
+- Terminate native journald fields correctly so debug/trace records and automatic
+  hang snapshots are retained rather than silently discarded by journald.
+
 ## [0.18.0] - 2026-11-10
 
 Core 0.18.0.
