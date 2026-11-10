@@ -70,8 +70,12 @@ fn emit(priority: u8, message: fmt::Arguments<'_>) -> bool {
     let Some(socket) = socket else {
         return false;
     };
+    send_record(socket, priority, message)
+}
+
+fn send_record(socket: &UnixDatagram, priority: u8, message: fmt::Arguments<'_>) -> bool {
     // All callers supply controlled metadata, never request bodies or raw errors.
-    let text = format!("PRIORITY={priority}\nSYSLOG_IDENTIFIER=network-orchestrator-daemon\nMESSAGE=network-orchestrator-daemon: {message}");
+    let text = format!("PRIORITY={priority}\nSYSLOG_IDENTIFIER=network-orchestrator-daemon\nMESSAGE=network-orchestrator-daemon: {message}\n");
     text.len() <= 4096 && socket.send(text.as_bytes()).is_ok()
 }
 
@@ -218,6 +222,29 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn native_journal_receives_the_message_as_a_complete_field() {
+        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        assert!(send_record(
+            &sender,
+            7,
+            format_args!("trace operation=probe")
+        ));
+        let mut buffer = [0u8; 4096];
+        let length = receiver.recv(&mut buffer).unwrap();
+        let packet = std::str::from_utf8(&buffer[..length]).unwrap();
+        // Native journal framing consumes newline-terminated fields only.
+        let fields: std::collections::BTreeMap<_, _> = packet
+            .split_inclusive('\n')
+            .filter_map(|field| field.strip_suffix('\n'))
+            .filter_map(|field| field.split_once('='))
+            .collect();
+        assert_eq!(
+            fields.get("MESSAGE"),
+            Some(&"network-orchestrator-daemon: trace operation=probe")
+        );
+    }
 
     #[test]
     fn hang_evidence_records_wait_and_frames_without_process_secrets_or_addresses() {
