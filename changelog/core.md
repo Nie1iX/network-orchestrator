@@ -10,6 +10,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-10
+
 ### Fixed
 
 - Refresh Linux subscription catalogs in the shared unprivileged runtime without
