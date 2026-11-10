@@ -10,6 +10,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep the Routing editor usable when serialized DNS settings omit empty server
+  or host collections instead of crashing the application window.
+
 ## [0.10.5] - 2026-11-09
 
 Core 0.16.1.

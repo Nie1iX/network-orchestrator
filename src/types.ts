@@ -283,8 +283,8 @@ export interface XrayDnsServer {
 }
 
 export interface XrayDnsConfig {
-  servers: XrayDnsServer[];
-  hosts: Record<string, string[]>;
+  servers?: XrayDnsServer[];
+  hosts?: Record<string, string[]>;
   fakeDns: boolean;
   queryStrategy: XrayDnsQueryStrategy | null;
   enableParallelQuery?: boolean | null;

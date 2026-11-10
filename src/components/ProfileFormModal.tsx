@@ -476,8 +476,8 @@ export default function ProfileFormModal({
       });
       const dns = imported.dns;
       const hasDns =
-        dns.servers.length > 0 ||
-        Object.keys(dns.hosts).length > 0 ||
+        (dns.servers?.length ?? 0) > 0 ||
+        Object.keys(dns.hosts ?? {}).length > 0 ||
         dns.fakeDns ||
         dns.queryStrategy != null ||
         dns.enableParallelQuery != null ||
@@ -1589,13 +1589,13 @@ export default function ProfileFormModal({
             </select>
           </label>
           {current.xrayDns &&
-            (current.xrayDns.servers.length > 0 ||
-              Object.keys(current.xrayDns.hosts).length > 0 ||
+            ((current.xrayDns.servers?.length ?? 0) > 0 ||
+              Object.keys(current.xrayDns.hosts ?? {}).length > 0 ||
               current.xrayDns.fakeDns) && (
               <span className="profile-routes-hint">
                 {tr("rules.dnsSummary", {
-                  servers: current.xrayDns.servers.length,
-                  hosts: Object.keys(current.xrayDns.hosts).length,
+                  servers: current.xrayDns.servers?.length ?? 0,
+                  hosts: Object.keys(current.xrayDns.hosts ?? {}).length,
                 })}
                 {current.xrayDns.fakeDns ? " · fakeDNS" : ""}
               </span>
