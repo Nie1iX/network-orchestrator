@@ -93,6 +93,17 @@ The diagnostic paths are:
   in the same app log. Event-stream disconnect/reconnect/resync is recorded by
   the observing CLI without logging every successful snapshot.
 
+HTTPS watchdog failures do not by themselves establish an Xray stall. After a
+successful probe, the watchdog remembers that target's peer address. If a later
+name-based probe fails, it verifies the same URL through the TUN with that address
+pinned, retaining the hostname for TLS/SNI. Only three consecutive failures of
+this DNS-independent path, with a reachable proxy node and available uplink, may
+request `HttpsStall`. Without a previously successful address, name-based failures
+remain diagnostic and do not restart the tunnel. Successful name-based probes
+refresh the pinned address. Existing cooldown, egress recovery and UDP-leak
+recovery still apply. Debug/trace HTTPS records distinguish `phase=name` from
+`phase=pinned`.
+
 Read-only collection after an incident:
 
 ```bash

@@ -58,6 +58,7 @@ enum ProbeOutcome {
     Skipped,
     Healthy(u32),
     Stalled,
+    ConfirmedStall,
 }
 
 struct RecoveryState {
@@ -65,6 +66,7 @@ struct RecoveryState {
     probe_after: Instant,
     pending_egress: bool,
     pending_stall: Option<RecoveryReason>,
+    confirmed_stall_streak: u32,
     last_egress_attempt: Option<Instant>,
     last_egress_change: Option<Instant>,
     last_stall_attempt: Option<Instant>,
@@ -78,6 +80,7 @@ impl RecoveryState {
             probe_after: now + SETTLE_DELAY,
             pending_egress: false,
             pending_stall: None,
+            confirmed_stall_streak: 0,
             last_egress_attempt: None,
             last_egress_change: None,
             last_stall_attempt: None,
@@ -100,6 +103,7 @@ impl RecoveryState {
             self.probe_after = now + SETTLE_DELAY;
             self.status.last_egress_change_unix = Some(unix);
             self.status.https_stall_streak = 0;
+            self.confirmed_stall_streak = 0;
             self.status.dns_stall_streak = 0;
             self.status.https_latency_ms = None;
         }
@@ -115,12 +119,18 @@ impl RecoveryState {
         match https {
             ProbeOutcome::Healthy(latency) => {
                 self.status.https_stall_streak = 0;
+                self.confirmed_stall_streak = 0;
                 self.status.https_latency_ms = Some(latency);
             }
-            ProbeOutcome::Stalled => {
+            ProbeOutcome::Stalled | ProbeOutcome::ConfirmedStall => {
                 self.status.https_stall_streak = self.status.https_stall_streak.saturating_add(1);
                 self.status.https_latency_ms = None;
-                if self.status.https_stall_streak >= STALL_LIMIT && node_reachable {
+                self.confirmed_stall_streak = if matches!(https, ProbeOutcome::ConfirmedStall) {
+                    self.confirmed_stall_streak.saturating_add(1)
+                } else {
+                    0
+                };
+                if self.confirmed_stall_streak >= STALL_LIMIT && node_reachable {
                     self.pending_stall = Some(RecoveryReason::HttpsStall);
                 }
             }
@@ -128,7 +138,7 @@ impl RecoveryState {
         }
         match dns {
             ProbeOutcome::Healthy(_) => self.status.dns_stall_streak = 0,
-            ProbeOutcome::Stalled => {
+            ProbeOutcome::Stalled | ProbeOutcome::ConfirmedStall => {
                 self.status.dns_stall_streak = self.status.dns_stall_streak.saturating_add(1)
             }
             ProbeOutcome::Skipped => {}
@@ -177,6 +187,7 @@ impl RecoveryState {
         self.stall_before_request = None;
         self.probe_after = when + SETTLE_DELAY;
         self.status.https_stall_streak = 0;
+        self.confirmed_stall_streak = 0;
         self.status.dns_stall_streak = 0;
         self.status.https_latency_ms = None;
     }
@@ -187,7 +198,9 @@ impl RecoveryState {
         udp_sockets: Option<u32>,
     ) -> bool {
         let cleared = match reason {
-            RecoveryReason::HttpsStall => matches!(https, ProbeOutcome::Healthy(_)),
+            RecoveryReason::HttpsStall => {
+                matches!(https, ProbeOutcome::Healthy(_) | ProbeOutcome::Stalled)
+            }
             RecoveryReason::UdpLeak => udp_sockets.is_some_and(|count| count <= UDP_LIMIT),
             RecoveryReason::Egress => false,
         };
@@ -344,21 +357,66 @@ fn probe_host(url: &str) -> Option<String> {
     }
     Some(host.to_string())
 }
-fn https_client(interface: &str) -> io::Result<reqwest::blocking::Client> {
-    let builder = reqwest::blocking::Client::builder()
+fn https_client(
+    interface: &str,
+    pinned: Option<(&str, SocketAddr)>,
+) -> io::Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(PROBE_TIMEOUT)
         .timeout(PROBE_TIMEOUT)
         .pool_max_idle_per_host(0)
         .interface(interface);
+    if let Some((host, address)) = pinned {
+        builder = builder.resolve(host, address);
+    }
     builder
         .build()
         .map_err(|_| io::Error::other("HTTPS prober unavailable"))
 }
-fn https(client: &reqwest::blocking::Client, url: &str) -> ProbeOutcome {
+
+struct HttpsProbe {
+    client: reqwest::blocking::Client,
+    pinned: Option<(SocketAddr, reqwest::blocking::Client)>,
+}
+
+impl HttpsProbe {
+    fn observe(&mut self, interface: &str, url: &str, hostname: Option<&str>) -> ProbeOutcome {
+        let (outcome, address) = https(&self.client, url, "name");
+        if matches!(outcome, ProbeOutcome::Healthy(_)) {
+            if let (Some(host), Some(address)) = (hostname, address) {
+                if self.pinned.as_ref().is_none_or(|(old, _)| *old != address) {
+                    self.pinned = https_client(interface, Some((host, address)))
+                        .ok()
+                        .map(|client| (address, client));
+                }
+            }
+            return outcome;
+        }
+        // A failed name-based request alone cannot establish a broken tunnel.
+        // Pin only an address learned from this URL's successful HTTPS response;
+        // reqwest keeps the original hostname for TLS verification and SNI.
+        let confirmed = if hostname.is_none() {
+            outcome
+        } else if let Some((_, client)) = &self.pinned {
+            https(client, url, "pinned").0
+        } else {
+            return ProbeOutcome::Stalled;
+        };
+        match confirmed {
+            ProbeOutcome::Stalled => ProbeOutcome::ConfirmedStall,
+            other => other,
+        }
+    }
+}
+fn https(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    phase: &'static str,
+) -> (ProbeOutcome, Option<SocketAddr>) {
     let started = Instant::now();
-    let result = (|| -> Result<(), (&'static str, Option<u16>)> {
+    let result = (|| -> Result<Option<SocketAddr>, (&'static str, Option<u16>)> {
         let response = client.get(url).send().map_err(|error| {
             let reason = if error.is_timeout() {
                 "timeout"
@@ -372,23 +430,29 @@ fn https(client: &reqwest::blocking::Client, url: &str) -> ProbeOutcome {
         if !response.status().is_success() {
             return Err(("http_status", Some(response.status().as_u16())));
         }
+        let response_address = response.remote_addr();
         // A bounded prefix is enough to prove the TLS/HTTP path, not the
         // integrity of an arbitrary site's entire response body.
         io::copy(&mut response.take(64 * 1024), &mut io::sink())
             .map_err(|_| ("body_read", None))?;
-        Ok(())
+        Ok(response_address)
     })();
     match result {
-        Ok(()) => {
+        Ok(address) => {
             crate::diagnostic_logging::trace(format_args!(
-                "watchdog https outcome=healthy duration_ms={}",
+                "watchdog https phase={phase} outcome=healthy duration_ms={}",
                 started.elapsed().as_millis()
             ));
-            ProbeOutcome::Healthy(started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32)
+            (
+                ProbeOutcome::Healthy(
+                    started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
+                ),
+                address,
+            )
         }
         Err((reason, status)) => {
-            crate::diagnostic_logging::debug(format_args!("watchdog https outcome=stalled reason={reason} http_status={status:?} duration_ms={}", started.elapsed().as_millis()));
-            ProbeOutcome::Stalled
+            crate::diagnostic_logging::debug(format_args!("watchdog https phase={phase} outcome=stalled reason={reason} http_status={status:?} duration_ms={}", started.elapsed().as_millis()));
+            (ProbeOutcome::Stalled, None)
         }
     }
 }
@@ -550,10 +614,15 @@ fn run(
         targets,
         Arc::clone(authorized),
     )?;
-    let client = spec
+    let mut probe = spec
         .probe_url
         .as_ref()
-        .map(|_| https_client(&spec.tun_name))
+        .map(|_| {
+            https_client(&spec.tun_name, None).map(|client| HttpsProbe {
+                client,
+                pinned: None,
+            })
+        })
         .transpose()?;
     let hostname = spec.probe_url.as_deref().and_then(probe_host);
     let mut tracker = EgressTracker::new();
@@ -591,8 +660,8 @@ fn run(
             let mut dns_result = ProbeOutcome::Skipped;
             let mut node_reachable = false;
             if online {
-                if let (Some(client), Some(url)) = (&client, &spec.probe_url) {
-                    https_result = https(client, url);
+                if let (Some(probe), Some(url)) = (&mut probe, &spec.probe_url) {
+                    https_result = probe.observe(&spec.tun_name, url, hostname.as_deref());
                 }
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -606,7 +675,7 @@ fn run(
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                if matches!(https_result, ProbeOutcome::Stalled) {
+                if matches!(https_result, ProbeOutcome::ConfirmedStall) {
                     if let Some(signature) = tracker.signature() {
                         for offset in 0..nodes.len().min(2) {
                             if stop.load(Ordering::Relaxed) {
@@ -885,6 +954,68 @@ mod tests {
         state.status.uplink = Some(true);
         state.probe_after = now;
     }
+
+    #[test]
+    fn successful_probe_address_survives_resolver_failure_but_not_transport_failure() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                let mut host_seen = false;
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    host_seen |= line
+                        .to_ascii_lowercase()
+                        .starts_with("host: watchdog.invalid:");
+                }
+                assert!(host_seen);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+                    )
+                    .unwrap();
+            }
+        });
+        let client = |address| {
+            reqwest::blocking::Client::builder()
+                .no_proxy()
+                .resolve("watchdog.invalid", address)
+                .build()
+                .unwrap()
+        };
+        let mut probe = HttpsProbe {
+            client: client(address),
+            pinned: None,
+        };
+        let url = format!("http://watchdog.invalid:{}/", address.port());
+        assert!(matches!(
+            probe.observe("lo", &url, Some("watchdog.invalid")),
+            ProbeOutcome::Healthy(_)
+        ));
+        probe.client = client(SocketAddr::from(([127, 0, 0, 2], address.port())));
+        assert!(matches!(
+            probe.observe("lo", &url, Some("watchdog.invalid")),
+            ProbeOutcome::Healthy(_)
+        ));
+        server.join().unwrap();
+        assert!(matches!(
+            probe.observe("lo", &url, Some("watchdog.invalid")),
+            ProbeOutcome::ConfirmedStall
+        ));
+    }
     #[test]
     fn node_outage_does_not_restart_xray_but_stalled_process_does_with_cooldown() {
         let now = Instant::now();
@@ -892,7 +1023,7 @@ mod tests {
         online(&mut state, now);
         for _ in 0..3 {
             state.observe(
-                ProbeOutcome::Stalled,
+                ProbeOutcome::ConfirmedStall,
                 ProbeOutcome::Skipped,
                 false,
                 Some(SocketReport::default()),
@@ -900,14 +1031,14 @@ mod tests {
         }
         assert_eq!(state.recovery(now), None);
         state.observe(
-            ProbeOutcome::Stalled,
+            ProbeOutcome::ConfirmedStall,
             ProbeOutcome::Skipped,
             true,
             Some(SocketReport::default()),
         );
         assert_eq!(state.recovery(now), Some(RecoveryReason::HttpsStall));
         state.observe(
-            ProbeOutcome::Stalled,
+            ProbeOutcome::ConfirmedStall,
             ProbeOutcome::Skipped,
             true,
             Some(SocketReport::default()),
@@ -918,6 +1049,46 @@ mod tests {
             Some(RecoveryReason::HttpsStall)
         );
     }
+    #[test]
+    fn dns_outage_does_not_turn_unconfirmed_https_failures_into_restarts() {
+        let now = Instant::now();
+        let mut state = RecoveryState::new(now);
+        online(&mut state, now);
+        for dns in [ProbeOutcome::Stalled, ProbeOutcome::Healthy(1)] {
+            for _ in 0..STALL_LIMIT {
+                state.observe(
+                    ProbeOutcome::Stalled,
+                    dns,
+                    true,
+                    Some(SocketReport::default()),
+                );
+            }
+            assert_eq!(state.recovery(now), None);
+        }
+        assert_eq!(state.status.https_stall_streak, STALL_LIMIT * 2);
+        for _ in 0..STALL_LIMIT - 1 {
+            state.observe(
+                ProbeOutcome::ConfirmedStall,
+                ProbeOutcome::Stalled,
+                true,
+                Some(SocketReport::default()),
+            );
+            assert_eq!(state.recovery(now), None);
+        }
+        state.observe(
+            ProbeOutcome::ConfirmedStall,
+            ProbeOutcome::Stalled,
+            true,
+            Some(SocketReport::default()),
+        );
+        assert_eq!(state.recovery(now), Some(RecoveryReason::HttpsStall));
+        assert!(state.cancel_cleared_request(
+            &RecoveryReason::HttpsStall,
+            ProbeOutcome::Stalled,
+            Some(0),
+        ));
+    }
+
     #[test]
     fn offline_guard_defers_egress_recovery_and_churn_is_rate_limited() {
         let now = Instant::now();
@@ -944,7 +1115,7 @@ mod tests {
         state.acknowledge(now);
         for _ in 0..STALL_LIMIT {
             state.observe(
-                ProbeOutcome::Stalled,
+                ProbeOutcome::ConfirmedStall,
                 ProbeOutcome::Skipped,
                 true,
                 Some(SocketReport::default()),
@@ -962,7 +1133,7 @@ mod tests {
         online(&mut state, now);
         for _ in 0..STALL_LIMIT {
             state.observe(
-                ProbeOutcome::Stalled,
+                ProbeOutcome::ConfirmedStall,
                 ProbeOutcome::Skipped,
                 true,
                 Some(SocketReport::default()),
@@ -973,7 +1144,7 @@ mod tests {
         assert!(state.cancel_cleared_request(&reason, ProbeOutcome::Healthy(2), Some(0)));
         for _ in 0..STALL_LIMIT {
             state.observe(
-                ProbeOutcome::Stalled,
+                ProbeOutcome::ConfirmedStall,
                 ProbeOutcome::Skipped,
                 true,
                 Some(SocketReport::default()),
