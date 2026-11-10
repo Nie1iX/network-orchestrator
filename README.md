@@ -379,10 +379,11 @@ Either client can inspect/disconnect the same connection. Routes, interfaces
 and DNS remain polkit-authorized operations of the system daemon.
 
 One unprivileged `netorch serve` process per data directory/daemon socket owns
-local Xray SOCKS/HTTP children and user proxy rollback. It starts on demand as
-a transient systemd user unit; closing the GUI or invoking shell does not
-disconnect it. Raw Xray JSON imports default to SOCKS mode.
-For these local proxies, the user manager must be available
+local Xray SOCKS/HTTP children, user proxy rollback and enabled subscription
+auto-refresh. It starts on demand as a transient systemd user unit; closing the
+GUI or invoking shell does not stop these jobs. Raw Xray JSON imports default
+to SOCKS mode. For local proxies and automatic refresh, the user manager must be
+available
 (`systemctl --user status`). Without one, run `netorch serve` in a separate
 foreground session using the same data directory and daemon socket. User units
 normally stop at logout; keeping them across logout requires an explicit
@@ -450,6 +451,16 @@ available; `netorch --json` emits machine-readable results. Use
 subscription identities, pins, checks, proxy exits and other settings survive.
 `subscription import` accepts separate private URL/HWID files and an optional
 `--cache-file`; cached import/refresh does not contact the provider.
+
+Enable a shared background schedule with `subscription interval PROFILE 60`
+(`15`, `60`, `360` minutes or `off`); existing Off settings stay Off.
+Refresh runs even while the profile is connected and does not reload or reconnect
+the tunnel. Saved config revisions are used on the next explicit connection/reload.
+A primary removed by the provider remains selected and marked missing rather than
+silently choosing another server. `netorch --json profile show PROFILE` exposes
+the interval, actual last-attempt timestamp and a redacted failure notice; the GUI
+reads the same persisted status. Changing the interval does not count as an attempt.
+
 `checks set PROFILE --file FILE` replaces the complete service-check list.
 Use private regular files owned by your user (`chmod 600`), or supported stdin
 inputs, rather than putting subscription URLs, credentials or setup keys in argv.

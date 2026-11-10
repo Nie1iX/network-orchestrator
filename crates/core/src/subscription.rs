@@ -805,6 +805,17 @@ pub fn list_endpoints(
             }
         })
         .collect();
+    if let Some(key) = active_key.filter(|key| !rows.iter().any(|row| row.key == *key)) {
+        rows.push(SubscriptionEndpointInfo {
+            name: key.clone(),
+            active: true,
+            protocol: None,
+            is_backup: backup.contains(key.as_str()),
+            is_missing: true,
+            in_pool: false,
+            key,
+        });
+    }
     for stored in subscription.backup_keys.iter().chain(
         subscription
             .pool_keys
@@ -1110,12 +1121,16 @@ pub struct RefreshOutcome {
 /// Replace a subscription's endpoints with a freshly fetched body, keeping
 /// the selected server when it still exists. Placeholder-only bodies are
 /// rejected and every write is rolled back on failure.
+/// With `preserve_selected`, occupied configured listener ports are retained,
+/// and a removed primary keeps its saved config/key rather than selecting a
+/// different server. Already-running children continue using their own snapshot.
 pub fn refresh_body(
     vault: &ConfigVault,
     store: &ProfileStore,
     id: &str,
     body: &str,
     meta: ResponseMeta,
+    preserve_selected: bool,
     available: impl Fn(u16) -> bool,
 ) -> io::Result<RefreshOutcome> {
     if body.len() > MAX_SUBSCRIPTION_BODY_BYTES {
@@ -1138,7 +1153,11 @@ pub fn refresh_body(
         profile.xray_socks_port,
         profile.xray_http_port,
         &used,
-        available,
+        |port| {
+            preserve_selected
+                && (profile.xray_socks_port == Some(port) || profile.xray_http_port == Some(port))
+                || available(port)
+        },
     )?;
     let previous = vault.read_subscription_endpoints(id)?;
     // The stored key wins; a profile saved before `active_key` existed
@@ -1172,17 +1191,29 @@ pub fn refresh_body(
     // a node, not a list position, so two identical entries can never steer
     // the selection to a different server.
     let new_index = selected.as_ref().and_then(|key| key_index(&endpoints, key));
-    let fallback_used = new_index.is_none();
-    let active_index = new_index.unwrap_or(0);
-    let imported =
-        vault.store_generated_xray(id, &serde_json::to_vec_pretty(&configs[active_index])?)?;
-    let new_path = imported.config_path;
+    let keep_missing = preserve_selected && selected.is_some() && new_index.is_none();
+    let fallback_used = new_index.is_none() && !keep_missing;
+    let active_index = new_index.unwrap_or_else(|| {
+        if keep_missing {
+            old_index.min(endpoints.len() - 1)
+        } else {
+            0
+        }
+    });
+    let old_path = profile.config_path.clone();
+    let new_path = if keep_missing {
+        old_path.clone()
+    } else {
+        vault
+            .store_generated_xray(id, &serde_json::to_vec_pretty(&configs[active_index])?)?
+            .config_path
+    };
     let rollback = || {
         let restored = vault
             .read_subscription_endpoints(id)
             .is_ok_and(|current| current == previous)
             || vault.store_subscription_endpoints(id, &previous).is_ok();
-        let removed = vault.remove_revision_for_config(&new_path).is_ok();
+        let removed = new_path == old_path || vault.remove_revision_for_config(&new_path).is_ok();
         restored && removed
     };
     let failure_message = |message: &str| {
@@ -1195,14 +1226,13 @@ pub fn refresh_body(
     if vault.store_subscription_endpoints(id, &endpoints).is_err() {
         return Err(failure_message("failed to store refreshed endpoints"));
     }
-    let old_path = profile.config_path.clone();
     // Missing headers keep the stored provider metadata.
     let stored_title = profile
         .subscription
         .as_ref()
         .and_then(|s| s.provider_title.clone());
     let title = meta.provider_title.clone().or(stored_title.clone());
-    if is_generated_name(&profile.name, stored_title.as_deref(), &previous) {
+    if !keep_missing && is_generated_name(&profile.name, stored_title.as_deref(), &previous) {
         profile.name = subscription_profile_name(title.as_deref(), &endpoints[active_index].name);
     }
     profile.config_path = new_path.clone();
@@ -1211,7 +1241,11 @@ pub fn refresh_body(
     let subscription = profile.subscription.as_mut().expect("checked above");
     subscription.endpoint_count = endpoints.len();
     subscription.active_index = active_index;
-    subscription.active_key = Some(endpoint_key(&endpoints[active_index].url));
+    subscription.active_key = if keep_missing {
+        selected
+    } else {
+        Some(endpoint_key(&endpoints[active_index].url))
+    };
     subscription.last_refresh_at_unix = Some(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1242,7 +1276,8 @@ pub fn refresh_body(
     if store.upsert(profile).is_err() {
         return Err(failure_message("failed to store refreshed profile"));
     }
-    let cleanup_failed = vault.is_managed_profile_path(id, &old_path)
+    let cleanup_failed = new_path != old_path
+        && vault.is_managed_profile_path(id, &old_path)
         && vault.remove_revision_for_config(&old_path).is_err();
     Ok(RefreshOutcome {
         endpoint_count: endpoints.len(),
@@ -1549,6 +1584,7 @@ mod tests {
             "panel",
             &panel_body(&["NL", "DE"]),
             ResponseMeta::default(),
+            false,
             |_| true,
         )
         .unwrap();
@@ -1672,9 +1708,7 @@ mod tests {
             }],
         )
         .unwrap();
-        refresh_body(&vault, &store, "nodes",
-            "vless://new@two.test:443?security=tls#Renamed\nvless://new@one.test:443?security=tls#Primary",
-            ResponseMeta::default(), |_| true).unwrap();
+        refresh_body(&vault, &store, "nodes", "vless://new@two.test:443?security=tls#Renamed\nvless://new@one.test:443?security=tls#Primary", ResponseMeta::default(), false, |_| true).unwrap();
         let profile = store.load().unwrap().profiles.remove(0);
         let meta = profile.subscription.as_ref().unwrap();
         assert_eq!(
@@ -1782,6 +1816,7 @@ mod tests {
             "panel",
             &panel_body(&["FI", "US", "DE", "NL"]),
             ResponseMeta::default(),
+            false,
             |_| true,
         )
         .unwrap();
@@ -1804,6 +1839,7 @@ mod tests {
             "panel",
             stub,
             ResponseMeta::default(),
+            false,
             |_| true,
         )
         .unwrap_err();
@@ -2170,9 +2206,15 @@ mod tests {
             .unwrap();
             assert_eq!(imported.profiles[0].xray_mode, mode);
             assert_eq!(store.load().unwrap().profiles[0].xray_mode, mode);
-            refresh_body(&vault, &store, "sub", BODY, ResponseMeta::default(), |_| {
-                true
-            })
+            refresh_body(
+                &vault,
+                &store,
+                "sub",
+                BODY,
+                ResponseMeta::default(),
+                false,
+                |_| true,
+            )
             .unwrap();
             assert_eq!(store.load().unwrap().profiles[0].xray_mode, mode);
         }

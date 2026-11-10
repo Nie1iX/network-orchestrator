@@ -45,6 +45,7 @@ pub(crate) enum Request {
     },
     Cleanup,
     RecoverProxy,
+    SyncSubscriptions,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -383,6 +384,7 @@ fn send_request(
         Some(Request::Status { .. }) => "status",
         Some(Request::Cleanup) => "cleanup",
         Some(Request::RecoverProxy) => "recover_proxy",
+        Some(Request::SyncSubscriptions) => "sync_subscriptions",
     };
     let mutation = !matches!(name, "status" | "capabilities");
     let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
@@ -412,6 +414,11 @@ fn send_request(
                     net_manager_core::system_proxy::load_ownership(&root.join("proxy-state.json"))?;
                 match request {
                     Some(Request::Status { id }) => return Ok(Response::status(stopped(id))),
+                    Some(Request::SyncSubscriptions)
+                        if !crate::linux_subscriptions::configured(root)? =>
+                    {
+                        return Ok(Response::status(stopped("")));
+                    }
                     Some(Request::Disconnect { id })
                         if !ownership
                             .as_ref()
@@ -773,6 +780,7 @@ impl Runtime {
                     prepared_connections_version: PREPARED_CONNECTIONS_VERSION,
                 }))
             }
+            Request::SyncSubscriptions => Ok(stopped("")),
             Request::ConnectPrepared { connection } => {
                 let result = self.connect(*connection);
                 if let Err(message) = &result {
@@ -937,9 +945,13 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
             libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
             libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
         }
+        let scheduler = crate::linux_subscriptions::Scheduler::start(root.clone(), daemon.clone())?;
         let mut idle_since = Instant::now();
         let mut health_check = Instant::now();
         while !STOP.load(Ordering::Relaxed) {
+            if scheduler.is_finished() {
+                break;
+            }
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     if !peer_is_user(&stream) {
@@ -951,7 +963,12 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
                         .ok()
                         .and_then(|bytes| serde_json::from_slice::<Request>(&bytes).ok())
                         .ok_or_else(|| "Invalid local runtime request".to_string())
-                        .and_then(|request| runtime.handle(request));
+                        .and_then(|request| {
+                            if matches!(request, Request::SyncSubscriptions) {
+                                scheduler.wake();
+                            }
+                            runtime.handle(request)
+                        });
                     let _ = serde_json::to_writer(&mut stream, &response);
                     let _ = stream.write_all(b"\n");
                     idle_since = Instant::now();
@@ -965,7 +982,7 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
                 runtime.check_child_health();
                 // Retain failed status until explicit disconnect, just like a
                 // live profile; only an empty runtime expires.
-                if !runtime.active.is_empty() {
+                if !runtime.active.is_empty() || scheduler.has_work() {
                     idle_since = Instant::now();
                 }
                 health_check = Instant::now();
@@ -974,6 +991,8 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
                 break;
             }
         }
+        let scheduler_failed = scheduler.is_finished();
+        drop(scheduler);
         session_log(
             &root,
             LogLevel::Info,
@@ -982,6 +1001,8 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
                 std::process::id(),
                 if STOP.load(Ordering::Relaxed) {
                     "signal"
+                } else if scheduler_failed {
+                    "subscription-worker-failed"
                 } else {
                     "idle"
                 },
@@ -993,7 +1014,11 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
             .handle(Request::Cleanup)
             .map_err(|message| error(&message));
         let _ = fs::remove_file(socket);
-        cleanup.map(|_| ())
+        cleanup?;
+        if scheduler_failed {
+            return Err(error("Subscription scheduler stopped unexpectedly"));
+        }
+        Ok(())
     };
     let result = run();
     let (level, outcome) = match &result {

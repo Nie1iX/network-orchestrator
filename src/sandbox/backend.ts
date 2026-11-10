@@ -1091,9 +1091,10 @@ export class SandboxBackend {
         p.subscription.refreshIntervalMinutes = args.refreshIntervalMinutes as number | null; return this.profiles;
       }
       case "refresh_subscription": {
-        const p = this.find(args.id); this.stopped(p);
+        const p = this.find(args.id);
         if (!p.subscription) throw new Error("Not a subscription profile");
         p.subscription.lastRefreshAtUnix = Math.floor(Date.now() / 1000);
+        p.subscription.lastRefreshError = null;
         const poolReport = p.subscription.nodePool ? this.rebuildPool(p) : null;
         return { endpointCount: this.endpoints.length, activeIndex: p.subscription.activeIndex, skippedCount: 0, fallbackUsed: false, cleanupFailed: false, poolReport };
       }

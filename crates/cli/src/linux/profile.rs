@@ -136,7 +136,7 @@ pub enum SubscriptionCommand {
         #[arg(long = "interval", alias = "refresh-interval", default_value = "off", value_parser = parse_interval)]
         refresh_interval: RefreshInterval,
     },
-    /// Refresh an inactive subscription using its original URL and HWID
+    /// Refresh the saved subscription without reconnecting an active tunnel
     Refresh {
         profile: String,
         #[arg(long, value_name = "FILE")]

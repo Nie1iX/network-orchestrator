@@ -387,7 +387,7 @@ export default function ProfileDetail({
                       refreshingSubscription ||
                       switching ||
                       isBusy ||
-                      status.state === "running",
+                      (os !== "linux" && status.state === "running"),
                   },
                 ]
               : []),

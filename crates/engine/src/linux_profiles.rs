@@ -391,11 +391,16 @@ impl ProfileService {
             return Err("Run subscription changes as your own user, without sudo".into());
         }
         let expected = self.subscription_profile(id)?;
+        let refresh_lock =
+            crate::linux_session::lock_file(&self.root.join("subscription-refresh.lock"))
+                .map_err(failed)?;
+        refresh_lock
+            .try_lock()
+            .map_err(|_| "A subscription refresh is already in progress".to_string())?;
         let meta = expected
             .subscription
             .as_ref()
             .expect("subscription checked");
-        self.ensure_editable(&expected)?;
         let refreshed = async {
             let fetched;
             let (body, response_meta) = if let Some(body) = cached {
@@ -411,13 +416,13 @@ impl ProfileService {
             if self.profile(id)? != expected {
                 return Err("The subscription changed during refresh; retry".into());
             }
-            self.ensure_editable(&expected)?;
             subscription::refresh_body(
                 &self.vault(),
                 &self.store(),
                 id,
                 body,
                 response_meta,
+                true,
                 available,
             )
             .map_err(failed)
@@ -497,7 +502,6 @@ impl ProfileService {
                     .as_mut()
                     .ok_or_else(|| invalid("Profile is not a subscription"))?;
                 meta.refresh_interval_minutes = minutes;
-                meta.last_refresh_at_unix = Some(now());
                 Ok(())
             })
             .map_err(failed)
@@ -1547,10 +1551,15 @@ pub fn metadata(profile: &Profile) -> Value {
                 "webPageUrl",
                 "announce",
                 "providerTitle",
-                "lastRefreshError",
                 "skippedProtocols",
             ] {
                 meta.remove(key);
+            }
+            if let Some(error) = meta
+                .get_mut("lastRefreshError")
+                .filter(|value| value.is_string())
+            {
+                *error = json!("Subscription refresh needs attention");
             }
         }
         if let Some(checks) = object

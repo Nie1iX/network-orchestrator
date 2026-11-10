@@ -19,8 +19,11 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::path::Path;
 #[cfg(not(target_os = "linux"))]
 use std::path::PathBuf;
+#[cfg(not(target_os = "linux"))]
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{Emitter, Manager, State};
+use tauri::State;
+#[cfg(not(target_os = "linux"))]
+use tauri::{Emitter, Manager};
 
 #[cfg(not(target_os = "linux"))]
 use net_manager_core::subscription::MAX_SUBSCRIPTION_BODY_BYTES;
@@ -35,6 +38,7 @@ fn validate_refresh_interval(minutes: Option<u32>) -> Result<(), String> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -42,10 +46,12 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn subscription_refresh_due(subscription: &SubscriptionMeta, now: u64) -> bool {
     net_manager_core::subscription::refresh_due(subscription, now)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn should_auto_refresh(profile: &Profile, now: u64, active: bool) -> bool {
     !active
         && profile.backend == TunnelBackend::Xray
@@ -865,9 +871,10 @@ fn refresh_subscription_body_into_with_metadata(
     meta: SubscriptionResponseMeta,
 ) -> Result<SubscriptionRefreshResult, String> {
     subscription_profile(store, id)?;
-    let outcome =
-        net_manager_core::subscription::refresh_body(vault, store, id, body, meta, available)
-            .map_err(|error| error.to_string())?;
+    let outcome = net_manager_core::subscription::refresh_body(
+        vault, store, id, body, meta, false, available,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(SubscriptionRefreshResult {
         endpoint_count: outcome.endpoint_count,
         active_index: outcome.active_index,
@@ -1081,8 +1088,8 @@ pub(crate) async fn refresh_subscription(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
-    #[cfg(not(target_os = "linux"))]
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent(net_manager_core::subscription::SUBSCRIPTION_USER_AGENT)
@@ -1109,15 +1116,6 @@ pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
                 continue;
             }
             let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-            #[cfg(target_os = "linux")]
-            let selected = {
-                let id = profile.id.clone();
-                linux_profiles_operation(state.inner(), move |service| {
-                    service.subscription_profile(&id)
-                })
-                .await
-            };
-            #[cfg(not(target_os = "linux"))]
             let selected = subscription_profile(&state.profiles, &profile.id);
             let Ok(current) = selected else {
                 continue;
@@ -1125,25 +1123,12 @@ pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
             if !should_auto_refresh(&current, unix_now(), false) {
                 continue;
             }
-            #[cfg(target_os = "linux")]
-            let active = {
-                let candidate = current.clone();
-                linux_profiles_operation(state.inner(), move |service| {
-                    service.ensure_editable(&candidate)
-                })
-                .await
-                .is_err()
-            };
-            #[cfg(not(target_os = "linux"))]
             let active = ensure_profile_stopped(&state, &current, "refreshing subscription")
                 .await
                 .is_err();
             if !should_auto_refresh(&current, unix_now(), active) {
                 continue;
             }
-            #[cfg(target_os = "linux")]
-            let refresh = linux_refresh_subscription(state.inner(), &current.id).await;
-            #[cfg(not(target_os = "linux"))]
             let refresh = refresh_subscription_into(
                 &state.config_vault,
                 &state.profiles,
@@ -1154,11 +1139,8 @@ pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
 
             match refresh {
                 Ok(result) => {
-                    #[cfg(not(target_os = "linux"))]
                     let completed =
                         finish_subscription_refresh(state.inner(), &current.id, result).await;
-                    #[cfg(target_os = "linux")]
-                    let completed: Result<_, String> = Ok(result);
                     match completed {
                         Ok(result) => {
                             let _ = app.emit("subscription-refreshed", (&current.id, &result));
@@ -1169,10 +1151,7 @@ pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
                         }
                     }
                 }
-                Err(_error) => {
-                    #[cfg(target_os = "linux")]
-                    let error = _error.as_str();
-                    #[cfg(not(target_os = "linux"))]
+                Err(_) => {
                     let error = if record_subscription_refresh_failure(
                         &state.profiles,
                         &current.id,
@@ -2010,6 +1989,15 @@ async fn linux_profiles_operation<R: Send + 'static>(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) async fn start_subscription_runtime(state: &AppState) -> Result<(), String> {
+    let root = state.data_dir().to_path_buf();
+    crate::daemon_client::DaemonClient::system()
+        .engine_request(move |engine| engine.with_data_root(root).sync_subscription_schedule())
+        .await
+        .map_err(|message| format!("Subscription auto-refresh runtime is unavailable: {message}"))
+}
+
+#[cfg(target_os = "linux")]
 async fn linux_profiles_document(
     state: &AppState,
     operation: impl FnOnce(
@@ -2155,7 +2143,7 @@ pub(crate) async fn import_subscription(
     refresh_interval_minutes: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<BatchImportResult, String> {
-    linux_profiles_operation(state.inner(), move |service| {
+    let result = linux_profiles_operation(state.inner(), move |service| {
         let id = net_manager_engine::linux_profiles::new_id()?;
         let request = net_manager_core::subscription::SubscriptionImport {
             id: &id,
@@ -2166,8 +2154,9 @@ pub(crate) async fn import_subscription(
         };
         profile_network(service.import_subscription(&request, None))
     })
-    .await
-    .map(redact_batch_import_for_ipc)
+    .await?;
+    start_subscription_runtime(state.inner()).await?;
+    Ok(redact_batch_import_for_ipc(result))
 }
 
 #[cfg(target_os = "linux")]
@@ -2201,10 +2190,12 @@ pub(crate) async fn set_subscription_refresh_interval(
     refresh_interval_minutes: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
-    linux_profiles_document(state.inner(), move |service| {
+    let profiles = linux_profiles_document(state.inner(), move |service| {
         service.set_refresh_interval(&profile_id, refresh_interval_minutes)
     })
-    .await
+    .await?;
+    start_subscription_runtime(state.inner()).await?;
+    Ok(profiles)
 }
 
 #[cfg(target_os = "linux")]

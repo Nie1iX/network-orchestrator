@@ -124,7 +124,16 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 #[cfg(target_os = "linux")]
-                auto_connect::start(handle.clone()).await;
+                {
+                    let state = handle.state::<state::AppState>();
+                    if let Err(error) =
+                        commands::profiles::start_subscription_runtime(state.inner()).await
+                    {
+                        eprintln!("network-orchestrator: {error}");
+                    }
+                    auto_connect::start(handle.clone()).await;
+                }
+                #[cfg(not(target_os = "linux"))]
                 commands::profiles::run_subscription_refresh_loop(handle).await;
             });
             let handle = app.handle().clone();

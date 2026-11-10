@@ -10,6 +10,14 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-10
+
+### Fixed
+
+- Refresh Linux subscription catalogs in the shared unprivileged runtime without
+  reconnecting active profiles, changing their listener ports or silently replacing
+  a primary removed by the provider. Preserve real attempt times and safe errors.
+
 ## [0.18.0] - 2026-11-10
 
 ### Added
