@@ -118,21 +118,14 @@ mod mihomo_process_tests {
     use super::*;
 
     #[test]
-    fn child_exit_is_observed_and_private_staging_is_removed() {
+    fn child_exit_before_readiness_removes_private_staging() {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let mut child =
-            MihomoChild::spawn(root.path(), Path::new("/bin/true"), &serde_json::json!({}))
-                .unwrap();
-        let directory = child.directory.clone();
-        assert!(directory.join("config.json").is_file());
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while child.running() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(!child.running());
-        drop(child);
-        assert!(!directory.exists());
+        let error = MihomoChild::spawn(root.path(), Path::new("/bin/true"), &serde_json::json!({}))
+            .err()
+            .expect("an exited backend must not become ready");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(fs::read_dir(root.path()).unwrap().next().is_none());
     }
 }
 
@@ -1379,16 +1372,18 @@ mod tests {
             dir.path().join("locks"),
         )
         .unwrap();
-        let executable = dir.path().join("fake-mihomo");
-        fs::write(&executable, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let child = MihomoChild::spawn(
-            &dir.path().join("staging"),
-            &executable,
-            &serde_json::json!({}),
-        )
-        .unwrap();
-        let staging = child.directory.clone();
+        let staging = dir.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("cache.db"), b"native fixture cache").unwrap();
+        let mut startup_probe =
+            net_manager_core::mihomo_startup::StartupProbe::prepare(&mut serde_json::json!({}))
+                .unwrap();
+        startup_probe.release_proxy_reservation();
+        let child = MihomoChild {
+            child: Command::new("/bin/sleep").arg("30").spawn().unwrap(),
+            directory: staging.clone(),
+            _startup_probe: startup_probe,
+        };
         let profile = Profile {
             id: "native".into(),
             backend: TunnelBackend::Mihomo,
