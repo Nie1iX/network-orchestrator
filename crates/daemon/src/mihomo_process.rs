@@ -17,8 +17,6 @@ use std::{
 #[cfg(target_os = "linux")]
 const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const LINK_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(target_os = "linux")]
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 pub trait MihomoProcessRunner: Send {
     fn verify_binary(&self) -> io::Result<()>;
@@ -37,7 +35,24 @@ pub trait MihomoProcessRunner: Send {
 
 #[cfg(target_os = "linux")]
 pub struct TrustedMihomoProcess {
-    children: HashMap<String, (u32, Child)>,
+    children: HashMap<String, TrackedMihomoChild>,
+}
+
+#[cfg(target_os = "linux")]
+struct TrackedMihomoChild {
+    uid: u32,
+    child: Child,
+    _startup_probe: net_manager_core::mihomo_startup::StartupProbe,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TrackedMihomoChild {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -54,65 +69,68 @@ impl TrustedMihomoProcess {
         directory: &Path,
         name: &str,
         selections: &std::collections::BTreeMap<String, String>,
-    ) -> io::Result<Child> {
+        mut startup_probe: net_manager_core::mihomo_startup::StartupProbe,
+    ) -> io::Result<(Child, net_manager_core::mihomo_startup::StartupProbe)> {
         let config = directory.join("config.json");
-        let mut child = Command::new(binary)
-            .args([
-                "-d",
-                directory.to_str().ok_or_else(invalid_input)?,
-                "-f",
-                config.to_str().ok_or_else(invalid_input)?,
-            ])
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .current_dir(directory)
-            .spawn()
-            .map_err(|_| io::Error::other("Mihomo launch failed"))?;
+        let mut child = {
+            let mut command = Command::new(binary);
+            command
+                .args([
+                    "-d",
+                    directory.to_str().ok_or_else(invalid_input)?,
+                    "-f",
+                    config.to_str().ok_or_else(invalid_input)?,
+                ])
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .current_dir(directory);
+            startup_probe.release_proxy_reservation();
+            command
+                .spawn()
+                .map_err(|_| io::Error::other("Mihomo launch failed"))?
+        };
         let started = (|| {
             let starttime = process_starttime(child.id())?;
             write_private(
                 &directory.join("process"),
                 format!("{} {starttime}\n", child.id()).as_bytes(),
             )?;
-            let deadline = Instant::now() + LINK_TIMEOUT;
-            loop {
-                if child
-                    .try_wait()
-                    .map_err(|_| io::Error::other("Mihomo child check failed"))?
-                    .is_some()
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "Mihomo exited during startup",
-                    ));
-                }
-                if self.link_index(name)?.is_some() {
-                    net_manager_core::mihomo_control::apply_group_selections(
-                        &directory.join("controller.sock"),
-                        selections,
-                    )
-                    .map_err(|_| io::Error::other("Mihomo group selection failed"))?;
-                    return Ok(());
-                }
-                if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "Mihomo interface did not appear",
-                    ));
-                }
-                thread::sleep(Duration::from_millis(25));
+            startup_probe.wait(&mut child)?;
+            if child
+                .try_wait()
+                .map_err(|_| io::Error::other("Mihomo child check failed"))?
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "Mihomo exited during startup",
+                ));
             }
+            if self.link_index(name)?.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "Mihomo interface did not appear",
+                ));
+            }
+            net_manager_core::mihomo_control::apply_group_selections(
+                &directory.join("controller.sock"),
+                selections,
+            )
+            .map_err(|_| io::Error::other("Mihomo group selection failed"))
         })();
         if let Err(error) = started {
             if terminate(&mut child).is_err() {
-                return Err(io::Error::other("Mihomo process stop failed"));
+                let _ = child.kill();
+                child
+                    .wait()
+                    .map_err(|_| io::Error::other("Mihomo process stop failed"))?;
             }
             let _ = fs::remove_file(directory.join("process"));
             return Err(error);
         }
-        Ok(child)
+        Ok((child, startup_probe))
     }
 }
 
@@ -203,6 +221,14 @@ impl MihomoProcessRunner for TrustedMihomoProcess {
             "external-controller-unix".into(),
             serde_json::json!(directory.join("controller.sock").display().to_string()),
         );
+        let startup_probe =
+            match net_manager_core::mihomo_startup::StartupProbe::prepare(&mut config_value) {
+                Ok(probe) => probe,
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&directory);
+                    return Err(error);
+                }
+            };
         let config = serde_json::to_vec(&config_value).map_err(|_| invalid_input())?;
         if let Err(error) = write_private(
             &directory.join("owner"),
@@ -213,9 +239,16 @@ impl MihomoProcessRunner for TrustedMihomoProcess {
             let _ = fs::remove_dir_all(&directory);
             return Err(error);
         }
-        match self.spawn(&binary, &directory, name, selections) {
-            Ok(child) => {
-                self.children.insert(name.to_owned(), (uid, child));
+        match self.spawn(&binary, &directory, name, selections, startup_probe) {
+            Ok((child, startup_probe)) => {
+                self.children.insert(
+                    name.to_owned(),
+                    TrackedMihomoChild {
+                        uid,
+                        child,
+                        _startup_probe: startup_probe,
+                    },
+                );
                 Ok(())
             }
             Err(error) => {
@@ -228,10 +261,11 @@ impl MihomoProcessRunner for TrustedMihomoProcess {
     }
 
     fn health(&mut self, name: &str) -> io::Result<bool> {
-        let Some((_, child)) = self.children.get_mut(name) else {
+        let Some(tracked) = self.children.get_mut(name) else {
             return Ok(false);
         };
-        if child
+        if tracked
+            .child
             .try_wait()
             .map_err(|_| io::Error::other("Mihomo child check failed"))?
             .is_some()
@@ -242,13 +276,13 @@ impl MihomoProcessRunner for TrustedMihomoProcess {
     }
 
     fn stop(&mut self, name: &str) -> io::Result<()> {
-        let Some((_, child)) = self.children.get_mut(name) else {
+        let Some(tracked) = self.children.get_mut(name) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "Mihomo child is not tracked",
             ));
         };
-        terminate(child)?;
+        terminate(&mut tracked.child)?;
         self.children.remove(name);
         Ok(())
     }
@@ -257,8 +291,8 @@ impl MihomoProcessRunner for TrustedMihomoProcess {
         if !valid_name(name) {
             return Err(invalid_input());
         }
-        if let Some((owner, _)) = self.children.get(name) {
-            if *owner != uid {
+        if let Some(tracked) = self.children.get(name) {
+            if tracked.uid != uid {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "Mihomo process ownership mismatch",

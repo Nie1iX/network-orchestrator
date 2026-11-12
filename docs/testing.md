@@ -129,6 +129,13 @@ the scoped packet actually entered its TUN; successful physical HTTP alone is
 not sufficient. Full payload addresses are unreachable without the tunnel.
 Foreign routes and primary resources must survive secondary teardown.
 
+A delayed native HTTP rule provider holds Mihomo in its initialization phase
+after opening listeners. Both daemon TUN and unprivileged mixed-proxy cases
+must carry their first payload immediately after `up` returns, without a
+caller-side sleep or retry. The daemon's internal readiness listener must
+reject unauthenticated access even if the provider requested loopback
+authentication bypass.
+
 The unprivileged mixed-proxy smoke uses a private data directory, HOME/XDG
 directories, no desktop D-Bus session, `useSystemProxy: false`, and an unreachable
 system-daemon socket. Independent selector groups sharing one inline provider

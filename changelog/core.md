@@ -9,6 +9,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
+### Fixed
+
+- Require real loopback HTTP forwarding through Mihomo's mixed listener before
+  reporting startup readiness; restrict the temporary DIRECT rule to that probe
+  destination and authenticate internally added mixed listeners.
 
 ## [0.19.1] - 2026-11-12
 
