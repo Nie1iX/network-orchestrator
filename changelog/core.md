@@ -10,6 +10,12 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Restrict endpoint identity migration to Xray subscriptions, including the
+  transaction recheck. Native Mihomo profiles have no Xray endpoint sidecar and
+  must remain readable by shared profile and status operations.
+
 ## [0.19.0] - 2026-11-12
 
 ### Added

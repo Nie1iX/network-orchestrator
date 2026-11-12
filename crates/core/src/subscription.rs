@@ -16,6 +16,43 @@ use std::{
 #[cfg(test)]
 mod mihomo_subscription_tests {
     #[test]
+    fn native_subscription_snapshot_does_not_require_xray_sidecar() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let store = ProfileStore::new(dir.path().join("profiles.json"));
+        let source = serde_json::json!({"proxies": [], "rules": ["MATCH,DIRECT"]});
+        let imported = vault.store_generated_mihomo("native", &source).unwrap();
+        let profile = Profile {
+            id: "native".into(),
+            name: "Native".into(),
+            backend: TunnelBackend::Mihomo,
+            config_path: imported.config_path,
+            mihomo: Some(MihomoProfileOptions::default()),
+            subscription: Some(
+                serde_json::from_value(serde_json::json!({
+                    "url": "https://example.test/subscription",
+                    "hwid": "registered-device",
+                    "endpointCount": 0,
+                    "activeIndex": 0
+                }))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let document = ProfileDocument {
+            version: crate::profiles::PROFILE_DOCUMENT_VERSION,
+            profiles: vec![profile.clone()],
+        };
+        store.save(&document).unwrap();
+        assert_eq!(
+            migrate_endpoint_ids(&vault, &store, "native").unwrap(),
+            profile
+        );
+        assert_eq!(store.load().unwrap(), document);
+    }
+
+    #[test]
     fn native_subscription_user_agent_is_recognized() {
         assert!(super::MIHOMO_SUBSCRIPTION_USER_AGENT.starts_with("clash.meta"));
     }
@@ -143,7 +180,7 @@ pub fn migrate_endpoint_ids(
         .into_iter()
         .find(|p| p.id == id)
         .ok_or_else(|| invalid("Profile not found"))?;
-    if current.subscription.is_none() {
+    if current.backend != TunnelBackend::Xray || current.subscription.is_none() {
         return Ok(current);
     }
     let sidecar = vault.read_subscription_sidecar(id)?;
@@ -170,7 +207,7 @@ pub fn migrate_endpoint_ids(
         .iter_mut()
         .find(|p| p.id == id)
         .ok_or_else(|| invalid("Profile not found"))?;
-    if profile.subscription.is_none() {
+    if profile.backend != TunnelBackend::Xray || profile.subscription.is_none() {
         return Ok(profile.clone());
     }
     let old = vault.read_subscription_sidecar(id)?;
