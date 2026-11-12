@@ -224,6 +224,12 @@ where
             .iter()
             .copied()
             .chain([
+                method::MIHOMO_INSTALL,
+                method::MIHOMO_REMOVE,
+                method::MIHOMO_CONNECT,
+                method::MIHOMO_DISCONNECT,
+                method::MIHOMO_STATUS,
+                method::MIHOMO_VALIDATE,
                 feature::XRAY_TUN_IPV6,
                 feature::MIHOMO_TUN,
                 feature::MIHOMO_MANAGED_INSTALL,
@@ -2782,18 +2788,23 @@ mod tests {
             .await;
         assert_eq!(reply["result"]["uid"], json!(1000));
         assert_eq!(reply["result"]["protocol"], json!(1));
-        assert_eq!(
-            reply["result"]["capabilities"],
-            json!(method::CAPABILITIES
-                .iter()
-                .copied()
-                .chain([
-                    feature::XRAY_TUN_IPV6,
-                    feature::MIHOMO_TUN,
-                    feature::MIHOMO_MANAGED_INSTALL,
-                ])
-                .collect::<Vec<_>>())
-        );
+        let hello: HelloResult = serde_json::from_value(reply["result"].clone()).unwrap();
+        for command in [
+            "mihomo.install",
+            "mihomo.remove",
+            "mihomo.connect",
+            "mihomo.disconnect",
+            "mihomo.status",
+            "mihomo.validate",
+        ] {
+            assert!(
+                hello
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == command),
+                "clients cannot use implemented command {command}"
+            );
+        }
         assert!(reply["result"]["tools"].is_object());
     }
 

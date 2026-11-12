@@ -88,6 +88,10 @@ chmod 600 subscription-url.txt
 netorch profile mihomo import --url-file subscription-url.txt --name native --interval 60
 ```
 
+For an existing device-bound subscription, add `--hwid-file subscription-hwid.txt`
+with its original HWID in another private file (`chmod 600`). Without this option
+the CLI derives its own device identity, which can exceed the provider's device limit.
+
 GUI: **Add connection → Mihomo**, then select a file, paste native configuration,
 or import a subscription. TUN mode belongs to the system daemon; closing either
 client does not disconnect it. Proxy mode uses a loopback mixed HTTP/SOCKS port

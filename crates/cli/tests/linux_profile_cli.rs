@@ -98,7 +98,7 @@ impl Sandbox {
                             })
                             .unwrap(),
                         ),
-                        method::XRAY_STATUS => ResponseFrame::ok(
+                        method::XRAY_STATUS | method::MIHOMO_STATUS => ResponseFrame::ok(
                             request.id,
                             json!({
                                 "profileId": request.params["profileId"],
@@ -341,6 +341,87 @@ fn assert_private(path: &Path) {
         "{} is accessible to other users",
         path.display()
     );
+}
+
+#[test]
+fn native_subscription_reuses_registered_identity_and_remains_editable() {
+    let sandbox = Sandbox::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = sandbox.file(
+        "native-url.txt",
+        format!("http://{}/subscription", listener.local_addr().unwrap()),
+    );
+    let hwid = sandbox.file("native-hwid.txt", HWID);
+    let provider = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(stream) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut registered = false;
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            registered |= line.trim().eq_ignore_ascii_case(&format!("x-hwid: {HWID}"));
+        }
+        let (status, body) = if registered {
+            (
+                "200 OK",
+                r#"{"proxies":[],"proxy-groups":[{"name":"Auto","type":"select","proxies":["DIRECT","REJECT"]}],"rules":["MATCH,Auto"]}"#,
+            )
+        } else {
+            ("403 Forbidden", "Device limit reached")
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    sandbox.ok(&[
+        "profile",
+        "mihomo",
+        "import",
+        "--url-file",
+        url.to_str().unwrap(),
+        "--hwid-file",
+        hwid.to_str().unwrap(),
+        "--name",
+        "Native subscription",
+    ]);
+    provider.join().unwrap();
+    let patch = sandbox.file("native-selection.json", r#"{"mihomo":{"mode":"tun","entryGroup":"Auto","mixedPort":null,"groupSelections":{"Auto":"REJECT"}}}"#);
+    sandbox.ok(&[
+        "profile",
+        "edit",
+        "Native subscription",
+        "--file",
+        patch.to_str().unwrap(),
+    ]);
+    let result = sandbox.ok(&[
+        "--json",
+        "profile",
+        "mihomo",
+        "groups",
+        "Native subscription",
+    ]);
+    let groups: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(groups[0]["selected"], "REJECT");
 }
 
 #[test]

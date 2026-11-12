@@ -10,6 +10,19 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-11-12
+
+Core 0.19.0.
+
+### Fixed
+
+- Advertise implemented Mihomo commands during the daemon handshake so the
+  optional-component installer and capability-aware clients can use them.
+- Accept an original provider HWID from a private file during native subscription
+  import, avoiding a new device registration when the provider limit is reached.
+- Keep native subscriptions usable across CLI invocations without trying to
+  migrate them as Xray endpoint catalogs.
+
 ## [0.19.0] - 2026-11-12
 
 Core 0.19.0.
