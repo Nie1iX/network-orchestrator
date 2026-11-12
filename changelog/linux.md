@@ -10,6 +10,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Advertise implemented Mihomo commands during the daemon handshake so the
+  optional-component installer and capability-aware clients can use them.
+
 ## [0.19.0] - 2026-11-12
 
 Core 0.19.0.
