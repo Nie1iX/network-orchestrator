@@ -41,6 +41,10 @@ pub(crate) use net_tables::{
 pub(crate) use netbird::{netbird_down, netbird_status, netbird_up};
 pub(crate) use nm::{nm_list_connections, nm_set_active};
 pub(crate) use profiles::{
+    apply_profile_document, get_mihomo_groups, get_profile_document, import_mihomo_subscription,
+    preview_profile_document, save_mihomo_document, save_profile_document,
+};
+pub(crate) use profiles::{
     apply_xray_policy_migration, delete_profile, get_profile_for_edit, get_profiles,
     get_subscription_endpoints, import_configs_batch, import_share_link, import_subscription,
     measure_subscription_endpoint_delay, preview_xray_policy_migration,
@@ -60,10 +64,12 @@ pub(crate) use sets::{
     get_connection_set, import_connection_sets, list_connection_sets, put_connection_set,
 };
 pub(crate) use system::{
-    cancel_managed_xray_install, daemon_status, discover_wireguard_configs,
-    get_backend_availability, get_managed_xray_offer, get_platform_capabilities, get_vpn_auth_mode,
-    install_managed_xray, is_elevated, remove_managed_xray, reset_backend_executable,
-    restart_elevated, set_backend_executable, set_vpn_auth_mode, system_proxy_status,
+    cancel_managed_mihomo_install, cancel_managed_xray_install, daemon_status,
+    discover_wireguard_configs, get_backend_availability, get_managed_mihomo_offer,
+    get_managed_xray_offer, get_platform_capabilities, get_vpn_auth_mode, install_managed_mihomo,
+    install_managed_xray, is_elevated, remove_managed_mihomo, remove_managed_xray,
+    reset_backend_executable, restart_elevated, set_backend_executable, set_vpn_auth_mode,
+    system_proxy_status,
 };
 pub(crate) use tunnels::{
     connect_openvpn_with_credentials, connect_profile, disconnect_profile, get_tunnel_statuses,

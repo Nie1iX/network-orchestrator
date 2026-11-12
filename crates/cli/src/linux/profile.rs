@@ -18,7 +18,7 @@ pub enum ProfileCommand {
     List,
     /// Show all saved settings, without credentials, sensitive URLs or config paths
     Show { profile: String },
-    /// Create from JSON settings and an optional config/share-link/WireGuard source
+    /// Create from JSON settings and an optional Xray, Mihomo, share-link or WireGuard source
     Create {
         /// Name, when not supplied by the JSON document
         profile: Option<String>,
@@ -88,6 +88,22 @@ pub enum ProfileCommand {
         #[arg(required = true)]
         profiles: Vec<String>,
     },
+    /// Native Mihomo provider subscriptions and groups
+    #[command(subcommand)]
+    Mihomo(MihomoProfileCommand),
+}
+#[derive(Debug, Subcommand)]
+pub enum MihomoProfileCommand {
+    Import {
+        #[arg(long, value_name = "FILE")]
+        url_file: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long = "interval", alias = "refresh-interval", default_value = "off", value_parser = parse_interval)]
+        refresh_interval: RefreshInterval,
+    },
+    /// Show native provider groups and selections
+    Groups { profile: String },
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +125,8 @@ fn parse_backend(value: &str) -> Result<TunnelBackend, String> {
         "wireguard" | "wireGuard" | "wg" => Ok(TunnelBackend::WireGuard),
         "openvpn" | "openVpn" => Ok(TunnelBackend::OpenVpn),
         "xray" => Ok(TunnelBackend::Xray),
-        _ => Err("Use none, wireguard, openvpn or xray".into()),
+        "mihomo" => Ok(TunnelBackend::Mihomo),
+        _ => Err("Use none, wireguard, openvpn, xray or mihomo".into()),
     }
 }
 
@@ -264,6 +281,26 @@ pub fn run_profile(ctx: &Ctx, command: ProfileCommand) -> Result<Output, String>
         }
         ProfileCommand::ImportConfigs { paths, backend } => {
             require_user(ctx)?;
+            let yaml_count = paths
+                .iter()
+                .filter(|path| {
+                    matches!(
+                        path.extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(str::to_ascii_lowercase)
+                            .as_deref(),
+                        Some("yaml" | "yml")
+                    )
+                })
+                .count();
+            if backend.is_none() && yaml_count != 0 && yaml_count != paths.len() {
+                return Err(
+                    "Import YAML Mihomo files separately from other backend configs".into(),
+                );
+            }
+            let backend = backend.or_else(|| {
+                (!paths.is_empty() && yaml_count == paths.len()).then_some(TunnelBackend::Mihomo)
+            });
             let paths = paths
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned())
@@ -369,6 +406,21 @@ pub fn run_profile(ctx: &Ctx, command: ProfileCommand) -> Result<Output, String>
             match source.as_ref() {
                 Some(ProfileSource::ShareLink(_)) => created.backend = TunnelBackend::Xray,
                 Some(ProfileSource::WireGuard(_)) => created.backend = TunnelBackend::WireGuard,
+                Some(ProfileSource::Config(path))
+                    if created.backend == TunnelBackend::Mihomo
+                        || matches!(
+                            path.extension()
+                                .and_then(|ext| ext.to_str())
+                                .map(str::to_ascii_lowercase)
+                                .as_deref(),
+                            Some("yaml" | "yml")
+                        ) =>
+                {
+                    created.backend = TunnelBackend::Mihomo;
+                    if created.mihomo.is_none() {
+                        created.mihomo = Some(Default::default());
+                    }
+                }
                 _ => {}
             }
             let id = created.id.clone();
@@ -398,6 +450,63 @@ pub fn run_profile(ctx: &Ctx, command: ProfileCommand) -> Result<Output, String>
                     .collect(),
             );
             Ok((value, "Profile order saved".into()))
+        }
+        ProfileCommand::Mihomo(command) => run_mihomo_profile(ctx, &service, command),
+    }
+}
+
+fn run_mihomo_profile(
+    ctx: &Ctx,
+    service: &ProfileService,
+    command: MihomoProfileCommand,
+) -> Result<Output, String> {
+    require_user(ctx)?;
+    match command {
+        MihomoProfileCommand::Import {
+            url_file,
+            name,
+            refresh_interval,
+        } => {
+            let url = read_input(&url_file, 16 * 1024)?;
+            let url = url.trim();
+            if url.is_empty() || url.contains(['\r', '\n']) {
+                return Err("Supply a single-line Mihomo subscription URL".into());
+            }
+            let id = linux_profiles::new_id()?;
+            let profile = Profile {
+                id: id.clone(),
+                name,
+                backend: TunnelBackend::Mihomo,
+                mihomo: Some(Default::default()),
+                ..Profile::default()
+            };
+            let result = runtime()?.block_on(service.import_mihomo_subscription(
+                profile,
+                url,
+                &super::library::hwid(),
+                refresh_interval.0,
+            ))?;
+            let imported = result
+                .profiles
+                .iter()
+                .find(|profile| profile.id == id)
+                .ok_or("The imported Mihomo profile could not be selected")?;
+            Ok((
+                linux_profiles::metadata(imported),
+                format!("Imported Mihomo profile \"{}\"", imported.name),
+            ))
+        }
+        MihomoProfileCommand::Groups { profile } => {
+            let profile = find(ctx, &profile)?;
+            if profile.backend != TunnelBackend::Mihomo {
+                return Err("The selected profile is not a Mihomo profile".into());
+            }
+            let groups = service.mihomo_groups(&profile.id)?;
+            let value =
+                serde_json::to_value(groups).map_err(|_| "Could not encode Mihomo groups")?;
+            let text = serde_json::to_string_pretty(&value)
+                .map_err(|_| "Could not render Mihomo groups")?;
+            Ok((value, text))
         }
     }
 }
@@ -657,4 +766,38 @@ fn read_input(path: &Path, max: usize) -> Result<String, String> {
         return Err("The input exceeds the size limit".into());
     }
     String::from_utf8(bytes).map_err(|_| "Input must be UTF-8".into())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linux::args::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn mihomo_profile_commands_parse_as_explicit_operations() {
+        for args in [
+            vec![
+                "netorch",
+                "profile",
+                "mihomo",
+                "import",
+                "--url-file",
+                "url",
+                "--name",
+                "Work",
+            ],
+            vec!["netorch", "profile", "mihomo", "groups", "work"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Profile(ProfileCommand::Mihomo(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_backend_parser_accepts_mihomo() {
+        assert_eq!(parse_backend("mihomo").unwrap(), TunnelBackend::Mihomo);
+    }
 }

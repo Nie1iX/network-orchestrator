@@ -10,7 +10,7 @@ import {
   SpinnerIcon,
 } from "../../icons";
 import { formatBytes } from "../../format";
-import { TranslationKey, useT } from "../../i18n";
+import { tr, TranslationKey, useT } from "../../i18n";
 import { providerPrefix } from "../../subscriptions";
 import {
   AlwaysOnKind,
@@ -380,7 +380,7 @@ export default function ProfileDetail({
                   },
                 ]
               : []),
-            ...(profile.subscription && endpoints
+            ...((profile.subscription && endpoints) || profile.backend === "mihomo"
               ? [
                   {
                     label: refreshingSubscription
@@ -533,6 +533,12 @@ export default function ProfileDetail({
               </span>
             </div>
           )}
+        {profile.backend === "mihomo" && profile.mihomo?.mixedPort != null && (
+          <div className="interface-row">
+            <span className="row-label">{tr("Mixed proxy")}</span>
+            <span className="row-value mono">127.0.0.1:{profile.mihomo.mixedPort}</span>
+          </div>
+        )}
         {profile.backend === "xray" &&
           profile.xrayMode === "socks" &&
           profile.xraySocksPort !== null &&

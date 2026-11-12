@@ -561,6 +561,15 @@ pub fn daemon_owner(profile: &Profile) -> Option<String> {
         TunnelBackend::Xray if profile.xray_mode == XrayMode::Tun => {
             Some(format!("xray:{}", profile.id))
         }
+        TunnelBackend::Mihomo
+            if profile
+                .mihomo
+                .as_ref()
+                .is_none_or(|options| options.mode == MihomoMode::Tun) =>
+        {
+            Some(format!("mihomo:{}", profile.id))
+        }
+        TunnelBackend::Mihomo => None,
         TunnelBackend::Xray => None,
     }
 }

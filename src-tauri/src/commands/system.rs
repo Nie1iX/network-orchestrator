@@ -318,6 +318,38 @@ pub(crate) fn get_managed_xray_offer() -> ManagedXrayOffer {
     managed_xray_offer()
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(crate) type ManagedMihomoOffer = ManagedXrayOffer;
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) fn get_managed_mihomo_offer() -> Result<ManagedMihomoOffer, String> {
+    Err("managed Mihomo installation is only supported on Linux".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn install_managed_mihomo(
+    _app: tauri::AppHandle,
+    _state: State<'_, AppState>,
+) -> Result<(), String> {
+    Err("managed Mihomo installation is only supported on Linux".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn cancel_managed_mihomo_install(
+    _state: State<'_, AppState>,
+) -> Result<(), String> {
+    Err("managed Mihomo installation is only supported on Linux".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn remove_managed_mihomo(_state: State<'_, AppState>) -> Result<(), String> {
+    Err("managed Mihomo installation is only supported on Linux".to_string())
+}
+
 /// Which OS-specific features the frontend may offer on this platform.
 #[cfg(not(target_os = "linux"))]
 #[derive(Debug, Serialize)]
@@ -327,6 +359,7 @@ pub(crate) struct PlatformCapabilities {
     system_proxy: bool,
     wireguard_standard_import: bool,
     managed_xray_install: bool,
+    managed_mihomo_install: bool,
     elevation_relaunch: bool,
     /// In-app updater remains hidden on Linux while no signed endpoint exists;
     /// `.deb` and other Linux installs update through their package manager.
@@ -364,6 +397,7 @@ fn platform_capabilities() -> PlatformCapabilities {
             any(target_os = "windows", target_os = "linux"),
             target_arch = "x86_64"
         )),
+        managed_mihomo_install: false,
         elevation_relaunch: windows,
         app_updates: app_updates_available(windows, tauri::utils::platform::bundle_type()),
         executable_extensions: if windows {
@@ -1048,7 +1082,9 @@ mod tests {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{ManagedXrayOffer, PlatformCapabilities, SystemProxyStatus};
+pub(crate) use linux::{
+    ManagedMihomoOffer, ManagedXrayOffer, PlatformCapabilities, SystemProxyStatus,
+};
 #[cfg(target_os = "linux")]
 use net_manager_engine::linux_system as linux;
 
@@ -1205,6 +1241,57 @@ pub(crate) async fn remove_managed_xray(state: State<'_, AppState>) -> Result<()
         .engine_request(move |engine| {
             let store = net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
             linux::remove_managed_xray(&engine.with_data_root(root.clone()), &root, &store)
+        })
+        .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) fn get_managed_mihomo_offer() -> ManagedMihomoOffer {
+    linux::managed_mihomo_offer()
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn install_managed_mihomo(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let root = state.data_dir().to_path_buf();
+    crate::daemon_client::DaemonClient::system()
+        .engine_request(move |engine| {
+            let store = net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
+            let runtime =
+                tokio::runtime::Runtime::new().map_err(|_| "Cannot start download runtime")?;
+            runtime.block_on(linux::install_managed_mihomo(
+                &engine.with_data_root(root.clone()),
+                &root,
+                &store,
+                &move |progress| {
+                    use tauri::Emitter;
+                    let _ = app.emit("backend-install-progress", progress);
+                },
+            ))
+        })
+        .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn cancel_managed_mihomo_install(
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    linux::cancel_managed_mihomo_install(state.data_dir())
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn remove_managed_mihomo(state: State<'_, AppState>) -> Result<(), String> {
+    let root = state.data_dir().to_path_buf();
+    crate::daemon_client::DaemonClient::system()
+        .engine_request(move |engine| {
+            let store = net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
+            linux::remove_managed_mihomo(&engine.with_data_root(root.clone()), &root, &store)
         })
         .await
 }

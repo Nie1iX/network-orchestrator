@@ -539,7 +539,7 @@ export default function ProfileManager() {
         const updated = await refreshAll();
         if (!updated) return;
         const next: Record<string, SubscriptionEndpointInfo[]> = {};
-        for (const profile of updated.filter((profile) => profile.subscription !== null)) {
+        for (const profile of updated.filter((profile) => profile.subscription !== null && profile.backend === "xray")) {
           try {
             next[profile.id] = await invoke<SubscriptionEndpointInfo[]>(
               "get_subscription_endpoints",
@@ -690,7 +690,7 @@ export default function ProfileManager() {
   };
 
   useEffect(() => {
-    const subProfiles = profiles.filter((p) => p.subscription !== null);
+    const subProfiles = profiles.filter((p) => p.subscription !== null && p.backend === "xray");
     if (subProfiles.length === 0) {
       if (Object.keys(endpoints).length > 0) setEndpoints({});
       return;
@@ -959,7 +959,7 @@ export default function ProfileManager() {
       });
       setProfiles(updated);
       const next: Record<string, SubscriptionEndpointInfo[]> = {};
-      for (const p of updated.filter((p) => p.subscription !== null)) {
+      for (const p of updated.filter((p) => p.subscription !== null && p.backend === "xray")) {
         try {
           next[p.id] = await invoke<SubscriptionEndpointInfo[]>(
             "get_subscription_endpoints",
@@ -1008,7 +1008,7 @@ export default function ProfileManager() {
     setProfiles(updated);
     const fresh = await refreshAll();
     if (!fresh) throw new Error(t("The change was saved, but refreshing the displayed profile or endpoints failed. Refresh the profile before making another change."));
-    if (fresh.some((profile) => profile.id === profileId && profile.subscription)) {
+    if (fresh.some((profile) => profile.id === profileId && profile.subscription && profile.backend === "xray")) {
       const list = await invoke<SubscriptionEndpointInfo[]>(
         "get_subscription_endpoints", { profileId },
       );
@@ -1061,6 +1061,10 @@ export default function ProfileManager() {
         id: profile.id,
       });
       await refreshAll();
+      if (profile.backend === "mihomo") {
+        toast("info", t("Mihomo subscription refreshed; reconnect to apply."));
+        return;
+      }
       const updated = await invoke<SubscriptionEndpointInfo[]>(
         "get_subscription_endpoints",
         { profileId: profile.id },
@@ -1449,7 +1453,7 @@ export default function ProfileManager() {
     : profiles;
 
   const groups: ProfileGroup[] = (
-    ["wireGuard", "openVpn", "xray", "none"] as TunnelBackend[]
+    ["wireGuard", "openVpn", "xray", "mihomo", "none"] as TunnelBackend[]
   )
     .map((backend) => ({
       backend,

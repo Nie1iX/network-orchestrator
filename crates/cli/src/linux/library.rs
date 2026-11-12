@@ -37,7 +37,7 @@ fn random_suffix() -> Result<String, String> {
 
 /// The machine's stable id, hashed into the HWID subscription panels expect.
 /// It differs from the app's HWID, so a panel counts the CLI as its own device.
-fn hwid() -> String {
+pub(super) fn hwid() -> String {
     ["/etc/machine-id", "/var/lib/dbus/machine-id"]
         .iter()
         .filter_map(|path| std::fs::read_to_string(path).ok())
@@ -100,7 +100,7 @@ fn rename_to(ctx: &Ctx, id: &str, name: &str) -> Result<Profile, String> {
 }
 
 /// Saves what `input` points at: a share link, a subscription URL or a
-/// `.conf` / `.ovpn` / `.json` file. A subscription can add several profiles.
+/// `.conf` / `.ovpn` / `.json` / `.yaml` / `.yml` file. A subscription can add several profiles.
 pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profile>, String> {
     require_user(ctx)?;
     let before: HashSet<String> = ctx.profiles()?.into_iter().map(|p| p.id).collect();
@@ -109,7 +109,7 @@ pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profi
         Input::Saved(_) => {
             return Err(
                 "That is not a vless:// / hysteria2:// link, an https:// subscription \
-                        URL or an existing .conf / .ovpn / .json file."
+                        URL or an existing .conf / .ovpn / .json / .yaml / .yml config file."
                     .into(),
             )
         }
@@ -187,7 +187,7 @@ pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profi
                 .map_err(io_message)?;
             }
         }
-        Input::File { path, .. } => import_file(ctx, &path)?,
+        Input::File { path, backend } => import_file(ctx, &path, backend)?,
     }
     let added = new_since(ctx, &before)?;
     if added.is_empty() {
@@ -199,16 +199,27 @@ pub fn add_input(ctx: &Ctx, input: &str, name: Option<&str>) -> Result<Vec<Profi
     }
 }
 
-fn import_file(ctx: &Ctx, path: &Path) -> Result<(), String> {
+fn import_file(
+    ctx: &Ctx,
+    path: &Path,
+    backend: net_manager_core::models::TunnelBackend,
+) -> Result<(), String> {
     let path = path
         .canonicalize()
         .map_err(|_| "The file could not be read".to_string())?;
+    #[cfg(not(target_os = "linux"))]
+    if backend == net_manager_core::models::TunnelBackend::Mihomo {
+        return Err("Mihomo profiles are supported on Linux only".into());
+    }
     #[cfg(target_os = "linux")]
     let result = net_manager_engine::linux_profiles::ProfileService::new(
         ctx.root.clone(),
         ctx.engine.clone(),
     )
-    .import_configs(&[path.to_string_lossy().into_owned()], None)?;
+    .import_configs(
+        &[path.to_string_lossy().into_owned()],
+        (backend == net_manager_core::models::TunnelBackend::Mihomo).then_some(backend),
+    )?;
     #[cfg(not(target_os = "linux"))]
     let result = profile_import::import_configs_into(
         &ctx.vault(),

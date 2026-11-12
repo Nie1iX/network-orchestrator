@@ -1040,6 +1040,7 @@ impl TunnelManager {
             TunnelBackend::WireGuard => self.wireguard_exe = path,
             TunnelBackend::OpenVpn => self.openvpn_exe = path,
             TunnelBackend::Xray => self.xray_exe = path,
+            TunnelBackend::Mihomo => {}
         }
     }
 
@@ -1194,6 +1195,9 @@ impl TunnelManager {
                     .ok()
                     .flatten();
                 xray_health(&status, log)
+            }
+            TunnelBackend::Mihomo => {
+                health(ProtocolHealthState::Unknown, "Mihomo is managed separately")
             }
             TunnelBackend::WireGuard => match status.state {
                 TunnelState::Stopped => health(ProtocolHealthState::Unknown, "not running"),
@@ -1459,6 +1463,10 @@ impl TunnelManager {
                 let prepared = self.prepare_xray_connection(profile)?;
                 self.spawn_prepared_xray(profile, &prepared)
             }
+            TunnelBackend::Mihomo => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Mihomo requires the Linux runtime",
+            )),
             TunnelBackend::None => unreachable!("None handled before config_path check"),
         }
     }
@@ -1485,6 +1493,10 @@ impl TunnelManager {
             TunnelBackend::Xray => {
                 Self::disconnect_child(&mut self.xray_children, &mut self.failures, profile)
             }
+            TunnelBackend::Mihomo => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Mihomo requires the Linux runtime",
+            )),
         }
     }
 
@@ -1559,6 +1571,11 @@ impl TunnelManager {
                 &mut self.failures,
                 &profile.id,
                 "xray",
+            ),
+            TunnelBackend::Mihomo => status_for(
+                &profile.id,
+                TunnelState::Stopped,
+                Some("Mihomo is managed separately".into()),
             ),
         }
     }

@@ -27,6 +27,7 @@ fn capability(profile: &Profile) -> &'static str {
     match profile.backend {
         TunnelBackend::WireGuard => method::WIREGUARD_CONNECT,
         TunnelBackend::OpenVpn => method::OPENVPN_CONNECT,
+        TunnelBackend::Mihomo => method::MIHOMO_CONNECT,
         _ => method::XRAY_CONNECT,
     }
 }
@@ -79,6 +80,17 @@ fn helper_side(privileged: &dyn Privileged, profile: &Profile) -> HelperSide {
         TunnelBackend::OpenVpn => privileged
             .call::<_, OpenVpnStatusResult>(method::OPENVPN_STATUS, params)
             .map(|s| (TunnelDetail::default(), diagnostics::openvpn_health(&s))),
+        TunnelBackend::Mihomo => privileged
+            .call::<_, net_manager_core::daemon_protocol::MihomoStatusResult>(
+                method::MIHOMO_STATUS,
+                params,
+            )
+            .map(|s| {
+                (
+                    diagnostics::xray_tun_detail(&s),
+                    diagnostics::xray_tun_health(&s),
+                )
+            }),
         _ => privileged
             .call::<_, XrayStatusResult>(method::XRAY_STATUS, params)
             .map(|s| {

@@ -25,7 +25,7 @@ macOS and Windows must be migrated and verified on their native platforms.
 | CLI / GUI | User interaction, authorization prompts, presentation | Background tunnel lifetime or authoritative runtime state |
 | Shared Engine/services | Typed commands, plan derivation, validation, orchestration and rollback | An additional universal coordinator daemon |
 | Privileged system backend | Tunnels, routes, interfaces, DNS, resource journal, reconciliation and recovery | Root/SYSTEM execution of user-writable binaries or user desktop proxy state |
-| Unprivileged user runtime | Local Xray SOCKS/HTTP children, user proxy settings, child health, proxy rollback and enabled subscription refresh jobs | Privileged route/interface/DNS mutations or a keepalive for system connections |
+| Unprivileged user runtime | Local Xray SOCKS/HTTP and Mihomo mixed-proxy children, user proxy settings, child health, proxy rollback and enabled subscription/provider refresh jobs | Privileged route/interface/DNS mutations or a keepalive for system connections |
 
 Every backend MUST validate requests at its trust boundary. Privileged requests
 MUST authenticate and authorize the actual caller. A user runtime MUST NOT become
@@ -33,11 +33,29 @@ an implicitly trusted authorization proxy. Existing approved tunnel launch paths
 may execute a verified binary after irreversibly dropping user credentials; the
 system backend still owns the privileged tunnel resources.
 
-Local Xray MUST run without root/SYSTEM privileges. User proxy changes MUST use
+Local Xray and Mihomo proxies MUST run without root/SYSTEM privileges. User proxy changes MUST use
 the appropriate user/session context and restore the prior snapshot on explicit
 disconnect or detected child failure. Merely persisting a proxy setting does not
 require a background process; supervising its target and restoring it does.
 Secrets/config contents MUST NOT appear in events, logs or errors.
+
+Optional Linux Mihomo TUN uses only the pinned, hash-verified root-owned managed
+executable. Its app-owned TUN, routes and per-link DNS belong to the system daemon;
+native auto-routing and external listeners/controllers are disabled. The private
+Unix controller applies independent saved group selections before Running.
+HTTP proxy providers are snapshotted unprivileged; bounded rule datasets use
+canonical paths inside private runtime staging. Existing Xray profiles are never
+converted implicitly.
+
+Mihomo TUN uses gVisor rather than mixed/system TCP: duplicated native gateway
+addresses must not send a secondary instance's internal TCP NAT into another
+TUN. Its implicit IPv6 gateway route uses a per-instance auxiliary table
+(`transport_mark + 128`), checked free alongside the reserved policy table.
+The auxiliary table is never used for profile capture; closing the owned TUN
+removes its native route.
+SIGKILL recovery also removes the native IPv6 output-interface rule by its
+full kernel identity and journaled interface/table, not an assumed priority.
+Unrelated selectors/rules are preserved; cleanup failure retains ownership for retry.
 
 ## Platform mapping
 

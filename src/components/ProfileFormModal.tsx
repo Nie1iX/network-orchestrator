@@ -8,6 +8,8 @@ import {
   DomainRouteTarget,
   HappRoutingImport,
   NetworkInterface,
+  MihomoGroupInfo,
+  MihomoProfileOptions,
   PinnedRoute,
   PolicyRoute,
   Profile,
@@ -32,6 +34,7 @@ const BACKEND_EXTENSIONS: Record<TunnelBackend, string[]> = {
   wireGuard: ["conf", "dpapi"],
   openVpn: ["ovpn", "conf"],
   xray: ["json"],
+  mihomo: ["yaml", "yml", "json"],
 };
 
 const PROXY_BYPASS_PLACEHOLDER = "10.*, *.corp.local";
@@ -120,6 +123,9 @@ export interface ProfileFormState {
   name: string;
   backend: TunnelBackend;
   configPath: string;
+  mihomo: MihomoProfileOptions;
+  mihomoSource: "file" | "document";
+  mihomoDocument: string;
   interfaceName: string;
   routes: PolicyRoute[];
   autoConnect: boolean;
@@ -205,6 +211,9 @@ export function newFormState(
     name: "",
     backend,
     configPath: "",
+    mihomo: { mode: "tun", entryGroup: null, mixedPort: null, groupSelections: {} },
+    mihomoSource: "file",
+    mihomoDocument: "",
     interfaceName: "",
     routes: [],
     autoConnect: false,
@@ -248,6 +257,9 @@ export function editFormState(profile: Profile, revision: string): ProfileFormSt
     name: profile.name,
     backend: profile.backend,
     configPath: profile.configPath,
+    mihomo: structuredClone(profile.mihomo ?? { mode: "tun", entryGroup: null, mixedPort: null, groupSelections: {} }),
+    mihomoSource: "file",
+    mihomoDocument: "",
     interfaceName: profile.interfaceName,
     routes: profile.routes.map((r) => ({ ...r })),
     autoConnect: profile.autoConnect,
@@ -320,6 +332,8 @@ export default function ProfileFormModal({
   const [routeCheckError, setRouteCheckError] = useState<string | null>(null);
   const [tab, setTab] = useState<FormTab>("general");
   const [rulesEditor, setRulesEditor] = useState<RulesSetId | null>(null);
+  const [mihomoGroups, setMihomoGroups] = useState<MihomoGroupInfo[]>([]);
+  const [mihomoGroupsError, setMihomoGroupsError] = useState<string | null>(null);
   const tr = useT();
 
   useEffect(() => {
@@ -341,18 +355,33 @@ export default function ProfileFormModal({
     }
   }, [open, editing?.id]);
 
+  useEffect(() => {
+    setMihomoGroups([]);
+    setMihomoGroupsError(null);
+    if (!open || !editing || editing.isNew || editing.backend !== "mihomo") return;
+    let cancelled = false;
+    invoke<MihomoGroupInfo[]>("get_mihomo_groups", { id: editing.id }).then(
+      (groups) => { if (!cancelled) setMihomoGroups(groups); },
+      (error) => { if (!cancelled) setMihomoGroupsError(String(error)); },
+    );
+    return () => { cancelled = true; };
+  }, [open, editing?.id, editing?.backend, editing?.isNew]);
+
   const current = form ?? editing;
   if (!current) return null;
 
   const targetable = interfaces.filter((i) => i.category !== "filter");
   const systemProxyAvailable =
-    current.xrayMode === "socks" &&
-    (current.xraySocksPort !== null ||
-      (current.isNew && current.xraySource === "vless"));
+    current.backend === "mihomo"
+      ? current.mihomo.mode === "proxy" && current.mihomo.mixedPort !== null
+      : current.xrayMode === "socks" &&
+        (current.xraySocksPort !== null ||
+          (current.isNew && current.xraySource === "vless"));
   const daemonManagedInterface = caps?.os === "linux" && (
     current.backend === "wireGuard" ||
     current.backend === "openVpn" ||
-    (current.backend === "xray" && current.xrayMode === "tun")
+    (current.backend === "xray" && current.xrayMode === "tun") ||
+    (current.backend === "mihomo" && current.mihomo.mode === "tun")
   );
 
   const update = (patch: Partial<ProfileFormState>) =>
@@ -578,8 +607,15 @@ export default function ProfileFormModal({
       current.backend === "wireGuard" &&
       current.isNew &&
       current.wgSource === "fields";
+    if (current.backend === "mihomo" && (
+      current.mihomo.mode === "proxy" && current.mihomo.mixedPort === null ||
+      current.mihomo.mixedPort !== null && (!Number.isInteger(current.mihomo.mixedPort) || current.mihomo.mixedPort < 1 || current.mihomo.mixedPort > 65535)
+    )) {
+      fail(tr("Enter a mixed proxy port between 1 and 65535."), "connection");
+      return;
+    }
     const proxyBypass = parseBypass(current.proxyBypass);
-    if (isXray && current.useSystemProxy) {
+    if ((isXray || current.backend === "mihomo") && current.useSystemProxy) {
       for (const entry of proxyBypass) {
         if (entry.includes(";")) {
           fail(tr("form.errBypassSemicolon"), "connection");
@@ -635,6 +671,7 @@ export default function ProfileFormModal({
       id: current.id,
       name: current.name.trim(),
       backend: current.backend,
+      mihomo: current.backend === "mihomo" ? current.mihomo : null,
       configPath: current.configPath.trim(),
       interfaceName: current.interfaceName.trim(),
       routes: current.routes.map((r) => ({
@@ -643,8 +680,8 @@ export default function ProfileFormModal({
         via: r.via?.trim() || null,
       })),
       autoConnect: current.autoConnect,
-      domainPolicies: isXray ? domainPolicies : [],
-      privateLanDirect: isXray && current.privateLanDirect,
+      domainPolicies: isXray || current.backend === "mihomo" ? domainPolicies : [],
+      privateLanDirect: (isXray || current.backend === "mihomo") && current.privateLanDirect,
       xraySocksPort: !isXray
         ? null
         : isVlessImport
@@ -653,8 +690,8 @@ export default function ProfileFormModal({
             ? null
             : current.xraySocksPort,
       xrayHttpPort: isXray && !current.isNew ? current.xrayHttpPort : null,
-      useSystemProxy: isXray && current.useSystemProxy && current.xrayMode === "socks",
-      proxyBypass: isXray ? proxyBypass : [],
+      useSystemProxy: current.useSystemProxy && (isXray && current.xrayMode === "socks" || current.backend === "mihomo" && current.mihomo.mode === "proxy"),
+      proxyBypass: isXray || current.backend === "mihomo" ? proxyBypass : [],
       subscription: current.isNew ? null : current.subscription ?? null,
       xrayMode: isXray ? current.xrayMode : "socks",
       xrayTunInterface: isXray
@@ -705,6 +742,12 @@ export default function ProfileFormModal({
           profile: payload,
           expectedRevision: current.expectedRevision,
           fields: current.wgFields,
+        });
+      } else if (current.backend === "mihomo" && current.mihomoSource === "document") {
+        updated = await invoke<Profile[]>("save_mihomo_document", {
+          profile: payload,
+          document: current.mihomoDocument,
+          expectedRevision: current.expectedRevision,
         });
       } else {
         updated = await invoke<Profile[]>("save_profile", { profile: payload, expectedRevision: current.expectedRevision });
@@ -802,6 +845,7 @@ export default function ProfileFormModal({
         <select
           className="filter-select"
           value={current.backend}
+          disabled={!current.isNew && current.backend === "mihomo"}
           onChange={(e) => {
             const backend = e.target.value as TunnelBackend;
             update({
@@ -826,6 +870,7 @@ export default function ProfileFormModal({
           <option value="wireGuard">WireGuard</option>
           <option value="openVpn">OpenVPN</option>
           <option value="xray">Xray</option>
+          {caps?.os === "linux" && (current.isNew || current.backend === "mihomo") && <option value="mihomo">Mihomo</option>}
         </select>
       </label>
       {caps?.os === "linux" && (
@@ -873,6 +918,13 @@ export default function ProfileFormModal({
           </select>
         </label>
       )}
+      {current.backend === "mihomo" && current.isNew && <label>
+        {tr("form.configSource")}
+        <select value={current.mihomoSource} onChange={(event) => update({ mihomoSource: event.target.value as "file" | "document" })}>
+          <option value="file">{tr("form.configFile")}</option>
+          <option value="document">{tr("Paste native YAML or JSON")}</option>
+        </select>
+      </label>}
       {current.backend === "xray" &&
       current.isNew &&
       current.xraySource === "vless" ? (
@@ -1017,6 +1069,10 @@ export default function ProfileFormModal({
             />
           </label>
         </div>
+      ) : current.backend === "mihomo" && current.mihomoSource === "document" ? (
+        <label>{tr("Paste native YAML or JSON")}
+          <textarea value={current.mihomoDocument} onChange={(event) => update({ mihomoDocument: event.target.value })} autoComplete="off" spellCheck={false} rows={8} />
+        </label>
       ) : current.backend !== "none" ? (
         <label>
           {tr("form.configFile")}
@@ -1081,6 +1137,50 @@ export default function ProfileFormModal({
           )}
         </div>
       )}
+      {current.backend === "mihomo" && <>
+        <label>{tr("Mihomo mode")}
+          <select value={current.mihomo.mode} onChange={(event) => update({ mihomo: { ...current.mihomo, mode: event.target.value as "tun" | "proxy" } })}>
+            <option value="tun">TUN</option>
+            <option value="proxy">{tr("Mixed proxy")}</option>
+          </select>
+        </label>
+        <label>{tr("Mixed proxy port")}
+          <input type="number" min={1} max={65535} value={current.mihomo.mixedPort ?? ""} onChange={(event) => update({ mihomo: { ...current.mihomo, mixedPort: event.target.value === "" ? null : Number(event.target.value) } })} />
+        </label>
+        {mihomoGroupsError && <div className="save-notice" role="alert">{mihomoGroupsError}</div>}
+        {mihomoGroups.length > 0 && <>
+          <label>{tr("Entry group")}
+            <select value={current.mihomo.entryGroup ?? ""} onChange={(event) => update({ mihomo: { ...current.mihomo, entryGroup: event.target.value || null } })}>
+              <option value="">{tr("Native default")}</option>
+              {current.mihomo.entryGroup && !mihomoGroups.some((group) => group.name === current.mihomo.entryGroup) && <option value={current.mihomo.entryGroup}>{current.mihomo.entryGroup} — {tr("Missing selection")}</option>}
+              {mihomoGroups.map((group) => <option key={group.name} value={group.name}>{group.name}</option>)}
+            </select>
+          </label>
+          <span>{tr("Group selections")}</span>
+          {mihomoGroups.filter((group) => group.kind === "select").map((group) => <label key={group.name}>{group.name}
+            <select value={current.mihomo.groupSelections[group.name] ?? ""} onChange={(event) => {
+              const groupSelections = { ...current.mihomo.groupSelections };
+              if (event.target.value) groupSelections[group.name] = event.target.value;
+              else delete groupSelections[group.name];
+              update({ mihomo: { ...current.mihomo, groupSelections } });
+            }}>
+              <option value="">{tr("Use native selection")}</option>
+              {current.mihomo.groupSelections[group.name] && !group.members.includes(current.mihomo.groupSelections[group.name]) && <option value={current.mihomo.groupSelections[group.name]}>{current.mihomo.groupSelections[group.name]} — {tr("Missing selection")}</option>}
+              {group.members.map((member) => <option key={member} value={member}>{member}</option>)}
+            </select>
+          </label>)}
+          {Object.entries(current.mihomo.groupSelections).filter(([name]) => !mihomoGroups.some((group) => group.name === name && group.kind === "select")).map(([name, member]) => <label key={name}>{name} — {tr("Missing selection")}
+            <select value={member} onChange={() => {
+              const groupSelections = { ...current.mihomo.groupSelections };
+              delete groupSelections[name];
+              update({ mihomo: { ...current.mihomo, groupSelections } });
+            }}>
+              <option value={member}>{member}</option>
+              <option value="">{tr("Use native selection")}</option>
+            </select>
+          </label>)}
+        </>}
+      </>}
       {current.backend === "xray" && (
         <label>
           {tr("form.xrayMode")}
@@ -1184,8 +1284,8 @@ export default function ProfileFormModal({
             </span>
           </div>
         )}
-      {current.backend === "xray" &&
-        current.xrayMode === "socks" &&
+      {((current.backend === "xray" && current.xrayMode === "socks") ||
+        (current.backend === "mihomo" && current.mihomo.mode === "proxy")) &&
         caps?.systemProxy && (
         <div className="profile-proxy">
           <label className="profile-proxy-toggle">
@@ -1424,7 +1524,7 @@ export default function ProfileFormModal({
           </span>
         </div>
       )}
-      {current.backend === "xray" && (
+      {(current.backend === "xray" || current.backend === "mihomo") && (
         <div className="profile-routes">
           <div className="profile-routes-head">
             <span>{tr("form.domainRouting")}</span>
@@ -1459,6 +1559,7 @@ export default function ProfileFormModal({
             />
             {tr("form.privateLanDirect")}
           </label>
+          {current.backend === "xray" && <>
           <div className="route-check">
             <div className="route-check-row">
               <input
@@ -1623,6 +1724,7 @@ export default function ProfileFormModal({
               </div>
             </div>
           )}
+          </>}
         </div>
       )}
       </div>

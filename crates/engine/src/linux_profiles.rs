@@ -17,6 +17,7 @@ pub enum ProfileSource {
     Config(PathBuf),
     ShareLink(String),
     WireGuard(WireGuardFields),
+    MihomoDocument(String),
 }
 
 #[derive(Clone)]
@@ -120,13 +121,17 @@ impl ProfileService {
         let _lock = self.mutation()?;
         let expected = self.profile(id)?;
         self.ensure_editable(&expected)?;
+        let merged = merge_profile(&expected, patch).map_err(failed)?;
+        validate(&merged).map_err(failed)?;
+        if merged.backend == TunnelBackend::Mihomo {
+            let source = crate::linux::read_mihomo_source(&self.vault(), &expected)?;
+            validate_mihomo_source(&source, &merged).map_err(|error| error.to_string())?;
+        }
         self.store()
             .update_profile(id, |stored| {
                 if stored != &expected {
                     return Err(invalid("Profile changed; retry the edit"));
                 }
-                let merged = merge_profile(stored, patch)?;
-                validate(&merged)?;
                 *stored = merged;
                 Ok(())
             })
@@ -160,7 +165,7 @@ impl ProfileService {
             profile.xray_service_checks.clear();
             profile.xray_proxy_exits.clear();
         }
-        self.save_locked(profile, source, stored.as_ref(), expected_revision)
+        self.save_locked(profile, source, stored.as_ref(), expected_revision, None)
     }
 
     pub fn create(
@@ -182,7 +187,7 @@ impl ProfileService {
         {
             return Err("Use subscription, routing, checks and proxy commands for canonical endpoint settings".into());
         }
-        self.save_locked(profile, source, None, None)
+        self.save_locked(profile, source, None, None, None)
     }
 
     fn save_locked(
@@ -191,6 +196,7 @@ impl ProfileService {
         source: Option<ProfileSource>,
         stored: Option<&Profile>,
         expected_revision: Option<&str>,
+        prepared_native: Option<Value>,
     ) -> Result<ProfileDocument, String> {
         net_manager_core::config_vault::sanitize_profile_id(&profile.id).map_err(failed)?;
         let vault = self.vault();
@@ -206,6 +212,7 @@ impl ProfileService {
                 TunnelBackend::WireGuard => "source.conf".into(),
                 TunnelBackend::OpenVpn => "source.ovpn".into(),
                 TunnelBackend::Xray => "source.json".into(),
+                TunnelBackend::Mihomo => "source.yaml".into(),
                 TunnelBackend::None => PathBuf::new(),
             };
         }
@@ -225,6 +232,10 @@ impl ProfileService {
                 "Select an existing profile's current managed revision or import a source".into(),
             );
         }
+        if source.is_none() && profile.backend == TunnelBackend::Mihomo {
+            let native = crate::linux::read_mihomo_source(&vault, &profile)?;
+            validate_mihomo_source(&native, &profile).map_err(|error| error.to_string())?;
+        }
         let imported: Option<ConfigImport> = match source {
             Some(ProfileSource::Config(path)) => {
                 if vault.is_managed_path(&path) {
@@ -232,11 +243,36 @@ impl ProfileService {
                         "A managed revision cannot be imported as another profile's source".into(),
                     );
                 }
-                Some(
-                    vault
-                        .import(&profile.id, profile.backend, &path)
-                        .map_err(failed)?,
-                )
+                if profile.backend == TunnelBackend::Mihomo {
+                    use std::io::Read;
+                    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                    if !["yaml", "yml", "json"]
+                        .iter()
+                        .any(|s| extension.eq_ignore_ascii_case(s))
+                    {
+                        return Err("Native configuration must be YAML or JSON".into());
+                    }
+                    let mut bytes = Vec::new();
+                    File::open(&path)
+                        .map_err(failed)?
+                        .take(net_manager_core::mihomo::MAX_CONFIG_BYTES as u64 + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(failed)?;
+                    let source = mihomo::resolve_source(&bytes)?;
+                    validate_mihomo_source(&source, &profile).map_err(|error| error.to_string())?;
+                    let body = serde_json::to_vec(&source).map_err(failed)?;
+                    Some(
+                        vault
+                            .store_mihomo_source(&profile.id, &body)
+                            .map_err(failed)?,
+                    )
+                } else {
+                    Some(
+                        vault
+                            .import(&profile.id, profile.backend, &path)
+                            .map_err(failed)?,
+                    )
+                }
             }
             Some(ProfileSource::ShareLink(link)) => {
                 if profile.backend != TunnelBackend::Xray {
@@ -277,6 +313,22 @@ impl ProfileService {
                         .map_err(failed)?,
                 )
             }
+            Some(ProfileSource::MihomoDocument(body)) => {
+                if profile.backend != TunnelBackend::Mihomo {
+                    return Err("Native configuration requires a Mihomo profile".into());
+                }
+                let parsed = match prepared_native {
+                    Some(source) => source,
+                    None => mihomo::resolve_source(body.as_bytes())?,
+                };
+                validate_mihomo_source(&parsed, &profile).map_err(|error| error.to_string())?;
+                let body = serde_json::to_vec(&parsed).map_err(failed)?;
+                Some(
+                    vault
+                        .store_mihomo_source(&profile.id, &body)
+                        .map_err(failed)?,
+                )
+            }
             None => None,
         };
         if let Some(imported) = &imported {
@@ -308,6 +360,21 @@ impl ProfileService {
                         "Profile saved, but the old managed revision could not be removed"
                             .to_string()
                     })?;
+            }
+        }
+        if imported.is_some() {
+            if let Some(native) = document.profiles.iter().find(|profile| {
+                profile.backend == TunnelBackend::Mihomo && profile.config_path == new_path
+            }) {
+                let source = crate::linux::read_mihomo_source(&vault, native).map_err(|_| {
+                    "Profile saved, but its provider schedule could not be inspected".to_string()
+                })?;
+                if crate::linux_subscriptions::provider_interval(&source).is_some() {
+                    self.engine.sync_subscription_schedule().map_err(|_| {
+                        "Profile saved, but the provider refresh runtime could not be started"
+                            .to_string()
+                    })?;
+                }
             }
         }
         Ok(document)
@@ -398,6 +465,16 @@ impl ProfileService {
     ) -> Result<SubscriptionRefreshResult, String> {
         if unsafe { libc::geteuid() } == 0 {
             return Err("Run subscription changes as your own user, without sudo".into());
+        }
+        let current = self.profile(id)?;
+        if current.backend == TunnelBackend::Mihomo {
+            return if current.subscription.is_some() {
+                self.refresh_mihomo_subscription(id, cached).await
+            } else if cached.is_none() {
+                self.refresh_mihomo_providers(id, false).await
+            } else {
+                Err("Cached subscription data requires a subscription profile".into())
+            };
         }
         let expected = self.subscription_profile(id)?;
         let refresh_lock =
@@ -503,7 +580,7 @@ impl ProfileService {
         validate_interval(minutes)?;
         self.store()
             .update_profile(id, |profile| {
-                if profile.backend != TunnelBackend::Xray {
+                if !matches!(profile.backend, TunnelBackend::Xray | TunnelBackend::Mihomo) {
                     return Err(invalid("Profile is not a subscription"));
                 }
                 let meta = profile
@@ -645,6 +722,47 @@ impl ProfileService {
         paths: &[String],
         backend: Option<TunnelBackend>,
     ) -> Result<BatchImportResult, String> {
+        if backend == Some(TunnelBackend::Mihomo) {
+            return self.import_mihomo_configs(paths);
+        }
+        if backend.is_none()
+            && paths.iter().any(|path| {
+                std::path::Path::new(path)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml")
+                    })
+            })
+        {
+            let mut errors = Vec::new();
+            for (index, path) in paths.iter().enumerate() {
+                let native = std::path::Path::new(path)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml")
+                    });
+                let result = if native {
+                    self.import_mihomo_configs(std::slice::from_ref(path))
+                } else {
+                    self.import_configs(std::slice::from_ref(path), None)
+                };
+                if result
+                    .as_ref()
+                    .map_or(true, |result| !result.errors.is_empty())
+                {
+                    errors.push(BatchImportError {
+                        path: format!("Input {}", index + 1),
+                        error: "The configuration could not be imported".into(),
+                    });
+                }
+            }
+            return Ok(BatchImportResult {
+                profiles: self.profiles()?,
+                errors,
+            });
+        }
         let _lock = self.mutation()?;
         // Arbitrary imported JSON is not a daemon-validated generated TUN config.
         profile_import::import_configs_into(
@@ -1362,6 +1480,9 @@ pub fn validate_interval(minutes: Option<u32>) -> Result<(), String> {
 }
 
 fn validate(profile: &Profile) -> io::Result<()> {
+    if profile.backend != TunnelBackend::Mihomo && profile.mihomo.is_some() {
+        return Err(invalid("Mihomo options require a Mihomo profile"));
+    }
     if profile.backend == TunnelBackend::None
         && (profile.tunnel_role != TunnelRole::Primary
             || !profile.tunnel_networks.is_empty()
@@ -1412,6 +1533,7 @@ fn merge_profile(profile: &Profile, patch: &Value) -> io::Result<Profile> {
     let target = value.as_object_mut().expect("profile is an object");
     // Optional fields omitted by serde are still editable.
     const OPTIONAL: &[&str] = &[
+        "mihomo",
         "xrayServiceChecks",
         "xrayProxyExits",
         "xrayGeoipUrl",
@@ -1430,6 +1552,9 @@ fn merge_profile(profile: &Profile, patch: &Value) -> io::Result<Profile> {
         "tunnelDnsDomains",
         "tunnelNetworks",
     ];
+    if let Some(value) = object.get("mihomo") {
+        editor_nested_fields(value, "/profile/mihomo").map_err(invalid_owned)?;
+    }
     for (key, value) in object {
         if matches!(
             key.as_str(),
@@ -1449,7 +1574,15 @@ fn merge_profile(profile: &Profile, patch: &Value) -> io::Result<Profile> {
         if !target.contains_key(key) && !OPTIONAL.contains(&key.as_str()) {
             return Err(invalid("Unknown profile setting"));
         }
-        merge_value(target.entry(key.clone()).or_insert(Value::Null), value);
+        let destination = target.entry(key.clone()).or_insert(Value::Null);
+        merge_value(destination, value);
+        if key == "mihomo" {
+            if let (Some(options), Some(selections)) =
+                (destination.as_object_mut(), value.get("groupSelections"))
+            {
+                options.insert("groupSelections".into(), selections.clone());
+            }
+        }
     }
     serde_json::from_value(value).map_err(|_| invalid("Invalid profile settings"))
 }
@@ -1465,8 +1598,16 @@ fn merge_value(target: &mut Value, patch: &Value) {
 }
 
 fn preserve_form_settings(profile: &mut Profile, stored: &Profile, same_source: bool) {
+    if profile.backend == TunnelBackend::Mihomo && stored.backend == TunnelBackend::Mihomo {
+        profile.subscription = stored.subscription.clone();
+        if profile.mihomo.is_none() {
+            profile.mihomo = stored.mihomo.clone();
+        }
+    }
     if profile.backend != TunnelBackend::Xray || stored.backend != TunnelBackend::Xray {
-        profile.subscription = None;
+        if profile.backend != TunnelBackend::Mihomo || stored.backend != TunnelBackend::Mihomo {
+            profile.subscription = None;
+        }
         profile.pinned_policies.clear();
         profile.xray_service_checks.clear();
         profile.xray_proxy_exits.clear();
@@ -1569,7 +1710,16 @@ pub fn metadata(profile: &Profile) -> Value {
                 .get_mut("lastRefreshError")
                 .filter(|value| value.is_string())
             {
-                *error = json!("Subscription refresh needs attention");
+                if !matches!(
+                    error.as_str(),
+                    Some(
+                        "Selected Mihomo group no longer exists"
+                            | "Selected Mihomo group member no longer exists"
+                            | "Selected Mihomo entry group does not exist"
+                    )
+                ) {
+                    *error = json!("Subscription refresh needs attention");
+                }
             }
         }
         if let Some(checks) = object
@@ -1717,5 +1867,688 @@ pub fn preview_of(
             .iter()
             .map(|item| item.reason.clone())
             .collect(),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorDocumentResult {
+    pub document: Value,
+    pub revision: String,
+    pub endpoints: Vec<SubscriptionEndpointInfo>,
+    pub running: bool,
+    pub running_revision: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorIssue {
+    pub path: String,
+    pub message: String,
+    pub severity: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorPreviewResult {
+    pub valid: bool,
+    pub issues: Vec<EditorIssue>,
+    pub daemon_validated: bool,
+    pub changed_paths: Vec<String>,
+    pub requires_reconnect: bool,
+}
+
+fn editor_sensitive(path: &str, value: &Value) -> bool {
+    if value.is_null() {
+        return false;
+    }
+    let key = path.rsplit('/').next().unwrap_or("");
+    path == "/profile/configPath"
+        || matches!(path, "/profile/xrayGeoipUrl" | "/profile/xrayGeositeUrl")
+        || (path.starts_with("/profile/subscription/")
+            && matches!(
+                key,
+                "url"
+                    | "hwid"
+                    | "probeUrl"
+                    | "supportUrl"
+                    | "webPageUrl"
+                    | "announce"
+                    | "providerTitle"
+                    | "lastRefreshError"
+                    | "skippedProtocols"
+            ))
+        || (path.starts_with("/profile/xrayServiceChecks/") && key == "url")
+        || (path.starts_with("/profile/xrayDns/servers/")
+            && key == "address"
+            && value
+                .as_str()
+                .is_some_and(|s| s.contains("://") || s.starts_with("vault:")))
+}
+
+fn editor_token(path: &str, _value: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    format!("vault:{:x}", Sha256::digest(path.as_bytes()))
+}
+
+fn editor_protect(
+    value: &mut Value,
+    path: &str,
+    refs: &mut std::collections::HashMap<String, (String, Value)>,
+) {
+    if editor_sensitive(path, value) {
+        let token = editor_token(path, value);
+        refs.insert(token.clone(), (path.to_string(), value.clone()));
+        *value = Value::String(token);
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                editor_protect(
+                    child,
+                    &format!("{path}/{}", key.replace('~', "~0").replace('/', "~1")),
+                    refs,
+                );
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter_mut().enumerate() {
+                editor_protect(child, &format!("{path}/{index}"), refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn editor_view(profile: &Profile) -> Result<Value, String> {
+    let mut document =
+        json!({"version": 1, "profile": serde_json::to_value(profile).map_err(failed)?});
+    editor_protect(&mut document, "", &mut std::collections::HashMap::new());
+    Ok(document)
+}
+
+fn safe_editor_https_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+fn editor_nested_fields(value: &Value, path: &str) -> Result<(), String> {
+    let shape = path
+        .split('/')
+        .map(|part| {
+            if part.parse::<usize>().is_ok() {
+                "*"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if shape == "/profile/xrayDns/hosts" || shape == "/profile/mihomo/groupSelections" {
+        return Ok(());
+    }
+    let allowed: Option<&[&str]> = match shape.as_str() {
+        "/profile/mihomo" => Some(&["mode", "entryGroup", "mixedPort", "groupSelections"]),
+        "/profile/routes/*" => Some(&["destination", "metric", "via"]),
+        "/profile/domainPolicies/*" => Some(&["domains", "target"]),
+        "/profile/pinnedPolicies/*" => Some(&["selectors", "endpointKey", "missing"]),
+        "/profile/subscription" => Some(&[
+            "url",
+            "hwid",
+            "endpointCount",
+            "activeIndex",
+            "refreshIntervalMinutes",
+            "lastRefreshAtUnix",
+            "lastRefreshError",
+            "userInfo",
+            "providerTitle",
+            "announce",
+            "supportUrl",
+            "webPageUrl",
+            "updateIntervalHours",
+            "skippedProtocols",
+            "activeKey",
+            "backupKeys",
+            "autoReturnPrimary",
+            "probeUrl",
+            "nodePool",
+            "poolKeys",
+        ]),
+        "/profile/subscription/userInfo" => Some(&[
+            "uploadBytes",
+            "downloadBytes",
+            "totalBytes",
+            "expiresAtUnix",
+        ]),
+        "/profile/subscription/backupKeys/*" | "/profile/subscription/poolKeys/*" => {
+            Some(&["key", "name"])
+        }
+        "/profile/subscription/nodePool" => Some(&["filters", "verifyExitCountry"]),
+        "/profile/subscription/nodePool/filters/*" => Some(&["nameContains", "exitCountry"]),
+        "/profile/xrayServiceChecks/*" => Some(&["id", "name", "url", "endpointKey", "background"]),
+        "/profile/xrayProxyExits/*" => Some(&["name", "target", "noProxy"]),
+        "/profile/xrayProxyExits/*/target" => Some(&["kind", "endpointKey", "endpointKeys"]),
+        "/profile/xrayDns" => Some(&[
+            "servers",
+            "hosts",
+            "fakeDns",
+            "queryStrategy",
+            "enableParallelQuery",
+            "outboundKey",
+            "outbound",
+        ]),
+        "/profile/xrayDns/servers/*" => {
+            Some(&["address", "port", "domains", "skipFallback", "route"])
+        }
+        "/profile/xrayDns/outbound" => {
+            Some(&["rewriteAddress", "rewriteNetwork", "rewritePort", "rules"])
+        }
+        "/profile/xrayDns/outbound/rules/*" => Some(&["action", "qType", "rCode", "domain"]),
+        "/profile/xraySockopts" => Some(&[
+            "tcpKeepAliveIdle",
+            "tcpKeepAliveInterval",
+            "tcpUserTimeout",
+            "tcpNoDelay",
+        ]),
+        "/profile/xrayTrafficRules/*" => Some(&["ips", "port", "network", "target"]),
+        "/profile/xrayInterfaceRoutes/*" => Some(&["selectors", "interfaceName", "domainStrategy"]),
+        _ => None,
+    };
+    match value {
+        Value::Object(object) => {
+            let fields = allowed.ok_or_else(|| format!("Unknown setting at {path}"))?;
+            for (key, child) in object {
+                if !fields.contains(&key.as_str()) {
+                    return Err(format!("Unknown setting at {path}"));
+                }
+                editor_nested_fields(child, &format!("{path}/{key}"))?;
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                editor_nested_fields(child, &format!("{path}/{index}"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn editor_restore(profile: &Profile, document: &Value) -> Result<Profile, String> {
+    let mut original =
+        json!({"version": 1, "profile": serde_json::to_value(profile).map_err(failed)?});
+    let mut refs = std::collections::HashMap::new();
+    editor_protect(&mut original, "", &mut refs);
+    if document.get("version") != Some(&json!(1))
+        || document.as_object().is_none_or(|o| o.len() != 2)
+        || document.pointer("/profile/id") != original.pointer("/profile/id")
+        || document.pointer("/profile/backend") != original.pointer("/profile/backend")
+        || document.pointer("/profile/configPath") != original.pointer("/profile/configPath")
+        || document.pointer("/profile/subscription/url")
+            != original.pointer("/profile/subscription/url")
+        || document.pointer("/profile/xrayGeoipUrl") != original.pointer("/profile/xrayGeoipUrl")
+        || document.pointer("/profile/xrayGeositeUrl")
+            != original.pointer("/profile/xrayGeositeUrl")
+        || document.pointer("/profile/subscription/hwid")
+            != original.pointer("/profile/subscription/hwid")
+    {
+        return Err("Protected profile fields cannot be changed".into());
+    }
+    let original_profile = original["profile"].as_object().ok_or("Invalid profile")?;
+    let input_profile = document["profile"].as_object().ok_or("Invalid profile")?;
+    const OPTIONAL: &[&str] = &[
+        "mihomo",
+        "xrayServiceChecks",
+        "xrayProxyExits",
+        "xrayGeoipUrl",
+        "xrayGeositeUrl",
+        "xrayDomainStrategy",
+        "xrayDomainMatcher",
+        "xrayDns",
+        "xraySockopts",
+        "xrayTrafficRules",
+        "xrayInterfaceRoutes",
+        "xrayConnectionIdleSecs",
+        "xrayTunMtu",
+        "xrayTunDnsServers",
+        "xrayDirectDomainStrategy",
+        "tunnelRole",
+        "tunnelDnsDomains",
+        "tunnelNetworks",
+    ];
+    if input_profile
+        .keys()
+        .any(|key| !original_profile.contains_key(key) && !OPTIONAL.contains(&key.as_str()))
+    {
+        return Err("Unknown profile setting".into());
+    }
+    for (key, value) in input_profile {
+        editor_nested_fields(value, &format!("/profile/{key}"))?;
+    }
+    if let Some(checks) = document
+        .pointer("/profile/xrayServiceChecks")
+        .and_then(Value::as_array)
+    {
+        for check in checks {
+            let Some(object) = check.as_object() else {
+                return Err("Invalid setting at /profile/xrayServiceChecks".into());
+            };
+            if object.keys().any(|key| {
+                !["id", "name", "url", "endpointKey", "background"].contains(&key.as_str())
+            }) {
+                return Err("Unknown setting at /profile/xrayServiceChecks".into());
+            }
+            if let Some(url) = object.get("url").and_then(Value::as_str) {
+                if !url.starts_with("vault:") && !safe_editor_https_url(url) {
+                    return Err("Unsafe service-check URL".into());
+                }
+            }
+        }
+    }
+    if let Some(servers) = document
+        .pointer("/profile/xrayDns/servers")
+        .and_then(Value::as_array)
+    {
+        if let Some(old) = original
+            .pointer("/profile/xrayDns/servers")
+            .and_then(Value::as_array)
+        {
+            if servers.len() >= old.len() {
+                for token in old
+                    .iter()
+                    .filter_map(|server| server.get("address").and_then(Value::as_str))
+                    .filter(|address| address.starts_with("vault:"))
+                {
+                    if !servers
+                        .iter()
+                        .any(|server| server.get("address").and_then(Value::as_str) == Some(token))
+                    {
+                        return Err("Protected DNS reference cannot be changed".into());
+                    }
+                }
+            }
+        }
+        for server in servers {
+            let Some(object) = server.as_object() else {
+                return Err("Invalid setting at /profile/xrayDns/servers".into());
+            };
+            if object.keys().any(|key| {
+                !["address", "port", "domains", "skipFallback", "route"].contains(&key.as_str())
+            }) {
+                return Err("Unknown setting at /profile/xrayDns/servers".into());
+            }
+            if let Some(address) = object.get("address").and_then(Value::as_str) {
+                if address.starts_with("https://") && !safe_editor_https_url(address) {
+                    return Err("Unsafe DNS HTTPS address".into());
+                }
+            }
+        }
+    }
+    if let Some(checks) = document
+        .pointer("/profile/xrayServiceChecks")
+        .and_then(Value::as_array)
+    {
+        let old = original
+            .pointer("/profile/xrayServiceChecks")
+            .and_then(Value::as_array);
+        for check in checks {
+            let id = check.get("id");
+            let prior = old.and_then(|items| items.iter().find(|item| item.get("id") == id));
+            let url = check
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or("Invalid service-check URL")?;
+            if url.starts_with("vault:") {
+                if prior.and_then(|item| item.get("url")) != Some(&json!(url)) {
+                    return Err("Protected service-check reference cannot be changed".into());
+                }
+            } else if prior.is_some() || !safe_editor_https_url(url) {
+                return Err("Unsafe service-check URL".into());
+            }
+        }
+    }
+    fn restore(
+        value: &mut Value,
+        path: &str,
+        refs: &std::collections::HashMap<String, (String, Value)>,
+    ) -> Result<(), String> {
+        if (path.starts_with("/profile/xrayServiceChecks/") && path.ends_with("/url")
+            || path.starts_with("/profile/xrayDns/servers/") && path.ends_with("/address"))
+            && value.as_str().is_some_and(safe_editor_https_url)
+        {
+            return Ok(());
+        }
+        if editor_sensitive(path, value) {
+            let token = value
+                .as_str()
+                .ok_or("Protected references cannot be changed")?;
+            let (source, original) = refs
+                .get(token)
+                .ok_or("Protected references cannot be changed")?;
+            let shape = |p: &str| {
+                p.split('/')
+                    .map(|part| {
+                        if part.parse::<usize>().is_ok() {
+                            "*"
+                        } else {
+                            part
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/")
+            };
+            if shape(source) != shape(path) {
+                return Err("Protected reference is in an invalid field".into());
+            }
+            *value = original.clone();
+            return Ok(());
+        }
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    restore(
+                        child,
+                        &format!("{path}/{}", key.replace('~', "~0").replace('/', "~1")),
+                        refs,
+                    )?;
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter_mut().enumerate() {
+                    restore(child, &format!("{path}/{index}"), refs)?;
+                }
+            }
+            Value::String(s) if s.starts_with("vault:") => {
+                return Err("Protected reference is in an invalid field".into())
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut restored = document.clone();
+    restore(&mut restored, "", &refs)?;
+    let candidate: Profile = serde_json::from_value(restored["profile"].clone())
+        .map_err(|_| "Invalid profile settings".to_string())?;
+    Ok(candidate)
+}
+
+fn editor_diff(before: &Value, after: &Value) -> Vec<String> {
+    fn walk(a: &Value, b: &Value, path: &str, out: &mut Vec<String>) {
+        if a == b {
+            return;
+        }
+        match (a, b) {
+            (Value::Object(a), Value::Object(b)) => {
+                let keys: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).collect();
+                for key in keys {
+                    let next = format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"));
+                    match (a.get(key), b.get(key)) {
+                        (Some(a), Some(b)) => walk(a, b, &next, out),
+                        _ => out.push(next),
+                    }
+                }
+            }
+            (Value::Array(a), Value::Array(b)) if a.len() == b.len() => {
+                for (i, (a, b)) in a.iter().zip(b).enumerate() {
+                    walk(a, b, &format!("{path}/{i}"), out);
+                }
+            }
+            _ => out.push(path.to_string()),
+        }
+    }
+    let mut out = Vec::new();
+    walk(before, after, "", &mut out);
+    out
+}
+
+#[path = "linux_profile_editor.rs"]
+mod editor;
+#[path = "linux_profiles_mihomo.rs"]
+mod mihomo;
+use mihomo::validate_mihomo_source;
+pub use net_manager_core::mihomo::MihomoGroupInfo;
+
+#[cfg(test)]
+mod editor_document_tests {
+    use super::*;
+
+    #[test]
+    fn mihomo_selection_patch_and_editor_reject_unknown_fields() {
+        let profile = Profile {
+            backend: TunnelBackend::Mihomo,
+            mihomo: Some(MihomoProfileOptions::default()),
+            ..Default::default()
+        };
+        let changed = merge_profile(&profile, &json!({"mihomo":{"entryGroup":"Auto"}})).unwrap();
+        assert_eq!(changed.mihomo.unwrap().entry_group.as_deref(), Some("Auto"));
+        let selected = merge_profile(
+            &profile,
+            &json!({"mihomo":{"groupSelections":{"Auto":"Node"}}}),
+        )
+        .unwrap();
+        let cleared = merge_profile(&selected, &json!({"mihomo":{"groupSelections":{}}})).unwrap();
+        assert!(cleared.mihomo.unwrap().group_selections.is_empty());
+        assert!(merge_profile(&profile, &json!({"mihomo":{"secret":"leak"}})).is_err());
+        let mut document = editor_view(&profile).unwrap();
+        document["profile"]["mihomo"]["unknown"] = json!(true);
+        assert!(editor_restore(&profile, &document).is_err());
+    }
+
+    #[test]
+    fn mihomo_refresh_rejects_vanished_selection_before_vault_write() {
+        let profile = Profile {
+            backend: TunnelBackend::Mihomo,
+            mihomo: Some(MihomoProfileOptions {
+                entry_group: Some("Missing".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let source = json!({"proxies": [], "proxy-groups": [{"name":"Auto","type":"select","proxies":["DIRECT"]}], "rules":["MATCH,Auto"]});
+        assert!(validate_mihomo_source(&source, &profile).is_err());
+    }
+
+    #[test]
+    fn mihomo_failed_revision_conflict_keeps_existing_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProfileService::new(dir.path().into(), LinuxEngine::new("native-test"));
+        let profile = Profile {
+            id: "native".into(),
+            name: "Native".into(),
+            backend: TunnelBackend::Mihomo,
+            ..Default::default()
+        };
+        let source = r#"{"proxies":[],"proxy-groups":[{"name":"Auto","type":"select","proxies":["DIRECT"]}],"rules":["MATCH,Auto"]}"#;
+        let saved = service
+            .save_locked(
+                profile,
+                Some(ProfileSource::MihomoDocument(source.into())),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let original = saved
+            .profiles
+            .into_iter()
+            .find(|p| p.id == "native")
+            .unwrap();
+        let old_bytes = fs::read(&original.config_path).unwrap();
+        let result = service.save_locked(
+            original.clone(),
+            Some(ProfileSource::MihomoDocument(source.into())),
+            Some(&original),
+            Some("stale"),
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&original.config_path).unwrap(), old_bytes);
+        assert_eq!(
+            service.store().load().unwrap().profiles[0].config_path,
+            original.config_path
+        );
+    }
+
+    #[test]
+    fn native_refresh_keeps_selection_and_rejects_missing_member_transactionally() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let service =
+            ProfileService::new(dir.path().into(), LinuxEngine::new("native-refresh-test"));
+        let options = MihomoProfileOptions {
+            entry_group: Some("Auto".into()),
+            group_selections: [("Auto".into(), "DIRECT".into())].into_iter().collect(),
+            ..Default::default()
+        };
+        let mut profile = Profile {
+            id: "native".into(),
+            name: "Native".into(),
+            backend: TunnelBackend::Mihomo,
+            mihomo: Some(options.clone()),
+            ..Default::default()
+        };
+        profile.subscription = Some(
+            serde_json::from_value(json!({
+                "url":"https://example.test/private", "hwid":"", "endpointCount":0,
+                "activeIndex":0, "refreshIntervalMinutes":60
+            }))
+            .unwrap(),
+        );
+        let original = r#"{"proxies":[],"proxy-groups":[{"name":"Auto","type":"select","proxies":["DIRECT","REJECT"]}],"rules":["MATCH,Auto"]}"#;
+        service
+            .save_locked(
+                profile,
+                Some(ProfileSource::MihomoDocument(original.into())),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rotated = r#"{"proxies":[],"proxy-groups":[{"name":"Auto","type":"select","proxies":["REJECT","DIRECT"]}],"rules":["MATCH,Auto"]}"#;
+        runtime
+            .block_on(service.refresh_subscription("native", Some(rotated)))
+            .unwrap();
+        let after = service.profile("native").unwrap();
+        assert_eq!(after.mihomo.as_ref(), Some(&options));
+        let missing = r#"{"proxies":[],"proxy-groups":[{"name":"Auto","type":"select","proxies":["REJECT"]}],"rules":["MATCH,Auto"]}"#;
+        assert!(runtime
+            .block_on(service.refresh_subscription("native", Some(missing)))
+            .is_err());
+        let failed = service.profile("native").unwrap();
+        assert_eq!(failed.config_path, after.config_path);
+        assert_eq!(failed.mihomo.as_ref(), Some(&options));
+        assert!(failed.subscription.unwrap().last_refresh_error.is_some());
+    }
+
+    #[test]
+    fn editor_protects_sources_and_rejects_changed_references() {
+        let profile = Profile {
+            id: "example".into(),
+            config_path: "/private/secret.conf".into(),
+            xray_geoip_url: Some("https://example.test/secret-token".into()),
+            ..Default::default()
+        };
+        let document = editor_view(&profile).unwrap();
+        let text = document.to_string();
+        assert!(!text.contains("secret.conf"));
+        assert!(!text.contains("secret-token"));
+        assert_eq!(editor_restore(&profile, &document).unwrap(), profile);
+        let mut changed = document;
+        changed["profile"]["configPath"] = json!("forged");
+        assert!(editor_restore(&profile, &changed).is_err());
+    }
+
+    #[test]
+    fn editor_rejects_unknown_nested_fields_and_accepts_safe_check_urls() {
+        let profile = Profile {
+            xray_service_checks: vec![ServiceCheck {
+                id: "one".into(),
+                name: "one".into(),
+                url: "https://one.test/secret".into(),
+                endpoint_key: "one".into(),
+                background: false,
+            }],
+            ..Default::default()
+        };
+        let document = editor_view(&profile).unwrap();
+        let mut changed = document.clone();
+        changed["profile"]["xrayServiceChecks"][0]["extra"] = json!(true);
+        assert!(editor_restore(&profile, &changed).is_err());
+        let mut changed = document;
+        changed["profile"]["xrayServiceChecks"].as_array_mut().unwrap().push(json!({"id":"two","name":"two","url":"https://new.test/check","endpointKey":"two","background":false}));
+        assert!(editor_restore(&profile, &changed).is_ok());
+        changed["profile"]["xrayServiceChecks"][1]["url"] =
+            json!("https://user:pass@new.test/check");
+        assert!(editor_restore(&profile, &changed).is_err());
+        changed["profile"]["xrayServiceChecks"][1]["url"] = json!("https://new.test/check?token=x");
+        assert!(editor_restore(&profile, &changed).is_err());
+    }
+
+    #[test]
+    fn editor_allows_safe_dns_https_address_and_rejects_nested_unknowns() {
+        let profile = Profile {
+            xray_dns: XrayDnsConfig {
+                servers: vec![XrayDnsServer {
+                    address: "https://dns.example/dns-query".into(),
+                    port: None,
+                    domains: vec![],
+                    skip_fallback: false,
+                    route: XrayDnsRoute::None,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut document = editor_view(&profile).unwrap();
+        document["profile"]["xrayDns"]["servers"][0]["unknown"] = json!(1);
+        assert!(editor_restore(&profile, &document).is_err());
+        let mut changed = editor_view(&profile).unwrap();
+        changed["profile"]["xrayDns"]["servers"].as_array_mut().unwrap().push(json!({"address":"https://new.example/dns-query","skipFallback":false,"route":"none"}));
+        assert!(editor_restore(&profile, &changed).is_ok());
+    }
+
+    #[test]
+    fn editor_rejects_unknown_fields_in_all_nested_profile_sections() {
+        let profile = Profile::default();
+        for (path, object) in [
+            (
+                "routes",
+                json!([{"destination":"10.0.0.0/8","metric":5,"hidden":"secret"}]),
+            ),
+            (
+                "domainPolicies",
+                json!([{"domains":["example.test"],"target":"direct","hidden":true}]),
+            ),
+            ("xrayDns", json!({"fakeDns":false,"hidden":true})),
+            ("xraySockopts", json!({"tcpNoDelay":false,"hidden":true})),
+            (
+                "xrayTrafficRules",
+                json!([{"ips":["1.1.1.1"],"port":443,"network":"tcp","target":"block","hidden":true}]),
+            ),
+        ] {
+            let mut document = editor_view(&profile).unwrap();
+            document["profile"][path] = object;
+            assert!(editor_restore(&profile, &document).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn editor_diff_reports_paths_without_values() {
+        let before = json!({"version": 1, "profile": {"name": "secret", "routes": []}});
+        let after = json!({"version": 1, "profile": {"name": "other", "routes": []}});
+        assert_eq!(editor_diff(&before, &after), vec!["/profile/name"]);
     }
 }

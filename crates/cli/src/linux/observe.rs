@@ -233,6 +233,7 @@ pub fn diagnose(ctx: &Ctx, target: Option<&str>) -> Result<Output, String> {
             TunnelBackend::WireGuard => method::WIREGUARD_CONNECT,
             TunnelBackend::OpenVpn => method::OPENVPN_CONNECT,
             TunnelBackend::Xray => method::XRAY_CONNECT,
+            TunnelBackend::Mihomo => method::MIHOMO_CONNECT,
             TunnelBackend::None => method::ROUTES_APPLY,
         };
         if LinuxEngine::requires_daemon(profile)

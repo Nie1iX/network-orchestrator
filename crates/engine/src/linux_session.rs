@@ -1,4 +1,4 @@
-//! One user-owned local Xray runtime per data directory and daemon endpoint.
+//! One user-owned local Xray/Mihomo proxy runtime per data directory and daemon endpoint.
 //! GUI and CLI exchange IDs or bounded prepared snapshots over authenticated IPC.
 //! Privileged route requests remain in the calling frontend's LinuxEngine so
 //! polkit authenticates the actual interactive client, not a user service.
@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const MAX_FRAME: u64 = 1024 * 1024;
+const MAX_FRAME: u64 = 32 * 1024 * 1024;
 const PREPARED_CONNECTIONS_VERSION: u32 = 1;
 static STOP: AtomicBool = AtomicBool::new(false);
 static STOP_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
@@ -105,9 +105,35 @@ pub(crate) fn ensure_prepared_support(root: &Path, daemon: &Path) -> Result<(), 
 #[serde(deny_unknown_fields)]
 pub(crate) struct PreparedLocalConnection {
     profile: Profile,
-    xray: net_manager_core::vpn::PreparedXrayConnection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    xray: Option<net_manager_core::vpn::PreparedXrayConnection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mihomo: Option<serde_json::Value>,
     assets: Option<PathBuf>,
     notices: Vec<String>,
+}
+
+#[cfg(test)]
+mod mihomo_process_tests {
+    use super::*;
+
+    #[test]
+    fn child_exit_is_observed_and_private_staging_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child =
+            MihomoChild::spawn(root.path(), Path::new("/bin/true"), &serde_json::json!({}))
+                .unwrap();
+        let directory = child.directory.clone();
+        assert!(directory.join("config.json").is_file());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child.running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!child.running());
+        drop(child);
+        assert!(!directory.exists());
+    }
 }
 
 /// Encoded once during preflight; input-only and never persisted or logged.
@@ -119,8 +145,14 @@ fn validate_local_profile(root: &Path, profile: &Profile) -> Result<(), String> 
     if uid() == 0 {
         return Err("Run the local Xray runtime as your own user, never root".into());
     }
-    if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Socks {
-        return Err("The user runtime only runs local Xray proxy profiles".into());
+    let local = profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Socks
+        || profile.backend == TunnelBackend::Mihomo
+            && profile
+                .mihomo
+                .as_ref()
+                .is_some_and(|options| options.mode == net_manager_core::models::MihomoMode::Proxy);
+    if !local {
+        return Err("The user runtime only runs local proxy profiles".into());
     }
     net_manager_core::profiles::validate_profile(profile)
         .map_err(|_| "Invalid local Xray profile")?;
@@ -139,6 +171,28 @@ pub(crate) fn prepare_connection(
     prepare_ports: bool,
 ) -> Result<PreparedLocalRequest, String> {
     validate_local_profile(root, candidate)?;
+    if candidate.backend == TunnelBackend::Mihomo {
+        crate::linux_system::backend_executable(root, TunnelBackend::Mihomo)?;
+        let source =
+            crate::linux::read_mihomo_source(&ConfigVault::new(root.join("configs")), candidate)?;
+        let config = net_manager_core::mihomo::compile_config(&source, candidate)
+            .map_err(|cause| cause.to_string())?;
+        let request = Request::ConnectPrepared {
+            connection: Box::new(PreparedLocalConnection {
+                profile: candidate.clone(),
+                xray: None,
+                mihomo: Some(config),
+                assets: None,
+                notices: Vec::new(),
+            }),
+        };
+        let bytes =
+            serde_json::to_vec(&request).map_err(|_| "Cannot encode local runtime request")?;
+        if bytes.len() as u64 + 1 > MAX_FRAME {
+            return Err("Local runtime request is too large".into());
+        }
+        return Ok(PreparedLocalRequest { bytes });
+    }
     let mut profile = candidate.clone();
     let notice = if prepare_ports {
         let vault = ConfigVault::new(root.join("configs"));
@@ -171,13 +225,14 @@ pub(crate) fn prepare_connection(
     let request = Request::ConnectPrepared {
         connection: Box::new(PreparedLocalConnection {
             profile,
-            xray,
+            xray: Some(xray),
+            mihomo: None,
             assets,
             notices,
         }),
     };
     let bytes = serde_json::to_vec(&request).map_err(|_| "Cannot encode local runtime request")?;
-    if bytes.len() as u64 + 1 > MAX_FRAME {
+    if bytes.len() as u64 + 1 > 1024 * 1024 {
         return Err("Local runtime request is too large".into());
     }
     Ok(PreparedLocalRequest { bytes })
@@ -567,9 +622,94 @@ impl Drop for ProxyLock {
     }
 }
 
+struct MihomoChild {
+    child: std::process::Child,
+    directory: PathBuf,
+}
+
+impl MihomoChild {
+    fn spawn(root: &Path, executable: &Path, config: &serde_json::Value) -> io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        private_directory(root)?;
+        let directory = root.join(format!(
+            "mihomo-{}-{}",
+            std::process::id(),
+            NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let result = (|| {
+            let mut config = config.clone();
+            for key in [
+                "external-controller",
+                "secret",
+                "external-ui",
+                "external-ui-url",
+                "external-ui-name",
+                "external-ui-download-url",
+            ] {
+                config.as_object_mut().map(|object| object.remove(key));
+            }
+            config["external-controller-unix"] = directory
+                .join("controller.sock")
+                .to_string_lossy()
+                .into_owned()
+                .into();
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(directory.join("config.json"))?;
+            serde_json::to_writer(&mut file, &config)?;
+            file.sync_all()?;
+            let mut command = Command::new(executable);
+            command
+                .arg("-d")
+                .arg(&directory)
+                .arg("-f")
+                .arg(directory.join("config.json"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let parent = std::process::id();
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
+                        || libc::getppid() != parent as libc::pid_t
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.spawn()
+        })();
+        match result {
+            Ok(child) => Ok(Self { child, directory }),
+            Err(cause) => {
+                let _ = fs::remove_dir_all(&directory);
+                Err(cause)
+            }
+        }
+    }
+
+    fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for MihomoChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
 struct Runtime {
     root: PathBuf,
     tunnels: TunnelManager,
+    mihomo: HashMap<String, MihomoChild>,
+    mihomo_staging: PathBuf,
     active: HashMap<String, Profile>,
     failed_children: std::collections::HashSet<String>,
     proxy: SystemProxyManager,
@@ -581,6 +721,8 @@ impl Runtime {
     fn new(root: PathBuf, proxy: SystemProxyManager, proxy_lock_root: PathBuf) -> io::Result<Self> {
         let mut runtime = Self {
             tunnels: TunnelManager::with_log_dir(root.join("logs")),
+            mihomo_staging: root.join("mihomo-runtime"),
+            mihomo: HashMap::new(),
             root,
             active: HashMap::new(),
             failed_children: std::collections::HashSet::new(),
@@ -654,6 +796,21 @@ impl Runtime {
         self.proxy_cleanup_failed = false;
         Ok(())
     }
+    fn status(&mut self, id: &str) -> TunnelStatus {
+        let Some(profile) = self.active.get(id) else {
+            return stopped(id);
+        };
+        if profile.backend == TunnelBackend::Mihomo {
+            let mut status = stopped(id);
+            status.state = if self.mihomo.get_mut(id).is_some_and(MihomoChild::running) {
+                TunnelState::Running
+            } else {
+                TunnelState::Failed
+            };
+            return status;
+        }
+        self.tunnels.status(profile)
+    }
     fn disconnect(&mut self, id: &str) -> Result<TunnelStatus, String> {
         if self
             .proxy
@@ -662,6 +819,16 @@ impl Runtime {
         {
             self.restore_proxy()
                 .map_err(|_| "Cannot restore the previous system proxy".to_string())?;
+        }
+        if self
+            .active
+            .get(id)
+            .is_some_and(|profile| profile.backend == TunnelBackend::Mihomo)
+        {
+            self.mihomo.remove(id);
+            self.active.remove(id);
+            self.failed_children.remove(id);
+            return Ok(stopped(id));
         }
         if let Some(profile) = self.active.get(id) {
             let status = self
@@ -675,9 +842,89 @@ impl Runtime {
             Ok(stopped(id))
         }
     }
+    fn connect_mihomo(
+        &mut self,
+        profile: Profile,
+        config: serde_json::Value,
+    ) -> Result<TunnelStatus, String> {
+        let port = profile
+            .mihomo
+            .as_ref()
+            .and_then(|options| options.mixed_port)
+            .filter(|port| *port != 0)
+            .ok_or("Mihomo proxy requires a mixed port")?;
+        net_manager_core::mihomo::validate_config(&config).map_err(|cause| cause.to_string())?;
+        if config["mixed-port"].as_u64() != Some(port as u64)
+            || config["allow-lan"] != false
+            || config["bind-address"] != "127.0.0.1"
+            || config["tun"]["enable"] != false
+        {
+            return Err("Invalid prepared Mihomo listener configuration".into());
+        }
+        let probe = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .map_err(|_| "Mihomo mixed port is already in use")?;
+        let executable =
+            crate::linux_system::backend_executable(&self.root, TunnelBackend::Mihomo)?;
+        if profile.use_system_proxy {
+            self.proxy_guard().map_err(|cause| cause.to_string())?;
+            if let Some(owner) = self.proxy.ownership().map(|owner| owner.profile_id.clone()) {
+                if self.status(&owner).state == TunnelState::Running {
+                    return Err("System proxy is already owned by a running profile".into());
+                }
+                self.proxy
+                    .restore_any()
+                    .map_err(|_| "Cannot restore previous system proxy")?;
+            }
+        }
+        let id = profile.id.clone();
+        drop(probe);
+        let child = MihomoChild::spawn(&self.mihomo_staging, &executable, &config)
+            .map_err(|_| "Cannot start local Mihomo")?;
+        self.mihomo.insert(id.clone(), child);
+        self.active.insert(id.clone(), profile);
+        let listener = ListenerTarget::Literal(SocketAddr::from(([127, 0, 0, 1], port)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !listener.ready() {
+            if self.status(&id).state != TunnelState::Running || Instant::now() >= deadline {
+                self.disconnect(&id)?;
+                return Err("Mihomo did not make its mixed listener ready".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let profile = self.active.get(&id).expect("connected profile is recorded");
+        let selections = profile
+            .mihomo
+            .as_ref()
+            .map(|options| &options.group_selections)
+            .ok_or("Missing Mihomo profile options")?;
+        let selections_result = net_manager_core::mihomo_control::apply_group_selections(
+            &self
+                .mihomo
+                .get(&id)
+                .expect("connected child is recorded")
+                .directory
+                .join("controller.sock"),
+            selections,
+        );
+        if selections_result.is_err() {
+            self.disconnect(&id)?;
+            return Err("Cannot apply Mihomo group selections".into());
+        }
+        if profile.use_system_proxy
+            && self
+                .proxy
+                .apply_with_http(&id, port, Some(port), &profile.proxy_bypass)
+                .is_err()
+        {
+            self.disconnect(&id)?;
+            return Err("Cannot apply the system proxy".into());
+        }
+        Ok(self.status(&id))
+    }
     fn connect(&mut self, connection: PreparedLocalConnection) -> Result<TunnelStatus, String> {
         let PreparedLocalConnection {
             profile,
+            mihomo,
             xray,
             assets,
             notices,
@@ -685,13 +932,20 @@ impl Runtime {
         let profile_id = profile.id.clone();
         let id = profile_id.as_str();
         validate_local_profile(&self.root, &profile)?;
-        if self
-            .active
-            .get(id)
-            .is_some_and(|profile| self.tunnels.status(profile).state == TunnelState::Running)
-        {
-            return Err("This local Xray profile is already running".into());
+        if self.active.contains_key(id) && self.status(id).state == TunnelState::Running {
+            return Err("This local proxy profile is already running".into());
         }
+        if profile.backend == TunnelBackend::Mihomo {
+            let config = mihomo.ok_or("Missing prepared Mihomo configuration")?;
+            if xray.is_some() || assets.is_some() {
+                return Err("Invalid prepared Mihomo configuration".into());
+            }
+            return self.connect_mihomo(profile, config);
+        }
+        if mihomo.is_some() {
+            return Err("Invalid prepared Xray configuration".into());
+        }
+        let xray = xray.ok_or("Missing prepared Xray configuration")?;
         let executable = crate::linux_system::backend_executable(&self.root, TunnelBackend::Xray)?;
         self.tunnels
             .set_executable(TunnelBackend::Xray, Some(executable));
@@ -722,11 +976,8 @@ impl Runtime {
         self.tunnels.set_xray_asset_dir(id, assets);
         if profile.use_system_proxy {
             self.proxy_guard().map_err(|cause| cause.to_string())?;
-            if self.proxy.ownership().is_some() {
-                if self.active.values().any(|running| {
-                    running.use_system_proxy
-                        && self.tunnels.status(running).state == TunnelState::Running
-                }) {
+            if let Some(owner) = self.proxy.ownership().map(|owner| owner.profile_id.clone()) {
+                if self.status(&owner).state == TunnelState::Running {
                     return Err("System proxy is already owned by a running profile".into());
                 }
                 self.proxy
@@ -794,11 +1045,7 @@ impl Runtime {
                 result
             }
             Request::Disconnect { id } => self.disconnect(&id),
-            Request::Status { id } => Ok(self
-                .active
-                .get(&id)
-                .map(|profile| self.tunnels.status(profile))
-                .unwrap_or_else(|| stopped(&id))),
+            Request::Status { id } => Ok(self.status(&id)),
             Request::Cleanup => {
                 let count = self.active.len();
                 session_log(
@@ -840,13 +1087,10 @@ impl Runtime {
                 }
             }
             Request::RecoverProxy => {
-                let healthy = self
-                    .proxy
-                    .ownership()
-                    .and_then(|owner| self.active.get(&owner.profile_id))
-                    .is_some_and(|profile| {
-                        self.tunnels.status(profile).state == TunnelState::Running
-                    });
+                let owner = self.proxy.ownership().map(|owner| owner.profile_id.clone());
+                let healthy = owner
+                    .as_deref()
+                    .is_some_and(|id| self.status(id).state == TunnelState::Running);
                 if !healthy {
                     self.restore_proxy()
                         .map_err(|_| "Cannot restore the previous system proxy")?;
@@ -858,9 +1102,10 @@ impl Runtime {
     }
     fn check_child_health(&mut self) {
         let mut restore = false;
-        for (id, profile) in &self.active {
-            let failed = self.tunnels.status(profile).state != TunnelState::Running;
+        for id in self.active.keys().cloned().collect::<Vec<_>>() {
+            let failed = self.status(&id).state != TunnelState::Running;
             if failed {
+                self.mihomo.remove(&id);
                 if self.failed_children.insert(id.clone()) {
                     let hash = Sha256::digest(id.as_bytes());
                     session_log(&self.root, crate::linux_diagnostics::LogLevel::Warn,
@@ -869,8 +1114,8 @@ impl Runtime {
                 restore |= self
                     .proxy
                     .ownership()
-                    .is_some_and(|owner| owner.profile_id == *id);
-            } else if self.failed_children.remove(id) {
+                    .is_some_and(|owner| owner.profile_id == id);
+            } else if self.failed_children.remove(&id) {
                 session_log(
                     &self.root,
                     crate::linux_diagnostics::LogLevel::Info,
@@ -937,6 +1182,13 @@ pub fn serve(root: PathBuf, daemon: PathBuf) -> Result<(), String> {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let proxy_root = proxy_state_root(state.as_deref(), home.as_deref())?;
         let mut runtime = Runtime::new(root.clone(), proxy, proxy_root)?;
+        let staging = directory.join("mihomo");
+        match fs::remove_dir_all(&staging) {
+            Ok(()) => {}
+            Err(cause) if cause.kind() == io::ErrorKind::NotFound => {}
+            Err(cause) => return Err(cause),
+        }
+        runtime.mihomo_staging = staging;
         let listener = UnixListener::bind(&socket)?;
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
@@ -1112,6 +1364,63 @@ mod tests {
             Box::new(Adapter(state.clone())),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn mihomo_child_death_restores_proxy_and_disconnect_removes_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let state = Arc::new(Mutex::new(FakeProxy::default()));
+        let mut runtime = Runtime::new(
+            root.clone(),
+            manager(&root, &state),
+            dir.path().join("locks"),
+        )
+        .unwrap();
+        let executable = dir.path().join("fake-mihomo");
+        fs::write(&executable, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let child = MihomoChild::spawn(
+            &dir.path().join("staging"),
+            &executable,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        let staging = child.directory.clone();
+        let profile = Profile {
+            id: "native".into(),
+            backend: TunnelBackend::Mihomo,
+            use_system_proxy: true,
+            ..Default::default()
+        };
+        runtime.active.insert(profile.id.clone(), profile);
+        runtime.mihomo.insert("native".into(), child);
+        runtime.proxy_guard().unwrap();
+        runtime
+            .proxy
+            .apply_with_http("native", 7890, Some(7890), &[])
+            .unwrap();
+        assert_eq!(runtime.status("native").state, TunnelState::Running);
+        runtime
+            .mihomo
+            .get_mut("native")
+            .unwrap()
+            .child
+            .kill()
+            .unwrap();
+        runtime
+            .mihomo
+            .get_mut("native")
+            .unwrap()
+            .child
+            .wait()
+            .unwrap();
+        runtime.check_child_health();
+        assert_eq!(runtime.status("native").state, TunnelState::Failed);
+        assert_eq!(state.lock().unwrap().restored.len(), 1);
+        runtime.disconnect("native").unwrap();
+        assert_eq!(runtime.status("native").state, TunnelState::Stopped);
+        assert!(!staging.exists());
     }
 
     #[test]
@@ -1556,6 +1865,8 @@ mod tests {
         fs::remove_file(&profile.config_path).unwrap();
         let mut runtime = Runtime {
             tunnels: manager,
+            mihomo: HashMap::new(),
+            mihomo_staging: directory.path().join("mihomo"),
             proxy: SystemProxyManager::new(root.join("proxy-state.json")).unwrap(),
             root,
             active: HashMap::new(),
@@ -1567,7 +1878,8 @@ mod tests {
         let id = profile.id.clone();
         let result = runtime.connect(PreparedLocalConnection {
             profile,
-            xray,
+            xray: Some(xray),
+            mihomo: None,
             assets: None,
             notices: Vec::new(),
         });

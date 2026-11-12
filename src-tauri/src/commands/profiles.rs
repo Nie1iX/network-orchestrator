@@ -2135,6 +2135,88 @@ pub(crate) async fn save_wireguard_profile(
 
 #[cfg(target_os = "linux")]
 #[tauri::command]
+pub(crate) async fn get_mihomo_groups(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<net_manager_core::mihomo::MihomoGroupInfo>, String> {
+    linux_profiles_operation(state.inner(), move |service| service.mihomo_groups(&id)).await
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn get_mihomo_groups(
+    _id: String,
+) -> Result<Vec<net_manager_core::mihomo::MihomoGroupInfo>, String> {
+    Err("Mihomo is supported on Linux only".into())
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn save_mihomo_document(
+    profile: Profile,
+    document: String,
+    expected_revision: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, String> {
+    linux_profiles_document(state.inner(), move |service| {
+        service.save_form(
+            profile,
+            Some(net_manager_engine::linux_profiles::ProfileSource::MihomoDocument(document)),
+            expected_revision.as_deref(),
+        )
+    })
+    .await
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn save_mihomo_document(
+    _profile: Profile,
+    _document: String,
+    _expected_revision: Option<String>,
+) -> Result<Vec<Profile>, String> {
+    Err("Mihomo is supported on Linux only".into())
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn import_mihomo_subscription(
+    url: String,
+    hwid: String,
+    refresh_interval_minutes: Option<u32>,
+    state: State<'_, AppState>,
+) -> Result<BatchImportResult, String> {
+    let result = linux_profiles_operation(state.inner(), move |service| {
+        let profile = Profile {
+            id: net_manager_engine::linux_profiles::new_id()?,
+            name: "Mihomo".into(),
+            backend: TunnelBackend::Mihomo,
+            ..Default::default()
+        };
+        profile_network(service.import_mihomo_subscription(
+            profile,
+            &url,
+            &hwid,
+            refresh_interval_minutes,
+        ))
+    })
+    .await?;
+    start_subscription_runtime(state.inner()).await?;
+    Ok(redact_batch_import_for_ipc(result))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn import_mihomo_subscription(
+    _url: String,
+    _hwid: String,
+    _refresh_interval_minutes: Option<u32>,
+) -> Result<BatchImportResult, String> {
+    Err("Mihomo is supported on Linux only".into())
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
 pub(crate) async fn delete_profile(
     id: String,
     state: State<'_, AppState>,
@@ -2268,7 +2350,9 @@ pub(crate) async fn refresh_subscription(
     state: State<'_, AppState>,
 ) -> Result<SubscriptionRefreshResult, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-    linux_refresh_subscription(state.inner(), &id).await
+    let result = linux_refresh_subscription(state.inner(), &id).await?;
+    start_subscription_runtime(state.inner()).await?;
+    Ok(result)
 }
 
 #[cfg(target_os = "linux")]
@@ -2446,6 +2530,101 @@ pub(crate) async fn apply_xray_policy_migration(
         service.apply_migration(&profile_id, Path::new(&path))
     })
     .await
+}
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn get_profile_document(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<net_manager_engine::linux_profiles::EditorDocumentResult, String> {
+    linux_profiles_operation(state.inner(), move |service| service.get_document(&id)).await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn preview_profile_document(
+    id: String,
+    document: serde_json::Value,
+    expected_revision: String,
+    state: State<'_, AppState>,
+) -> Result<net_manager_engine::linux_profiles::EditorPreviewResult, String> {
+    linux_profiles_operation(state.inner(), move |service| {
+        service.preview_document(&id, document, &expected_revision)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn save_profile_document(
+    id: String,
+    document: serde_json::Value,
+    expected_revision: String,
+    state: State<'_, AppState>,
+) -> Result<net_manager_engine::linux_profiles::EditorDocumentResult, String> {
+    linux_profiles_operation(state.inner(), move |service| {
+        service.save_document(&id, document, &expected_revision)
+    })
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub(crate) async fn apply_profile_document(
+    id: String,
+    expected_revision: String,
+    state: State<'_, AppState>,
+) -> Result<TunnelStatus, String> {
+    let credentials = state.openvpn_credentials.clone();
+    linux_profiles_operation(state.inner(), move |service| {
+        service.apply_document(&id, &expected_revision, credentials.as_ref())
+    })
+    .await
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn get_profile_document(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let _ = (id, state);
+    Err("Profile document editing is only available on Linux".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn preview_profile_document(
+    id: String,
+    document: serde_json::Value,
+    expected_revision: String,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let _ = (id, document, expected_revision, state);
+    Err("Profile document editing is only available on Linux".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn save_profile_document(
+    id: String,
+    document: serde_json::Value,
+    expected_revision: String,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let _ = (id, document, expected_revision, state);
+    Err("Profile document editing is only available on Linux".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+pub(crate) async fn apply_profile_document(
+    id: String,
+    expected_revision: String,
+    state: State<'_, AppState>,
+) -> Result<TunnelStatus, String> {
+    let _ = (id, expected_revision, state);
+    Err("Profile document editing is only available on Linux".into())
 }
 
 #[cfg(all(test, not(target_os = "linux")))]

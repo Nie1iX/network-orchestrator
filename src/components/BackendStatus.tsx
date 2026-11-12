@@ -32,6 +32,7 @@ export default function BackendStatus() {
   const [items, setItems] = useState<BackendAvailability[]>([]);
   const caps = usePlatformCapabilities();
   const [offer, setOffer] = useState<ManagedXrayOffer | null>(null);
+  const [mihomoOffer, setMihomoOffer] = useState<ManagedXrayOffer | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -42,18 +43,22 @@ export default function BackendStatus() {
     setLoading(true);
     setError(null);
     try {
-      const [availability, managedOffer] = await Promise.all([
+      const [availability, managedOffer, mihomoManagedOffer] = await Promise.all([
         invoke<BackendAvailability[]>("get_backend_availability"),
         invoke<ManagedXrayOffer>("get_managed_xray_offer"),
+        caps?.managedMihomoInstall
+          ? invoke<ManagedXrayOffer>("get_managed_mihomo_offer")
+          : Promise.resolve(null),
       ]);
       setItems(availability);
       setOffer(managedOffer);
+      setMihomoOffer(mihomoManagedOffer);
     } catch (err) {
       setError(String(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [caps?.managedMihomoInstall]);
 
   useEffect(() => {
     load();
@@ -63,7 +68,7 @@ export default function BackendStatus() {
     const unlisten = listen<BackendInstallProgress>(
       "backend-install-progress",
       (event) => {
-        if (event.payload.backend === "xray") {
+        if (event.payload.backend === "xray" || event.payload.backend === "mihomo") {
           setProgress(event.payload);
         }
       }
@@ -140,11 +145,41 @@ export default function BackendStatus() {
       if (!approved) return;
       await invoke("remove_managed_xray");
     });
+  const installMihomo = () =>
+    run("install-mihomo", async () => {
+      if (!mihomoOffer) return;
+      const approved = await confirm(
+        t("backend.installConfirm", {
+          version: mihomoOffer.version,
+          url: mihomoOffer.sourceUrl,
+          sha256: mihomoOffer.sha256,
+        }),
+        { title: t("backend.installTitle"), kind: "info" }
+      );
+      if (!approved) return;
+      setProgress(null);
+      setCancelling(false);
+      await invoke("install_managed_mihomo");
+    });
+
+  const removeMihomo = () =>
+    run("remove-mihomo", async () => {
+      const approved = await confirm(
+        t("backend.removeConfirm"),
+        { title: t("backend.removeTitle"), kind: "warning" }
+      );
+      if (!approved) return;
+      await invoke("remove_managed_mihomo");
+    });
 
   const cancelInstall = async () => {
     setCancelling(true);
     try {
-      await invoke("cancel_managed_xray_install");
+      await invoke(
+        busy === "install-mihomo"
+          ? "cancel_managed_mihomo_install"
+          : "cancel_managed_xray_install"
+      );
     } catch (err) {
       setError(String(err));
       setCancelling(false);
@@ -181,7 +216,7 @@ export default function BackendStatus() {
             {!item.available && item.path ? ` — ${item.message}` : ""}
           </span>
           <span className="backend-actions">
-            {!(caps?.os === "linux" && (item.backend === "wireGuard" || item.backend === "openVpn")) && (
+            {item.backend !== "mihomo" && !(caps?.os === "linux" && (item.backend === "wireGuard" || item.backend === "openVpn")) && (
               <button
                 type="button"
                 className="btn-sm"
@@ -224,10 +259,37 @@ export default function BackendStatus() {
                 {t("backend.removeManaged")}
               </button>
             )}
+            {item.backend === "mihomo" && (
+              caps?.managedMihomoInstall ? (
+                item.source === "managed" ? (
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={busy !== null}
+                    onClick={removeMihomo}
+                  >
+                    {t("Remove Mihomo")}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={busy !== null || !mihomoOffer}
+                    onClick={installMihomo}
+                  >
+                    {mihomoOffer
+                      ? t("Install Mihomo")
+                      : t("Managed Mihomo is supported on Linux x86-64 only.")}
+                  </button>
+                )
+              ) : (
+                <span className="row-value">{t("Managed Mihomo is supported on Linux x86-64 only.")}</span>
+              )
+            )}
           </span>
         </div>
       ))}
-      {busy === "install-xray" && progress && (
+      {(busy === "install-xray" || busy === "install-mihomo") && progress && (
         <div className="backend-install-progress">
           <div className="progress">
             <div

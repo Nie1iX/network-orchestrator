@@ -6,9 +6,40 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+mod mihomo_vault_tests {
+    use super::*;
+
+    #[test]
+    fn stores_native_config_as_managed_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path());
+        let value = serde_json::json!({"proxies": [], "rules": ["MATCH,DIRECT"]});
+        let imported = vault.store_generated_mihomo("native", &value).unwrap();
+        assert!(vault.is_managed_profile_path("native", &imported.config_path));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(imported.config_path).unwrap())
+                .unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn stores_original_native_yaml_in_new_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path());
+        let source =
+            b"# provider formatting\nproxies: []\nproxy-groups: []\nrules: ['MATCH,DIRECT']\n";
+        let imported = vault.store_mihomo_source("native", source).unwrap();
+        assert!(vault.is_managed_profile_path("native", &imported.config_path));
+        assert_eq!(fs::read(imported.config_path).unwrap(), source);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigImport {
@@ -155,6 +186,16 @@ impl ConfigVault {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_lowercase();
+        let native_source = if backend == TunnelBackend::Mihomo {
+            let mut bytes = Vec::new();
+            fs::File::open(source)?
+                .take(8 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            crate::mihomo::parse_config(&bytes)?;
+            Some(bytes)
+        } else {
+            None
+        };
         let config_name = match backend {
             TunnelBackend::WireGuard if source_name.ends_with(".conf.dpapi") => {
                 format!("{safe}.conf.dpapi")
@@ -163,6 +204,9 @@ impl ConfigVault {
             TunnelBackend::OpenVpn if source_name.ends_with(".ovpn") => "client.ovpn".to_string(),
             TunnelBackend::OpenVpn if source_name.ends_with(".conf") => "client.conf".to_string(),
             TunnelBackend::Xray if source_name.ends_with(".json") => "config.json".to_string(),
+            TunnelBackend::Mihomo if source_name.ends_with(".yaml") => "mihomo.yaml".to_string(),
+            TunnelBackend::Mihomo if source_name.ends_with(".yml") => "mihomo.yml".to_string(),
+            TunnelBackend::Mihomo if source_name.ends_with(".json") => "mihomo.json".to_string(),
             _ => {
                 return Err(invalid_input(format!(
                     "unsupported {} config extension for '{}'",
@@ -187,7 +231,11 @@ impl ConfigVault {
                 TunnelBackend::OpenVpn => stage_openvpn(source, &staging, &config_name)?,
                 _ => {
                     let staged_config = staging.join(&config_name);
-                    copy_source_with_backup_fallback(source, &staged_config)?;
+                    if let Some(bytes) = &native_source {
+                        fs::write(&staged_config, bytes)?;
+                    } else {
+                        copy_source_with_backup_fallback(source, &staged_config)?;
+                    }
                     protect_path(&staged_config)?;
                     (Vec::new(), Vec::new())
                 }
@@ -235,8 +283,25 @@ impl ConfigVault {
         }
     }
 
+    pub fn store_generated_mihomo(
+        &self,
+        profile_id: &str,
+        config: &serde_json::Value,
+    ) -> io::Result<ConfigImport> {
+        self.store_revision_file(
+            profile_id,
+            &serde_json::to_vec_pretty(config)?,
+            "mihomo.json",
+        )
+    }
+
+    pub fn store_mihomo_source(&self, profile_id: &str, source: &[u8]) -> io::Result<ConfigImport> {
+        crate::mihomo::parse_config(source)?;
+        self.store_revision_file(profile_id, source, "mihomo.yaml")
+    }
+
     pub fn store_xray_config(&self, profile_id: &str, bytes: &[u8]) -> io::Result<ConfigImport> {
-        self.store_xray_file(profile_id, bytes, "config.json")
+        self.store_revision_file(profile_id, bytes, "config.json")
     }
 
     pub fn store_protected_xray_config(
@@ -244,7 +309,7 @@ impl ConfigVault {
         profile_id: &str,
         encrypted_bytes: &[u8],
     ) -> io::Result<ConfigImport> {
-        self.store_xray_file(profile_id, encrypted_bytes, "config.json.dpapi")
+        self.store_revision_file(profile_id, encrypted_bytes, "config.json.dpapi")
     }
 
     /// Store a generated WireGuard `.conf` as a new managed revision. The
@@ -294,7 +359,7 @@ impl ConfigVault {
         }
     }
 
-    fn store_xray_file(
+    fn store_revision_file(
         &self,
         profile_id: &str,
         bytes: &[u8],
@@ -441,6 +506,9 @@ const CONFIG_NAMES: &[&str] = &[
     "client.conf",
     "config.json",
     "config.json.dpapi",
+    "mihomo.yaml",
+    "mihomo.yml",
+    "mihomo.json",
 ];
 
 const PATH_DIRECTIVES: &[&str] = &[
@@ -816,6 +884,7 @@ fn backend_label(backend: TunnelBackend) -> &'static str {
         TunnelBackend::WireGuard => "wireguard",
         TunnelBackend::OpenVpn => "openvpn",
         TunnelBackend::Xray => "xray",
+        TunnelBackend::Mihomo => "mihomo",
     }
 }
 

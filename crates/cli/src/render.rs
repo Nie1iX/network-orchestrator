@@ -20,6 +20,7 @@ pub fn kind_of(profile: &Profile) -> &'static str {
         (TunnelBackend::Xray, _) => "xray-socks",
         (TunnelBackend::WireGuard, _) => "wireguard",
         (TunnelBackend::OpenVpn, _) => "openvpn",
+        (TunnelBackend::Mihomo, _) => "mihomo",
         (TunnelBackend::None, _) => "static",
     }
 }
@@ -98,5 +99,14 @@ mod tests {
         assert_eq!(row_of(&profile).role, "secondary");
         let json = serde_json::to_string(&row_of(&profile)).unwrap();
         assert!(!json.contains("configPath"));
+    }
+
+    #[test]
+    fn mihomo_profiles_are_identified_as_native_backend() {
+        let profile = Profile {
+            backend: TunnelBackend::Mihomo,
+            ..Default::default()
+        };
+        assert_eq!(kind_of(&profile), "mihomo");
     }
 }

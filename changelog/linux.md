@@ -10,6 +10,15 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Optional Mihomo v1.19.34 component on x86_64, explicitly installed/removed through
+  Settings or `netorch backend mihomo`. Import native configurations/subscriptions,
+  edit group selections in the shared form/JSON/node editor, and choose daemon TUN
+  or user-runtime mixed-proxy mode without changing existing Xray profiles.
+  Preserve native provider filters, fallback and load balancing; enabled refresh
+  updates protected snapshots without reconnecting an active profile.
+
 ### Fixed
 
 - Accept validated socket options on Hysteria TUN outbounds instead of rejecting

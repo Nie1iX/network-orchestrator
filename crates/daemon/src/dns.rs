@@ -281,7 +281,8 @@ fn validate_link(link: &str) -> Result<(), DnsError> {
     let suffix = link
         .strip_prefix("wg-")
         .or_else(|| link.strip_prefix("ovpn-"))
-        .or_else(|| link.strip_prefix("xray-"));
+        .or_else(|| link.strip_prefix("xray-"))
+        .or_else(|| link.strip_prefix("mh-"));
     if link.len() <= 15
         && suffix.is_some_and(|suffix| {
             !suffix.is_empty()
@@ -413,6 +414,23 @@ mod tests {
             DnsApply::Applied
         );
         assert_eq!(dns.runner.seen[2], ["dns", "ovpn-1234567890", "10.78.0.1"]);
+    }
+
+    #[test]
+    fn mihomo_link_applies_and_reverts_per_link_dns() {
+        let mut dns = executor(vec![ok(), help(), ok(), ok(), ok(), ok(), ok()]);
+        assert_eq!(
+            dns.apply("mh-123abc", &["10.8.0.53".parse().unwrap()], &[], true)
+                .unwrap(),
+            DnsApply::Applied
+        );
+        dns.revert("mh-123abc").unwrap();
+        assert_eq!(dns.runner.seen[2], ["dns", "mh-123abc", "10.8.0.53"]);
+        assert_eq!(dns.runner.seen[3], ["domain", "mh-123abc", "~."]);
+        assert_eq!(dns.runner.seen[4], ["default-route", "mh-123abc", "yes"]);
+        assert_eq!(dns.runner.seen[6], ["revert", "mh-123abc"]);
+        assert!(validate_link("mh-").is_err());
+        assert!(validate_link("mh-invalid/name").is_err());
     }
 
     #[test]

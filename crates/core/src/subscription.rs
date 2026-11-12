@@ -13,6 +13,97 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+mod mihomo_subscription_tests {
+    #[test]
+    fn native_subscription_user_agent_is_recognized() {
+        assert!(super::MIHOMO_SUBSCRIPTION_USER_AGENT.starts_with("clash.meta"));
+    }
+
+    #[tokio::test]
+    async fn native_fetch_sends_client_identity_and_keeps_document() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let size = stream.read(&mut request).await.unwrap();
+            let body = "proxies: []\nproxy-groups: []\nrules: ['MATCH,DIRECT']\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request[..size].to_vec())
+                .unwrap()
+                .to_lowercase()
+        });
+        let (document, fetched) =
+            super::fetch_mihomo(&format!("http://{addr}/source"), "device-id")
+                .await
+                .unwrap();
+        let request = server.await.unwrap();
+        assert!(request.contains("user-agent: clash.meta/"));
+        assert!(request.contains("x-hwid: device-id"));
+        assert!(fetched.body.contains("proxy-groups:"));
+        assert!(document["proxy-groups"].is_array());
+    }
+
+    #[tokio::test]
+    async fn native_dataset_fetch_keeps_binary_bytes() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n\xff\x00",
+                )
+                .await
+                .unwrap();
+        });
+        let bytes = super::fetch_mihomo_dataset(&format!("http://{addr}/dataset"))
+            .await
+            .unwrap();
+        assert_eq!(bytes, [0xff, 0]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_headers_are_not_forwarded_across_origins() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut upstream, _) = source.accept().await.unwrap();
+            let mut request = [0; 8192];
+            let read = upstream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read])
+                .to_lowercase()
+                .contains("x-token: secret"));
+            upstream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/data\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+            let (mut downstream, _) = target.accept().await.unwrap();
+            let read = downstream.read(&mut request).await.unwrap();
+            let forwarded = String::from_utf8_lossy(&request[..read]).to_lowercase();
+            downstream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx")
+                .await
+                .unwrap();
+            forwarded
+        });
+        let headers = std::collections::BTreeMap::from([("x-token".into(), vec!["secret".into()])]);
+        super::fetch_mihomo_dataset_with_headers(&format!("http://{source_addr}/data"), &headers)
+            .await
+            .unwrap();
+        assert!(!server.await.unwrap().contains("x-token"));
+    }
+}
+
 fn referenced_ids(profile: &Profile) -> std::collections::HashSet<String> {
     let mut keys = profile.named_exit_keys();
     if let Some(meta) = &profile.subscription {
@@ -227,6 +318,113 @@ fn failure(message: &str) -> io::Error {
 /// User-Agent and answer unknown clients with a placeholder server. v2rayN is
 /// universally recognized and receives the Base64 list of share links.
 pub const SUBSCRIPTION_USER_AGENT: &str = "v2rayN/7.13.8";
+pub const MIHOMO_SUBSCRIPTION_USER_AGENT: &str = "clash.meta/1.19.34";
+
+pub fn mihomo_http_client() -> io::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(MIHOMO_SUBSCRIPTION_USER_AGENT)
+        .build()
+        .map_err(|_| failure("Could not create the subscription HTTP client"))
+}
+
+pub async fn fetch_mihomo(
+    source: &str,
+    hwid: &str,
+) -> io::Result<(serde_json::Value, FetchedSubscription)> {
+    let client = mihomo_http_client()?;
+    let fetched = fetch(&client, source, hwid).await?;
+    let config = crate::mihomo::parse_config(fetched.body.as_bytes())?;
+    Ok((config, fetched))
+}
+
+pub async fn fetch_mihomo_dataset(source: &str) -> io::Result<Vec<u8>> {
+    fetch_mihomo_dataset_with_headers(source, &std::collections::BTreeMap::new()).await
+}
+
+pub async fn fetch_mihomo_dataset_with_headers(
+    source: &str,
+    headers: &std::collections::BTreeMap<String, Vec<String>>,
+) -> io::Result<Vec<u8>> {
+    async fn download(
+        source: &str,
+        headers: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> io::Result<Vec<u8>> {
+        let client = mihomo_http_client()?;
+        let mut url = validate_url(source)?;
+        let original = url.origin();
+        let mut forward_headers = true;
+        let mut safe_headers = reqwest::header::HeaderMap::new();
+        for (name, values) in headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| invalid("Invalid Mihomo provider header"))?;
+            if matches!(
+                name.as_str(),
+                "host"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "connection"
+                    | "proxy-authorization"
+            ) {
+                return Err(invalid("Unsafe Mihomo provider header"));
+            }
+            for value in values {
+                let mut value = reqwest::header::HeaderValue::from_str(value)
+                    .map_err(|_| invalid("Invalid Mihomo provider header"))?;
+                value.set_sensitive(true);
+                safe_headers.append(name.clone(), value);
+            }
+        }
+        for redirect in 0..=5 {
+            let mut request = client.get(url.clone());
+            if forward_headers {
+                request = request.headers(safe_headers.clone());
+            }
+            let mut response = request
+                .send()
+                .await
+                .map_err(|_| failure("Could not fetch the Mihomo dataset"))?;
+            if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                if redirect == 5 {
+                    return Err(failure("Mihomo dataset redirected too many times"));
+                }
+                let next = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|location| url.join(location).ok())
+                    .ok_or_else(|| invalid("Invalid Mihomo dataset redirect"))?;
+                validate_url(next.as_str())?;
+                if url.scheme() == "https" && next.scheme() != "https" {
+                    return Err(invalid("Insecure Mihomo dataset redirect was rejected"));
+                }
+                forward_headers &= next.origin() == original;
+                url = next;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(failure("Mihomo dataset request failed"));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| failure("Could not read the Mihomo dataset"))?
+            {
+                if chunk.len() > MAX_SUBSCRIPTION_BODY_BYTES - bytes.len() {
+                    return Err(invalid("Mihomo dataset exceeds the 4 MiB limit"));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            return Ok(bytes);
+        }
+        Err(failure("Mihomo dataset redirected too many times"))
+    }
+    tokio::time::timeout(Duration::from_secs(30), download(source, headers))
+        .await
+        .map_err(|_| failure("Mihomo dataset request timed out"))?
+}
 
 pub const UNSUPPORTED_CLIENT_MESSAGE: &str =
     "The subscription server returned a placeholder instead of servers. It may not recognize this app or require an HWID.";

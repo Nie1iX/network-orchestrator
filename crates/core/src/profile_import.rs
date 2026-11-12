@@ -291,8 +291,15 @@ pub fn detect_backend(path: &Path, default: Option<TunnelBackend>) -> Option<Tun
     if lower.ends_with(".ovpn") {
         return Some(TunnelBackend::OpenVpn);
     }
+    if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+        return Some(TunnelBackend::Mihomo);
+    }
     if lower.ends_with(".json") {
-        return Some(TunnelBackend::Xray);
+        return Some(
+            default
+                .filter(|backend| *backend == TunnelBackend::Mihomo)
+                .unwrap_or(TunnelBackend::Xray),
+        );
     }
     if lower.ends_with(".conf.dpapi") {
         return Some(TunnelBackend::WireGuard);
@@ -325,6 +332,7 @@ fn backend_label(backend: TunnelBackend) -> &'static str {
         TunnelBackend::WireGuard => "WireGuard",
         TunnelBackend::OpenVpn => "OpenVPN",
         TunnelBackend::Xray => "Xray",
+        TunnelBackend::Mihomo => "Mihomo",
     }
 }
 

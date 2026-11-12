@@ -102,6 +102,47 @@ refresh, cancellation before teardown and memory-only OpenVPN credential
 collection. Native desktop/tray acceptance and live third-party provider login
 remain separate from this sandbox contract.
 
+## Optional Linux Mihomo acceptance
+
+Build `netorch` and the daemon, then run only in the disposable harness:
+
+```bash
+cargo build -p network-orchestrator-daemon -p net-manager-cli
+NETORCH_E2E_SUITE=mihomo \
+  MIHOMO_E2E_ARCHIVE=/absolute/path/mihomo-linux-amd64-v1-v1.19.34.gz \
+  NETORCH_E2E_DAEMON="$PWD/target/debug/network-orchestrator-daemon" \
+  NETORCH_E2E_CLI="$PWD/target/debug/netorch" \
+  e2e/linux/run.sh
+```
+
+The archive must match the managed component's compiled hash. The scenario
+rejects a tampered archive, installs the verified component in the container,
+imports native YAML/JSON, and validates without spawning a child or changing
+kernel state. Real VLESS peers carry IPv4/IPv6 HTTP and fresh resolved DNS.
+The peer explicitly resolves the synthetic test domain: native redir-host DNS
+may send its restored hostname through VLESS rather than its cached IP.
+
+Acceptance includes independent client exit, UID isolation, explicit teardown,
+a secondary scoped TUN alongside a full primary, native marked DIRECT traffic,
+daemon crash recovery and component removal. An ingress packet observer proves
+the scoped packet actually entered its TUN; successful physical HTTP alone is
+not sufficient. Full payload addresses are unreachable without the tunnel.
+Foreign routes and primary resources must survive secondary teardown.
+
+The unprivileged mixed-proxy smoke uses a private data directory, HOME/XDG
+directories, no desktop D-Bus session, `useSystemProxy: false`, and an unreachable
+system-daemon socket. Independent selector groups sharing one inline provider
+must reach distinct loopback HTTP markers, then release their listener and child.
+Native third-party subscription import/start is separate from synthetic packet
+acceptance; neither proves public-provider availability or native desktop install.
+
+The complete Mihomo scenario passed in disposable Linux containers: pinned install
+and removal, read-only validation, native provider filter/name overrides, IPv4/IPv6
+HTTP, DNS, simultaneous primary/secondary capture, packet-observed DIRECT and
+SIGKILL recovery back to the original kernel snapshot. Native third-party source
+import/start/stop also passed in isolated unprivileged Proxy mode. GUI verification
+used the browser sandbox; no production profile or installed application was changed.
+
 ## Linux multinode routing and recovery
 
 ```bash

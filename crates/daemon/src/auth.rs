@@ -76,7 +76,10 @@ pub fn required_action(method_name: &str) -> Option<Action> {
         | method::OPENVPN_PROBE
         | method::OPENVPN_DISCONNECT
         | method::XRAY_CONNECT
-        | method::XRAY_DISCONNECT => Some(Action::ConnectProfile),
+        | method::XRAY_DISCONNECT
+        | method::MIHOMO_CONNECT
+        | method::MIHOMO_DISCONNECT => Some(Action::ConnectProfile),
+        method::MIHOMO_INSTALL | method::MIHOMO_REMOVE => Some(Action::SystemNetwork),
         _ => None,
     }
 }
@@ -274,13 +277,25 @@ mod tests {
             required_action(method::OPENVPN_DISCONNECT),
             Some(Action::ConnectProfile)
         );
+        for method in [method::MIHOMO_CONNECT, method::MIHOMO_DISCONNECT] {
+            assert_eq!(required_action(method), Some(Action::ConnectProfile));
+        }
+        for method in [method::MIHOMO_INSTALL, method::MIHOMO_REMOVE] {
+            assert_eq!(required_action(method), Some(Action::SystemNetwork));
+        }
+        assert_eq!(required_action(method::MIHOMO_STATUS), None);
+        assert_eq!(required_action(method::MIHOMO_VALIDATE), None);
+        assert_eq!(
+            Action::ConnectProfile.polkit_id(),
+            "com.netmanager.app.connect-profile"
+        );
         assert_eq!(
             Action::SystemNetwork.polkit_id(),
             "com.netmanager.app.system-network"
         );
         assert_eq!(
-            Action::ConnectProfile.polkit_id(),
-            "com.netmanager.app.connect-profile"
+            required_action(method::XRAY_DISCONNECT),
+            Some(Action::ConnectProfile)
         );
     }
 

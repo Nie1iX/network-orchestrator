@@ -62,6 +62,53 @@ daemon plus `wireguard-tools` or `openvpn`; per-link DNS needs
 No backend is silently downloaded or updated; the Profiles tab shows which
 backends were found.
 
+### Optional Mihomo backend (Linux x86_64)
+
+Xray remains unchanged. Install Mihomo explicitly in **Settings → System** or:
+
+```bash
+netorch backend mihomo offer
+netorch backend mihomo install
+netorch profile import-configs --backend mihomo ./provider.yaml
+netorch profile mihomo groups PROFILE
+netorch up PROFILE
+netorch down PROFILE
+```
+
+The managed component is Mihomo v1.19.34, with pinned archive/executable hashes.
+Nothing is downloaded merely by selecting this backend. Native YAML/JSON keeps
+select, URL-test, fallback and load-balance groups, provider filters and rules;
+it is not converted to Xray. HTTP proxy providers are fetched as the user and
+stored as protected snapshots before privileged validation.
+
+For a subscription, keep its URL in a private file rather than shell history:
+
+```bash
+chmod 600 subscription-url.txt
+netorch profile mihomo import --url-file subscription-url.txt --name native --interval 60
+```
+
+GUI: **Add connection → Mihomo**, then select a file, paste native configuration,
+or import a subscription. TUN mode belongs to the system daemon; closing either
+client does not disconnect it. Proxy mode uses a loopback mixed HTTP/SOCKS port
+and the shared unprivileged `netorch serve` runtime; only this mode supports the
+user system-proxy toggle. A custom executable may be selected for Proxy mode
+with `netorch backend path set mihomo /path/to/mihomo`; TUN always uses the
+verified root-owned managed component.
+
+Native options are shared with the JSON/node editor:
+`mihomo.mode`, `mixedPort`, `entryGroup` and `groupSelections`. Saved selections
+are applied independently through the private controller, without reordering
+shared providers. Secondary TUN profiles use `tunnelNetworks` and optional
+`tunnelDnsDomains`. Profile block/proxy/direct policies precede native rules.
+Xray-only endpoint backups, named command exits and service checks are rejected,
+not silently translated.
+
+Enabled subscription/provider refresh runs in the existing user runtime,
+without the GUI. It updates protected source snapshots, not a running tunnel;
+reconnect explicitly to apply a new snapshot. Unsupported local file extensions,
+hooks, external listeners and unsafe provider options are refused.
+
 ### Linux Xray subscriptions: backups and pinned nodes
 
 One Xray TUN can use a primary subscription server, an ordered chain of

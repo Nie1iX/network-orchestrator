@@ -809,6 +809,34 @@ fn system_rule_message(rule: &SystemRule) -> RuleMessage {
     message
 }
 
+fn is_mihomo_native_rule(message: &RuleMessage, name: &str, table: u32) -> bool {
+    if message.header.family != AddressFamily::Inet6
+        || message.header.action != RuleAction::ToTable
+        || message.header.src_len != 0
+        || message.header.dst_len != 0
+        || message.header.tos != 0
+        || message.header.flags.contains(&RuleFlag::Invert)
+        || rule_table(message) != table
+        || rule_priority(message).is_none_or(|priority| priority == 0)
+    {
+        return false;
+    }
+    let mut names = 0;
+    let valid = message.attributes.iter().all(|attribute| match attribute {
+        RuleAttribute::Oifname(value) => {
+            names += 1;
+            value == name
+        }
+        RuleAttribute::Priority(_) | RuleAttribute::Table(_) => true,
+        RuleAttribute::SuppressPrefixLen(value) | RuleAttribute::SuppressIfGroup(value) => {
+            *value == u32::MAX
+        }
+        RuleAttribute::Protocol(value) => u8::from(*value) == 0,
+        _ => false,
+    });
+    valid && names == 1
+}
+
 fn is_owned_rule(message: &RuleMessage, rule: &OwnedRuleResource) -> bool {
     let expected = rule_request(rule);
     if message.header.family != expected.header.family
@@ -1009,6 +1037,11 @@ enum Command {
         rule: OwnedRuleResource,
         reply: mpsc::Sender<io::Result<bool>>,
     },
+    MihomoNativeRuleCleanup {
+        name: String,
+        table: u32,
+        reply: mpsc::Sender<io::Result<()>>,
+    },
     Link {
         index: u32,
         up: bool,
@@ -1072,6 +1105,7 @@ impl Command {
             Self::Rule { .. } => "rule",
             Self::TableInUse { .. } => "table_in_use",
             Self::RulePresent { .. } => "rule_present",
+            Self::MihomoNativeRuleCleanup { .. } => "mihomo_native_rule_cleanup",
             Self::Link { .. } => "link_set",
             Self::LinkDel { .. } => "link_delete",
             Self::InterfaceAddrs { .. } => "interface_addrs",
@@ -1536,6 +1570,35 @@ async fn run_actor(
                     .await;
                     let _ = reply.send(result);
                 }
+                Command::MihomoNativeRuleCleanup { name, table, reply } => {
+                    let result = async {
+                        for message in get_rules(&handle).await? {
+                            if is_mihomo_native_rule(&message, &name, table) {
+                                match handle
+                                    .rule()
+                                    .del(message)
+                                    .execute()
+                                    .await
+                                    .map_err(netlink_error_to_io)
+                                {
+                                    Ok(()) => {}
+                                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                                    Err(err) => return Err(err),
+                                }
+                            }
+                        }
+                        if get_rules(&handle)
+                            .await?
+                            .iter()
+                            .any(|message| is_mihomo_native_rule(message, &name, table))
+                        {
+                            return Err(io::Error::other("Mihomo native rule survived cleanup"));
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    let _ = reply.send(result);
+                }
                 Command::Rule { rule, add, reply } => {
                     let result = async {
                         let existing = get_rules(&handle).await?;
@@ -1929,6 +1992,32 @@ impl PolicyRuleExecutor for NetlinkExecutor {
         })
     }
 
+    fn remove_mihomo_native_rules(&mut self, name: &str, mark: u32) -> io::Result<()> {
+        let suffix = name.strip_prefix("mh").unwrap_or("");
+        if !(51820..51948).contains(&mark)
+            || name.len() > 15
+            || suffix.len() < 2 && suffix.starts_with('-')
+            || !suffix
+                .as_bytes()
+                .first()
+                .is_some_and(|b| *b == b'-' || b.is_ascii_digit())
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Mihomo rule owner",
+            ));
+        }
+        let name = name.to_owned();
+        self.call(|reply| Command::MihomoNativeRuleCleanup {
+            name,
+            table: mark + 128,
+            reply,
+        })
+    }
+
     fn table_in_use(&mut self, table: u32) -> io::Result<bool> {
         self.call_with(|reply| Command::TableInUse { table, reply })
     }
@@ -2105,6 +2194,30 @@ mod tests {
             invert: true,
             suppress_prefix_length: Some(0),
         }
+    }
+
+    #[test]
+    fn native_mihomo_rule_identity_rejects_foreign_rules() {
+        let mut rule = RuleMessage::default();
+        rule.header.family = AddressFamily::Inet6;
+        rule.header.action = RuleAction::ToTable;
+        rule.attributes = vec![
+            RuleAttribute::Priority(32765),
+            RuleAttribute::Table(51948),
+            RuleAttribute::Oifname("mh-owned".into()),
+        ];
+        assert!(is_mihomo_native_rule(&rule, "mh-owned", 51948));
+        assert!(!is_mihomo_native_rule(&rule, "mh-foreign", 51948));
+        assert!(!is_mihomo_native_rule(&rule, "mh-owned", 51949));
+        let mut foreign = rule.clone();
+        foreign.attributes.push(RuleAttribute::FwMark(42));
+        assert!(!is_mihomo_native_rule(&foreign, "mh-owned", 51948));
+        let mut foreign = rule.clone();
+        foreign.header.family = AddressFamily::Inet;
+        assert!(!is_mihomo_native_rule(&foreign, "mh-owned", 51948));
+        let mut foreign = rule;
+        foreign.header.flags.push(RuleFlag::Invert);
+        assert!(!is_mihomo_native_rule(&foreign, "mh-owned", 51948));
     }
 
     #[test]

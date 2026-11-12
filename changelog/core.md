@@ -10,6 +10,15 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Optional native Mihomo profile model and bounded YAML/JSON import, protected
+  source revisions, HTTP provider snapshots and shared subscription scheduling.
+  Preserve native groups, load balancing, filters, inline/HTTP rule providers and
+  independently selected groups without converting them to Xray.
+- Hash-pinned Mihomo component verification, typed daemon lifecycle requests and
+  shared Linux Engine services for daemon TUN and unprivileged mixed-proxy mode.
+
 ### Fixed
 
 - Persist subscription record IDs independently of server addresses and credentials.

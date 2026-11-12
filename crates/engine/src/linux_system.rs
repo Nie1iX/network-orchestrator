@@ -18,6 +18,13 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[path = "linux_mihomo_system.rs"]
+mod mihomo;
+pub use mihomo::{
+    cancel_managed_mihomo_install, install_managed_mihomo, managed_mihomo_offer,
+    remove_managed_mihomo, ManagedMihomoOffer,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DaemonState {
@@ -59,6 +66,7 @@ pub struct PlatformCapabilities {
     pub system_proxy: bool,
     pub wireguard_standard_import: bool,
     pub managed_xray_install: bool,
+    pub managed_mihomo_install: bool,
     pub elevation_relaunch: bool,
     pub app_updates: bool,
     pub executable_extensions: Vec<String>,
@@ -172,6 +180,7 @@ pub fn platform_capabilities() -> PlatformCapabilities {
         system_proxy: system_proxy_supported(),
         wireguard_standard_import: false,
         managed_xray_install: cfg!(target_arch = "x86_64"),
+        managed_mihomo_install: cfg!(target_arch = "x86_64"),
         elevation_relaunch: false,
         app_updates: false,
         executable_extensions: Vec::new(),
@@ -208,6 +217,7 @@ fn resolve(backend: TunnelBackend, configured: Option<&Path>) -> Result<PathBuf,
     use net_manager_core::vpn;
     match backend {
         TunnelBackend::Xray => vpn::resolve_xray_executable(configured),
+        TunnelBackend::Mihomo => return mihomo::resolve(configured),
         TunnelBackend::WireGuard => vpn::resolve_wireguard_executable(configured),
         TunnelBackend::OpenVpn => vpn::resolve_openvpn_executable(configured),
         TunnelBackend::None => return Err("Static routes have no executable".into()),
@@ -260,6 +270,10 @@ fn resolve_setting(
 ) -> Result<PathBuf, String> {
     match setting {
         Some(setting) if setting.source == BackendExecutableSource::Managed => {
+            if backend == TunnelBackend::Mihomo {
+                mihomo::verified_managed(setting)?;
+                return Ok(setting.path.clone());
+            }
             if backend != TunnelBackend::Xray {
                 return Err("Managed executables are only supported for Xray".into());
             }
@@ -368,6 +382,7 @@ pub fn backend_availability(
                 (false, false) => "Xray unavailable; TUN requires verified package Xray and network daemon.",
             }.into() });
     }
+    entries.push(mihomo::availability(&store, hello.as_ref().ok())?);
     Ok(entries)
 }
 
@@ -384,8 +399,8 @@ fn ensure_stopped(
         .filter(|p| p.backend == backend)
     {
         // Unknown status is not permission to replace a running executable.
-        if engine.status(profile)?.state == TunnelState::Running {
-            return Err("Cannot change a backend executable while a profile is running".into());
+        if engine.status(profile)?.state != TunnelState::Stopped {
+            return Err("Cannot change a backend executable until every profile is stopped".into());
         }
     }
     Ok(())
@@ -401,6 +416,7 @@ fn write_settings(
         .map_err(|_| "Cannot read backend settings")?;
     match backend {
         TunnelBackend::Xray => doc.xray = setting,
+        TunnelBackend::Mihomo => doc.mihomo = setting,
         TunnelBackend::WireGuard => doc.wire_guard = setting,
         TunnelBackend::OpenVpn => doc.open_vpn = setting,
         TunnelBackend::None => return Err("Static routes have no executable".into()),
@@ -466,9 +482,7 @@ pub fn set_backend_executable(
         .map_err(|_| "Cannot read backend settings")?
         .is_some_and(|s| s.source == BackendExecutableSource::Managed)
     {
-        return Err(
-            "Remove the managed Xray installation before choosing another executable".into(),
-        );
+        return Err("Remove the managed installation before choosing another executable".into());
     }
     let path = resolve(backend, Some(path))?;
     ensure_stopped(engine, store, backend)?;
@@ -497,7 +511,7 @@ pub fn reset_backend_executable(
         .map_err(|_| "Cannot read backend settings")?
         .is_some_and(|s| s.source == BackendExecutableSource::Managed)
     {
-        return Err("Remove the managed Xray installation instead of resetting it".into());
+        return Err("Remove the managed installation instead of resetting it".into());
     }
     ensure_stopped(engine, store, backend)?;
     write_settings(root, backend, None)
@@ -532,13 +546,15 @@ struct InstallGuard {
 }
 impl InstallGuard {
     fn begin(directory: &Path) -> Result<Self, String> {
-        let mutation = mutation_lock(directory)?;
+        Self::begin_with_mutation(directory, mutation_lock(directory)?)
+    }
+    fn begin_with_mutation(directory: &Path, mutation: File) -> Result<Self, String> {
         let mut state = control(directory)?;
         let active = lock_file(&directory.join("backend-install.lock"))
             .map_err(|_| "Invalid installer lock")?;
         active
             .try_lock()
-            .map_err(|_| "An Xray installation is already active")?;
+            .map_err(|_| "A managed backend installation is already active")?;
         set_phase(&mut state, "active")?;
         Ok(Self {
             directory: directory.to_path_buf(),
@@ -548,7 +564,7 @@ impl InstallGuard {
     }
     fn check_cancelled(&self) -> Result<(), String> {
         if phase(&mut control(&self.directory)?)? == "cancelled" {
-            Err("Managed Xray install cancelled".into())
+            Err("Managed backend install cancelled".into())
         } else {
             Ok(())
         }
@@ -556,7 +572,7 @@ impl InstallGuard {
     fn commit(&self, select: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
         let mut state = control(&self.directory)?;
         if phase(&mut state)? != "active" {
-            return Err("Managed Xray install cancelled".into());
+            return Err("Managed backend install cancelled".into());
         }
         set_phase(&mut state, "committed")?;
         select()
@@ -567,12 +583,12 @@ fn cancel_in(directory: &Path) -> Result<(), String> {
     let active =
         lock_file(&directory.join("backend-install.lock")).map_err(|_| "Invalid installer lock")?;
     match active.try_lock() {
-        Ok(()) => return Err("No cancellable managed Xray installation is active".into()),
+        Ok(()) => return Err("No cancellable managed installation is active".into()),
         Err(std::fs::TryLockError::WouldBlock) => {}
         Err(_) => return Err("Cannot inspect active installer ownership".into()),
     }
     if phase(&mut state)? != "active" {
-        return Err("No cancellable managed Xray installation is active".into());
+        return Err("No cancellable managed installation is active".into());
     }
     set_phase(&mut state, "cancelled")
 }
@@ -615,7 +631,7 @@ async fn cancellable_download<T>(
         guard.check_cancelled()?;
         match tokio::time::timeout(Duration::from_millis(200), future.as_mut()).await {
             Err(_) => continue,
-            Ok(result) => return result.map_err(|_| "Managed Xray download failed".into()),
+            Ok(result) => return result.map_err(|_| "Managed backend download failed".into()),
         }
     }
 }
@@ -703,7 +719,7 @@ pub async fn install_managed_xray(
     });
     if let Err(error) = selection {
         emit(
-            if error == "Managed Xray install cancelled" {
+            if error == "Managed backend install cancelled" {
                 "cancelled"
             } else {
                 "failed"
@@ -861,6 +877,41 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
+    #[test]
+    fn component_install_cancellation_does_not_cross_backends() {
+        let directory = directory();
+        let xray = InstallGuard::begin(directory.path()).unwrap();
+        assert!(mihomo::cancel_in(directory.path()).is_err());
+        xray.check_cancelled().unwrap();
+        drop(xray);
+        let native = mihomo::begin_install(directory.path()).unwrap();
+        assert!(cancel_in(directory.path()).is_err());
+        mihomo::cancel_in(directory.path()).unwrap();
+        assert!(native
+            .commit(|| panic!("cancelled component must not be selected"))
+            .is_err());
+    }
+
+    #[test]
+    fn mihomo_settings_do_not_replace_an_existing_xray_selection() {
+        let directory = directory();
+        let setting = BackendExecutableSetting {
+            path: std::env::current_exe().unwrap(),
+            source: BackendExecutableSource::Configured,
+            version: None,
+        };
+        write_settings(directory.path(), TunnelBackend::Xray, Some(setting.clone())).unwrap();
+        write_settings(
+            directory.path(),
+            TunnelBackend::Mihomo,
+            Some(setting.clone()),
+        )
+        .unwrap();
+        let saved = settings(directory.path()).load().unwrap();
+        assert_eq!(saved.xray, Some(setting.clone()));
+        assert_eq!(saved.mihomo, Some(setting));
+    }
+
     fn directory() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1012,7 +1063,12 @@ mod tests {
                 tools,
             }));
             let entries = backend_availability(&engine, directory.path()).unwrap();
-            for entry in entries.iter().filter(|e| e.backend != TunnelBackend::Xray) {
+            for entry in entries.iter().filter(|entry| {
+                matches!(
+                    entry.backend,
+                    TunnelBackend::WireGuard | TunnelBackend::OpenVpn
+                )
+            }) {
                 assert_eq!(entry.available, usable != Some(false));
                 assert!(entry.path.is_none());
                 assert!(entry.source.is_none());
@@ -1028,7 +1084,10 @@ mod tests {
         let entries = backend_availability(&engine, directory.path()).unwrap();
         assert!(entries
             .iter()
-            .filter(|e| e.backend != TunnelBackend::Xray)
+            .filter(|entry| matches!(
+                entry.backend,
+                TunnelBackend::WireGuard | TunnelBackend::OpenVpn
+            ))
             .all(|e| !e.available));
     }
 

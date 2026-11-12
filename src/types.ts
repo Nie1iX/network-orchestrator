@@ -105,7 +105,7 @@ export function ifTypeName(ifType: number): string {
   return IF_TYPE_NAMES[ifType] ?? `Type ${ifType}`;
 }
 
-export type TunnelBackend = "none" | "wireGuard" | "openVpn" | "xray";
+export type TunnelBackend = "none" | "wireGuard" | "openVpn" | "xray" | "mihomo";
 
 export interface PolicyRoute {
   destination: string;
@@ -492,10 +492,25 @@ export interface WireGuardFields {
 
 export type XrayMode = "socks" | "tun";
 
+export interface MihomoProfileOptions {
+  mode: "tun" | "proxy";
+  entryGroup: string | null;
+  mixedPort: number | null;
+  groupSelections: Record<string, string>;
+}
+
+export interface MihomoGroupInfo {
+  name: string;
+  kind: string;
+  members: string[];
+  selected: string | null;
+}
+
 export interface Profile {
   id: string;
   name: string;
   backend: TunnelBackend;
+  mihomo?: MihomoProfileOptions | null;
   configPath: string;
   interfaceName: string;
   routes: PolicyRoute[];
@@ -759,6 +774,7 @@ export interface PlatformCapabilities {
   systemProxy: boolean;
   wireguardStandardImport: boolean;
   managedXrayInstall: boolean;
+  managedMihomoInstall: boolean;
   elevationRelaunch: boolean;
   appUpdates: boolean;
   executableExtensions: string[];
