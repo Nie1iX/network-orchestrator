@@ -101,6 +101,7 @@ interface ProfileDetailProps {
   onConnect: () => void;
   onDisconnect: () => void;
   onEdit: () => void;
+  onOpenDocument: () => void;
   onMoveUp: () => void;
   onMoveDown: () => void;
   onToggleAlwaysOn: (kind: AlwaysOnKind, enrolled: boolean) => void;
@@ -149,6 +150,7 @@ export default function ProfileDetail({
   onConnect,
   onDisconnect,
   onEdit,
+  onOpenDocument,
   onMoveUp,
   onMoveDown,
   onToggleAlwaysOn,
@@ -411,6 +413,7 @@ export default function ProfileDetail({
       </div>
 
       <div className="profile-detail-body">
+        {os === "linux" && <button type="button" className="btn-sm profile-document-entry" onClick={onOpenDocument} disabled={isBusy}>{tr("Nodes / JSON")}</button>}
         {connectionFailure && (
           <div className="save-notice" role="alert">
             <div className="diagnostics-head">

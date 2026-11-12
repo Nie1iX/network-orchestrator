@@ -1,0 +1,189 @@
+.profile-graph {
+  min-width: 0;
+  color: var(--text-primary);
+}
+
+.profile-graph-toolbar { margin-bottom: var(--sp-2); }
+
+.profile-graph-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(16rem, 0.42fr);
+  gap: var(--sp-4);
+  align-items: start;
+}
+
+.profile-graph-canvas {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--sp-3);
+  min-height: 18rem;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-card);
+  overflow: auto;
+}
+
+.profile-graph-column {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.profile-graph-column h3,
+.profile-graph-inspector h3 {
+  margin: 0 0 var(--sp-1);
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+}
+
+.profile-graph-node {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-1);
+  width: 100%;
+  background: var(--bg-elev);
+  padding: var(--sp-2) var(--sp-3);
+  text-align: left;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.profile-graph-node:hover { background: var(--bg-card-hover); }
+.profile-graph-node.selected { border-color: var(--accent-border); box-shadow: inset 2px 0 var(--accent); }
+.profile-graph-node.has-issue { border-color: var(--warn-border); }
+.profile-graph-node strong { font-weight: var(--fw-strong); }
+.profile-graph-node span,
+.profile-graph-node small,
+.profile-graph-muted { color: var(--text-secondary); font-size: var(--fs-xs); }
+.profile-graph-node code,
+.profile-graph-path,
+.profile-graph-issue code { color: var(--text-muted); font: var(--fs-2xs) var(--font-mono); overflow-wrap: anywhere; }
+
+.profile-graph-edges {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  opacity: 0.8;
+}
+
+.profile-graph-inspector {
+  display: flex;
+  position: sticky;
+  top: 0;
+  max-height: 60vh;
+  overflow: auto;
+  flex-direction: column;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-card);
+}
+
+.profile-graph-inspector label,
+.profile-graph-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+}
+
+.profile-graph-inspector input,
+.profile-graph-inspector select { width: 100%; min-width: 0; }
+.profile-graph-inspector .profile-graph-check { flex-direction: row; align-items: center; }
+.profile-graph-inspector .profile-graph-check input { width: auto; }
+.profile-graph-fields { display: grid; gap: var(--sp-2); }
+.profile-graph-issue { display: grid; gap: var(--sp-1); padding: var(--sp-2); border-left: 2px solid var(--warn); background: var(--warn-bg); font-size: var(--fs-xs); overflow-wrap: anywhere; }
+.profile-graph-issue.error { border-color: var(--down); background: var(--down-bg); }
+
+.profile-graph-node-wrap {
+  position: relative;
+  z-index: 2;
+  cursor: grab;
+}
+
+.profile-graph-node-wrap:active { cursor: grabbing; }
+
+.profile-graph-edge {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.profile-graph-add,
+.profile-graph-order {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+
+.profile-graph-order { margin-top: var(--sp-2); }
+
+.profile-graph-catalog { display: grid; gap: var(--sp-1); max-width: 24rem; margin-top: var(--sp-2); }
+.profile-graph-catalog label { display: grid; gap: var(--sp-1); font-size: var(--fs-xs); }
+.profile-graph-catalog button { text-align: left; }
+.profile-graph-catalog small { color: var(--text-secondary); }
+
+.profile-graph-order button:focus-visible,
+.profile-graph-add button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.profile-graph-endpoint-refs { color: var(--warn); font-size: var(--fs-xs); }
+.profile-graph-column > .btn-sm { align-self: flex-start; }
+
+.profile-graph-list {
+  display: grid;
+  gap: var(--sp-2);
+  min-width: 0;
+  padding: var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+
+.profile-graph-list legend {
+  padding: 0 var(--sp-1);
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+}
+
+.profile-graph-list-row {
+  display: flex;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.profile-graph-list-row input { flex: 1; min-width: 0; }
+
+.profile-graph-connection-error {
+  color: var(--down);
+  font-size: var(--fs-xs);
+}
+
+@media (max-width: 900px) {
+  .profile-graph-layout { grid-template-columns: 1fr; }
+  .profile-graph-canvas { grid-template-columns: repeat(3, minmax(12rem, 1fr)); }
+  .profile-graph-inspector { grid-row: 2; max-height: 35vh; z-index: 3; }
+  .profile-graph-canvas { grid-row: 1; }
+}
+
+@media (max-width: 560px) {
+  .profile-graph-canvas { grid-template-columns: 1fr; overflow: visible; }
+  .profile-graph-column { border-bottom: 1px solid var(--border); padding-bottom: var(--sp-2); }
+  .profile-graph-edges { display: none; }
+}

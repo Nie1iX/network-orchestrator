@@ -12,6 +12,15 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ### Added
 
+- Edit a complete saved profile through synchronized JSON and a visual node graph.
+  Inspect sources, ordered routing, DNS, endpoint references, pools and named exits;
+  validation identifies unresolved references without silently retargeting traffic.
+  Show only configured blocks and referenced endpoints; add functional blocks from
+  a searchable catalog without changing the tunnel. Preserve incomplete drafts
+  and unresolved references on the canvas.
+- Preview generated Xray TUN settings through the daemon's read-only validator.
+  Save drafts with optimistic revision checks without interrupting a running
+  connection; apply a saved revision only through an explicit reconnect action.
 - Optional Mihomo v1.19.34 component on x86_64, explicitly installed/removed through
   Settings or `netorch backend mihomo`. Import native configurations/subscriptions,
   edit group selections in the shared form/JSON/node editor, and choose daemon TUN
