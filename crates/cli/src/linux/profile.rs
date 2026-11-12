@@ -97,6 +97,9 @@ pub enum MihomoProfileCommand {
     Import {
         #[arg(long, value_name = "FILE")]
         url_file: PathBuf,
+        /// Reuse a provider-registered device instead of deriving a new CLI HWID.
+        #[arg(long, value_name = "FILE")]
+        hwid_file: Option<PathBuf>,
         #[arg(long)]
         name: String,
         #[arg(long = "interval", alias = "refresh-interval", default_value = "off", value_parser = parse_interval)]
@@ -464,14 +467,35 @@ fn run_mihomo_profile(
     match command {
         MihomoProfileCommand::Import {
             url_file,
+            hwid_file,
             name,
             refresh_interval,
         } => {
+            if url_file.as_os_str() == "-"
+                && hwid_file
+                    .as_ref()
+                    .is_some_and(|path| path.as_os_str() == "-")
+            {
+                return Err(
+                    "Only one input may read stdin; use private files for the others".into(),
+                );
+            }
             let url = read_input(&url_file, 16 * 1024)?;
             let url = url.trim();
             if url.is_empty() || url.contains(['\r', '\n']) {
                 return Err("Supply a single-line Mihomo subscription URL".into());
             }
+            let hwid = match hwid_file {
+                Some(path) => {
+                    let value = read_input(&path, 16 * 1024)?;
+                    let value = value.trim();
+                    if value.is_empty() || value.contains(['\r', '\n']) {
+                        return Err("Supply the original single-line subscription HWID".into());
+                    }
+                    value.to_owned()
+                }
+                None => super::library::hwid(),
+            };
             let id = linux_profiles::new_id()?;
             let profile = Profile {
                 id: id.clone(),
@@ -483,7 +507,7 @@ fn run_mihomo_profile(
             let result = runtime()?.block_on(service.import_mihomo_subscription(
                 profile,
                 url,
-                &super::library::hwid(),
+                &hwid,
                 refresh_interval.0,
             ))?;
             let imported = result

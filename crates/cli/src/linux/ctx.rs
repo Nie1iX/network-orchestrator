@@ -96,7 +96,9 @@ impl Ctx {
             .map_err(|_| "Profiles could not be loaded")?
             .profiles;
         for profile in &mut profiles {
-            if profile.subscription.is_some() {
+            if profile.backend == net_manager_core::models::TunnelBackend::Xray
+                && profile.subscription.is_some()
+            {
                 *profile = net_manager_core::subscription::migrate_endpoint_ids(
                     &vault,
                     &store,
