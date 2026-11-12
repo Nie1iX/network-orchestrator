@@ -31,6 +31,8 @@ pub mod managed_xray;
 pub mod mihomo;
 #[cfg(unix)]
 pub mod mihomo_control;
+#[cfg(unix)]
+pub mod mihomo_startup;
 pub mod models;
 #[cfg(unix)]
 pub mod netbird;

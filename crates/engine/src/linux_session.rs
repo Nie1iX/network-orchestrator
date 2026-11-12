@@ -118,21 +118,14 @@ mod mihomo_process_tests {
     use super::*;
 
     #[test]
-    fn child_exit_is_observed_and_private_staging_is_removed() {
+    fn child_exit_before_readiness_removes_private_staging() {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let mut child =
-            MihomoChild::spawn(root.path(), Path::new("/bin/true"), &serde_json::json!({}))
-                .unwrap();
-        let directory = child.directory.clone();
-        assert!(directory.join("config.json").is_file());
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while child.running() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(!child.running());
-        drop(child);
-        assert!(!directory.exists());
+        let error = MihomoChild::spawn(root.path(), Path::new("/bin/true"), &serde_json::json!({}))
+            .err()
+            .expect("an exited backend must not become ready");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(fs::read_dir(root.path()).unwrap().next().is_none());
     }
 }
 
@@ -625,6 +618,7 @@ impl Drop for ProxyLock {
 struct MihomoChild {
     child: std::process::Child,
     directory: PathBuf,
+    _startup_probe: net_manager_core::mihomo_startup::StartupProbe,
 }
 
 impl MihomoChild {
@@ -649,6 +643,8 @@ impl MihomoChild {
             ] {
                 config.as_object_mut().map(|object| object.remove(key));
             }
+            let mut startup_probe =
+                net_manager_core::mihomo_startup::StartupProbe::prepare(&mut config)?;
             config["external-controller-unix"] = directory
                 .join("controller.sock")
                 .to_string_lossy()
@@ -681,10 +677,21 @@ impl MihomoChild {
                     Ok(())
                 });
             }
-            command.spawn()
+            startup_probe.release_proxy_reservation();
+            let mut child = command.spawn()?;
+            if let Err(error) = startup_probe.wait(&mut child) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            Ok((child, startup_probe))
         })();
         match result {
-            Ok(child) => Ok(Self { child, directory }),
+            Ok((child, startup_probe)) => Ok(Self {
+                child,
+                directory,
+                _startup_probe: startup_probe,
+            }),
             Err(cause) => {
                 let _ = fs::remove_dir_all(&directory);
                 Err(cause)
@@ -861,8 +868,6 @@ impl Runtime {
         {
             return Err("Invalid prepared Mihomo listener configuration".into());
         }
-        let probe = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            .map_err(|_| "Mihomo mixed port is already in use")?;
         let executable =
             crate::linux_system::backend_executable(&self.root, TunnelBackend::Mihomo)?;
         if profile.use_system_proxy {
@@ -877,20 +882,10 @@ impl Runtime {
             }
         }
         let id = profile.id.clone();
-        drop(probe);
         let child = MihomoChild::spawn(&self.mihomo_staging, &executable, &config)
-            .map_err(|_| "Cannot start local Mihomo")?;
+            .map_err(|cause| cause.to_string())?;
         self.mihomo.insert(id.clone(), child);
         self.active.insert(id.clone(), profile);
-        let listener = ListenerTarget::Literal(SocketAddr::from(([127, 0, 0, 1], port)));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !listener.ready() {
-            if self.status(&id).state != TunnelState::Running || Instant::now() >= deadline {
-                self.disconnect(&id)?;
-                return Err("Mihomo did not make its mixed listener ready".into());
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
         let profile = self.active.get(&id).expect("connected profile is recorded");
         let selections = profile
             .mihomo
@@ -1377,16 +1372,18 @@ mod tests {
             dir.path().join("locks"),
         )
         .unwrap();
-        let executable = dir.path().join("fake-mihomo");
-        fs::write(&executable, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-        let child = MihomoChild::spawn(
-            &dir.path().join("staging"),
-            &executable,
-            &serde_json::json!({}),
-        )
-        .unwrap();
-        let staging = child.directory.clone();
+        let staging = dir.path().join("staging");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("cache.db"), b"native fixture cache").unwrap();
+        let mut startup_probe =
+            net_manager_core::mihomo_startup::StartupProbe::prepare(&mut serde_json::json!({}))
+                .unwrap();
+        startup_probe.release_proxy_reservation();
+        let child = MihomoChild {
+            child: Command::new("/bin/sleep").arg("30").spawn().unwrap(),
+            directory: staging.clone(),
+            _startup_probe: startup_probe,
+        };
         let profile = Profile {
             id: "native".into(),
             backend: TunnelBackend::Mihomo,

@@ -100,6 +100,11 @@ user system-proxy toggle. A custom executable may be selected for Proxy mode
 with `netorch backend path set mihomo /path/to/mihomo`; TUN always uses the
 verified root-owned managed component.
 
+Connection startup waits for actual loopback forwarding through Mihomo, not just
+an open listener or an existing TUN interface. Native provider initialization
+has a bounded 30-second wait before a clear startup failure; `Running` and the
+user system proxy are published only after forwarding is ready.
+
 Native options are shared with the JSON/node editor:
 `mihomo.mode`, `mixedPort`, `entryGroup` and `groupSelections`. Saved selections
 are applied independently through the private controller, without reordering

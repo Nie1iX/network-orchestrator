@@ -80,10 +80,14 @@ print(json.dumps(sorted(found)))
 
 def start_marker(server):
     script = """
-import http.server,json,socket
+import http.server,json,socket,time
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body=json.dumps({'marker':'mihomo-e2e','client':self.client_address[0].removeprefix('::ffff:')}).encode()
+        if self.path == '/cold-start.list':
+            time.sleep(2)
+            body=b'cold-start.invalid\\n'
+        else:
+            body=json.dumps({'marker':'mihomo-e2e','client':self.client_address[0].removeprefix('::ffff:')}).encode()
         self.send_response(200)
         self.send_header('Content-Length',str(len(body)))
         self.end_headers()
@@ -170,6 +174,7 @@ def main():
     fixture.docker_exec(server, "sh", "-c", f"python3 /opt/netorch/e2e/dns_peer.py {server_ip} 10.76.0.1 /run/mihomo-dns-count /run/mihomo-dns-ready >/dev/null 2>&1 &")
     profile_id = "mihomo-e2e"
     split_id = "mihomo-split-e2e"
+    ready_id = "mihomo-startup-e2e"
     try:
         fixture.wait_tcp(server, 11001)
         wait_until(lambda: fixture.docker_exec(server, "test", "-f", "/run/mihomo-dns-ready") == "", "fixture DNS did not start")
@@ -201,6 +206,79 @@ def main():
         assert direct_v6.returncode != 0, "IPv6 target unexpectedly reachable without the tunnel"
         direct_v4 = subprocess.run(["docker","exec",client,"curl","--silent","--show-error","--fail","--max-time","2","--noproxy","*","http://10.76.0.1:8765/server-health.txt"],capture_output=True,timeout=5)
         assert direct_v4.returncode != 0, "IPv4 payload unexpectedly reachable without the tunnel"
+        cold_native = {
+            **native,
+            "skip-auth-prefixes": ["127.0.0.0/8"],
+            "proxy-groups": [
+                native["proxy-groups"][0],
+                {**native["proxy-groups"][1], "proxies": ["Pool", "Unreachable"]},
+            ],
+            "rule-providers": {"Cold": {
+                "type": "http", "behavior": "domain", "format": "text",
+                "url": f"http://{server_ip}:8766/cold-start.list",
+                "path": "./providers/cold.txt", "interval": 3600,
+            }},
+            "rules": ["RULE-SET,Cold,DIRECT", *native["rules"]],
+        }
+        cold_profile = {
+            **profile, "id": ready_id, "name": "Mihomo cold startup",
+            "interfaceName": "mh-ready",
+            "mihomo": {"mode": "tun", "entryGroup": "Selected", "groupSelections": {}},
+        }
+        for filename, value in [("cold-source.json", cold_native), ("cold-profile.json", cold_profile)]:
+            path = f"/home/alice/mihomo-inputs/{filename}"
+            fixture.write_container_json(client, path, value)
+            fixture.docker_exec(client, "chown", "1001:1001", path)
+        cli(client, "profile", "create", "--file", "/home/alice/mihomo-inputs/cold-profile.json", "--source", "/home/alice/mihomo-inputs/cold-source.json")
+        cli(client, "up", ready_id)
+        first_payload = fixture.docker_exec(client, "curl", "--silent", "--show-error", "--fail", "--max-time", "10", "--noproxy", "*", "http://10.76.0.1:8765/server-health.txt")
+        assert first_payload == "netorch-e2e-server", "connected returned before native cold-start forwarding was ready"
+        private_proxy_port = fixture.docker_exec(client, "python3", "-c", """
+import json,sys
+from pathlib import Path
+args=Path('/proc/'+sys.argv[1]+'/cmdline').read_bytes().split(b'\\0')
+config=Path(args[args.index(b'-f')+1].decode())
+print(json.loads(config.read_text())['mixed-port'])
+""", str(mihomo_processes(client)[0]))
+        unauthenticated = fixture.docker_exec(client, "runuser", "-u", "bob", "--", "curl", "--silent", "--max-time", "5", "--proxy", f"http://127.0.0.1:{private_proxy_port}", "--noproxy", "", "-o", "/dev/null", "-w", "%{http_code}", "http://10.76.0.1:8765/server-health.txt")
+        assert unauthenticated == "407", "internal root readiness listener accepted an unauthenticated user"
+        cli(client, "down", ready_id)
+        assert network_snapshot(client) == baseline_network and not mihomo_processes(client), "cold-start teardown left owned resources"
+        print("ok   cold native provider initialization completes before the first TUN payload", flush=True)
+        proxy_patch = {
+            "mihomo": {**cold_profile["mihomo"], "mode": "proxy", "mixedPort": 18081},
+            "useSystemProxy": False,
+        }
+        patch_path = "/home/alice/mihomo-inputs/cold-proxy.json"
+        fixture.write_container_json(client, patch_path, proxy_patch)
+        fixture.docker_exec(client, "chown", "1001:1001", patch_path)
+        cli(client, "profile", "edit", ready_id, "--file", patch_path)
+        runtime_pid = fixture.docker_exec(client, "python3", "-c", """
+import subprocess
+child=subprocess.Popen(
+    ['runuser','-u','alice','--','env','HOME=/home/alice','XDG_RUNTIME_DIR=/run/user/1001',
+     '/usr/bin/netorch','--data-dir','/home/alice/mihomo-e2e','serve'],
+    stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+    start_new_session=True)
+print(child.pid)
+""")
+        try:
+            wait_until(lambda: fixture.docker_exec(client, "sh", "-c", "test -S /run/user/1001/netorch/session-*/runtime.sock") == "", "unprivileged native runtime did not start")
+            cli(client, "up", ready_id)
+            first_proxy_payload = fixture.docker_exec(client, "curl", "--silent", "--show-error", "--fail", "--max-time", "10", "--proxy", "http://127.0.0.1:18081", "--noproxy", "", "http://10.76.0.1:8765/server-health.txt")
+            assert first_proxy_payload == "netorch-e2e-server", "local proxy returned connected before native forwarding was ready"
+            cli(client, "down", ready_id)
+            fixture.write_container_json(client, patch_path, {"mihomo": cold_profile["mihomo"]})
+            fixture.docker_exec(client, "chown", "1001:1001", patch_path)
+            cli(client, "profile", "edit", ready_id, "--file", patch_path)
+        finally:
+            fixture.docker_exec(client, "python3", "-c", """
+import os,signal,sys
+try: os.killpg(int(sys.argv[1]),signal.SIGTERM)
+except ProcessLookupError: pass
+""", runtime_pid)
+        assert network_snapshot(client) == baseline_network and not mihomo_processes(client), "local proxy changed kernel resources or left a managed child"
+        print("ok   unprivileged cold proxy forwards its first payload without a kernel mutation", flush=True)
         cli(client, "up", profile_id)
         running = state(client, profile_id)
         assert running["state"] == "running", "daemon must own the connection after CLI exits"
@@ -252,7 +330,7 @@ def main():
         assert not mihomo_processes(client), "crash recovery left the managed process alive"
         print("ok   daemon crash recovery removes journaled process, interface, policy routes and DNS", flush=True)
     finally:
-        for owned_id in (split_id,profile_id):
+        for owned_id in (ready_id,split_id,profile_id):
             try:
                 cli(client, "down", owned_id)
             except (RuntimeError, ValueError):
