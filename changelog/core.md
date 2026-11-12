@@ -9,6 +9,9 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
+
+## [0.19.2] - 2026-11-12
+
 ### Fixed
 
 - Require real loopback HTTP forwarding through Mihomo's mixed listener before
