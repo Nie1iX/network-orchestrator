@@ -9,6 +9,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
+
+## [0.19.3] - 2026-11-12
+
+Core 0.19.2.
+
 - Mihomo startup waits for verified local HTTP forwarding before reporting a
   connection as running or applying group selections/system proxy settings.
 
