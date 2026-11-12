@@ -10,6 +10,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-12
+
 ### Added
 
 - Optional native Mihomo profile model and bounded YAML/JSON import, protected
