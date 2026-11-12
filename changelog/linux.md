@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-12
+
+Core 0.19.0.
+
 ### Added
 
 - Edit a complete saved profile through synchronized JSON and a visual node graph.
