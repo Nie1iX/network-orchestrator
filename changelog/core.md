@@ -10,6 +10,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-11-12
+
 ### Fixed
 
 - Restrict endpoint identity migration to Xray subscriptions, including the
