@@ -75,6 +75,17 @@ pub enum BackendCommand {
         #[command(subcommand)]
         command: XrayCommand,
     },
+    Mihomo {
+        #[command(subcommand)]
+        command: MihomoCommand,
+    },
+}
+#[derive(Debug, Subcommand)]
+pub enum MihomoCommand {
+    Offer,
+    Install,
+    Cancel,
+    Remove,
 }
 #[derive(Debug, Subcommand)]
 pub enum PathCommand {
@@ -93,6 +104,7 @@ pub enum Backend {
     Wireguard,
     Openvpn,
     Xray,
+    Mihomo,
 }
 impl From<Backend> for TunnelBackend {
     fn from(value: Backend) -> Self {
@@ -100,6 +112,7 @@ impl From<Backend> for TunnelBackend {
             Backend::Wireguard => Self::WireGuard,
             Backend::Openvpn => Self::OpenVpn,
             Backend::Xray => Self::Xray,
+            Backend::Mihomo => Self::Mihomo,
         }
     }
 }
@@ -230,6 +243,75 @@ pub fn run_backend(ctx: &Ctx, command: BackendCommand) -> Result<Output, String>
         } => {
             service::remove_managed_xray(&ctx.engine, &ctx.root, &ctx.store())?;
             completed()
+        }
+        BackendCommand::Mihomo {
+            command: MihomoCommand::Offer,
+        } => output(service::managed_mihomo_offer()),
+        BackendCommand::Mihomo {
+            command: MihomoCommand::Install,
+        } => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| "Cannot start download runtime")?
+                .block_on(service::install_managed_mihomo(
+                    &ctx.engine,
+                    &ctx.root,
+                    &ctx.store(),
+                    &|progress| {
+                        if let Some(total) = progress.total {
+                            eprintln!(
+                                "Mihomo {}: {}/{} bytes",
+                                progress.stage, progress.downloaded, total
+                            );
+                        } else {
+                            eprintln!("Mihomo {}: {} bytes", progress.stage, progress.downloaded);
+                        }
+                    },
+                ))?;
+            completed()
+        }
+        BackendCommand::Mihomo {
+            command: MihomoCommand::Cancel,
+        } => {
+            service::cancel_managed_mihomo_install(&ctx.root)?;
+            completed()
+        }
+        BackendCommand::Mihomo {
+            command: MihomoCommand::Remove,
+        } => {
+            service::remove_managed_mihomo(&ctx.engine, &ctx.root, &ctx.store())?;
+            completed()
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linux::args::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn mihomo_backend_commands_are_explicit() {
+        for (args, expected) in [
+            (vec!["netorch", "backend", "mihomo", "offer"], "offer"),
+            (vec!["netorch", "backend", "mihomo", "install"], "install"),
+            (vec!["netorch", "backend", "mihomo", "cancel"], "cancel"),
+            (vec!["netorch", "backend", "mihomo", "remove"], "remove"),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Backend(BackendCommand::Mihomo { command }) = cli.command else {
+                panic!("expected an explicit Mihomo backend command");
+            };
+            assert_eq!(
+                match command {
+                    MihomoCommand::Offer => "offer",
+                    MihomoCommand::Install => "install",
+                    MihomoCommand::Cancel => "cancel",
+                    MihomoCommand::Remove => "remove",
+                },
+                expected
+            );
         }
     }
 }

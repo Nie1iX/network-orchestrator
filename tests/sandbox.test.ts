@@ -72,6 +72,40 @@ test("managed Xray install toggles the managed backend without touching the host
   assert.equal(removed?.source, null);
 });
 
+test("synthetic Mihomo profile exposes native groups and changes only sandbox state", () => {
+  const backend = new SandboxBackend();
+  const profile = (backend.invoke("get_profiles") as Profile[]).find((item) => item.id === "mihomo")!;
+  assert.equal(profile.backend, "mihomo");
+  assert.equal(profile.mihomo?.entryGroup, "Auto");
+  const groups = backend.invoke("get_mihomo_groups", { id: profile.id }) as { name: string; members: string[] }[];
+  assert.ok(groups.some((group) => group.name === "Auto" && group.members.includes("Netherlands")));
+  backend.invoke("connect_profile", { id: profile.id });
+  assert.equal((backend.invoke("get_tunnel_statuses") as TunnelStatus[]).find((item) => item.profileId === profile.id)?.state, "running");
+  backend.invoke("disconnect_profile", { id: profile.id });
+  assert.equal((backend.invoke("get_tunnel_statuses") as TunnelStatus[]).find((item) => item.profileId === profile.id)?.state, "stopped");
+});
+
+test("saving a synthetic Mihomo document retains backend and selected options", () => {
+  const backend = new SandboxBackend();
+  const edit = backend.invoke("get_profile_for_edit", { id: "mihomo" }) as { profile: Profile; revision: string };
+  const updated = backend.invoke("save_mihomo_document", {
+    profile: { ...edit.profile, mihomo: { ...edit.profile.mihomo!, entryGroup: "Auto" } },
+    expectedRevision: edit.revision,
+    document: "proxies: []\nproxy-groups: []",
+  }) as Profile[];
+  assert.equal(updated.find((item) => item.id === "mihomo")?.mihomo?.entryGroup, "Auto");
+});
+
+test("synthetic Mihomo component is optional and explicitly installed", () => {
+  const backend = new SandboxBackend();
+  const availability = () => (backend.invoke("get_backend_availability") as BackendAvailability[]).find((item) => item.backend === "mihomo");
+  assert.equal(availability()?.available, false);
+  backend.invoke("install_managed_mihomo");
+  assert.equal(availability()?.source, "managed");
+  backend.invoke("remove_managed_mihomo");
+  assert.equal(availability()?.available, false);
+});
+
 test("profile responses cannot mutate stored fixtures; active profiles cannot be deleted", () => {
   const backend = new SandboxBackend();
   const profiles = backend.invoke("get_profiles") as Profile[];

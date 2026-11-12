@@ -93,11 +93,7 @@ pub fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
     });
 
     #[cfg(target_os = "linux")]
-    if matches!(
-        profile.backend,
-        TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-    ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun)
-    {
+    if linux_daemon_tunnel(profile) {
         checks.push(diag_check(
             "Network daemon",
             if input.status.state == TunnelState::Failed {
@@ -119,6 +115,16 @@ pub fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
                     "verified package Xray is available".into(),
                 ),
                 Err(err) => diag_check("Package Xray", DiagnosticLevel::Error, err.clone()),
+            });
+        }
+        if profile.backend == TunnelBackend::Mihomo {
+            checks.push(match &input.executable {
+                Ok(_) => diag_check(
+                    "Package Mihomo",
+                    DiagnosticLevel::Healthy,
+                    "verified package Mihomo is available".into(),
+                ),
+                Err(err) => diag_check("Package Mihomo", DiagnosticLevel::Error, err.clone()),
             });
         }
     } else {
@@ -339,14 +345,7 @@ pub fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
         }
     }
 
-    if !profile.routes.is_empty()
-        && !(cfg!(target_os = "linux")
-            && (matches!(
-                profile.backend,
-                TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-            ) || (profile.backend == TunnelBackend::Xray
-                && profile.xray_mode == XrayMode::Tun)))
-    {
+    if !profile.routes.is_empty() && !(cfg!(target_os = "linux") && linux_daemon_tunnel(profile)) {
         let check = match &input.interfaces {
             Err(err) => diag_check(
                 "Target interface",
@@ -376,12 +375,7 @@ pub fn build_diagnostics(input: &DiagnosticsInput) -> Vec<DiagnosticCheck> {
         checks.push(check);
     }
 
-    if cfg!(target_os = "linux")
-        && (matches!(
-            profile.backend,
-            TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-        ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun))
-    {
+    if cfg!(target_os = "linux") && linux_daemon_tunnel(profile) {
         checks.push(diag_check(
             "Applied routes",
             match input.status.state {
@@ -502,6 +496,11 @@ fn linux_daemon_tunnel(profile: &Profile) -> bool {
         profile.backend,
         TunnelBackend::WireGuard | TunnelBackend::OpenVpn
     ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun)
+        || (profile.backend == TunnelBackend::Mihomo
+            && profile
+                .mihomo
+                .as_ref()
+                .is_none_or(|options| options.mode == net_manager_core::models::MihomoMode::Tun))
 }
 #[cfg(target_os = "linux")]
 pub fn linux_owned_checks(
@@ -514,6 +513,7 @@ pub fn linux_owned_checks(
         TunnelBackend::WireGuard => format!("wg:{}", profile.id),
         TunnelBackend::OpenVpn => format!("ovpn:{}", profile.id),
         TunnelBackend::Xray => format!("xray:{}", profile.id),
+        TunnelBackend::Mihomo => format!("mihomo:{}", profile.id),
         TunnelBackend::None => return checks,
     };
     let Some(listing) = listing else {
@@ -577,6 +577,11 @@ pub fn linux_owned_checks(
                 Some((process.name.as_str(), None, process.full.as_ref()))
             }
             (TunnelBackend::Xray, OwnedResource::XrayProcess(process)) => Some((
+                process.name.as_str(),
+                Some(process.index),
+                process.full.as_ref(),
+            )),
+            (TunnelBackend::Mihomo, OwnedResource::MihomoProcess(process)) => Some((
                 process.name.as_str(),
                 Some(process.index),
                 process.full.as_ref(),
@@ -1398,6 +1403,26 @@ pub fn stats(engine: &LinuxEngine, profile: &Profile) -> Result<ProtocolHealth, 
         TunnelBackend::Xray if profile.xray_mode == XrayMode::Tun => engine
             .xray_status_result(&profile.id)
             .map(|status| xray_tun_health(&status)),
+        TunnelBackend::Mihomo if linux_daemon_tunnel(profile) => engine
+            .mihomo_status_result(&profile.id)
+            .map(|status| ProtocolHealth {
+                state: if status.state == TunnelState::Failed {
+                    ProtocolHealthState::Failed
+                } else {
+                    ProtocolHealthState::Unknown
+                },
+                summary: match status.state {
+                    TunnelState::Running => "Mihomo TUN is running; traffic has not been verified",
+                    TunnelState::Stopped => "Mihomo TUN is not running",
+                    TunnelState::Failed => "Mihomo TUN process failed",
+                }
+                .into(),
+                last_handshake_unix: None,
+                rx_bytes: status.rx_bytes,
+                tx_bytes: status.tx_bytes,
+                log_tail: None,
+                pushed_routes: Vec::new(),
+            }),
         _ => {
             let status = engine.status(profile)?;
             Ok(ProtocolHealth {
@@ -1420,6 +1445,13 @@ pub fn stats(engine: &LinuxEngine, profile: &Profile) -> Result<ProtocolHealth, 
 }
 
 fn resolve_backend_executable(root: &Path, profile: &Profile) -> Result<PathBuf, String> {
+    if profile.backend == TunnelBackend::Mihomo {
+        return resolve_backend_executable_at(
+            root,
+            profile,
+            Path::new(net_manager_core::managed_mihomo::LINUX_MIHOMO_PACKAGE_ROOT),
+        );
+    }
     #[cfg(target_arch = "x86_64")]
     let package_root = Path::new(net_manager_core::managed_xray::LINUX_XRAY_PACKAGE_ROOT);
     #[cfg(not(target_arch = "x86_64"))]
@@ -1432,6 +1464,22 @@ fn resolve_backend_executable_at(
     profile: &Profile,
     _package_root: &Path,
 ) -> Result<PathBuf, String> {
+    if profile.backend == TunnelBackend::Mihomo {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let executable =
+                net_manager_core::managed_mihomo::linux_managed_version_dir(_package_root)
+                    .join("mihomo");
+            net_manager_core::managed_mihomo::verify_managed_linux_executable(
+                _package_root,
+                &executable,
+            )
+            .map_err(|_| "Install the optional Mihomo component to use this profile".to_string())?;
+            return Ok(executable);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        return Err("Mihomo is not available for this architecture".into());
+    }
     if profile.backend != TunnelBackend::Xray {
         return Ok(PathBuf::new());
     }
@@ -1708,6 +1756,43 @@ mod safety_tests {
     use super::*;
     use net_manager_core::daemon_protocol::{OwnedEntry, OwnedState};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn mihomo_recovery_uses_mihomo_disconnect() {
+        let (method, params) = cleanup_request("mihomo:native").unwrap();
+        assert_eq!(
+            method,
+            net_manager_core::daemon_protocol::method::MIHOMO_DISCONNECT
+        );
+        assert_eq!(params["profileId"], "native");
+        assert!(TUNNEL_OWNER_PREFIXES.contains(&"mihomo:"));
+    }
+
+    #[test]
+    fn mihomo_daemon_ownership_depends_on_mode() {
+        let mut profile = Profile {
+            backend: TunnelBackend::Mihomo,
+            mihomo: Some(net_manager_core::models::MihomoProfileOptions::default()),
+            ..Profile::default()
+        };
+        assert!(linux_daemon_tunnel(&profile));
+        profile.mihomo.as_mut().unwrap().mode = net_manager_core::models::MihomoMode::Proxy;
+        assert!(!linux_daemon_tunnel(&profile));
+    }
+
+    #[test]
+    fn mihomo_missing_package_is_not_reported_as_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile {
+            backend: TunnelBackend::Mihomo,
+            ..Profile::default()
+        };
+        assert!(
+            resolve_backend_executable_at(dir.path(), &profile, dir.path())
+                .unwrap_err()
+                .contains("Mihomo")
+        );
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -1989,14 +2074,11 @@ fn daemon_managed_owner(owner: &str) -> bool {
             .iter()
             .any(|prefix| owner.starts_with(prefix))
 }
-const TUNNEL_OWNER_PREFIXES: [&str; 4] = ["wg:", "ovpn:", "ovpn-probe:", "xray:"];
+const TUNNEL_OWNER_PREFIXES: [&str; 5] = ["wg:", "ovpn:", "ovpn-probe:", "xray:", "mihomo:"];
 use crate::linux_runtime::daemon_owner;
 #[cfg(target_os = "linux")]
 fn daemon_owned_profile(profile: &Profile) -> bool {
-    matches!(
-        profile.backend,
-        TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-    ) || (profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun)
+    linux_daemon_tunnel(profile)
 }
 
 /// Owners that are leftovers rather than healthy state: non-applied journal
@@ -2078,6 +2160,7 @@ pub fn cleanup_request(owner: &str) -> Option<(&'static str, serde_json::Value)>
         ("wg:", method::WIREGUARD_DISCONNECT),
         ("ovpn:", method::OPENVPN_DISCONNECT),
         ("xray:", method::XRAY_DISCONNECT),
+        ("mihomo:", method::MIHOMO_DISCONNECT),
     ] {
         if let Some(profile_id) = owner.strip_prefix(prefix) {
             return Some((method, json!({ "profileId": profile_id })));

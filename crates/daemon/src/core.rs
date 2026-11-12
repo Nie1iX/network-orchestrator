@@ -1278,6 +1278,8 @@ mod openvpn_tests {
             wg_config: None,
             openvpn: Some(Box::new(process.clone())),
             xray: None,
+            #[cfg(target_os = "linux")]
+            mihomo: Some(Box::new(crate::mihomo_process::TrustedMihomoProcess::new())),
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
@@ -1422,6 +1424,10 @@ pub trait PolicyRuleExecutor: Send {
     fn table_in_use(&mut self, table: u32) -> io::Result<bool>;
     fn add_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()>;
     fn remove_rule(&mut self, rule: &OwnedRuleResource) -> io::Result<()>;
+    #[cfg(target_os = "linux")]
+    fn remove_mihomo_native_rules(&mut self, _name: &str, _mark: u32) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     /// Whether exactly this daemon-owned rule is installed.
     fn rule_present(&mut self, rule: &OwnedRuleResource) -> io::Result<bool> {
         Ok(self.rules_snapshot()?.contains(rule))
@@ -1614,6 +1620,8 @@ pub struct DaemonCore {
     wg_config: Option<Box<dyn WgConfigExecutor>>,
     openvpn: Option<Box<dyn OpenVpnProcessRunner>>,
     xray: Option<Box<dyn XrayProcessRunner>>,
+    #[cfg(target_os = "linux")]
+    mihomo: Option<Box<dyn crate::mihomo_process::MihomoProcessRunner>>,
     openvpn_runtime: HashMap<(u32, String), OpenVpnRuntime>,
     openvpn_failed: HashSet<(u32, String)>,
     openvpn_auth_failed: HashSet<(u32, String)>,
@@ -1789,6 +1797,8 @@ impl DaemonCore {
             wg_config: None,
             openvpn: None,
             xray: None,
+            #[cfg(target_os = "linux")]
+            mihomo: Some(Box::new(crate::mihomo_process::TrustedMihomoProcess::new())),
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
@@ -1837,6 +1847,8 @@ impl DaemonCore {
             wg_config: Some(wg_config),
             openvpn: None,
             xray: None,
+            #[cfg(target_os = "linux")]
+            mihomo: Some(Box::new(crate::mihomo_process::TrustedMihomoProcess::new())),
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
@@ -1883,6 +1895,7 @@ impl DaemonCore {
             wg_config: Some(wg_config),
             openvpn: None,
             xray: None,
+            mihomo: Some(Box::new(crate::mihomo_process::TrustedMihomoProcess::new())),
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
@@ -1923,6 +1936,8 @@ impl DaemonCore {
             wg_config: None,
             openvpn: Some(openvpn),
             xray: None,
+            #[cfg(target_os = "linux")]
+            mihomo: Some(Box::new(crate::mihomo_process::TrustedMihomoProcess::new())),
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
@@ -1967,6 +1982,8 @@ impl DaemonCore {
             wg_config: None,
             openvpn: None,
             xray: Some(xray),
+            #[cfg(target_os = "linux")]
+            mihomo: Some(Box::new(crate::mihomo_process::TrustedMihomoProcess::new())),
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
@@ -2016,6 +2033,7 @@ impl DaemonCore {
             wg_config: Some(wg_config),
             openvpn: Some(openvpn),
             xray: Some(xray),
+            mihomo: Some(Box::new(crate::mihomo_process::TrustedMihomoProcess::new())),
             openvpn_runtime: HashMap::new(),
             openvpn_failed: HashSet::new(),
             openvpn_auth_failed: HashSet::new(),
@@ -2038,6 +2056,324 @@ impl DaemonCore {
             core.teardown(|_| true)?;
         }
         Ok(core)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn connect_mihomo(
+        &mut self,
+        uid: u32,
+        params: net_manager_core::daemon_protocol::MihomoConnectParams,
+    ) -> io::Result<XrayStatusResult> {
+        let owner = format!("mihomo:{}", params.profile_id);
+        if self.position(uid, &owner).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Mihomo profile is already connected",
+            ));
+        }
+        let mark = self.allocate_openvpn_mark()?;
+        let plan = crate::mihomo::prepare_mihomo(uid, params, mark)?;
+        let runner = self
+            .mihomo
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Mihomo executor unavailable"))?;
+        runner.verify_binary()?;
+        if runner.link_index(&plan.name)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Mihomo interface already exists",
+            ));
+        }
+        let captures_full = plan.full_ipv4 || plan.full_ipv6;
+        if captures_full
+            && self.journal.entries.iter().any(|e| {
+                e.resources.iter().any(|r| match r {
+                    OwnedResource::WireGuardLink(p) => p.full.is_some(),
+                    OwnedResource::OpenVpnProcess(p) => p.full.is_some(),
+                    OwnedResource::XrayProcess(p) => p.full.is_some(),
+                    OwnedResource::MihomoProcess(p) => p.full.is_some(),
+                    _ => false,
+                })
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "another tunnel owns policy routing",
+            ));
+        }
+        let policy = if !plan.routes.is_empty() {
+            if self.policy.is_none() {
+                return Err(io::Error::other("policy executor unavailable"));
+            }
+            let slot = mark - 51820;
+            Some(WireGuardFullResource {
+                table: mark,
+                fwmark: mark,
+                priority_main: 10000 + slot * 2,
+                priority_tunnel: 10001 + slot * 2,
+                ipv4: plan
+                    .routes
+                    .iter()
+                    .any(|route| route.destination.addr().is_ipv4()),
+                ipv6: plan
+                    .routes
+                    .iter()
+                    .any(|route| route.destination.addr().is_ipv6()),
+            })
+        } else {
+            None
+        };
+        if !plan.dns_servers.is_empty() && self.dns.is_none() {
+            return Err(io::Error::other("DNS executor unavailable"));
+        }
+        self.journal.entries.push(JournalEntry {
+            uid,
+            owner: owner.clone(),
+            state: OwnedState::Applying,
+            resources: vec![OwnedResource::MihomoProcess(
+                net_manager_core::daemon_protocol::MihomoProcessResource {
+                    name: plan.name.clone(),
+                    index: 0,
+                    owner_marker: format!("network-orchestrator:{uid}:{owner}"),
+                    transport_mark: mark,
+                    full: policy.as_ref().filter(|_| captures_full).map(|policy| {
+                        let mut full = policy.clone();
+                        full.ipv4 = plan.full_ipv4;
+                        full.ipv6 = plan.full_ipv6;
+                        full
+                    }),
+                },
+            )],
+        });
+        if let Err(err) = self.store.save(&self.journal) {
+            self.journal.entries.pop();
+            return Err(err);
+        }
+        let index = self.journal.entries.len() - 1;
+        let mut phase = "Mihomo process startup failed";
+        let result = (|| -> io::Result<()> {
+            self.mihomo
+                .as_mut()
+                .unwrap()
+                .start(uid, &plan.name, &plan.config, &plan.group_selections)
+                .inspect_err(|err| {
+                    phase = match err.to_string().as_str() {
+                        "Mihomo group selection failed" => "Mihomo group selection failed",
+                        "Mihomo exited during startup" => "Mihomo exited during startup",
+                        "Mihomo interface did not appear" => "Mihomo interface did not appear",
+                        _ => "Mihomo process startup failed",
+                    };
+                })?;
+            phase = "Mihomo TUN link discovery failed";
+            let link = self
+                .mihomo
+                .as_ref()
+                .unwrap()
+                .link_index(&plan.name)?
+                .ok_or_else(|| io::Error::other("Mihomo TUN unavailable"))?;
+            if let OwnedResource::MihomoProcess(process) =
+                &mut self.journal.entries[index].resources[0]
+            {
+                process.index = link;
+            }
+            phase = "Mihomo journal update failed";
+            self.store.save(&self.journal)?;
+            phase = "Mihomo upstream route setup failed";
+            let mut bypassed = HashSet::new();
+            for host in &plan.server_hosts {
+                for ip in resolve_host_addrs(Some(host)) {
+                    if !plan.routes.iter().any(|route| {
+                        route.destination.contains(&ip)
+                            && !is_full_route(plan.full_ipv4, plan.full_ipv6, route.destination)
+                    }) || !bypassed.insert(ip)
+                    {
+                        continue;
+                    }
+                    let applied = self
+                        .uplink_host_route(ip, 5)
+                        .ok_or_else(|| io::Error::other("Mihomo upstream route unavailable"))?;
+                    self.journal.entries[index]
+                        .resources
+                        .push(OwnedResource::Route(applied.clone()));
+                    self.store.save(&self.journal)?;
+                    if let Err(err) = self.routes.add_route(&applied) {
+                        if err.kind() == io::ErrorKind::AlreadyExists {
+                            self.journal.entries[index].resources.pop();
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+            phase = "Mihomo route setup failed";
+            for route in &plan.routes {
+                let mut applied = AppliedRoute::on_link(route.destination, link, route.metric);
+                applied.table = policy.as_ref().map(|v| v.table);
+                self.journal.entries[index]
+                    .resources
+                    .push(OwnedResource::Route(applied.clone()));
+                self.store.save(&self.journal)?;
+                if let Err(err) = self.routes.add_route(&applied) {
+                    if err.kind() == io::ErrorKind::AlreadyExists {
+                        self.journal.entries[index].resources.pop();
+                    }
+                    return Err(err);
+                }
+            }
+            phase = "Mihomo policy rule setup failed";
+            if let Some(policy) = &policy {
+                for rule in mihomo_policy_rules(policy, plan.full_ipv4, plan.full_ipv6) {
+                    self.journal.entries[index]
+                        .resources
+                        .push(OwnedResource::Rule(rule.clone()));
+                    self.store.save(&self.journal)?;
+                    if let Err(err) = self.policy.as_mut().unwrap().add_rule(&rule) {
+                        if err.kind() == io::ErrorKind::AlreadyExists {
+                            self.journal.entries[index].resources.pop();
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            phase = "Mihomo DNS setup failed";
+            if !plan.dns_servers.is_empty() {
+                self.journal.entries[index]
+                    .resources
+                    .push(OwnedResource::Dns(
+                        net_manager_core::daemon_protocol::WireGuardDnsResource {
+                            interface_index: link,
+                            name: plan.name.clone(),
+                            servers: plan.dns_servers.clone(),
+                            domains: plan.dns_domains.clone(),
+                            full: plan.full_ipv4 || plan.full_ipv6,
+                            applied: false,
+                        },
+                    ));
+                self.store.save(&self.journal)?;
+                match self.dns.as_mut().unwrap().apply(
+                    &plan.name,
+                    &plan.dns_servers,
+                    &plan.dns_domains,
+                    captures_full,
+                ) {
+                    Ok(DnsApply::Applied) => {
+                        if let Some(OwnedResource::Dns(dns)) =
+                            self.journal.entries[index].resources.last_mut()
+                        {
+                            dns.applied = true;
+                        }
+                    }
+                    Ok(DnsApply::Unavailable | DnsApply::Skipped) => {}
+                    Err(_) => return Err(io::Error::other("Mihomo DNS apply failed")),
+                }
+            }
+            phase = "Mihomo journal update failed";
+            self.journal.entries[index].state = OwnedState::Applied;
+            self.store.save(&self.journal)
+        })();
+        if let Err(err) = result {
+            eprintln!("network-orchestrator-daemon: {phase}");
+            let _ = self.teardown_mihomo_entry(index);
+            self.persist();
+            return Err(io::Error::new(err.kind(), phase));
+        }
+        self.tunnel_failed.remove(&(uid, owner));
+        Ok(self.mihomo_status(uid, &plan.profile_id))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn remove_mihomo_installation(&mut self, root: &std::path::Path) -> io::Result<bool> {
+        if self.journal.entries.iter().any(|entry| {
+            entry
+                .resources
+                .iter()
+                .any(|resource| matches!(resource, OwnedResource::MihomoProcess(_)))
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Disconnect Mihomo profiles before removing the component",
+            ));
+        }
+        net_manager_core::managed_mihomo::remove_managed_linux_installation(root)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn disconnect_mihomo(&mut self, uid: u32, profile_id: &str) -> io::Result<()> {
+        let owner = format!("mihomo:{profile_id}");
+        let Some(index) = self.position(uid, &owner) else {
+            return if self.tunnel_failed.remove(&(uid, owner)) {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Mihomo profile is not connected",
+                ))
+            };
+        };
+        let result = self.teardown_mihomo_entry(index);
+        self.store.save(&self.journal)?;
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn mihomo_status(&mut self, uid: u32, profile_id: &str) -> XrayStatusResult {
+        let owner = format!("mihomo:{profile_id}");
+        let entry = self
+            .journal
+            .entries
+            .iter()
+            .find(|entry| entry.uid == uid && entry.owner == owner);
+        let process = entry.and_then(|entry| {
+            entry.resources.iter().find_map(|resource| match resource {
+                OwnedResource::MihomoProcess(p) => Some(p),
+                _ => None,
+            })
+        });
+        let state = match (entry, process) {
+            (None, _) if self.tunnel_failed.contains(&(uid, owner)) => TunnelState::Failed,
+            (None, _) => TunnelState::Stopped,
+            (Some(entry), Some(p))
+                if entry.state == OwnedState::Applied
+                    && self
+                        .mihomo
+                        .as_mut()
+                        .is_some_and(|r| r.health(&p.name).unwrap_or(false)) =>
+            {
+                TunnelState::Running
+            }
+            _ => TunnelState::Failed,
+        };
+        XrayStatusResult {
+            profile_id: profile_id.into(),
+            state,
+            interface_name: process.map(|p| p.name.clone()),
+            rx_bytes: None,
+            tx_bytes: None,
+            dns_applied: entry.is_some_and(|e| {
+                e.resources
+                    .iter()
+                    .any(|r| matches!(r, OwnedResource::Dns(d) if d.applied))
+            }),
+            ipv4_covered: process.is_some_and(|p| {
+                p.full.as_ref().is_some_and(|full| {
+                    full.ipv4
+                        && entry.is_some_and(|entry| entry.resources.iter().any(|resource| {
+                            matches!(resource, OwnedResource::Route(route) if route.destination.addr().is_ipv4() && is_full_route(full.ipv4, full.ipv6, route.destination))
+                        }))
+                })
+            }),
+            ipv6_covered: process.is_some_and(|p| {
+                p.full.as_ref().is_some_and(|full| {
+                    full.ipv6
+                        && entry.is_some_and(|entry| entry.resources.iter().any(|resource| {
+                            matches!(resource, OwnedResource::Route(route) if route.destination.addr().is_ipv6() && is_full_route(full.ipv4, full.ipv6, route.destination))
+                        }))
+                })
+            }),
+            watchdog: None,
+            proxy_exits: Vec::new(),
+            failover: None,
+        }
     }
 
     pub fn connect_xray(
@@ -2078,6 +2414,7 @@ impl DaemonCore {
                     OwnedResource::WireGuardLink(link) => link.full.is_some(),
                     OwnedResource::OpenVpnProcess(process) => process.full.is_some(),
                     OwnedResource::XrayProcess(process) => process.full.is_some(),
+                    OwnedResource::MihomoProcess(process) => process.full.is_some(),
                     _ => false,
                 })
             }) {
@@ -3225,11 +3562,13 @@ impl DaemonCore {
         for slot in 0..128_u32 {
             let mark = 51820 + slot;
             let priority_main = 10000 + slot * 2;
+            let priority_scoped = 9000 + slot;
             let priority_tunnel = priority_main + 1;
             let used_by_owner = self.journal.entries.iter().any(|entry| {
                 entry.resources.iter().any(|resource| match resource {
                     OwnedResource::OpenVpnProcess(process) => process.transport_mark == Some(mark),
                     OwnedResource::XrayProcess(process) => process.transport_mark == mark,
+                    OwnedResource::MihomoProcess(process) => process.transport_mark == mark,
                     OwnedResource::WireGuardLink(link) => {
                         link.full.as_ref().is_some_and(|full| full.fwmark == mark)
                     }
@@ -3242,17 +3581,19 @@ impl DaemonCore {
             #[cfg(target_os = "linux")]
             if existing_rules.iter().any(|rule| {
                 rule.fwmark == Some(mark)
+                    || rule.table == mark
+                    || rule.table == mark + 128
                     || rule.priority == priority_main
                     || rule.priority == priority_tunnel
+                    || rule.priority == priority_scoped
             }) {
                 continue;
             }
             #[cfg(target_os = "linux")]
-            if self
-                .policy
-                .as_mut()
-                .is_some_and(|policy| policy.table_in_use(mark).unwrap_or(true))
-            {
+            if self.policy.as_mut().is_some_and(|policy| {
+                policy.table_in_use(mark).unwrap_or(true)
+                    || policy.table_in_use(mark + 128).unwrap_or(true)
+            }) {
                 continue;
             }
             return Ok(mark);
@@ -3284,6 +3625,7 @@ impl DaemonCore {
                         OwnedResource::WireGuardLink(link) => link.full.is_some(),
                         OwnedResource::OpenVpnProcess(process) => process.full.is_some(),
                         OwnedResource::XrayProcess(process) => process.full.is_some(),
+                        OwnedResource::MihomoProcess(process) => process.full.is_some(),
                         _ => false,
                     })
             })
@@ -4015,6 +4357,7 @@ impl DaemonCore {
                 OwnedResource::WireGuardLink(link) => link.full.is_some(),
                 OwnedResource::OpenVpnProcess(process) => process.full.is_some(),
                 OwnedResource::XrayProcess(process) => process.full.is_some(),
+                OwnedResource::MihomoProcess(process) => process.full.is_some(),
                 _ => false,
             })
         }) {
@@ -4036,7 +4379,7 @@ impl DaemonCore {
             let priority_main = 10000 + slot * 2;
             let priority_tunnel = priority_main + 1;
             if wg_marks.contains(&table)
-                || self.journal.entries.iter().any(|entry| entry.resources.iter().any(|resource| matches!(resource, OwnedResource::OpenVpnProcess(process) if process.transport_mark == Some(table)) || matches!(resource, OwnedResource::XrayProcess(process) if process.transport_mark == table)))
+                || self.journal.entries.iter().any(|entry| entry.resources.iter().any(|resource| matches!(resource, OwnedResource::OpenVpnProcess(process) if process.transport_mark == Some(table)) || matches!(resource, OwnedResource::XrayProcess(process) if process.transport_mark == table) || matches!(resource, OwnedResource::MihomoProcess(process) if process.transport_mark == table)))
                 || existing.iter().any(|rule| {
                     rule.fwmark == Some(table)
                         || rule.priority == priority_main
@@ -4198,6 +4541,37 @@ impl DaemonCore {
                 };
                 let same_link = self
                     .xray
+                    .as_ref()
+                    .and_then(|runner| runner.link_index(&dns.name).ok().flatten())
+                    == Some(dns.interface_index);
+                if !same_link {
+                    continue;
+                }
+                let applied = matches!(
+                    dns_executor.apply(&dns.name, &dns.servers, &dns.domains, dns.full),
+                    Ok(DnsApply::Applied)
+                );
+                if let Some(OwnedResource::Dns(resource)) = entry
+                    .resources
+                    .iter_mut()
+                    .find(|resource| matches!(resource, OwnedResource::Dns(_)))
+                {
+                    if resource.applied != applied {
+                        resource.applied = applied;
+                        changed_any = true;
+                    }
+                }
+                continue;
+            }
+            if entry.owner.starts_with("mihomo:") {
+                let Some(dns) = entry.resources.iter().find_map(|resource| match resource {
+                    OwnedResource::Dns(dns) => Some(dns.clone()),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let same_link = self
+                    .mihomo
                     .as_ref()
                     .and_then(|runner| runner.link_index(&dns.name).ok().flatten())
                     == Some(dns.interface_index);
@@ -4416,6 +4790,11 @@ impl DaemonCore {
                     runner.health(&process.name).unwrap_or(false)
                         && runner.link_index(&process.name).ok()? == Some(process.index),
                 )
+            }
+            OwnedResource::MihomoProcess(process) if process.index != 0 => {
+                let runner = self.mihomo.as_mut()?;
+                Some(runner.health(&process.name).unwrap_or(false)
+                    && runner.link_index(&process.name).ok()? == Some(process.index))
             }
             OwnedResource::OpenVpnProcess(process) => {
                 let connected = runtime
@@ -4767,6 +5146,7 @@ impl DaemonCore {
             .iter()
             .filter_map(|resource| match resource {
                 OwnedResource::XrayProcess(process) if process.index != 0 => Some(process.index),
+                OwnedResource::MihomoProcess(process) if process.index != 0 => Some(process.index),
                 _ => None,
             })
             .collect();
@@ -6084,6 +6464,12 @@ impl DaemonCore {
                 ExplainStatus::Effective,
                 "managed Xray".into(),
             ),
+            OwnedResource::MihomoProcess(process) => make(
+                "process",
+                process.name.clone(),
+                ExplainStatus::Effective,
+                "managed Mihomo".into(),
+            ),
             OwnedResource::Address(address) => make(
                 "address",
                 format!("{} dev #{}", address.address, address.interface_index),
@@ -6168,6 +6554,7 @@ impl DaemonCore {
             .filter_map(|resource| match resource {
                 OwnedResource::WireGuardLink(link) => Some(link.index),
                 OwnedResource::XrayProcess(process) => Some(process.index),
+                OwnedResource::MihomoProcess(process) => Some(process.index),
                 OwnedResource::Address(address) => Some(address.interface_index),
                 _ => None,
             })
@@ -6382,6 +6769,7 @@ impl DaemonCore {
                 OwnedResource::WireGuardLink(link) => link.name == name,
                 OwnedResource::OpenVpnProcess(proc) => proc.name == name,
                 OwnedResource::XrayProcess(proc) => proc.name == name,
+                OwnedResource::MihomoProcess(proc) => proc.name == name,
                 _ => false,
             })
         })
@@ -6422,6 +6810,10 @@ impl DaemonCore {
     /// failure it keeps only what could not be removed and becomes `stale`.
     /// The caller persists the journal.
     fn teardown_entry(&mut self, index: usize) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.journal.entries[index].owner.starts_with("mihomo:") {
+            return self.teardown_mihomo_entry(index);
+        }
         if self.journal.entries[index].owner.starts_with("xray:") {
             return self.teardown_xray_entry(index);
         }
@@ -6482,6 +6874,96 @@ impl DaemonCore {
             entry.resources = failed.into_iter().rev().collect();
             Err(io::Error::other("owner teardown left resources behind"))
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn teardown_mihomo_entry(&mut self, index: usize) -> io::Result<()> {
+        let entry = self.journal.entries[index].clone();
+        let process = entry
+            .resources
+            .iter()
+            .find_map(|r| match r {
+                OwnedResource::MihomoProcess(p) => Some(p),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Mihomo process marker missing")
+            })?;
+        let runner = self
+            .mihomo
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Mihomo executor unavailable"))?;
+        let current = runner.link_index(&process.name)?;
+        if process.index == 0 && entry.resources.len() == 1 {
+            self.stop_mihomo_process(entry.uid, &process.name, process.transport_mark)?;
+            self.journal.entries.remove(index);
+            return Ok(());
+        }
+        if current.is_some_and(|link| process.index == 0 || link != process.index) {
+            self.journal.entries[index].state = OwnedState::Stale;
+            return Err(io::Error::other("Mihomo interface identity is unverified"));
+        }
+        let mut failed = Vec::new();
+        for resource in entry.resources.iter().rev() {
+            let result = match resource {
+                OwnedResource::Dns(_) if current.is_none() => Ok(()),
+                OwnedResource::Dns(dns) => match self.dns.as_mut() {
+                    Some(executor) => match executor.revert(&dns.name) {
+                        Ok(()) | Err(crate::dns::DnsError::Unavailable) => Ok(()),
+                        Err(_) => Err(io::Error::other("Mihomo DNS cleanup failed")),
+                    },
+                    None => Err(io::Error::other("DNS executor unavailable")),
+                },
+                OwnedResource::Rule(rule) => self
+                    .policy
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("policy executor unavailable"))
+                    .and_then(|p| p.remove_rule(rule)),
+                OwnedResource::Route(route) => self.routes.remove_route(route),
+                OwnedResource::MihomoProcess(_) => {
+                    self.stop_mihomo_process(entry.uid, &process.name, process.transport_mark)
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected Mihomo resource",
+                )),
+            };
+            let removed = result.as_ref().is_ok()
+                || result
+                    .as_ref()
+                    .is_err_and(|err| err.kind() == io::ErrorKind::NotFound);
+            if !removed || matches!(resource, OwnedResource::MihomoProcess(_)) && !failed.is_empty()
+            {
+                failed.push(resource.clone());
+            }
+        }
+        if failed.is_empty() {
+            self.journal.entries.remove(index);
+            Ok(())
+        } else {
+            self.journal.entries[index].state = OwnedState::Stale;
+            self.journal.entries[index].resources = failed.into_iter().rev().collect();
+            Err(io::Error::other("Mihomo cleanup left owned resources"))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stop_mihomo_process(&mut self, uid: u32, name: &str, mark: u32) -> io::Result<()> {
+        let runner = self
+            .mihomo
+            .as_mut()
+            .ok_or_else(|| io::Error::other("Mihomo executor unavailable"))?;
+        match runner.stop(name) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        runner.cleanup(uid, name)?;
+        self.policy
+            .as_mut()
+            .ok_or_else(|| io::Error::other("policy executor unavailable"))?
+            .remove_mihomo_native_rules(name, mark)
+            .map_err(|_| io::Error::other("Mihomo native rule cleanup failed"))
     }
 
     fn teardown_xray_entry(&mut self, index: usize) -> io::Result<()> {
@@ -6789,6 +7271,10 @@ impl DaemonCore {
                     io::ErrorKind::InvalidData,
                     "Xray resource in WireGuard journal entry",
                 )),
+                OwnedResource::MihomoProcess(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Mihomo resource in WireGuard journal entry",
+                )),
                 OwnedResource::NetRoute(_)
                 | OwnedResource::NetRule(_)
                 | OwnedResource::SuppressedRoute(_)
@@ -6887,6 +7373,34 @@ fn full_policy_rules(full: &WireGuardFullResource) -> Vec<OwnedRuleResource> {
             invert: true,
             suppress_prefix_length: None,
         });
+    }
+    rules
+}
+
+#[cfg(target_os = "linux")]
+fn mihomo_policy_rules(
+    policy: &WireGuardFullResource,
+    full_ipv4: bool,
+    full_ipv6: bool,
+) -> Vec<OwnedRuleResource> {
+    let mut full = policy.clone();
+    full.ipv4 &= full_ipv4;
+    full.ipv6 &= full_ipv6;
+    let mut rules = full_policy_rules(&full);
+    for (family, enabled, captures_full) in [
+        (IpFamily::Ipv4, policy.ipv4, full_ipv4),
+        (IpFamily::Ipv6, policy.ipv6, full_ipv6),
+    ] {
+        if enabled && !captures_full {
+            rules.push(OwnedRuleResource {
+                family,
+                priority: 9000 + (policy.fwmark - 51820),
+                table: policy.table,
+                fwmark: Some(policy.fwmark),
+                invert: true,
+                suppress_prefix_length: None,
+            });
+        }
     }
     rules
 }
@@ -7252,6 +7766,18 @@ mod xray_core_tests {
             self.0.push(format!("rule-del:{}", rule.priority));
             Ok(())
         }
+        #[cfg(target_os = "linux")]
+        fn remove_mihomo_native_rules(&mut self, name: &str, mark: u32) -> io::Result<()> {
+            self.0.push(format!("native-rule-cleanup:{name}:{mark}"));
+            let events = self.0.list();
+            if events.contains(&"native-fail".to_owned())
+                && !events.contains(&"native-ok".to_owned())
+            {
+                Err(io::Error::other("synthetic cleanup failure"))
+            } else {
+                Ok(())
+            }
+        }
     }
     struct Dns(Events);
     impl DnsExecutor for Dns {
@@ -7260,9 +7786,10 @@ mod xray_core_tests {
             name: &str,
             _: &[std::net::IpAddr],
             _: &[String],
-            _: bool,
+            full: bool,
         ) -> Result<DnsApply, crate::dns::DnsError> {
             self.0.push(format!("dns-apply:{name}"));
+            self.0.push(format!("dns-full:{full}"));
             Ok(DnsApply::Applied)
         }
         fn revert(&mut self, name: &str) -> Result<(), crate::dns::DnsError> {
@@ -7303,6 +7830,198 @@ mod xray_core_tests {
         fn cleanup(&mut self, _: u32, _: &str) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct FakeMihomo {
+        events: Events,
+        journal: std::path::PathBuf,
+    }
+    #[cfg(target_os = "linux")]
+    impl crate::mihomo_process::MihomoProcessRunner for FakeMihomo {
+        fn verify_binary(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn link_index(&self, _: &str) -> io::Result<Option<u32>> {
+            let events = self.events.list();
+            Ok((events.contains(&"mihomo-spawn".to_owned())
+                && !events.contains(&"mihomo-stop".to_owned()))
+            .then_some(42))
+        }
+        fn start(
+            &mut self,
+            _: u32,
+            _: &str,
+            _: &str,
+            _: &std::collections::BTreeMap<String, String>,
+        ) -> io::Result<()> {
+            let journal = JournalStore::new(self.journal.clone()).load()?;
+            assert!(matches!(
+                journal.entries.last().unwrap().resources[0],
+                OwnedResource::MihomoProcess(_)
+            ));
+            assert_eq!(journal.entries.last().unwrap().state, OwnedState::Applying);
+            self.events.push("mihomo-spawn");
+            Ok(())
+        }
+        fn health(&mut self, name: &str) -> io::Result<bool> {
+            Ok(self.link_index(name)?.is_some())
+        }
+        fn stop(&mut self, _: &str) -> io::Result<()> {
+            self.events.push("mihomo-stop");
+            Ok(())
+        }
+        fn cleanup(&mut self, _: u32, _: &str) -> io::Result<()> {
+            self.events.push("mihomo-cleanup");
+            Ok(())
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mihomo_mixed_policy_prioritizes_scoped_family_and_preserves_full_family() {
+        let policy = WireGuardFullResource {
+            table: 51821,
+            fwmark: 51821,
+            priority_main: 10002,
+            priority_tunnel: 10003,
+            ipv4: true,
+            ipv6: true,
+        };
+        let rules = mihomo_policy_rules(&policy, true, false);
+        assert_eq!(rules.len(), 3);
+        assert!(rules.iter().any(|rule| rule.family == IpFamily::Ipv4
+            && rule.table == 254
+            && rule.suppress_prefix_length == Some(0)));
+        assert!(rules.iter().any(|rule| rule.family == IpFamily::Ipv4
+            && rule.table == 51821
+            && rule.priority == 10003
+            && rule.invert));
+        assert!(rules.iter().any(|rule| rule.family == IpFamily::Ipv6
+            && rule.table == 51821
+            && rule.priority < 10000
+            && rule.fwmark == Some(51821)
+            && rule.invert));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mihomo_journals_before_spawn_and_disconnects_owned_resources() {
+        let events = Events::default();
+        let dir = std::env::temp_dir().join(format!("netmgr-mihomo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = dir.join("state.json");
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(journal.clone()),
+            Box::new(Routes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Dying(events.clone())),
+        )
+        .unwrap();
+        core.mihomo = Some(Box::new(FakeMihomo {
+            events: events.clone(),
+            journal,
+        }));
+        core.policy = Some(Box::new(Policy(events.clone())));
+        core.dns = Some(Box::new(Dns(events.clone())));
+        core.journal.entries.push(JournalEntry {
+            uid: 1000,
+            owner: "wg:primary".into(),
+            state: OwnedState::Applied,
+            resources: vec![OwnedResource::WireGuardLink(
+                net_manager_core::daemon_protocol::WireGuardLinkResource {
+                    name: "wg-primary".into(),
+                    index: 7,
+                    owner_marker: "primary".into(),
+                    full: Some(WireGuardFullResource {
+                        table: 51820,
+                        fwmark: 51820,
+                        priority_main: 10000,
+                        priority_tunnel: 10001,
+                        ipv4: true,
+                        ipv6: true,
+                    }),
+                    warnings: vec![],
+                },
+            )],
+        });
+        let params = serde_json::from_value(json!({"profileId":"home","role":"secondary","config":"{\"proxies\":[],\"proxy-groups\":[],\"rules\":[\"MATCH,DIRECT\"]}","routes":[{"destination":"10.0.0.0/8","metric":10}],"dnsServers":["10.0.0.53"]})).unwrap();
+        let status = core.connect_mihomo(1000, params).unwrap();
+        assert_eq!(status.state, TunnelState::Running);
+        assert!(!status.ipv4_covered);
+        let entry = core.position(1000, "mihomo:home").unwrap();
+        let resources = &core.journal.entries[entry].resources;
+        assert!(resources.iter().any(|resource| matches!(resource, OwnedResource::Route(route) if route.destination.to_string() == "10.0.0.0/8" && route.table == Some(51821))));
+        assert!(resources.iter().any(|resource| matches!(resource, OwnedResource::Rule(rule) if rule.table == 51821 && rule.priority < 10000 && rule.fwmark == Some(51821) && rule.invert)));
+        assert!(!resources
+            .iter()
+            .any(|resource| matches!(resource, OwnedResource::Rule(rule) if rule.table == 254)));
+        assert!(resources.iter().any(|resource| matches!(resource, OwnedResource::MihomoProcess(process) if process.full.is_none())));
+        assert!(resources
+            .iter()
+            .any(|resource| matches!(resource, OwnedResource::Dns(dns) if !dns.full)));
+        assert!(events.list().contains(&"dns-full:false".to_owned()));
+        core.reapply_dns().unwrap();
+        assert_eq!(
+            events
+                .list()
+                .iter()
+                .filter(|event| event.starts_with("dns-apply:"))
+                .count(),
+            2
+        );
+        assert!(core.mihomo_status(1000, "home").dns_applied);
+        assert_eq!(core.mihomo_status(1001, "home").state, TunnelState::Stopped);
+        events.push("native-fail");
+        assert!(core.disconnect_mihomo(1000, "home").is_err());
+        let entry = core.position(1000, "mihomo:home").unwrap();
+        assert_eq!(core.journal.entries[entry].state, OwnedState::Stale);
+        assert!(core.journal.entries[entry]
+            .resources
+            .iter()
+            .any(|resource| matches!(resource, OwnedResource::MihomoProcess(_))));
+        assert!(events.list().contains(&"mihomo-cleanup".to_owned()));
+        events.push("native-ok");
+        core.disconnect_mihomo(1000, "home").unwrap();
+        assert_eq!(core.mihomo_status(1000, "home").state, TunnelState::Stopped);
+        assert!(events
+            .list()
+            .iter()
+            .any(|event| event.starts_with("native-rule-cleanup:") && event.ends_with(":51821")));
+        assert!(events.list().contains(&"mihomo-cleanup".to_owned()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mihomo_route_failure_rolls_back_process_and_journal() {
+        let events = Events::default();
+        let dir =
+            std::env::temp_dir().join(format!("netmgr-mihomo-rollback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = dir.join("state.json");
+        let mut core = DaemonCore::open_with_xray(
+            JournalStore::new(journal.clone()),
+            Box::new(RejectRoutes(events.clone())),
+            Box::new(Links),
+            Box::new(Tun(events.clone())),
+            Box::new(Dying(events.clone())),
+        )
+        .unwrap();
+        core.mihomo = Some(Box::new(FakeMihomo {
+            events: events.clone(),
+            journal: journal.clone(),
+        }));
+        core.policy = Some(Box::new(Policy(events.clone())));
+        let params = serde_json::from_value(json!({"profileId":"home","config":"{\"proxies\":[],\"proxy-groups\":[],\"rules\":[\"MATCH,DIRECT\"]}","routes":[{"destination":"10.1.0.0/16","metric":10}]})).unwrap();
+        assert!(core.connect_mihomo(1000, params).is_err());
+        assert!(events.list().contains(&"mihomo-stop".to_owned()));
+        assert!(JournalStore::new(journal)
+            .load()
+            .unwrap()
+            .entries
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

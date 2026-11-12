@@ -105,6 +105,16 @@ echo "==> Installing daemon as a package would"
     systemctl enable --now network-orchestrator.service
 '
 
+case "${NETORCH_E2E_SUITE:-all}" in
+    mihomo)
+        echo "==> Running native Mihomo CLI/TUN scenarios"
+        python3 "$REPO_ROOT/e2e/linux/mihomo_scenarios.py" "$NAME" "$SERVER"
+        exit 0
+        ;;
+    all) ;;
+    *) echo "Unsupported NETORCH_E2E_SUITE" >&2; exit 2 ;;
+esac
+
 echo "==> Running scenarios"
 "$ENGINE" exec "$NAME" bash /opt/netorch/e2e/scenarios.sh
 
@@ -122,6 +132,11 @@ python3 "$REPO_ROOT/e2e/linux/xray_scenarios.py" "$NAME" "$SERVER"
 
 echo "==> Running Xray TUN scenarios"
 python3 "$REPO_ROOT/e2e/linux/xray_tun_scenarios.py" "$NAME" "$SERVER"
+
+if [ -n "${MIHOMO_E2E_ARCHIVE:-}" ]; then
+    echo "==> Running optional native Mihomo CLI/TUN scenarios"
+    python3 "$REPO_ROOT/e2e/linux/mihomo_scenarios.py" "$NAME" "$SERVER"
+fi
 
 echo "==> Running always-on lifecycle scenarios"
 "$ENGINE" exec "$NAME" bash /opt/netorch/e2e/always_on_scenarios.sh

@@ -1071,7 +1071,7 @@ pub fn verify(ctx: &Ctx, target: &str) -> Result<Output, String> {
                     .acquire_owned()
                     .await
                     .map_err(|_| "Exit verification was cancelled".to_string())?;
-                let key = subscription::endpoint_key(&endpoint.url);
+                let key = endpoint.id.clone();
                 let mut command = tokio::process::Command::new(&executable);
                 command.args(["run", "-config", "stdin:"]);
 
@@ -1494,6 +1494,20 @@ pub fn verify(ctx: &Ctx, target: &str) -> Result<Output, String> {
 #[cfg(target_os = "linux")]
 pub fn refresh(ctx: &Ctx, target: &str) -> Result<Output, String> {
     library::require_user(ctx)?;
+    let profile = ctx.find(target)?;
+    if profile.backend == net_manager_core::models::TunnelBackend::Mihomo {
+        let service = net_manager_engine::linux_profiles::ProfileService::new(
+            ctx.root.clone(),
+            ctx.engine.clone(),
+        );
+        let result = block_on(service.refresh_subscription(&profile.id, None))??;
+        let value =
+            serde_json::to_value(result).map_err(|_| "Could not encode Mihomo refresh result")?;
+        return Ok((
+            value,
+            format!("Refreshed Mihomo source for \"{}\"", profile.name),
+        ));
+    }
     let profile = subscription_profile(ctx, target)?;
     let service = net_manager_engine::linux_profiles::ProfileService::new(
         ctx.root.clone(),

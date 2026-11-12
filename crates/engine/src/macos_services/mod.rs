@@ -199,24 +199,29 @@ impl<R: BusinessRuntime> MacosServices<R> {
     }
     /// Executable profile for a typed runtime call. Never serialize this value.
     pub fn profile(&self, id: &str) -> Result<Profile, String> {
-        let mut profile = self
-            .store()
-            .load()
-            .map_err(store_error)?
-            .profiles
-            .into_iter()
-            .find(|p| p.id == id)
-            .ok_or_else(|| "Profile not found".to_string())?;
+        let mut profile =
+            net_manager_core::subscription::migrate_endpoint_ids(&self.vault(), &self.store(), id)
+                .map_err(store_error)?;
         normalize_profile_path(&mut profile, None)?;
         Ok(profile)
     }
     pub fn public_profiles(&self) -> Result<Vec<Profile>, String> {
-        Ok(redact_profiles(
-            self.store().load().map_err(store_error)?.profiles,
-        ))
+        Ok(redact_profiles(self.profiles()?))
     }
     fn profiles(&self) -> Result<Vec<Profile>, String> {
         let mut profiles = self.store().load().map_err(store_error)?.profiles;
+        let store = self.store();
+        let vault = self.vault();
+        for profile in &mut profiles {
+            if profile.subscription.is_some() {
+                *profile = net_manager_core::subscription::migrate_endpoint_ids(
+                    &vault,
+                    &store,
+                    &profile.id,
+                )
+                .map_err(store_error)?;
+            }
+        }
         for profile in &mut profiles {
             normalize_profile_path(profile, None)?;
         }

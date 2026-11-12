@@ -43,6 +43,7 @@ export default function ImportModal({
   const [subUrl, setSubUrl] = useState("");
   const [subHwid, setSubHwid] = useState("");
   const [subRefreshMinutes, setSubRefreshMinutes] = useState<number | null>(null);
+  const [subscriptionBackend, setSubscriptionBackend] = useState<"xray" | "mihomo">("xray");
   const [error, setError] = useState<string | null>(null);
   const t = useT();
 
@@ -80,7 +81,7 @@ export default function ImportModal({
         filters: [
           {
             name: t("import.filesFilter"),
-            extensions: ["conf", "dpapi", "ovpn", "json"],
+            extensions: ["conf", "dpapi", "ovpn", "json", "yaml", "yml"],
           },
           { name: tr("All files"), extensions: ["*"] },
         ],
@@ -128,7 +129,7 @@ export default function ImportModal({
     } else if (tab === "subscription") {
       if (!subUrl.trim()) return;
       void run(() =>
-        invoke<BatchImportResult>("import_subscription", {
+        invoke<BatchImportResult>(subscriptionBackend === "mihomo" ? "import_mihomo_subscription" : "import_subscription", {
           url: subUrl.trim(),
           hwid: subHwid.trim(),
           refreshIntervalMinutes: subRefreshMinutes,
@@ -220,7 +221,7 @@ export default function ImportModal({
       >
         {tab === "files" && (
           <>
-            <p className="profile-help">{t("import.filesHelp")}</p>
+            <p className="profile-help">{caps?.os === "linux" ? tr("Choose a backend explicitly for Mihomo YAML or JSON files.") : t("import.filesHelp")}</p>
             <div>
               <button type="button" onClick={() => void chooseFiles()} disabled={busy}>
                 {tr("Choose files…")}
@@ -246,6 +247,7 @@ export default function ImportModal({
                     <option value="wireGuard">{tr("WireGuard")}</option>
                     <option value="openVpn">{tr("OpenVPN")}</option>
                     <option value="xray">{tr("Xray")}</option>
+                    {caps?.os === "linux" && <option value="mihomo">Mihomo</option>}
                   </select>
                 </label>
               </>
@@ -304,7 +306,13 @@ export default function ImportModal({
 
         {tab === "subscription" && (
           <>
-            <p className="profile-help">{t("import.subHelp")}</p>
+            {caps?.os === "linux" && <label>{tr("Subscription backend")}
+              <select value={subscriptionBackend} onChange={(event) => setSubscriptionBackend(event.target.value as "xray" | "mihomo")}>
+                <option value="xray">Xray</option>
+                <option value="mihomo">Mihomo</option>
+              </select>
+            </label>}
+            <p className="profile-help">{subscriptionBackend === "mihomo" ? tr("Import a native Mihomo subscription without starting a connection.") : t("import.subHelp")}</p>
             <label>
               {t("import.subUrl")}
               <input

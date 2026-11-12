@@ -89,10 +89,23 @@ impl Ctx {
 
     /// Profiles as stored, for running them. Never printed as they are.
     pub fn profiles(&self) -> Result<Vec<Profile>, String> {
-        self.store()
+        let store = self.store();
+        let vault = self.vault();
+        let mut profiles = store
             .load()
-            .map(|document| document.profiles)
-            .map_err(|_| "Profiles could not be loaded".to_string())
+            .map_err(|_| "Profiles could not be loaded")?
+            .profiles;
+        for profile in &mut profiles {
+            if profile.subscription.is_some() {
+                *profile = net_manager_core::subscription::migrate_endpoint_ids(
+                    &vault,
+                    &store,
+                    &profile.id,
+                )
+                .map_err(|_| "Subscription identities could not be migrated")?;
+            }
+        }
+        Ok(profiles)
     }
 
     pub fn find(&self, query: &str) -> Result<Profile, String> {

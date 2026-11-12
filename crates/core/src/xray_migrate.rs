@@ -48,8 +48,7 @@ pub enum ResolvedOutbound {
         name: String,
         domain_strategy: Option<String>,
     },
-    /// A specific subscription endpoint; carries its
-    /// [`subscription::endpoint_key`].
+    /// A specific subscription endpoint, identified by its persisted ID.
     Pinned(String),
     /// Anything else: unknown protocol, foreign tunnel (interface-bound
     /// freedom, dialerProxy), unparseable — unrepresentable.
@@ -194,7 +193,7 @@ fn is_auxiliary(outbound: &Value) -> bool {
     )
 }
 
-/// Resolve a source outbound to a [`subscription::endpoint_key`]:
+/// Resolve a source outbound to a persisted subscription endpoint ID:
 /// generate the outbound the endpoint's share link produces and compare
 /// the canonical signature — host, port, transport and every transport
 /// parameter must match, so a rotated-but-identical link maps while a
@@ -204,22 +203,18 @@ pub fn endpoint_key_for_outbound(
     endpoints: &[SubscriptionEndpoint],
 ) -> Option<String> {
     let signature = outbound_signature(outbound)?;
-    for endpoint in endpoints {
-        let Ok(generated) = xray::generate_share_link_config(&endpoint.url, 1) else {
-            continue;
-        };
-        let Some(produced) = generated
-            .get("outbounds")
-            .and_then(Value::as_array)
-            .and_then(|v| v.first())
-        else {
-            continue;
-        };
-        if outbound_signature(produced).as_deref() == Some(signature.as_str()) {
-            return Some(subscription::endpoint_key(&endpoint.url));
-        }
+    let mut matches = endpoints.iter().filter_map(|endpoint| {
+        let generated = xray::generate_share_link_config(&endpoint.url, 1).ok()?;
+        let produced = generated.get("outbounds")?.as_array()?.first()?;
+        (outbound_signature(produced).as_deref() == Some(signature.as_str()))
+            .then_some(&endpoint.id)
+    });
+    let id = matches.next()?;
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(id.clone())
     }
-    None
 }
 
 /// Resolver for [`plan_xray_policy_migration`]: classify every managed

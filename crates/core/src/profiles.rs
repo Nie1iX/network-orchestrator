@@ -31,6 +31,11 @@ impl ProfileStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
+    #[cfg(unix)]
+    pub(crate) fn owner_uid(&self) -> io::Result<u32> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(fs::metadata(&self.path)?.uid())
+    }
 
     pub fn load(&self) -> io::Result<ProfileDocument> {
         let raw = match fs::read_to_string(&self.path) {
@@ -71,7 +76,7 @@ impl ProfileStore {
     /// A separate file survives atomic replacement of the document. Each
     /// transaction opens its own handle, so threads and other processes use
     /// the same OS lock; dropping the handle releases it even on errors.
-    fn lock(&self) -> io::Result<fs::File> {
+    pub(crate) fn lock(&self) -> io::Result<fs::File> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
             crate::config_security::protect_path(parent)?;
@@ -95,7 +100,7 @@ impl ProfileStore {
         Ok(file)
     }
 
-    fn save_locked(&self, document: &ProfileDocument) -> io::Result<()> {
+    pub(crate) fn save_locked(&self, document: &ProfileDocument) -> io::Result<()> {
         for profile in &document.profiles {
             crate::service_checks::validate_profile_service_checks(profile)?;
             crate::proxy_exits::validate_profile_proxy_exits(profile)?;
@@ -273,6 +278,46 @@ impl ProfileStore {
     }
 }
 
+#[cfg(test)]
+mod mihomo_profile_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_native_proxy_profile_with_system_proxy() {
+        let profile = Profile {
+            id: "native".into(),
+            name: "Native".into(),
+            backend: TunnelBackend::Mihomo,
+            config_path: "mihomo.yaml".into(),
+            mihomo: Some(crate::models::MihomoProfileOptions {
+                mode: crate::models::MihomoMode::Proxy,
+                mixed_port: Some(7890),
+                ..Default::default()
+            }),
+            use_system_proxy: true,
+            ..Default::default()
+        };
+        validate_profile(&profile).unwrap();
+    }
+
+    #[test]
+    fn rejects_zero_native_proxy_port() {
+        let profile = Profile {
+            id: "native".into(),
+            name: "Native".into(),
+            backend: TunnelBackend::Mihomo,
+            config_path: "native.yaml".into(),
+            mihomo: Some(crate::models::MihomoProfileOptions {
+                mode: crate::models::MihomoMode::Proxy,
+                mixed_port: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_profile(&profile).is_err());
+    }
+}
+
 pub fn validate_profile(profile: &Profile) -> io::Result<()> {
     if profile.id.trim().is_empty() {
         return Err(invalid_data("profile id must not be blank"));
@@ -290,7 +335,12 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
             profile.backend,
             TunnelBackend::WireGuard | TunnelBackend::OpenVpn
         ) || (profile.backend == TunnelBackend::Xray
-            && profile.xray_mode == crate::models::XrayMode::Tun));
+            && profile.xray_mode == crate::models::XrayMode::Tun)
+            || (profile.backend == TunnelBackend::Mihomo
+                && profile
+                    .mihomo
+                    .as_ref()
+                    .is_none_or(|options| options.mode == crate::models::MihomoMode::Tun)));
     // Нативный клиент macOS импортирует и анализирует OpenVPN без запуска туннеля.
     let read_only_openvpn = cfg!(target_os = "macos") && profile.backend == TunnelBackend::OpenVpn;
     // Static routes that all name their own gateway go through no interface.
@@ -330,10 +380,22 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
     }
     crate::service_checks::validate_profile_service_checks(profile)?;
     crate::proxy_exits::validate_profile_proxy_exits(profile)?;
-    if profile.backend != TunnelBackend::Xray && !profile.domain_policies.is_empty() {
-        return Err(invalid_data(
-            "domain policies are only supported for Xray profiles",
-        ));
+    if profile.backend == TunnelBackend::Mihomo {
+        let options = profile.mihomo.as_ref().cloned().unwrap_or_default();
+        if options.mixed_port == Some(0)
+            || (options.mode == crate::models::MihomoMode::Proxy && options.mixed_port.is_none())
+        {
+            return Err(invalid_data(
+                "Mihomo proxy mode requires a nonzero mixed port",
+            ));
+        }
+    } else if profile.mihomo.is_some() {
+        return Err(invalid_data("Mihomo options require a Mihomo profile"));
+    }
+    if !matches!(profile.backend, TunnelBackend::Xray | TunnelBackend::Mihomo)
+        && !profile.domain_policies.is_empty()
+    {
+        return Err(invalid_data("domain policies require Xray or Mihomo"));
     }
     if profile.backend == TunnelBackend::Xray {
         crate::xray::validate_routing_policy_selectors(&profile.domain_policies)
@@ -374,17 +436,18 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
         }
     }
     if profile.use_system_proxy {
-        if profile.backend != TunnelBackend::Xray {
-            return Err(invalid_data(
-                "system proxy is only supported for Xray profiles",
-            ));
-        }
-        match profile.xray_socks_port {
-            Some(port) if port != 0 => {}
+        match profile.backend {
+            TunnelBackend::Xray if profile.xray_socks_port.is_some_and(|port| port != 0) => {}
+            TunnelBackend::Mihomo
+                if profile
+                    .mihomo
+                    .as_ref()
+                    .and_then(|o| o.mixed_port)
+                    .is_some_and(|port| port != 0) => {}
             _ => {
                 return Err(invalid_data(
-                    "system proxy requires a nonzero xray socks port",
-                ));
+                    "system proxy requires a nonzero proxy listener",
+                ))
             }
         }
     }
@@ -408,6 +471,11 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
         }
         TunnelBackend::OpenVpn => file_name.ends_with(".ovpn") || file_name.ends_with(".conf"),
         TunnelBackend::Xray => file_name.ends_with(".json") || file_name.ends_with(".json.dpapi"),
+        TunnelBackend::Mihomo => {
+            file_name.ends_with(".yaml")
+                || file_name.ends_with(".yml")
+                || file_name.ends_with(".json")
+        }
     };
     if !allowed {
         return Err(invalid_data(format!(

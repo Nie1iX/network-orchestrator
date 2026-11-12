@@ -4,9 +4,10 @@ import type {
   PoolProbeEntry, Profile, ProfileInspection, RouteEntry, RouteMap, TunnelStatus, VpnAuthMode, LoggingVerbosity,
   XrayPolicyPreview,
   ServiceCheck, ServiceCheckOutcome, ServiceCheckResult,
-  ConnectionSetCredentialInput,
+  ConnectionSetCredentialInput, SubscriptionEndpointInfo,
 } from "../types.ts";
 import type { ConnectionSnippet } from "../components/profiles/sets";
+import { buildProfileGraph, documentDiff, parseProfileDocument, type ProfileDocument, type JsonValue } from "../profileDocument.ts";
 
 const CONNECTION_SETS_KEY = "netmanager.sandbox.connectionSets";
 
@@ -14,7 +15,7 @@ const CONNECTION_SETS_KEY = "netmanager.sandbox.connectionSets";
 // It models UI transitions only; Rust tests verify actual backend behavior.
 function profile(id: string, name: string, backend: Profile["backend"], cidr?: string, endpointBypasses?: string[]): Profile {
   return {
-    id, name, backend, configPath: backend === "none" ? "" : `/sandbox/${id}.${backend === "xray" ? "json" : backend === "openVpn" ? "ovpn" : "conf"}`,
+    id, name, backend, configPath: backend === "none" ? "" : `/sandbox/${id}.${backend === "mihomo" ? "yaml" : backend === "xray" ? "json" : backend === "openVpn" ? "ovpn" : "conf"}`,
     interfaceName: backend === "none" ? "qa-ethernet" : `qa-${id}`,
     routes: cidr ? [{ destination: cidr, metric: 5, via: null }] : [],
     autoConnect: false, domainPolicies: [], privateLanDirect: false,
@@ -50,6 +51,64 @@ export class SandboxBackend {
   private editRevisions = new Map<string, string>();
   private nextEditRevision = 0;
   private loggingVerbosity: LoggingVerbosity = "normal";
+
+  private editorView(profile: Profile): { document: ProfileDocument; references: Map<string, unknown> } {
+    const references = new Map<string, unknown>();
+    const protectedField = (path: string) =>
+      /^\/profile\/(?:configPath|xrayGeoipUrl|xrayGeositeUrl)$/.test(path) ||
+      /^\/profile\/subscription\/(?:url|hwid|probeUrl|supportUrl|webPageUrl|announce|providerTitle|lastRefreshError|skippedProtocols)$/.test(path) ||
+      /^\/profile\/xrayServiceChecks\/\d+\/url$/.test(path);
+    const visit = (value: unknown, path: string): unknown => {
+      if (value != null && (protectedField(path) || /\/xrayDns\/servers\/\d+\/address$/.test(path) && typeof value === "string" && value.includes("://"))) {
+        const reference = `vault:sandbox:${path}`;
+        references.set(reference, structuredClone(value));
+        return reference;
+      }
+      if (Array.isArray(value)) return value.map((item, index) => visit(item, `${path}/${index}`));
+      if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, visit(item, `${path}/${key.replace(/~/g, "~0").replace(/\//g, "~1")}`)]));
+      return value;
+    };
+    return { document: { version: 1, profile: visit(profile, "/profile") as Record<string, JsonValue> }, references };
+  }
+
+  private editorSnapshot(id: unknown) {
+    const profile = this.find(id);
+    const revision = String(++this.nextEditRevision);
+    this.editRevisions.set(revision, JSON.stringify(profile));
+    return {
+      document: this.editorView(profile).document, revision,
+      endpoints: profile.subscription ? this.dispatch("get_subscription_endpoints", { profileId: profile.id }) : [],
+      running: this.running.has(profile.id), runningRevision: null,
+    };
+  }
+
+  private editorCandidate(args: Record<string, unknown>): { profile: Profile; document: ProfileDocument; before: ProfileDocument } {
+    const stored = this.find(args.id);
+    if (this.editRevisions.get(String(args.expectedRevision)) !== JSON.stringify(stored)) throw new Error("The profile changed. Reload the saved profile before applying this draft.");
+    const parsed = parseProfileDocument(JSON.stringify(args.document));
+    if (!parsed.document) throw new Error("Invalid profile document");
+    const { document: before, references } = this.editorView(stored);
+    for (const key of ["id", "backend", "configPath", "xrayGeoipUrl", "xrayGeositeUrl"]) {
+      if (JSON.stringify(parsed.document.profile[key]) !== JSON.stringify(before.profile[key])) throw new Error("The protected profile source cannot be changed in this editor.");
+    }
+    const subscription = parsed.document.profile.subscription as Record<string, JsonValue> | null;
+    const source = before.profile.subscription as Record<string, JsonValue> | null;
+    if (Boolean(source) !== Boolean(subscription) || source && ["url", "hwid"].some((key) => subscription?.[key] !== source[key])) throw new Error("The protected subscription source cannot be changed.");
+    const restore = (value: unknown, path: string): unknown => {
+      if (typeof value === "string" && value.startsWith("vault:")) {
+        const referencePath = value.slice("vault:sandbox:".length);
+        if (!references.has(value) || referencePath.replace(/\/\d+(?=\/)/g, "/#") !== path.replace(/\/\d+(?=\/)/g, "/#")) throw new Error("Invalid protected vault reference");
+        return structuredClone(references.get(value));
+      }
+      if (Array.isArray(value)) return value.map((item, index) => restore(item, `${path}/${index}`));
+      if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restore(item, `${path}/${key.replace(/~/g, "~0").replace(/\//g, "~1")}`)]));
+      return value;
+    };
+    const profile = restore(parsed.document.profile, "/profile") as Profile;
+    if (!profile.name?.trim()) throw new Error("Profile name is required");
+    this.validateServiceSpecs(profile, profile.xrayServiceChecks ?? []);
+    return { profile, document: parsed.document, before };
+  }
 
   private connectionSets: ConnectionSnippet[] = [];
   private rememberedOpenVpn = new Set<string>();
@@ -129,7 +188,7 @@ export class SandboxBackend {
     const enrolled = new Set(this.enrollment.profiles.map((item) => item.profileId));
     const targets = set.profileIds.map((member) => this.find(member));
     if (!down && targets.filter((p) => (p.tunnelRole ?? "primary") === "primary" &&
-      (["wireGuard", "openVpn"].includes(p.backend) || p.backend === "xray" && p.xrayMode === "tun")).length > 1) {
+      (["wireGuard", "openVpn"].includes(p.backend) || p.backend === "xray" && p.xrayMode === "tun" || p.backend === "mihomo" && (p.mihomo?.mode ?? "tun") === "tun")).length > 1) {
       throw new Error("A connection set cannot start multiple primary tunnels");
     }
     for (const p of targets) {
@@ -464,6 +523,7 @@ export class SandboxBackend {
     profile("ovpn", "QA OpenVPN", "openVpn", "10.88.0.0/24", ["203.0.113.7"]),
     profile("xray", "AcmeVPN · ⚡ Нидерланды", "xray"),
     profile("static", "QA Static routes", "none", "203.0.113.0/24"),
+    { ...profile("mihomo", "QA Mihomo", "mihomo"), mihomo: { mode: "tun", entryGroup: "Auto", mixedPort: null, groupSelections: { Auto: "Netherlands" } } },
   ];
   private running = new Set<string>();
   // Foreign tunnels raised outside the app (wg-quick, another VPN app).
@@ -485,6 +545,7 @@ export class SandboxBackend {
   private readonly exitCountries = ["NL", "NL", "FI", "JP", "US", "BR", "SG", "GB"];
   private backendPaths = new Map<string, string>();
   private xrayManaged = false;
+  private mihomoManaged = false;
   private condRules: ConditionalRuleEntry[] = [
     {
       rule: {
@@ -695,7 +756,7 @@ export class SandboxBackend {
     // Managed tunnel interfaces exist only while the tunnel runs — same as on
     // a real system. A foreign device holding the same name stays listed and
     // surfaces as the external-tunnel conflict in Profiles.
-    const managed = this.profiles.filter((p) => p.backend !== "none" && !(p.backend === "xray" && p.xrayMode === "socks") && this.running.has(p.id)).map((p, i) => iface(p.interfaceName, i + 2, false, "up", p.backend === "none" ? "ethernet" : p.backend));
+    const managed = this.profiles.filter((p) => p.backend !== "none" && !(p.backend === "xray" && p.xrayMode === "socks") && !(p.backend === "mihomo" && p.mihomo?.mode === "proxy") && this.running.has(p.id)).map((p, i) => iface(p.interfaceName, i + 2, false, "up", p.backend === "mihomo" ? { other: "Mihomo" } : p.backend === "none" ? "ethernet" : p.backend));
     const runningNames = new Set(this.profiles.filter((p) => this.running.has(p.id)).map((p) => p.interfaceName));
     return [iface("qa-ethernet", 1, true, "up"), ...managed, ...this.externalIfaces.filter((e) => !runningNames.has(e.name))];
   }
@@ -758,7 +819,7 @@ export class SandboxBackend {
 
   private dispatch(command: string, args: Record<string, unknown>): unknown {
     switch (command) {
-      case "get_platform_capabilities": return { os: "linux", systemProxy: false, wireguardStandardImport: false, managedXrayInstall: true, elevationRelaunch: false, appUpdates: false, executableExtensions: [] };
+      case "get_platform_capabilities": return { os: "linux", systemProxy: false, wireguardStandardImport: false, managedXrayInstall: true, managedMihomoInstall: true, elevationRelaunch: false, appUpdates: false, executableExtensions: [] };
       case "get_profiles": return this.profiles;
       case "list_connection_sets": return this.loadConnectionSets();
       case "get_connection_set": return this.connectionSet(args.id);
@@ -836,6 +897,36 @@ export class SandboxBackend {
         this.clearServiceState(p.id);
         return this.statuses().find((status) => status.profileId === p.id);
       }
+      case "get_mihomo_groups": {
+        const p = this.find(args.id);
+        if (p.backend !== "mihomo") throw new Error("Profile is not Mihomo");
+        return [{ name: "Auto", kind: "select", members: ["Netherlands", "Germany"], selected: p.mihomo?.groupSelections.Auto ?? null }];
+      }
+      case "get_profile_document": return this.editorSnapshot(args.id);
+      case "preview_profile_document": {
+        const candidate = this.editorCandidate(args);
+        const endpoints = (candidate.profile.subscription ? this.dispatch("get_subscription_endpoints", { profileId: args.id }) : []) as SubscriptionEndpointInfo[];
+        const graph = buildProfileGraph(candidate.document, endpoints);
+        return {
+          valid: !graph.issues.some((issue) => issue.severity === "error"),
+          issues: [...graph.issues, { path: "/profile", message: "Sandbox validation is simulated; no daemon was contacted.", severity: "warning" }],
+          daemonValidated: false, changedPaths: documentDiff(candidate.before, candidate.document),
+          requiresReconnect: this.running.has(candidate.profile.id),
+        };
+      }
+      case "save_profile_document": {
+        const candidate = this.editorCandidate(args);
+        const preview = this.dispatch("preview_profile_document", args) as { valid: boolean };
+        if (!preview.valid) throw new Error("The draft was rejected. Nothing was saved or reconnected.");
+        this.profiles = this.profiles.map((profile) => profile.id === candidate.profile.id ? structuredClone(candidate.profile) : profile);
+        return this.editorSnapshot(candidate.profile.id);
+      }
+      case "apply_profile_document": {
+        const profile = this.find(args.id);
+        if (this.editRevisions.get(String(args.expectedRevision)) !== JSON.stringify(profile)) throw new Error("The profile changed. Reload the saved profile before reconnecting.");
+        if (this.running.has(profile.id)) this.dispatch("disconnect_profile", { id: profile.id });
+        return this.dispatch("connect_profile", { id: profile.id });
+      }
       case "get_profile_for_edit": {
         const profile = this.find(args.id);
         const revision = String(++this.nextEditRevision);
@@ -844,6 +935,7 @@ export class SandboxBackend {
       }
       case "save_profile":
       case "save_vless_profile":
+      case "save_mihomo_document":
       case "save_wireguard_profile": {
         const p = structuredClone(args.profile) as Profile;
         if (!p.id || !p.name?.trim()) throw new Error("Profile name is required");
@@ -1126,6 +1218,17 @@ export class SandboxBackend {
         this.profiles.push(p);
         return { profiles: this.profiles, errors: [] };
       }
+      case "import_mihomo_subscription": {
+        const p = profile(`mihomo-subscription-${this.profiles.length}`, "QA Mihomo subscription", "mihomo");
+        p.mihomo = { mode: "tun", entryGroup: "Auto", mixedPort: null, groupSelections: {} };
+        p.subscription = structuredClone(this.profiles.find((item) => item.subscription)?.subscription ?? null);
+        if (p.subscription) {
+          p.subscription.nodePool = null;
+          p.subscription.refreshIntervalMinutes = args.refreshIntervalMinutes as number | null;
+        }
+        this.profiles.push(p);
+        return { profiles: [p], errors: [] };
+      }
       case "import_subscription": {
         const p = profile(`subscription-${this.profiles.length}`, "QA Imported subscription", "xray");
         this.allocateProxyPorts(p);
@@ -1133,12 +1236,17 @@ export class SandboxBackend {
         this.profiles.push(p); return { profiles: [p], errors: [] };
       }
       case "import_configs_batch": {
-        const imported = [profile(`import-${this.profiles.length}`, "QA Imported WireGuard", "wireGuard", "10.99.0.0/24")];
+        const backend = args.defaultBackend === "mihomo" ? "mihomo" : "wireGuard";
+        const imported = [profile(`import-${this.profiles.length}`, backend === "mihomo" ? "QA Imported Mihomo" : "QA Imported WireGuard", backend, backend === "wireGuard" ? "10.99.0.0/24" : undefined)];
+        if (backend === "mihomo") imported[0].mihomo = { mode: "tun", entryGroup: null, mixedPort: null, groupSelections: {} };
         this.profiles.push(...imported); return { profiles: imported, errors: [] };
       }
-      case "get_backend_availability": return (["wireGuard", "openVpn", "xray"] as const).map((backend): BackendAvailability => {
+      case "get_backend_availability": return (["wireGuard", "openVpn", "xray", "mihomo"] as const).map((backend): BackendAvailability => {
         if (backend === "xray" && this.xrayManaged) {
           return { backend, available: true, path: "/usr/lib/network-orchestrator/xray/v26.10.31/xray", source: "managed", version: "v26.10.31", message: "Simulated managed package; nothing is launched." };
+        }
+        if (backend === "mihomo") {
+          return { backend, available: this.mihomoManaged, path: this.mihomoManaged ? "/sandbox/mihomo" : null, source: this.mihomoManaged ? "managed" : null, version: this.mihomoManaged ? "v1.19.34" : null, message: "Synthetic component; no process is launched." };
         }
         if (backend === "xray") {
           return { backend, available: false, path: this.backendPaths.get(backend) ?? null, source: this.backendPaths.has(backend) ? "configured" : null, version: null, message: "Xray unavailable; TUN requires verified package Xray and network daemon." };
@@ -1149,6 +1257,10 @@ export class SandboxBackend {
       case "install_managed_xray": this.xrayManaged = true; return "/usr/lib/network-orchestrator/xray/v26.10.31/xray";
       case "remove_managed_xray": this.xrayManaged = false; this.backendPaths.delete("xray"); return null;
       case "cancel_managed_xray_install": return null;
+      case "get_managed_mihomo_offer": return { version: "v1.19.34", sourceUrl: "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.34/mihomo-linux-amd64-v1-v1.19.34.gz", sha256: "0c07340a01408d033dda4088ea2a4c1e4d82aeed7b2f84f7c046e93b6ff3290c", maxDownloadBytes: 22766449 };
+      case "install_managed_mihomo": this.mihomoManaged = true; return null;
+      case "remove_managed_mihomo": this.mihomoManaged = false; return null;
+      case "cancel_managed_mihomo_install": return null;
       case "set_backend_executable": this.backendPaths.set(String(args.backend), String(args.path)); return null;
       case "reset_backend_executable": this.backendPaths.delete(String(args.backend)); return null;
       case "plugin:app|version": return "Sandbox";

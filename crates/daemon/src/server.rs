@@ -18,7 +18,9 @@ use net_manager_core::daemon_protocol::{
     AlwaysOnSetParams, AlwaysOnSetResult, CondRulesListResult, CondRulesPutParams,
     CondRulesPutResult, CondRulesRemoveParams, CondRulesRemoveResult, ConditionalRuleEntry,
     ErrorCode, EventFrame, ExternalTunnelStopParams, HelloParams, HelloResult, LinkSetStateParams,
-    LoggingSettings, LoggingVerbosity, NetDnsProbeParams, NetEditResult, NetIntentDelParams,
+    LoggingSettings, LoggingVerbosity, MihomoConnectParams, MihomoConnectResult,
+    MihomoDisconnectResult, MihomoInstallParams, MihomoInstallResult, MihomoProfileParams,
+    MihomoRemoveResult, MihomoStatusResult, NetDnsProbeParams, NetEditResult, NetIntentDelParams,
     NetIntentResult, NetIntentSetParams, NetRouteAddParams, NetRouteDelParams, NetRuleAddParams,
     NetRuleDelParams, NmListResult, NmSetActiveParams, OpenVpnConnectRequest, OpenVpnConnectResult,
     OpenVpnDisconnectResult, OpenVpnProbeResult, OpenVpnProfileParams, OwnedChanged,
@@ -64,12 +66,12 @@ pub struct ServerContext<A> {
     pub settings: Arc<Mutex<DaemonSettings>>,
     /// `None` keeps settings in memory only (tests).
     pub settings_store: Option<Arc<SettingsStore>>,
-    /// Root the `xray.install`/`xray.remove` methods write under; tests
-    /// point it at a tempdir so they never touch the real package tree.
+    /// Managed Xray and Mihomo package roots; tests point these at tempdirs.
     #[cfg(target_os = "linux")]
     pub xray_package_root: std::path::PathBuf,
-    /// Reports whether each trusted system binary (see `tool::*` in the
-    /// protocol) is usable right now; tests substitute a stub.
+    #[cfg(target_os = "linux")]
+    pub mihomo_package_root: std::path::PathBuf,
+    /// Reports whether each trusted system binary is usable right now.
     #[cfg(target_os = "linux")]
     pub tools_probe: fn() -> std::collections::BTreeMap<String, bool>,
 }
@@ -92,6 +94,8 @@ impl<A: Authorizer> ServerContext<A> {
             #[cfg(target_os = "linux")]
             xray_package_root: Self::default_xray_package_root(),
             #[cfg(target_os = "linux")]
+            mihomo_package_root: Self::default_mihomo_package_root(),
+            #[cfg(target_os = "linux")]
             tools_probe: default_tool_presence,
         }
     }
@@ -107,6 +111,17 @@ impl<A: Authorizer> ServerContext<A> {
         #[cfg(target_arch = "x86_64")]
         {
             net_manager_core::managed_xray::LINUX_XRAY_PACKAGE_ROOT.into()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            std::path::PathBuf::new()
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn default_mihomo_package_root() -> std::path::PathBuf {
+        #[cfg(target_arch = "x86_64")]
+        {
+            net_manager_core::managed_mihomo::LINUX_MIHOMO_PACKAGE_ROOT.into()
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -208,8 +223,12 @@ where
         capabilities: method::CAPABILITIES
             .iter()
             .copied()
-            .chain([feature::XRAY_TUN_IPV6])
-            .map(str::to_string)
+            .chain([
+                feature::XRAY_TUN_IPV6,
+                feature::MIHOMO_TUN,
+                feature::MIHOMO_MANAGED_INSTALL,
+            ])
+            .map(str::to_owned)
             .collect(),
         tools: (ctx.tools_probe)(),
     };
@@ -351,6 +370,8 @@ async fn dispatch<A: Authorizer>(
             | method::OPENVPN_STATUS
             | method::OPENVPN_PLAN
             | method::XRAY_STATUS
+            | method::MIHOMO_STATUS
+            | method::MIHOMO_VALIDATE
             | method::XRAY_PROXY_EXITS
             | method::TAILSCALE_STATUS
             | method::NM_LIST
@@ -711,11 +732,37 @@ async fn handle<A: Authorizer>(
             .await?;
             to_value(&status)
         }
+        method::XRAY_VALIDATE => {
+            let params: XrayConnectParams = from_value(request.params)
+                .map_err(|_| invalid("invalid Xray validation parameters".into()))?;
+            if let Err(error) = prepare_xray(uid, params.clone(), 1) {
+                let message = crate::xray::validation_message(&error);
+                return to_value(&serde_json::json!({
+                    "valid": false,
+                    "issues": [{
+                        "path": validation_issue_path(),
+                        "message": message,
+                        "severity": "error"
+                    }]
+                }));
+            }
+            if let Err(message) = net_manager_core::models::validate_secondary(
+                params.role,
+                &params.routes,
+                &params.dns_domains,
+            ) {
+                return to_value(&serde_json::json!({
+                    "valid": false,
+                    "issues": [{"path": "/profile", "message": message, "severity": "error"}]
+                }));
+            }
+            to_value(&serde_json::json!({"valid": true, "issues": []}))
+        }
         method::XRAY_CONNECT => {
             let params: XrayConnectParams = from_value(request.params)
                 .map_err(|_| invalid("invalid Xray connect parameters".into()))?;
             prepare_xray(uid, params.clone(), 1)
-                .map_err(|_| invalid("unsupported generated Xray TUN config".into()))?;
+                .map_err(|error| invalid(crate::xray::validation_message(&error)))?;
             net_manager_core::models::validate_secondary(
                 params.role,
                 &params.routes,
@@ -749,6 +796,90 @@ async fn handle<A: Authorizer>(
             }
             result?;
             to_value(&XrayDisconnectResult { stopped: true })
+        }
+        #[cfg(target_os = "linux")]
+        method::MIHOMO_VALIDATE => {
+            let params: MihomoConnectParams = params(request.params)
+                .map_err(|_| invalid("invalid Mihomo validation parameters".into()))?;
+            crate::mihomo::prepare_mihomo(uid, params.clone(), 1)
+                .map_err(|_| invalid("unsafe or invalid Mihomo configuration".into()))?;
+            net_manager_core::models::validate_secondary(
+                params.role,
+                &params.routes,
+                &params.dns_domains,
+            )
+            .map_err(|message| invalid(message.into()))?;
+            to_value(&serde_json::json!({ "valid": true, "issues": [] }))
+        }
+        #[cfg(target_os = "linux")]
+        method::MIHOMO_CONNECT => {
+            let params: MihomoConnectParams = params(request.params)
+                .map_err(|_| invalid("invalid Mihomo connect parameters".into()))?;
+            crate::mihomo::prepare_mihomo(uid, params.clone(), 1)
+                .map_err(|_| invalid("unsafe or invalid Mihomo configuration".into()))?;
+            net_manager_core::models::validate_secondary(
+                params.role,
+                &params.routes,
+                &params.dns_domains,
+            )
+            .map_err(|message| invalid(message.into()))?;
+            let broad = params
+                .routes
+                .iter()
+                .any(|route| captures_all_traffic(route.destination));
+            authorize(ctx, peer, connect_action(ctx.vpn_auth_mode(), broad)).await?;
+            let owner = format!("mihomo:{}", params.profile_id);
+            let status = with_core(ctx, move |core| core.connect_mihomo(uid, params))
+                .await
+                .map_err(|(code, message)| {
+                    match message.as_str() {
+                        "Managed Mihomo is missing or untrusted; install the optional Mihomo component"
+                        | "Mihomo process startup failed"
+                        | "Mihomo group selection failed"
+                        | "Mihomo exited during startup"
+                        | "Mihomo interface did not appear"
+                        | "Mihomo TUN link discovery failed"
+                        | "Mihomo journal update failed"
+                        | "Mihomo upstream route setup failed"
+                        | "Mihomo route setup failed"
+                        | "Mihomo policy rule setup failed"
+                        | "Mihomo DNS setup failed" => (code, message),
+                        _ => (code, "Mihomo connection failed".into()),
+                    }
+                })?;
+            notify(ctx, uid, owner);
+            to_value(&MihomoConnectResult { status })
+        }
+        #[cfg(target_os = "linux")]
+        method::MIHOMO_DISCONNECT => {
+            let params: MihomoProfileParams = params(request.params)
+                .map_err(|_| invalid("invalid Mihomo profile parameters".into()))?;
+            let owner = format!("mihomo:{}", params.profile_id);
+            validate_owner(&owner).map_err(invalid)?;
+            authorize(ctx, peer, Action::ConnectProfile).await?;
+            let result = with_core(ctx, move |core| {
+                core.disconnect_mihomo(uid, &params.profile_id)
+            })
+            .await;
+            if !matches!(
+                &result,
+                Err((ErrorCode::NotFound | ErrorCode::InvalidParams, _))
+            ) {
+                notify(ctx, uid, owner);
+            }
+            result?;
+            to_value(&MihomoDisconnectResult { stopped: true })
+        }
+        #[cfg(target_os = "linux")]
+        method::MIHOMO_STATUS => {
+            let params: MihomoProfileParams = params(request.params)
+                .map_err(|_| invalid("invalid Mihomo profile parameters".into()))?;
+            validate_owner(&format!("mihomo:{}", params.profile_id)).map_err(invalid)?;
+            let status: MihomoStatusResult = with_core(ctx, move |core| {
+                Ok(core.mihomo_status(uid, &params.profile_id))
+            })
+            .await?;
+            to_value(&status)
         }
         method::XRAY_STATUS => {
             let params: XrayProfileParams = params(request.params)?;
@@ -799,6 +930,38 @@ async fn handle<A: Authorizer>(
             let status = with_core(ctx, move |core| core.reload_xray(uid, params)).await?;
             notify(ctx, uid, owner);
             to_value(&XrayConnectResult { status })
+        }
+        #[cfg(target_os = "linux")]
+        method::MIHOMO_INSTALL => {
+            let params: MihomoInstallParams = params(request.params)
+                .map_err(|_| invalid("invalid Mihomo installation parameters".into()))?;
+            let archive = decode_mihomo_archive(&params.archive_b64)
+                .map_err(|err| invalid(err.to_string()))?;
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let root = ctx.mihomo_package_root.clone();
+            let installation = tokio::task::spawn_blocking(move || {
+                net_manager_core::managed_mihomo::install_verified_linux_archive(&root, &archive)
+            })
+            .await
+            .map_err(|_| (ErrorCode::Internal, "Mihomo install task failed".into()))?
+            .map_err(|_| {
+                (
+                    ErrorCode::Internal,
+                    "managed Mihomo installation failed".into(),
+                )
+            })?;
+            to_value(&MihomoInstallResult {
+                version: installation.version,
+                created: installation.created,
+            })
+        }
+        #[cfg(target_os = "linux")]
+        method::MIHOMO_REMOVE => {
+            authorize(ctx, peer, Action::SystemNetwork).await?;
+            let root = ctx.mihomo_package_root.clone();
+            let removed =
+                with_core(ctx, move |core| core.remove_mihomo_installation(&root)).await?;
+            to_value(&MihomoRemoveResult { removed })
         }
         #[cfg(target_os = "linux")]
         method::XRAY_INSTALL => {
@@ -1295,6 +1458,9 @@ fn notify<A>(ctx: &ServerContext<A>, uid: u32, owner: String) {
 fn params<T: DeserializeOwned>(value: Value) -> Result<T, Failure> {
     from_value(value).map_err(|err| (ErrorCode::InvalidParams, err.to_string()))
 }
+fn validation_issue_path() -> &'static str {
+    "/profile/configPath"
+}
 
 fn invalid(message: String) -> Failure {
     (ErrorCode::InvalidParams, message)
@@ -1317,10 +1483,22 @@ fn decode_xray_archive(archive_b64: &str) -> io::Result<Vec<u8>> {
         .decode(archive_b64)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed base64 archive"))
 }
+#[cfg(target_os = "linux")]
+fn decode_mihomo_archive(archive_b64: &str) -> io::Result<Vec<u8>> {
+    use base64::Engine;
+    const MAX_B64_LEN: usize = ((24 * 1024 * 1024) / 3 + 1) * 4;
+    if archive_b64.len() > MAX_B64_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed Mihomo archive exceeds the size limit",
+        ));
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(archive_b64)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed base64 archive"))
+}
 
-/// Whether the daemon could execute each trusted tool binary right now —
-/// the same checks the connect paths apply, so this cannot disagree with
-/// a real connect attempt.
+/// Whether the daemon can execute each trusted binary right now.
 #[cfg(target_os = "linux")]
 fn default_tool_presence() -> std::collections::BTreeMap<String, bool> {
     std::collections::BTreeMap::from([
@@ -1331,6 +1509,16 @@ fn default_tool_presence() -> std::collections::BTreeMap<String, bool> {
         (
             net_manager_core::daemon_protocol::tool::OPENVPN.to_string(),
             crate::openvpn_process::trusted_binary().is_ok(),
+        ),
+        (
+            net_manager_core::daemon_protocol::tool::MIHOMO.to_string(),
+            net_manager_core::managed_mihomo::verify_managed_linux_executable(
+                std::path::Path::new(net_manager_core::managed_mihomo::LINUX_MIHOMO_PACKAGE_ROOT),
+                &std::path::Path::new(net_manager_core::managed_mihomo::LINUX_MIHOMO_PACKAGE_ROOT)
+                    .join(net_manager_core::managed_mihomo::LINUX_MIHOMO_VERSION)
+                    .join("mihomo"),
+            )
+            .is_ok(),
         ),
     ])
 }
@@ -2033,6 +2221,88 @@ mod tests {
         assert_eq!(error_code(&reply), "invalidParams", "{reply}");
         assert_eq!(harness.auth_calls(), 0);
     }
+    #[tokio::test]
+    async fn xray_validate_is_read_only_and_secret_safe() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+        let mut config = net_manager_core::xray::generate_share_link_config(
+            "vless://11111111-2222-3333-4444-555555555555@node.test:443?type=raw&security=none",
+            10808,
+        )
+        .unwrap();
+        let accepted = client
+            .call(
+                2,
+                method::XRAY_VALIDATE,
+                json!({
+                    "profileId": "home",
+                    "config": config.to_string()
+                }),
+            )
+            .await;
+        assert_eq!(
+            accepted["result"],
+            json!({"valid": true, "issues": []}),
+            "{accepted}"
+        );
+        let mut without_servers = config.clone();
+        without_servers["dns"] = json!({"hosts": {}});
+        let boundary = client
+            .call(
+                6,
+                method::XRAY_VALIDATE,
+                json!({
+                    "profileId": "home", "config": without_servers.to_string()
+                }),
+            )
+            .await;
+        assert_eq!(boundary["result"]["valid"], true, "{boundary}");
+        config["outbounds"][0]["streamSettings"]["sockopt"] =
+            json!({"SECRET-FIELD": "https://SECRET-TOKEN.invalid"});
+        let rejected = client
+            .call(
+                3,
+                method::XRAY_VALIDATE,
+                json!({
+                    "profileId": "home",
+                    "config": config.to_string()
+                }),
+            )
+            .await;
+        assert_eq!(rejected["result"]["valid"], false, "{rejected}");
+        assert_eq!(
+            rejected["result"]["issues"][0]["path"],
+            "/profile/configPath"
+        );
+        assert_eq!(rejected["result"]["issues"][0]["severity"], "error");
+        assert!(rejected["result"]["issues"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("outbounds[0].streamSettings"));
+        assert!(!rejected.to_string().contains("SECRET-"));
+        let invalid_request = client
+            .call(
+                4,
+                method::XRAY_VALIDATE,
+                json!({"profileId": 99, "config": "secret"}),
+            )
+            .await;
+        assert_eq!(
+            error_code(&invalid_request),
+            "invalidParams",
+            "{invalid_request}"
+        );
+        assert!(!invalid_request.to_string().contains("secret"));
+        assert_eq!(harness.auth_calls(), 0);
+        assert!(harness.ctx.authorizer.actions.lock().unwrap().is_empty());
+        assert!(harness.recorder.ops().is_empty());
+        assert_eq!(
+            client
+                .call(5, method::XRAY_STATUS, json!({"profileId":"home"}))
+                .await["result"]["state"],
+            "stopped"
+        );
+    }
 
     #[tokio::test]
     async fn xray_rejects_custom_root_config_before_authorization_without_echoing_secrets() {
@@ -2053,6 +2323,37 @@ mod tests {
             assert_eq!(error_code(&reply), "invalidParams", "{reply}");
             assert!(!reply.to_string().contains("SECRET-"));
         }
+        assert_eq!(harness.auth_calls(), 0);
+        assert!(harness.recorder.ops().is_empty());
+    }
+
+    #[tokio::test]
+    async fn xray_validation_identifies_transport_location_without_leaking_values() {
+        let harness = Harness::new(AuthDecision::Authorized);
+        let mut client = harness.hello(1000).await;
+        let mut config = net_manager_core::xray::generate_share_link_config(
+            "vless://SECRET-UUID@node.test:443?security=none",
+            10808,
+        )
+        .unwrap();
+        config["outbounds"][0]["streamSettings"]["sockopt"] =
+            json!({"SECRET-FIELD": "https://SECRET-TOKEN.invalid"});
+        let reply = client
+            .call(
+                2,
+                method::XRAY_CONNECT,
+                json!({"profileId":"home","config":config.to_string()}),
+            )
+            .await;
+        assert_eq!(error_code(&reply), "invalidParams");
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("outbounds[0].streamSettings"),
+            "{reply}"
+        );
+        assert!(!reply.to_string().contains("SECRET-"));
         assert_eq!(harness.auth_calls(), 0);
         assert!(harness.recorder.ops().is_empty());
     }
@@ -2486,7 +2787,11 @@ mod tests {
             json!(method::CAPABILITIES
                 .iter()
                 .copied()
-                .chain([feature::XRAY_TUN_IPV6])
+                .chain([
+                    feature::XRAY_TUN_IPV6,
+                    feature::MIHOMO_TUN,
+                    feature::MIHOMO_MANAGED_INSTALL,
+                ])
                 .collect::<Vec<_>>())
         );
         assert!(reply["result"]["tools"].is_object());

@@ -6,6 +6,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::io;
 use std::net::IpAddr;
+mod provider_graph;
 
 pub const MAX_XRAY_CONFIG_BYTES: usize = 512 * 1024;
 
@@ -83,6 +84,42 @@ fn rejected() -> io::Error {
     )
 }
 
+#[derive(Debug)]
+struct TransportValidationFailure {
+    outbound_index: usize,
+    protocol: &'static str,
+}
+
+impl std::fmt::Display for TransportValidationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Unsupported {} transport or socket settings at outbounds[{}].streamSettings. Review this node's settings.",
+            self.protocol, self.outbound_index
+        )
+    }
+}
+
+impl std::error::Error for TransportValidationFailure {}
+
+fn transport_rejected(outbound_index: usize, protocol: &'static str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        TransportValidationFailure {
+            outbound_index,
+            protocol,
+        },
+    )
+}
+
+pub(crate) fn validation_message(error: &io::Error) -> String {
+    error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<TransportValidationFailure>())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unsupported generated Xray TUN config".into())
+}
+
 fn object<'a>(value: &'a Value, allowed: &[&str]) -> io::Result<&'a Map<String, Value>> {
     let map = value.as_object().ok_or_else(rejected)?;
     if map.keys().any(|key| !allowed.contains(&key.as_str())) {
@@ -138,6 +175,8 @@ fn validate_generated(config: &Value) -> io::Result<()> {
             "dns",
             "fakedns",
             "policy",
+            "observatory",
+            "burstObservatory",
         ],
     )?;
     if let Some(log) = root.get("log") {
@@ -201,7 +240,7 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         .get("outbounds")
         .and_then(Value::as_array)
         .ok_or_else(rejected)?;
-    if outbounds.len() < 2 || outbounds.len() > 64 {
+    if outbounds.len() < 2 || outbounds.len() > 512 {
         return Err(rejected());
     }
     // Tags the daemon injects itself; a client-supplied one would collide
@@ -210,10 +249,17 @@ fn validate_generated(config: &Value) -> io::Result<()> {
     let mut tags = HashSet::new();
     let mut proxies = 0usize;
     let mut freedom = false;
-    for outbound in outbounds.iter() {
+    for (outbound_index, outbound) in outbounds.iter().enumerate() {
         let map = object(
             outbound,
-            &["tag", "protocol", "settings", "streamSettings", "mux"],
+            &[
+                "tag",
+                "protocol",
+                "settings",
+                "streamSettings",
+                "mux",
+                "proxySettings",
+            ],
         )?;
         let tag = string(&outbound["tag"])?;
         if !tags.insert(tag.to_string()) {
@@ -232,7 +278,27 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         if let Some(mux) = map.get("mux") {
             validate_mux(mux)?;
         }
+        if let Some(proxy_settings) = map.get("proxySettings") {
+            let settings = object(proxy_settings, &["tag", "transportLayer"])?;
+            string(&settings["tag"])?;
+            if settings
+                .get("transportLayer")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(rejected());
+            }
+        }
         match string(&outbound["protocol"])? {
+            "loopback" => {
+                if map.contains_key("streamSettings")
+                    || map.contains_key("mux")
+                    || map.contains_key("proxySettings")
+                {
+                    return Err(rejected());
+                }
+                let settings = object(&outbound["settings"], &["inboundTag"])?;
+                string(&settings["inboundTag"])?;
+            }
             "vless" => {
                 proxies += 1;
                 let settings = object(&outbound["settings"], &["vnext"])?;
@@ -256,7 +322,8 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                         return Err(rejected());
                     }
                 }
-                validate_vless_stream(&outbound["streamSettings"])?;
+                validate_vless_stream(&outbound["streamSettings"])
+                    .map_err(|_| transport_rejected(outbound_index, "VLESS"))?;
             }
             "hysteria" => {
                 proxies += 1;
@@ -266,7 +333,8 @@ fn validate_generated(config: &Value) -> io::Result<()> {
                 }
                 string(&outbound["settings"]["address"])?;
                 port(&outbound["settings"]["port"])?;
-                validate_hysteria_stream(&outbound["streamSettings"])?;
+                validate_hysteria_stream(&outbound["streamSettings"])
+                    .map_err(|_| transport_rejected(outbound_index, "Hysteria"))?;
             }
             "freedom" => {
                 freedom = true;
@@ -286,23 +354,7 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         &config["routing"],
         &["domainStrategy", "domainMatcher", "rules", "balancers"],
     )?;
-    // The only balancer this daemon runs: `failover`, initially selecting
-    // nothing but the `unavailable` blackhole (the override that pins a
-    // real node is installed by the probe supervisor at runtime).
-    if let Some(balancers) = routing.get("balancers") {
-        let balancers = balancers.as_array().ok_or_else(rejected)?;
-        if balancers.len() != 1 {
-            return Err(rejected());
-        }
-        let balancer = object(&balancers[0], &["tag", "selector"])?;
-        if string(&balancer["tag"])? != "failover" {
-            return Err(rejected());
-        }
-        let selector = balancer["selector"].as_array().ok_or_else(rejected)?;
-        if selector.len() != 1 || selector[0] != "unavailable" {
-            return Err(rejected());
-        }
-    }
+    provider_graph::validate(config)?;
     if let Some(strategy) = routing.get("domainStrategy") {
         if !matches!(
             strategy.as_str(),
@@ -317,7 +369,7 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         }
     }
     let rules = config["routing"]["rules"].as_array().ok_or_else(rejected)?;
-    if rules.len() > 64 {
+    if rules.len() > 512 {
         return Err(rejected());
     }
     for rule in rules {
@@ -349,7 +401,7 @@ fn validate_generated(config: &Value) -> io::Result<()> {
             }
             // The only balancer a generated config may target.
             (None, Some(balancer)) => {
-                if string(balancer)? != "failover" {
+                if string(balancer)? != "failover" && !string(balancer)?.starts_with("src-") {
                     return Err(rejected());
                 }
             }
@@ -419,7 +471,11 @@ fn validate_auxiliary(outbound: &Value, map: &Map<String, Value>) -> io::Result<
         validate_auxiliary_settings(string(&outbound["protocol"]).unwrap_or_default(), settings)?;
     }
     if let Some(stream) = map.get("streamSettings") {
-        validate_auxiliary_stream(stream)?;
+        let interface_allowed = outbound["protocol"] == "freedom"
+            && !outbound["tag"]
+                .as_str()
+                .is_some_and(|tag| tag.starts_with("src-"));
+        validate_auxiliary_stream(stream, interface_allowed)?;
     }
     Ok(())
 }
@@ -633,7 +689,7 @@ fn validate_tcp_settings(tcp: &Value) -> io::Result<()> {
 
 /// `streamSettings.sockopt` — kernel knobs and dialer chaining. `mark` is
 /// written by the daemon itself; callers may set the rest.
-fn validate_sockopt(sockopt: &Value) -> io::Result<()> {
+fn validate_sockopt(sockopt: &Value, interface_allowed: bool) -> io::Result<()> {
     let map = object(
         sockopt,
         &[
@@ -646,15 +702,27 @@ fn validate_sockopt(sockopt: &Value) -> io::Result<()> {
             "tcpKeepAliveIdle",
             "tcpUserTimeout",
             "tcpcongestion",
-            "interface",
             "V6Only",
             "tcpWindowClamp",
             "tcpMptcp",
             "tcpNoDelay",
+            "interface",
         ],
     )?;
     for (key, value) in map {
         match key.as_str() {
+            "interface" => {
+                let name = string(value)?;
+                if !interface_allowed
+                    || name.len() > 15
+                    || name.starts_with('-')
+                    || !name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+                {
+                    return Err(rejected());
+                }
+            }
             "mark" | "tcpKeepAliveInterval" | "tcpKeepAliveIdle" | "tcpWindowClamp" => {
                 value
                     .as_u64()
@@ -826,7 +894,7 @@ fn value_u64(value: &Value) -> io::Result<()> {
 
 /// `streamSettings` on auxiliary outbounds: transport extras only — sockopt
 /// for fwmark/dialer chaining, tcpSettings for masquerade headers.
-fn validate_auxiliary_stream(stream: &Value) -> io::Result<()> {
+fn validate_auxiliary_stream(stream: &Value, interface_allowed: bool) -> io::Result<()> {
     let map = object(stream, &["network", "security", "tcpSettings", "sockopt"])?;
     for key in ["network", "security"] {
         if let Some(value) = map.get(key) {
@@ -837,7 +905,7 @@ fn validate_auxiliary_stream(stream: &Value) -> io::Result<()> {
         validate_tcp_settings(tcp)?;
     }
     if let Some(sockopt) = map.get("sockopt") {
-        validate_sockopt(sockopt)?;
+        validate_sockopt(sockopt, interface_allowed)?;
     }
     Ok(())
 }
@@ -914,7 +982,7 @@ fn validate_vless_stream(stream: &Value) -> io::Result<()> {
         validate_tcp_settings(tcp)?;
     }
     if let Some(sockopt) = map.get("sockopt") {
-        validate_sockopt(sockopt)?;
+        validate_sockopt(sockopt, false)?;
     }
     if !matches!(
         stream["network"].as_str(),
@@ -974,8 +1042,12 @@ fn validate_hysteria_stream(stream: &Value) -> io::Result<()> {
             "tlsSettings",
             "hysteriaSettings",
             "finalmask",
+            "sockopt",
         ],
     )?;
+    if let Some(sockopt) = stream.get("sockopt") {
+        validate_sockopt(sockopt, false)?;
+    }
     if stream["network"] != "hysteria" || stream["security"] != "tls" {
         return Err(rejected());
     }
@@ -1082,6 +1154,12 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         Some(Err(err)) => return Err(err),
         None => None,
     };
+    let has_failover_balancer = config["routing"]["balancers"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["tag"] == "failover"));
+    if has_failover_balancer != failover.is_some() {
+        return Err(rejected());
+    }
     // Upstream host of every proxy outbound: each candidate node needs its
     // own bypass route (the failover target changes at runtime).
     let mut server_hosts: Vec<String> = Vec::new();
@@ -1154,7 +1232,12 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         .as_array()
         .ok_or_else(rejected)?
         .iter()
-        .filter(|outbound| matches!(outbound["protocol"].as_str(), Some("vless" | "hysteria")))
+        .filter(|outbound| {
+            matches!(
+                outbound["protocol"].as_str(),
+                Some("vless" | "hysteria" | "loopback")
+            )
+        })
         .filter_map(|outbound| {
             outbound["tag"]
                 .as_str()?
@@ -1290,7 +1373,7 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
     }
     crate::proxy_exits::inject(&mut config, &proxy_exits, mark)?;
     for outbound in config["outbounds"].as_array_mut().ok_or_else(rejected)? {
-        if outbound["protocol"] != "blackhole" {
+        if outbound["protocol"] != "blackhole" && outbound["protocol"] != "loopback" {
             if outbound["streamSettings"].is_null() {
                 outbound["streamSettings"] = json!({});
             }
@@ -1578,6 +1661,155 @@ mod tests {
         }
     }
 
+    fn scoped_graph() -> Value {
+        let mut config: Value = serde_json::from_str(&params().config).unwrap();
+        let mut first = config["outbounds"][0].clone();
+        first["tag"] = json!("src-proxy-o-0000");
+        let mut second = first.clone();
+        second["tag"] = json!("src-proxy-o-0001");
+        second["settings"]["vnext"][0]["address"] = json!("second.example");
+        config["outbounds"][0] =
+            json!({"tag":"proxy","protocol":"loopback","settings":{"inboundTag":"src-proxy-in"}});
+        config["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .extend([first, second]);
+        config["routing"]["rules"] = json!([{"type":"field","inboundTag":["src-proxy-in"],"balancerTag":"src-proxy-b-0000"}]);
+        config["routing"]["balancers"] = json!([{"tag":"src-proxy-b-0000","selector":["src-proxy-o-0000","src-proxy-o-0001"],"fallbackTag":"src-proxy-o-0001","strategy":{"type":"leastPing"}}]);
+        config["burstObservatory"] = json!({"subjectSelector":["src-proxy-o-0000","src-proxy-o-0001"],"pingConfig":{"destination":"https://www.google.com/generate_204","interval":"30s","timeout":"5s","sampling":2}});
+        config
+    }
+
+    #[test]
+    fn accepts_scoped_provider_balancer_graph() {
+        let config = scoped_graph();
+        assert!(validate_generated(&config).is_ok());
+        let mut request = params();
+        request.config = config.to_string();
+        let plan = prepare_xray(1000, request, 51820).unwrap();
+        assert!(plan.server_hosts.contains(&"example.test".to_owned()));
+        assert!(plan.server_hosts.contains(&"second.example".to_owned()));
+        let running: Value = serde_json::from_str(&plan.config).unwrap();
+        assert_eq!(running["routing"]["rules"][0]["outboundTag"], "api");
+        assert_eq!(
+            running["routing"]["rules"][1]["inboundTag"][0],
+            "src-proxy-in"
+        );
+        assert!(running["outbounds"][0].get("streamSettings").is_none());
+    }
+
+    #[test]
+    fn rejects_scoped_provider_selection_escapes_and_cycles() {
+        let config = scoped_graph();
+        for (pointer, value) in [
+            ("/routing/balancers/0/selector/0", json!("direct")),
+            ("/routing/balancers/0/selector/0", json!("src-proxy-o-")),
+            ("/routing/balancers/0/fallbackTag", json!("direct")),
+            (
+                "/routing/rules/0/inboundTag/0",
+                json!("src-pin-1111111111111111-in"),
+            ),
+            (
+                "/outbounds/3/streamSettings/sockopt",
+                json!({"dialerProxy":"missing"}),
+            ),
+            (
+                "/outbounds/3/streamSettings/sockopt",
+                json!({"dialerProxy":"src-proxy-o-0000"}),
+            ),
+        ] {
+            let mut candidate = config.clone();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            let target = candidate.pointer_mut(parent).unwrap();
+            if target.is_array() {
+                target[key.parse::<usize>().unwrap()] = value;
+            } else {
+                target[key] = value;
+            }
+            assert!(validate_generated(&candidate).is_err(), "{pointer}");
+        }
+        let mut without_fallback = config.clone();
+        without_fallback["routing"]["balancers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("fallbackTag");
+        assert!(validate_generated(&without_fallback).is_err());
+    }
+
+    #[test]
+    fn accepts_scoped_transport_dependency_and_blackhole_fallback() {
+        let mut config = scoped_graph();
+        config["outbounds"].as_array_mut().unwrap().extend([
+            json!({"tag":"src-proxy-o-0002","protocol":"freedom","settings":{"fragment":{"packets":"tlshello","length":"100-200","interval":"10-20"}}}),
+            json!({"tag":"src-proxy-o-0003","protocol":"blackhole"}),
+        ]);
+        config["outbounds"][3]["streamSettings"]["sockopt"] =
+            json!({"dialerProxy":"src-proxy-o-0002"});
+        config["routing"]["balancers"][0]["fallbackTag"] = json!("src-proxy-o-0003");
+        config["routing"]["balancers"][0]["strategy"] =
+            json!({"type":"leastLoad","settings":{"expected":1,"maxRTT":"2s","tolerance":0.1}});
+        assert!(validate_generated(&config).is_ok());
+        config["outbounds"][3]["streamSettings"]["sockopt"]["dialerProxy"] =
+            json!("src-pin-1111111111111111-o-0002");
+        assert!(validate_generated(&config).is_err());
+    }
+
+    #[test]
+    fn nested_balancer_fallback_is_scoped_and_acyclic() {
+        let mut config = scoped_graph();
+        config["outbounds"].as_array_mut().unwrap().push(json!({
+            "tag":"src-proxy-o-0002","protocol":"loopback","settings":{"inboundTag":"src-proxy-in-0002"}
+        }));
+        config["routing"]["balancers"][0]["fallbackTag"] = json!("src-proxy-o-0002");
+        config["routing"]["balancers"].as_array_mut().unwrap().push(json!({
+            "tag":"src-proxy-b-0001","selector":["src-proxy-o-0001"],"fallbackTag":"src-proxy-o-0001","strategy":{"type":"leastPing"}
+        }));
+        config["routing"]["rules"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "type":"field","inboundTag":["src-proxy-in-0002"],"balancerTag":"src-proxy-b-0001"
+            }));
+        config["burstObservatory"]["pingConfig"]["httpMethod"] = json!("GET");
+        assert!(validate_generated(&config).is_ok());
+        config["routing"]["balancers"][1]["fallbackTag"] = json!("src-proxy-o-0002");
+        assert!(validate_generated(&config).is_err());
+    }
+
+    #[test]
+    fn pinned_graph_gets_a_probe_without_bypassing_its_dispatch() {
+        let mut config = scoped_graph();
+        let mut leaf = config["outbounds"][3].clone();
+        leaf["tag"] = json!("src-pin-1111111111111111-o-0000");
+        config["outbounds"].as_array_mut().unwrap().extend([
+            json!({"tag":"pin-1111111111111111","protocol":"loopback","settings":{"inboundTag":"src-pin-1111111111111111-in"}}),
+            leaf,
+        ]);
+        config["routing"]["rules"].as_array_mut().unwrap().extend([
+            json!({"type":"field","inboundTag":["src-pin-1111111111111111-in"],"outboundTag":"src-pin-1111111111111111-o-0000"}),
+            json!({"type":"field","domain":["domain:pinned.test"],"outboundTag":"pin-1111111111111111"}),
+        ]);
+        let mut request = params();
+        request.config = config.to_string();
+        let plan = prepare_xray(1000, request, 51820).unwrap();
+        assert_eq!(plan.pinned_keys, ["1111111111111111"]);
+        let running: Value = serde_json::from_str(&plan.config).unwrap();
+        let rules = running["routing"]["rules"].as_array().unwrap();
+        let dispatch = rules
+            .iter()
+            .position(|r| r["inboundTag"] == json!(["src-pin-1111111111111111-in"]))
+            .unwrap();
+        let pin = rules
+            .iter()
+            .position(|r| r["domain"] == json!(["domain:pinned.test"]))
+            .unwrap();
+        assert!(dispatch < pin);
+        assert!(rules
+            .iter()
+            .any(|r| r["inboundTag"] == json!(["pin-probe-1111111111111111"])
+                && r["outboundTag"] == "pin-1111111111111111"));
+    }
+
     #[test]
     fn address_set_tracks_all_route_families_without_expanding_scope() {
         for destinations in [
@@ -1849,6 +2081,43 @@ mod tests {
     }
 
     #[test]
+    fn generated_hysteria_socket_options_survive_daemon_preparation() {
+        let generated = net_manager_core::xray::generate_share_link_config(
+            "hy2://fixture-password@node.test:443?sni=node.test",
+            10808,
+        )
+        .unwrap();
+        let profile = net_manager_core::models::Profile {
+            xray_sockopts: Some(
+                serde_json::from_value(json!({
+                    "tcpKeepAliveIdle": 30,
+                    "tcpKeepAliveInterval": 10,
+                    "tcpUserTimeout": 20000,
+                    "tcpNoDelay": true
+                }))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let configured = net_manager_core::xray::apply_profile_routing(
+            &generated,
+            &[],
+            &net_manager_core::xray::ProfileRoutingOptions::from(&profile),
+        )
+        .unwrap();
+        let mut input = params();
+        input.config = configured.to_string();
+        let plan = prepare_xray(1000, input, 51820).unwrap();
+        let effective: Value = serde_json::from_str(&plan.config).unwrap();
+        let options = &effective["outbounds"][0]["streamSettings"]["sockopt"];
+        assert_eq!(options["tcpKeepAliveIdle"], 30);
+        assert_eq!(options["tcpKeepAliveInterval"], 10);
+        assert_eq!(options["tcpUserTimeout"], 20000);
+        assert_eq!(options["tcpNoDelay"], true);
+        assert_eq!(options["mark"], 51820);
+    }
+
+    #[test]
     fn routing_selectors_cannot_load_arbitrary_asset_files() {
         let with_rule = |rule: Value| {
             let mut config: Value = serde_json::from_str(&params().config).unwrap();
@@ -2058,6 +2327,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plan_accepts_missing_dns_section_without_panicking() {
+        let mut input = params();
+        let mut config: Value = serde_json::from_str(&input.config).unwrap();
+        config.as_object_mut().unwrap().remove("dns");
+        input.config = config.to_string();
+        assert!(prepare_xray(1000, input, 51820).is_ok());
+    }
+
+    #[test]
+    fn plan_accepts_dns_section_without_servers() {
+        let mut input = params();
+        let mut config: Value = serde_json::from_str(&input.config).unwrap();
+        config["dns"] = json!({"hosts": {}});
+        input.config = config.to_string();
+        assert!(prepare_xray(1000, input, 51820).is_ok());
+    }
     #[test]
     fn plan_rejects_malformed_dns_sections() {
         let with_dns = |dns: Value| {

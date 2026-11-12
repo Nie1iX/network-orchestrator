@@ -73,7 +73,8 @@ pub fn start_eligibility(
 ) -> StartEligibility {
     let mode_blocked = !mode.allows_start(backend);
     let loopback = backend == TunnelBackend::Xray && xray_mode == XrayMode::Socks;
-    let can_try_start = !mode_blocked && availability.proxy_connections;
+    let can_try_start =
+        backend != TunnelBackend::Mihomo && !mode_blocked && availability.proxy_connections;
     StartEligibility {
         can_start: can_try_start && (loopback || availability.helper_serves),
         can_try_start,
@@ -104,6 +105,9 @@ pub fn ensure_start_allowed_for_user(
 }
 
 fn check_start_mode(mode: AppMode, backend: TunnelBackend) -> Result<(), String> {
+    if backend == TunnelBackend::Mihomo {
+        return Err("Mihomo is only supported on Linux".into());
+    }
     if mode.allows_start(backend) {
         Ok(())
     } else {
@@ -551,6 +555,23 @@ mod tests {
         assert!(SettingsStore::new(dir.path().join("../escape"))
             .load()
             .is_err());
+    }
+
+    #[test]
+    fn mihomo_is_not_available_on_native_macos() {
+        let eligibility = start_eligibility(
+            AppMode::Combined,
+            TunnelBackend::Mihomo,
+            XrayMode::Socks,
+            StartAvailability {
+                proxy_connections: true,
+                helper_serves: true,
+            },
+        );
+        assert!(!eligibility.can_start && !eligibility.can_try_start);
+        assert!(check_start_mode(AppMode::Combined, TunnelBackend::Mihomo)
+            .unwrap_err()
+            .contains("only supported on Linux"));
     }
 
     #[test]

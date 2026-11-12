@@ -153,9 +153,113 @@ pub fn openvpn_credentials_path(
     Ok(profile_dir.join("openvpn-credentials.json"))
 }
 
+pub fn read_mihomo_source(
+    vault: &net_manager_core::config_vault::ConfigVault,
+    profile: &Profile,
+) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    if profile.backend != TunnelBackend::Mihomo
+        || !vault.is_managed_profile_path(&profile.id, &profile.config_path)
+    {
+        return Err("Mihomo requires its own managed configuration".into());
+    }
+    let revision = profile
+        .config_path
+        .parent()
+        .ok_or("Invalid managed Mihomo directory")?;
+    let profile_directory = revision
+        .parent()
+        .ok_or("Invalid managed Mihomo directory")?;
+    for directory in [vault.root(), profile_directory, revision] {
+        let metadata = std::fs::symlink_metadata(directory)
+            .map_err(|_| "Cannot inspect managed Mihomo directory")?;
+        if !metadata.file_type().is_dir() {
+            return Err("Invalid managed Mihomo directory".into());
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&profile.config_path)
+        .map_err(|_| "Cannot read managed Mihomo configuration")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "Cannot inspect managed Mihomo configuration")?;
+    let limit = net_manager_core::mihomo::MAX_CONFIG_BYTES;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > limit as u64
+    {
+        return Err("Managed Mihomo configuration is not private or exceeds the size limit".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Cannot read managed Mihomo configuration")?;
+    if bytes.len() > limit {
+        return Err("Managed Mihomo configuration exceeds the size limit".into());
+    }
+    net_manager_core::mihomo::parse_config(&bytes).map_err(|error| error.to_string())
+}
+
+pub fn prepare_linux_mihomo_params(
+    vault: &net_manager_core::config_vault::ConfigVault,
+    profile: &Profile,
+) -> Result<net_manager_core::daemon_protocol::MihomoConnectParams, String> {
+    let source = read_mihomo_source(vault, profile)?;
+    let mut routes = profile.effective_routes();
+    let default_route = profile.tunnel_role == TunnelRole::Primary && routes.is_empty();
+    if default_route {
+        routes = ["0.0.0.0/0", "::/0"]
+            .into_iter()
+            .map(|destination| PolicyRoute {
+                destination: destination.parse().expect("constant network"),
+                metric: 5,
+                via: None,
+            })
+            .collect();
+    }
+    net_manager_core::models::validate_secondary(
+        profile.tunnel_role,
+        &routes,
+        &profile.tunnel_dns_domains,
+    )
+    .map_err(str::to_owned)?;
+    let config = net_manager_core::mihomo::compile_config(&source, profile)
+        .map_err(|error| error.to_string())?;
+    Ok(net_manager_core::daemon_protocol::MihomoConnectParams {
+        profile_id: profile.id.clone(),
+        config: serde_json::to_string(&config).map_err(|_| "Cannot encode Mihomo configuration")?,
+        routes,
+        dns_servers: if default_route {
+            vec!["1.1.1.1".parse().expect("constant address")]
+        } else {
+            Vec::new()
+        },
+        dns_domains: profile.tunnel_dns_domains.clone(),
+        interface_name: link_name_hint(profile),
+        role: profile.tunnel_role,
+        group_selections: profile
+            .mihomo
+            .as_ref()
+            .map(|options| options.group_selections.clone())
+            .unwrap_or_default(),
+    })
+}
+
 pub fn prepare_linux_xray_tun_params(
     vault: &net_manager_core::config_vault::ConfigVault,
     profile: &Profile,
+) -> Result<XrayConnectParams, String> {
+    prepare_linux_xray_tun_params_with_base(vault, profile, None)
+}
+
+pub(crate) fn prepare_linux_xray_tun_params_with_base(
+    vault: &net_manager_core::config_vault::ConfigVault,
+    profile: &Profile,
+    override_base: Option<&serde_json::Value>,
 ) -> Result<XrayConnectParams, String> {
     if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Tun {
         return Err("profile is not an Xray TUN profile".into());
@@ -182,11 +286,11 @@ pub fn prepare_linux_xray_tun_params(
     let raw =
         net_manager_core::config_security::read_xray_config(&profile.config_path, &profile.id)
             .map_err(|_| "cannot read managed Xray config".to_string())?;
-    let base: serde_json::Value =
+    let stored_base: serde_json::Value =
         serde_json::from_slice(&raw).map_err(|_| "managed Xray config is invalid".to_string())?;
-    // Subscription panels that serve whole Xray configs carry sections the
-    // daemon does not run; reduce them to the server itself.
-    let base = net_manager_core::xray::tun_compatible_config(&base).map_err(str::to_string)?;
+    let base = override_base.unwrap_or(&stored_base);
+    // Normalize provider selection graphs while keeping profile routing authoritative.
+    let base = net_manager_core::xray::tun_compatible_config(base).map_err(str::to_string)?;
     let inbounds = base["inbounds"]
         .as_array()
         .ok_or_else(|| "unsupported Xray TUN config".to_string())?;
@@ -331,14 +435,14 @@ fn build_multinode(
     String,
 > {
     use net_manager_core::daemon_protocol::{XrayFailoverNode, XrayFailoverParams};
-    use net_manager_core::xray::{multinode_outbound, PinnedOutbound};
+    use net_manager_core::xray::{multinode_endpoint, PinnedOutbound};
 
     let (nodes, pinned) = net_manager_core::subscription::failover_plan(vault, profile)
         .map_err(|_| "The subscription's failover endpoints could not be resolved".to_string())?;
-    let primary_url = nodes[0].url.clone();
-    let primary_key = net_manager_core::subscription::endpoint_key(&primary_url);
+    let primary_url = &nodes[0].url;
+    let primary_key = nodes[0].id.clone();
     let mut primary_config = net_manager_core::xray::tun_compatible_config(
-        &net_manager_core::xray::generate_share_link_config(&primary_url, 1)
+        &net_manager_core::xray::generate_share_link_config(primary_url, 1)
             .map_err(|_| "The selected endpoint is invalid".to_string())?,
     )
     .map_err(str::to_string)?;
@@ -349,12 +453,12 @@ fn build_multinode(
     )
     .map_err(|_| "invalid Xray routing rules".to_string())?;
     let mut backups = Vec::new();
-    for node in &nodes[1..] {
-        let key = net_manager_core::subscription::endpoint_key(&node.url);
+    for (index, node) in nodes[1..].iter().enumerate() {
+        let key = node.id.clone();
         backups.push((
             key.clone(),
-            multinode_outbound(&node.url, &net_manager_core::xray::node_tag(&key))
-                .map_err(|_| "A backup endpoint is invalid".to_string())?,
+            multinode_endpoint(&node.url, &net_manager_core::xray::node_tag(&key))
+                .map_err(|error| format!("Backup {} ({key}) is invalid: {error}", index + 1))?,
         ));
     }
     let mut pinned_outbounds = Vec::new();
@@ -371,8 +475,10 @@ fn build_multinode(
                 });
             match endpoint {
                 Some(url) => Some(
-                    multinode_outbound(&url, &net_manager_core::xray::pin_tag(&route.endpoint_key))
-                        .map_err(|_| "A pinned endpoint is invalid".to_string())?,
+                    multinode_endpoint(&url, &net_manager_core::xray::pin_tag(&route.endpoint_key))
+                        .map_err(|error| {
+                            format!("Pinned endpoint {} is invalid: {error}", route.endpoint_key)
+                        })?,
                 ),
                 // Resolution disagreed with the plan — fail closed.
                 None => None,
@@ -391,14 +497,12 @@ fn build_multinode(
                 .map_err(|_| "cannot read subscription endpoints".to_string())?;
             let outbound = endpoints
                 .iter()
-                .find(|endpoint| {
-                    net_manager_core::subscription::endpoint_key(&endpoint.url) == *key
-                })
+                .find(|endpoint| endpoint.id == *key)
                 .map(|endpoint| {
-                    multinode_outbound(&endpoint.url, &net_manager_core::xray::pin_tag(key))
+                    multinode_endpoint(&endpoint.url, &net_manager_core::xray::pin_tag(key))
                 })
                 .transpose()
-                .map_err(|_| "The DNS endpoint is invalid".to_string())?;
+                .map_err(|error| format!("DNS endpoint {key} is invalid: {error}"))?;
             pinned_outbounds.push(PinnedOutbound {
                 key: key.clone(),
                 outbound,
@@ -412,7 +516,7 @@ fn build_multinode(
         &backups,
         &pinned_outbounds,
     )
-    .map_err(|_| "cannot encode the multinode Xray config".to_string())?;
+    .map_err(|error| format!("cannot compose the multinode Xray config: {error}"))?;
     if let Some(sockopts) = &profile.xray_sockopts {
         for outbound in config["outbounds"]
             .as_array_mut()
@@ -432,7 +536,7 @@ fn build_multinode(
         nodes: nodes
             .iter()
             .map(|node| XrayFailoverNode {
-                key: net_manager_core::subscription::endpoint_key(&node.url),
+                key: node.id.clone(),
             })
             .collect(),
         primary_key,
@@ -470,7 +574,11 @@ pub fn linux_xray_tunnel_status(status: XrayStatusResult, profile: &Profile) -> 
     let mut notices = Vec::new();
     if status.state == TunnelState::Running && profile.routes.is_empty() {
         if !status.dns_applied {
-            notices.push("Xray TUN DNS was not applied");
+            notices.push(if profile.backend == TunnelBackend::Mihomo {
+                "Mihomo TUN DNS was not applied"
+            } else {
+                "Xray TUN DNS was not applied"
+            });
         }
         if !status.ipv4_covered {
             notices.push("IPv4 is not covered by this tunnel");
@@ -479,7 +587,11 @@ pub fn linux_xray_tunnel_status(status: XrayStatusResult, profile: &Profile) -> 
             notices.push("IPv6 is not covered by this tunnel");
         }
     } else if status.state == TunnelState::Failed {
-        notices.push("Xray TUN failed in network daemon");
+        notices.push(if profile.backend == TunnelBackend::Mihomo {
+            "Mihomo TUN failed in network daemon"
+        } else {
+            "Xray TUN failed in network daemon"
+        });
     }
     TunnelStatus {
         profile_id: status.profile_id,
@@ -753,6 +865,88 @@ pub fn linux_wireguard_tunnel_status(status: WireGuardStatusResult) -> TunnelSta
 mod tests {
     use super::*;
     use net_manager_core::config_vault::ConfigVault;
+
+    #[test]
+    fn mihomo_prepare_rejects_a_source_outside_its_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let profile = Profile {
+            id: "native".into(),
+            backend: TunnelBackend::Mihomo,
+            config_path: dir.path().join("provider.yaml"),
+            ..Profile::default()
+        };
+        assert!(prepare_linux_mihomo_params(&vault, &profile).is_err());
+    }
+
+    #[test]
+    fn mihomo_failed_status_names_the_correct_backend() {
+        let status: XrayStatusResult = serde_json::from_value(serde_json::json!({
+            "profileId":"native","state":"failed","interfaceName":null,
+            "dnsApplied":false,"ipv4Covered":false,"ipv6Covered":false
+        }))
+        .unwrap();
+        let profile = Profile {
+            backend: TunnelBackend::Mihomo,
+            ..Profile::default()
+        };
+        let message = linux_xray_tunnel_status(status, &profile).message.unwrap();
+        assert!(message.contains("Mihomo"));
+        assert!(!message.contains("Xray"));
+    }
+
+    #[test]
+    fn mihomo_source_rejects_symlinked_revision() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let foreign = dir.path().join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("config.json"), b"{}").unwrap();
+        std::fs::set_permissions(
+            foreign.join("config.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let profile_dir = vault.root().join("native");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        symlink(&foreign, profile_dir.join("rev-one")).unwrap();
+        let profile = Profile {
+            id: "native".into(),
+            backend: TunnelBackend::Mihomo,
+            config_path: profile_dir.join("rev-one/config.json"),
+            ..Profile::default()
+        };
+        assert!(read_mihomo_source(&vault, &profile)
+            .unwrap_err()
+            .contains("directory"));
+    }
+
+    #[test]
+    fn mihomo_tun_prepares_default_routes_without_changing_native_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let source = br#"{"proxies":[],"proxy-groups":[{"name":"Available","type":"select","proxies":["DIRECT"]}],"rules":["MATCH,Available"]}"#;
+        let imported = vault.store_mihomo_source("native", source).unwrap();
+        let profile = Profile {
+            id: "native".into(),
+            name: "Native".into(),
+            backend: TunnelBackend::Mihomo,
+            config_path: imported.config_path.clone(),
+            ..Profile::default()
+        };
+        let prepared = prepare_linux_mihomo_params(&vault, &profile).unwrap();
+        assert_eq!(prepared.routes.len(), 2);
+        assert!(prepared
+            .routes
+            .iter()
+            .any(|route| route.destination.to_string() == "0.0.0.0/0"));
+        assert!(prepared
+            .routes
+            .iter()
+            .any(|route| route.destination.to_string() == "::/0"));
+        assert_eq!(std::fs::read(imported.config_path).unwrap(), source);
+    }
     use net_manager_core::profile_import::import_share_link;
     use net_manager_core::profiles::ProfileStore;
 
@@ -773,6 +967,62 @@ mod tests {
         let mut profile = store.load().unwrap().profiles.remove(0);
         profile.xray_mode = XrayMode::Tun;
         (directory, vault, profile)
+    }
+
+    #[test]
+    fn reference_errors_identify_the_record_without_exposing_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(directory.path().join("configs"));
+        let store = ProfileStore::new(directory.path().join("profiles.json"));
+        net_manager_core::subscription::import_body(
+            &vault,
+            &store,
+            &net_manager_core::subscription::SubscriptionImport {
+                id: "subscription",
+                url: "https://example.test/list",
+                hwid: "device",
+                name: "Example",
+                refresh_interval_minutes: None,
+            },
+            "vless://one@first.test:443?security=none#First\nvless://two@second.test:443?security=none#Second",
+            net_manager_core::subscription::ResponseMeta::default(),
+            XrayMode::Tun,
+            |_| true,
+        ).unwrap();
+        let mut endpoints = vault.read_subscription_endpoints("subscription").unwrap();
+        let id = endpoints[1].id.clone();
+        endpoints[1].url = "unsupported://private-secret".into();
+        vault
+            .store_subscription_endpoints("subscription", &endpoints)
+            .unwrap();
+        let profile = store.load().unwrap().profiles.remove(0);
+        for role in ["Backup", "Pinned", "DNS"] {
+            let mut candidate = profile.clone();
+            match role {
+                "Backup" => {
+                    candidate
+                        .subscription
+                        .as_mut()
+                        .unwrap()
+                        .backup_keys
+                        .push(EndpointRef {
+                            key: id.clone(),
+                            name: "Second".into(),
+                        })
+                }
+                "Pinned" => candidate.pinned_policies.push(PinnedRoute {
+                    endpoint_key: id.clone(),
+                    selectors: vec!["domain:example.test".into()],
+                    missing: false,
+                }),
+                "DNS" => candidate.xray_dns.outbound_key = Some(id.clone()),
+                _ => unreachable!(),
+            }
+            let error = build_multinode(&vault, &candidate).unwrap_err();
+            assert!(error.contains(&id), "{role}: {error}");
+            assert!(error.contains(role), "{role}: {error}");
+            assert!(!error.contains("private-secret"), "{role}");
+        }
     }
 
     fn route(destination: &str) -> PolicyRoute {

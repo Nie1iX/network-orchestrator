@@ -35,7 +35,7 @@ pub fn bindings(exits: &[NamedProxyExit], config: &Value) -> io::Result<Vec<Prox
                 .ok_or_else(rejected)?;
             if !matches!(
                 outbound["protocol"].as_str(),
-                Some("vless" | "hysteria" | "blackhole")
+                Some("vless" | "hysteria" | "blackhole" | "loopback")
             ) || !outbound["proxySettings"].is_null()
                 || !outbound["streamSettings"]["sockopt"]["dialerProxy"].is_null()
             {
@@ -113,10 +113,24 @@ pub fn inject(config: &mut Value, exits: &[ProxyExitBinding], mark: u32) -> io::
         }
         forced_rules.push(rule);
     }
-    config["routing"]["rules"]
+    let rules = config["routing"]["rules"]
         .as_array_mut()
-        .ok_or_else(rejected)?
-        .splice(0..0, forced_rules);
+        .ok_or_else(rejected)?;
+    let prefix = rules
+        .iter()
+        .take_while(|rule| {
+            rule["inboundTag"].as_array().is_some_and(|tags| {
+                tags.len() == 1
+                    && tags[0].as_str().is_some_and(|tag| {
+                        tag == "api-in"
+                            || tag.starts_with("probe-")
+                            || tag.starts_with("pin-probe-")
+                            || tag.starts_with("src-")
+                    })
+            })
+        })
+        .count();
+    rules.splice(prefix..prefix, forced_rules);
     if !balancers.is_empty() {
         let routing = config["routing"].as_object_mut().ok_or_else(rejected)?;
         routing

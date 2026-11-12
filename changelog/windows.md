@@ -12,8 +12,12 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ### Fixed
 
+- Keep profile connection failures visible through background refresh and selection
+  changes, with dismiss, edit and diagnose actions.
 - Keep the Routing editor usable when serialized DNS settings omit empty server
   or host collections instead of crashing the application window.
+- Consume persistent subscription record IDs instead of deriving endpoint references
+  from server addresses; ambiguous legacy aliases require explicit selection.
 
 ## [0.10.5] - 2026-11-09
 

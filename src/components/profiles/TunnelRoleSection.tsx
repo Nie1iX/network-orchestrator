@@ -17,7 +17,8 @@ export function supportsRole(profile: Profile): boolean {
   return (
     profile.backend === "wireGuard" ||
     profile.backend === "openVpn" ||
-    (profile.backend === "xray" && profile.xrayMode === "tun")
+    (profile.backend === "xray" && profile.xrayMode === "tun") ||
+    (profile.backend === "mihomo" && (profile.mihomo?.mode ?? "tun") === "tun")
   );
 }
 

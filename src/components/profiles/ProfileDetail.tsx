@@ -10,7 +10,7 @@ import {
   SpinnerIcon,
 } from "../../icons";
 import { formatBytes } from "../../format";
-import { TranslationKey, useT } from "../../i18n";
+import { tr, TranslationKey, useT } from "../../i18n";
 import { providerPrefix } from "../../subscriptions";
 import {
   AlwaysOnKind,
@@ -79,6 +79,8 @@ function delayClass(
 interface ProfileDetailProps {
   profile: Profile;
   status: TunnelStatus;
+  connectionFailure: string | null;
+  onDismissConnectionFailure: () => void;
   rate: { rxRate: number; txRate: number } | null;
   isBusy: boolean;
   backendLabel: string;
@@ -99,6 +101,7 @@ interface ProfileDetailProps {
   onConnect: () => void;
   onDisconnect: () => void;
   onEdit: () => void;
+  onOpenDocument: () => void;
   onMoveUp: () => void;
   onMoveDown: () => void;
   onToggleAlwaysOn: (kind: AlwaysOnKind, enrolled: boolean) => void;
@@ -125,6 +128,8 @@ interface ProfileDetailProps {
 export default function ProfileDetail({
   profile,
   status,
+  connectionFailure,
+  onDismissConnectionFailure,
   rate,
   isBusy: profileBusy,
   backendLabel,
@@ -145,6 +150,7 @@ export default function ProfileDetail({
   onConnect,
   onDisconnect,
   onEdit,
+  onOpenDocument,
   onMoveUp,
   onMoveDown,
   onToggleAlwaysOn,
@@ -376,7 +382,7 @@ export default function ProfileDetail({
                   },
                 ]
               : []),
-            ...(profile.subscription && endpoints
+            ...((profile.subscription && endpoints) || profile.backend === "mihomo"
               ? [
                   {
                     label: refreshingSubscription
@@ -407,6 +413,25 @@ export default function ProfileDetail({
       </div>
 
       <div className="profile-detail-body">
+        {os === "linux" && <button type="button" className="btn-sm profile-document-entry" onClick={onOpenDocument} disabled={isBusy}>{tr("Nodes / JSON")}</button>}
+        {connectionFailure && (
+          <div className="save-notice" role="alert">
+            <div className="diagnostics-head">
+              <span>{connectionFailure}</span>
+              <button type="button" onClick={onDismissConnectionFailure}>
+                {t("common.dismiss")}
+              </button>
+            </div>
+            <div className="diagnostics-head">
+              <button type="button" onClick={onEdit}>
+                {t("common.edit")}
+              </button>
+              <button type="button" onClick={onDiagnose} disabled={diagBusy}>
+                {t("profiles.diagnose")}
+              </button>
+            </div>
+          </div>
+        )}
         <div className="interface-row">
           <span className="row-label">{t("detail.backend")}</span>
           <span className="row-value">{backendLabel}</span>
@@ -511,6 +536,12 @@ export default function ProfileDetail({
               </span>
             </div>
           )}
+        {profile.backend === "mihomo" && profile.mihomo?.mixedPort != null && (
+          <div className="interface-row">
+            <span className="row-label">{tr("Mixed proxy")}</span>
+            <span className="row-value mono">127.0.0.1:{profile.mihomo.mixedPort}</span>
+          </div>
+        )}
         {profile.backend === "xray" &&
           profile.xrayMode === "socks" &&
           profile.xraySocksPort !== null &&

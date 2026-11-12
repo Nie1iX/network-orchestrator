@@ -41,6 +41,14 @@ fn owner_key(profile: &Profile) -> Option<String> {
             Some(format!("xray:{}", profile.id))
         }
         TunnelBackend::Xray => None,
+        TunnelBackend::Mihomo
+            if profile.mihomo.as_ref().is_none_or(|options| {
+                options.mode == net_manager_core::models::MihomoMode::Tun
+            }) =>
+        {
+            Some(format!("mihomo:{}", profile.id))
+        }
+        TunnelBackend::Mihomo => None,
     }
 }
 

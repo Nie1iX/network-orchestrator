@@ -18,6 +18,31 @@ use std::net::IpAddr;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 pub const PROTOCOL_VERSION: u32 = 1;
+
+#[cfg(test)]
+mod mihomo_wire_tests {
+    use super::*;
+
+    #[test]
+    fn connect_debug_redacts_native_configuration() {
+        let params = MihomoConnectParams {
+            profile_id: "p".into(),
+            config: "secret-credential".into(),
+            routes: vec![],
+            dns_servers: vec![],
+            dns_domains: vec![],
+            interface_name: None,
+            role: TunnelRole::default(),
+            group_selections: Default::default(),
+        };
+        assert!(!format!("{params:?}").contains("secret-credential"));
+        assert_eq!(
+            serde_json::from_str::<MihomoConnectParams>(&serde_json::to_string(&params).unwrap())
+                .unwrap(),
+            params
+        );
+    }
+}
 pub const DEFAULT_SOCKET_PATH: &str = "/run/network-orchestrator/daemon.sock";
 pub const SOCKET_ENV: &str = "NETWORK_ORCHESTRATOR_SOCKET";
 /// Socket of the macOS launchd helper.
@@ -50,6 +75,7 @@ pub mod method {
     pub const OPENVPN_STATUS: &str = "openvpn.status";
     pub const OPENVPN_PROBE: &str = "openvpn.probe";
     pub const OPENVPN_PLAN: &str = "openvpn.plan";
+    pub const XRAY_VALIDATE: &str = "xray.validate";
     pub const XRAY_CONNECT: &str = "xray.connect";
     pub const XRAY_DISCONNECT: &str = "xray.disconnect";
     pub const XRAY_STATUS: &str = "xray.status";
@@ -58,6 +84,12 @@ pub mod method {
     pub const XRAY_PROXY_EXITS: &str = "xray.proxyExits";
     pub const XRAY_INSTALL: &str = "xray.install";
     pub const XRAY_REMOVE: &str = "xray.remove";
+    pub const MIHOMO_CONNECT: &str = "mihomo.connect";
+    pub const MIHOMO_DISCONNECT: &str = "mihomo.disconnect";
+    pub const MIHOMO_STATUS: &str = "mihomo.status";
+    pub const MIHOMO_VALIDATE: &str = "mihomo.validate";
+    pub const MIHOMO_INSTALL: &str = "mihomo.install";
+    pub const MIHOMO_REMOVE: &str = "mihomo.remove";
     pub const TAILSCALE_STATUS: &str = "tailscale.status";
     pub const TAILSCALE_UP: &str = "tailscale.up";
     pub const TAILSCALE_DOWN: &str = "tailscale.down";
@@ -107,6 +139,7 @@ pub mod method {
         OPENVPN_STATUS,
         OPENVPN_PROBE,
         OPENVPN_PLAN,
+        XRAY_VALIDATE,
         XRAY_CONNECT,
         XRAY_DISCONNECT,
         XRAY_STATUS,
@@ -152,6 +185,8 @@ pub mod feature {
     /// Linux Xray TUN owns both families' link addresses, routes and DNS.
     /// Not part of the shared method list or the macOS helper's capabilities.
     pub const XRAY_TUN_IPV6: &str = "xray.tun.ipv6";
+    pub const MIHOMO_TUN: &str = "mihomo.tun";
+    pub const MIHOMO_MANAGED_INSTALL: &str = "mihomo.managedInstall";
 }
 
 /// Tool names reported in `HelloResult::tools`. A `false` value means the
@@ -161,6 +196,7 @@ pub mod feature {
 pub mod tool {
     pub const WIREGUARD: &str = "wireguard";
     pub const OPENVPN: &str = "openvpn";
+    pub const MIHOMO: &str = "mihomo";
 }
 
 /// When connecting a VPN profile asks for an administrator password. Chosen
@@ -1151,6 +1187,65 @@ pub struct OpenVpnPlanResult {
     pub conflicts: Vec<OpenVpnPlanConflict>,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MihomoConnectParams {
+    pub profile_id: String,
+    pub config: String,
+    #[serde(default)]
+    pub routes: Vec<PolicyRoute>,
+    #[serde(default)]
+    pub dns_servers: Vec<IpAddr>,
+    #[serde(default)]
+    pub dns_domains: Vec<String>,
+    #[serde(default)]
+    pub interface_name: Option<String>,
+    #[serde(default)]
+    pub role: TunnelRole,
+    #[serde(default)]
+    pub group_selections: std::collections::BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for MihomoConnectParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MihomoConnectParams")
+            .field("profile_id", &self.profile_id)
+            .field("config", &"[REDACTED]")
+            .field("routes", &self.routes)
+            .field("dns_servers", &self.dns_servers)
+            .field("dns_domains", &self.dns_domains)
+            .field("interface_name", &self.interface_name)
+            .field("role", &self.role)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MihomoProfileParams {
+    pub profile_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MihomoInstallParams {
+    pub archive_b64: String,
+}
+
+impl std::fmt::Debug for MihomoInstallParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MihomoInstallParams")
+            .field("archive_b64", &"[REDACTED]")
+            .finish()
+    }
+}
+
+pub type MihomoInstallResult = XrayInstallResult;
+pub type MihomoRemoveResult = XrayRemoveResult;
+pub type MihomoStatusResult = XrayStatusResult;
+pub type MihomoConnectResult = XrayConnectResult;
+pub type MihomoDisconnectResult = XrayDisconnectResult;
+
 /// Managed generated Xray JSON from the app's vault; never a user path.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1219,7 +1314,7 @@ pub struct XrayServiceChecksParams {
 }
 
 /// One ordered failover candidate; `key` is the stable subscription
-/// endpoint key ([`crate::subscription::endpoint_key`], 16 lowercase hex)
+/// endpoint ID (16 lowercase hex)
 /// and doubles as the suffix of the config's `node-<key>` outbound tag.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1698,6 +1793,7 @@ pub enum OwnedResource {
     WireGuardLink(WireGuardLinkResource),
     OpenVpnProcess(OpenVpnProcessResource),
     XrayProcess(XrayProcessResource),
+    MihomoProcess(MihomoProcessResource),
     Address(WireGuardAddressResource),
     Rule(OwnedRuleResource),
     Dns(WireGuardDnsResource),
@@ -1787,6 +1883,18 @@ pub struct OpenVpnProcessResource {
     pub owner_marker: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_mark: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<WireGuardFullResource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MihomoProcessResource {
+    pub name: String,
+    #[serde(default)]
+    pub index: u32,
+    pub owner_marker: String,
+    pub transport_mark: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full: Option<WireGuardFullResource>,
 }

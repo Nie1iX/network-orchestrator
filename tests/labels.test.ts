@@ -17,6 +17,7 @@ const MAPS = {
 
 test("label maps cover every enum value exactly once", () => {
   assert.deepEqual(Object.keys(BACKEND_LABEL_KEYS).sort(), [
+    "mihomo",
     "none",
     "openVpn",
     "wireGuard",

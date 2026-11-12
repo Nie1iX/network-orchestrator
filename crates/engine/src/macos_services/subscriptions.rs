@@ -180,28 +180,11 @@ impl<R: BusinessRuntime> MacosServices<R> {
         &self,
         id: &str,
     ) -> Result<Vec<SubscriptionEndpointInfo>, String> {
-        let meta = self
-            .profile(id)?
-            .subscription
-            .ok_or("Profile is not a subscription")?;
-        Ok(self
-            .vault()
-            .read_subscription_endpoints(id)
-            .map_err(store_error)?
-            .into_iter()
-            .enumerate()
-            .map(|(index, endpoint)| SubscriptionEndpointInfo {
-                protocol: net_manager_core::xray::endpoint_protocol(&endpoint.url),
-                key: subscription::endpoint_key(&endpoint.url),
-                is_backup: false,
-                is_missing: false,
-                in_pool: false,
-                name: endpoint.name,
-                active: index == meta.active_index,
-            })
-            .collect())
+        self.profile(id)?;
+        subscription::list_endpoints(&self.vault(), &self.store(), id).map_err(store_error)
     }
     pub fn switch_subscription_endpoint(&self, id: &str, index: usize) -> Result<Profile, String> {
+        self.profile(id)?;
         self.runtime
             .restart_around(&self.root, &self.store(), id, || {
                 subscription::switch_endpoint(
@@ -220,6 +203,7 @@ impl<R: BusinessRuntime> MacosServices<R> {
         id: &str,
         minutes: Option<u32>,
     ) -> Result<Profile, String> {
+        self.profile(id)?;
         self.locked(|| {
             subscription::set_refresh_interval(&self.store(), id, minutes, unix_now())
                 .map_err(subscription_error)?;

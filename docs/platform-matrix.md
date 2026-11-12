@@ -27,12 +27,13 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 
 | Feature | Windows | Linux | macOS | Notes |
 |---|---|---|---|---|
-| Several tunnels at once (primary + secondary by network) | — | ✅ WireGuard, OpenVPN, Xray TUN (daemon-enforced; split DNS via systemd-resolved) | ✅ Xray, WireGuard, OpenVPN | macOS: one primary connection, secondary ones carry only listed networks — `docs/plans/2026-10-14-18-macos-multi-tunnel.md` |
+| Several tunnels at once (primary + secondary by network) | — | ✅ WireGuard, OpenVPN, Xray TUN, Mihomo TUN (daemon-enforced; split DNS via systemd-resolved) | ✅ Xray, WireGuard, OpenVPN | macOS: one primary connection, secondary ones carry only listed networks — `docs/plans/2026-10-14-18-macos-multi-tunnel.md` |
 | NetBird | — | ✅ via the user's own daemon (unverified against a live daemon) | ✅ via the user's own daemon | `net_manager_core::netbird` shared by both clients; Linux: Profiles → Services row; macOS: status/up/down through the NetBird CLI, SSO or setup key — `docs/plans/2026-10-14-18-macos-multi-tunnel.md` |
 | WireGuard profile | ✅ | ✅ | ✅ helper, arm64 | Win: embedded tunnel lib + service install; Linux: `wireguard-tools` + daemon; macOS: userspace engine (`boringtun`) inside the privileged helper — `docs/plans/2026-10-14-17-macos-wireguard-openvpn.md` |
 | OpenVPN profile | ✅ | ✅ | ✅ helper, arm64 | Win/Linux as before; macOS: pinned self-contained OpenVPN from the app bundle run by the helper, routes/DNS installed by the helper, credentials in the Keychain |
 | Xray — SOCKS mode | ✅ | ✅ | ✅ native, arm64 | macOS: the shared unprivileged Engine runtime owner runs managed Xray for both GUI and CLI |
 | Xray — TUN mode | ✅ manual | ✅ managed | ✅ helper, arm64 | Win: user sets iface name/IP; Linux: daemon generates config (`xrayMode: "tun"` default); macOS: the launchd helper creates the `utun`, hands its fd to Xray (`XRAY_TUN_FD`, Xray runs as the console user) and owns routes + DNS — `docs/plans/2026-10-14-16-macos-xray-tun.md`; one tunnel at a time |
+| Mihomo — mixed proxy / managed TUN | ❌ | ✅ x86_64 | ❌ | Optional v1.19.34 component; native YAML/JSON, select/URL-test/fallback/load-balance groups and rule providers. Proxy mode shares the unprivileged runtime; TUN/routes/DNS belong to the daemon. Existing Xray profiles are not migrated. |
 | Managed Xray TUN dual-stack capture | — | ✅ IPv4 + IPv6 | — | Linux primary defaults and four split-default halves; explicit/secondary scope preserved, captured-family FakeDNS, `/32` + `/128` ownership/recovery; requires daemon `xray.tun.ipv6` |
 | Xray backup nodes and pinned domain egress | — | ✅ app + CLI | — | One TUN, ordered HTTPS-probed backups with automatic primary return; pinned domains fail closed, including when a subscription node disappears |
 | Xray filtered pools and actual exit countries | — | ✅ app + CLI | — | Opt-in country/name filters, bounded candidate probes, explicit primary/backups/domain/DNS nodes excluded from automatic recruitment |
@@ -40,6 +41,7 @@ SOCKS/HTTP mode and the per-user system proxy. Everything that needs root
 | Xray underlay/stall watchdog and QUIC rejection | — | ✅ daemon | — | Owned-child recovery, gateway/OIF/source migration, DNS/HTTPS/socket diagnostics; tunnel-scoped nftables UDP/443 REJECT |
 | Static routes (`none`) | ✅ | ✅ | ✅ helper | Policy routes only, no tunnel; route mutation is IP Helper / netlink; macOS: the profile's routes are a routing intent `static-<id>` kept by the helper (armed while the interface is absent when "wait for the interface" is on); routes with their own gateway are not supported yet |
 | Managed Xray install | ✅ x86_64 only | ✅ x86_64 only | ✅ arm64, download or local zip | `managedXrayInstall`; fixed-version, hash-pinned download. Win: app-local store; Linux: archive goes to the daemon (`xray.install`), which re-verifies hashes and installs root-owned files under `/usr/lib/network-orchestrator/xray`; macOS: per-user managed root |
+| Managed Mihomo install | ❌ | ✅ x86_64 only | ❌ | Explicit Settings/CLI install and removal, fixed version and pinned archive/executable hashes; root-owned daemon install, no automatic download on backend selection. |
 | WireGuard standard `.conf` import | ✅ | — | — | `wireguardStandardImport` |
 
 ## System integration

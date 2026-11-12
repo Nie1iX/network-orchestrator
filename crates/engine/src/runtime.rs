@@ -960,6 +960,31 @@ impl Engine {
         profile: &Profile,
         credentials: Option<OpenVpnCredentials>,
     ) -> Result<(), String> {
+        let migrated;
+        let profile = if profile.subscription.is_some() {
+            let vault = ConfigVault::new(self.root.join("configs"));
+            let before = store
+                .load()
+                .map_err(|_| "Profiles could not be loaded")?
+                .profiles
+                .into_iter()
+                .find(|stored| stored.id == profile.id)
+                .ok_or("Profile not found")?;
+            migrated =
+                net_manager_core::subscription::migrate_endpoint_ids(&vault, store, &profile.id)
+                    .map_err(|_| "Subscription identities could not be migrated")?;
+            if &before == profile {
+                &migrated
+            } else if before != migrated {
+                return Err(
+                    "The subscription changed; reload the profile before connecting".into(),
+                );
+            } else {
+                profile
+            }
+        } else {
+            profile
+        };
         require_supported_profile(profile)?;
         if self.client.is_some() {
             return self
@@ -1536,9 +1561,9 @@ impl Engine {
         change: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
         let load = || {
-            store
-                .load()
-                .map(|document| document.profiles)
+            let vault = ConfigVault::new(self.root.join("configs"));
+            net_manager_core::subscription::migrate_endpoint_ids(&vault, store, id)
+                .map(|profile| vec![profile])
                 .map_err(|_| "Profiles could not be loaded".to_string())
         };
         let before = find_profile(&load()?, id)?;
@@ -1704,6 +1729,18 @@ impl OwnerBackend {
             .load()
             .map(|document| document.profiles)
             .map_err(|_| "Profiles could not be loaded".to_string())?;
+        let store = ProfileStore::new(self.engine.root.join("profiles.json"));
+        let vault = ConfigVault::new(self.engine.root.join("configs"));
+        for profile in &mut profiles {
+            if profile.subscription.is_some() {
+                *profile = net_manager_core::subscription::migrate_endpoint_ids(
+                    &vault,
+                    &store,
+                    &profile.id,
+                )
+                .map_err(|_| "Subscription identities could not be migrated")?;
+            }
+        }
         for profile in &mut profiles {
             crate::macos_services::normalize_profile_path(profile, None)?;
         }

@@ -58,6 +58,12 @@ pub fn classify(input: &str, exists: impl Fn(&Path) -> bool) -> Input {
                     backend: TunnelBackend::Xray,
                 }
             }
+            Some("yaml" | "yml") => {
+                return Input::File {
+                    path,
+                    backend: TunnelBackend::Mihomo,
+                }
+            }
             _ => {}
         }
     }
@@ -190,6 +196,19 @@ mod tests {
                 backend: TunnelBackend::Xray,
             }
         );
+    }
+
+    #[test]
+    fn native_mihomo_yaml_files_classify_as_mihomo() {
+        for path in ["/tmp/provider.yaml", "/tmp/provider.YML"] {
+            assert_eq!(
+                classify(path, |_: &Path| true),
+                Input::File {
+                    path: path.into(),
+                    backend: TunnelBackend::Mihomo,
+                }
+            );
+        }
     }
 
     #[test]

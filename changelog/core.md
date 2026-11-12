@@ -10,6 +10,32 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-12
+
+### Added
+
+- Optional native Mihomo profile model and bounded YAML/JSON import, protected
+  source revisions, HTTP provider snapshots and shared subscription scheduling.
+  Preserve native groups, load balancing, filters, inline/HTTP rule providers and
+  independently selected groups without converting them to Xray.
+- Hash-pinned Mihomo component verification, typed daemon lifecycle requests and
+  shared Linux Engine services for daemon TUN and unprivileged mixed-proxy mode.
+
+### Fixed
+
+- Persist subscription record IDs independently of server addresses and credentials.
+  Preserve unique-name selections across provider rotations and distinguish full
+  configurations sharing a first hop. Retain identity history for returning nodes.
+- Migrate primary, backup, pool, pinned, DNS, check and named-exit references together.
+  Ambiguous legacy aliases stay unresolved instead of silently selecting another
+  record; interrupted migration resumes without changing existing IDs.
+- Preserve provider endpoint candidate, balancer, fallback and transport graphs
+  across connection planning, pinned/DNS/named exits and temporary probes instead
+  of selecting the first proxy. Keep profile routing authoritative and sources
+  isolated; use the primary observation policy for shared per-process checks.
+- Bound observation warmup separately from temporary proxy readiness and request
+  deadlines, preserving timeout classification and awaited child cleanup.
+
 ## [0.18.1] - 2026-11-10
 
 ### Fixed

@@ -172,7 +172,7 @@ fn build_definition(vault: &ConfigVault, profile: &Profile) -> Result<AlwaysOnDe
                 routes,
             }))
         }
-        TunnelBackend::OpenVpn | TunnelBackend::Xray => {
+        TunnelBackend::OpenVpn | TunnelBackend::Xray | TunnelBackend::Mihomo => {
             Err("always-on supports only WireGuard and static routes".into())
         }
     }
@@ -212,7 +212,7 @@ pub fn always_on_resume(engine: &LinuxEngine) -> Result<AlwaysOnResumeResult, St
 pub fn ensure_not_enrolled(engine: &LinuxEngine, profile: &Profile) -> Result<(), String> {
     if matches!(
         profile.backend,
-        TunnelBackend::OpenVpn | TunnelBackend::Xray
+        TunnelBackend::OpenVpn | TunnelBackend::Xray | TunnelBackend::Mihomo
     ) {
         return Ok(());
     }
@@ -272,7 +272,11 @@ mod tests {
     #[test]
     fn enrollment_rejects_unsupported_backends_and_unstable_static_interfaces() {
         let (root, vault) = fixture();
-        for backend in [TunnelBackend::OpenVpn, TunnelBackend::Xray] {
+        for backend in [
+            TunnelBackend::OpenVpn,
+            TunnelBackend::Xray,
+            TunnelBackend::Mihomo,
+        ] {
             let profile = Profile {
                 id: "test".into(),
                 backend,

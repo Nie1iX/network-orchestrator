@@ -48,6 +48,9 @@ fn diagnostic_read_method(name: &str) -> bool {
             | method::WIREGUARD_STATUS
             | method::OPENVPN_STATUS
             | method::XRAY_STATUS
+            | method::XRAY_VALIDATE
+            | method::MIHOMO_STATUS
+            | method::MIHOMO_VALIDATE
             | method::OPENVPN_PLAN
             | method::TAILSCALE_STATUS
             | method::ALWAYS_ON_LIST
@@ -98,6 +101,15 @@ pub fn daemon_error(error: HelperError) -> String {
     }
 }
 
+fn local_proxy(profile: &Profile) -> bool {
+    profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Socks
+        || profile.backend == TunnelBackend::Mihomo
+            && profile
+                .mihomo
+                .as_ref()
+                .is_some_and(|options| options.mode == net_manager_core::models::MihomoMode::Proxy)
+}
+
 #[derive(Clone)]
 pub struct LinuxEngine {
     privileged: Arc<dyn Privileged>,
@@ -117,6 +129,7 @@ enum PreparedRequest {
     WireGuard(WireGuardConnectParams),
     OpenVpn(OpenVpnConnectRequest, Option<&'static str>),
     Xray(XrayConnectParams, Vec<String>),
+    Mihomo(net_manager_core::daemon_protocol::MihomoConnectParams),
     #[cfg(target_os = "linux")]
     Local(
         crate::linux_session::PreparedLocalRequest,
@@ -172,6 +185,10 @@ impl LinuxEngine {
         self
     }
 
+    pub(crate) fn data_root(&self) -> Option<&std::path::Path> {
+        self.data_root.as_deref()
+    }
+
     #[cfg(target_os = "linux")]
     fn local_request(
         &self,
@@ -217,10 +234,7 @@ impl LinuxEngine {
     }
 
     pub fn requires_daemon(profile: &Profile) -> bool {
-        profile.backend != TunnelBackend::Xray
-            || profile.xray_mode != XrayMode::Socks
-            || !profile.routes.is_empty()
-            || !profile.endpoint_bypasses.is_empty()
+        !local_proxy(profile) || !profile.routes.is_empty() || !profile.endpoint_bypasses.is_empty()
     }
 
     fn prepare_profile_routes(&self, profile: &Profile) -> Result<RoutesApplyParams, String> {
@@ -425,6 +439,36 @@ impl LinuxEngine {
         remembered: &dyn CredentialSource,
         prepare_local_ports: bool,
     ) -> Result<PreparedConnection, String> {
+        let migrated;
+        let profile = if profile.subscription.is_some() && profile.backend == TunnelBackend::Xray {
+            let root = self
+                .data_root
+                .as_deref()
+                .or_else(|| vault.root().parent())
+                .ok_or("The application data directory is required")?;
+            let store = net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
+            let before = store
+                .load()
+                .map_err(|_| "Profiles could not be loaded")?
+                .profiles
+                .into_iter()
+                .find(|stored| stored.id == profile.id)
+                .ok_or("Profile not found")?;
+            migrated =
+                net_manager_core::subscription::migrate_endpoint_ids(vault, &store, &profile.id)
+                    .map_err(|_| "Subscription identities could not be migrated")?;
+            if &before == profile {
+                &migrated
+            } else if before != migrated {
+                return Err(
+                    "The subscription changed; reload the profile before connecting".into(),
+                );
+            } else {
+                profile
+            }
+        } else {
+            profile
+        };
         #[cfg(not(target_os = "linux"))]
         let _ = prepare_local_ports;
         profile.check_role()?;
@@ -439,7 +483,7 @@ impl LinuxEngine {
                 PreparedRequest::Routes(self.prepare_profile_routes(profile)?)
             }
             #[cfg(target_os = "linux")]
-            TunnelBackend::Xray if profile.xray_mode == XrayMode::Socks => {
+            _ if local_proxy(profile) => {
                 let root = self
                     .data_root
                     .as_deref()
@@ -471,6 +515,13 @@ impl LinuxEngine {
                     method::OPENVPN_CONNECT,
                 )?;
                 PreparedRequest::OpenVpn(request, notice)
+            }
+            TunnelBackend::Mihomo => {
+                if !cfg!(target_os = "linux") {
+                    return Err("Mihomo is only supported on Linux".into());
+                }
+                debug_assert!(!local_proxy(profile));
+                PreparedRequest::Mihomo(crate::linux::prepare_linux_mihomo_params(vault, profile)?)
             }
             _ => {
                 let (params, notices) = self.xray_params(vault, profile)?;
@@ -521,6 +572,12 @@ impl LinuxEngine {
             PreparedRequest::OpenVpn(request, _) => {
                 let _: OpenVpnPlanResult = self.ask(method::OPENVPN_PLAN, request)?;
             }
+            PreparedRequest::Mihomo(params) => {
+                let result: serde_json::Value = self.ask(method::MIHOMO_VALIDATE, params)?;
+                if result.get("valid").and_then(serde_json::Value::as_bool) != Some(true) {
+                    return Err("The daemon rejected the Mihomo configuration".into());
+                }
+            }
             PreparedRequest::Routes(_) | PreparedRequest::Xray(_, _) => {}
             #[cfg(target_os = "linux")]
             PreparedRequest::Local(_, _) => {}
@@ -545,6 +602,18 @@ impl LinuxEngine {
             }
             PreparedRequest::Xray(params, notices) => {
                 self.execute_xray(profile, params, notices, method::XRAY_CONNECT)
+            }
+            PreparedRequest::Mihomo(params) => {
+                let result: net_manager_core::daemon_protocol::MihomoConnectResult = self
+                    .traced_daemon_call(method::MIHOMO_CONNECT, || {
+                        self.privileged().call_with_capability(
+                            method::MIHOMO_CONNECT,
+                            params,
+                            feature::MIHOMO_TUN,
+                        )
+                    })
+                    .map_err(daemon_error)?;
+                Ok(linux_xray_tunnel_status(result.status, profile))
             }
             #[cfg(target_os = "linux")]
             PreparedRequest::Local(local, routes) => {
@@ -647,6 +716,36 @@ impl LinuxEngine {
         vault: &ConfigVault,
         profile: &Profile,
     ) -> Result<TunnelStatus, String> {
+        let migrated;
+        let profile = if profile.subscription.is_some() {
+            let root = self
+                .data_root
+                .as_deref()
+                .or_else(|| vault.root().parent())
+                .ok_or("The application data directory is required")?;
+            let store = net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
+            let before = store
+                .load()
+                .map_err(|_| "Profiles could not be loaded")?
+                .profiles
+                .into_iter()
+                .find(|stored| stored.id == profile.id)
+                .ok_or("Profile not found")?;
+            migrated =
+                net_manager_core::subscription::migrate_endpoint_ids(vault, &store, &profile.id)
+                    .map_err(|_| "Subscription identities could not be migrated")?;
+            if &before == profile {
+                &migrated
+            } else if before != migrated {
+                return Err(
+                    "The subscription changed; reload the profile before connecting".into(),
+                );
+            } else {
+                profile
+            }
+        } else {
+            profile
+        };
         profile.check_role()?;
         if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Tun {
             return Err("Reload requires an Xray TUN profile".into());
@@ -702,7 +801,23 @@ impl LinuxEngine {
         )
     }
 
+    pub fn mihomo_status_result(
+        &self,
+        profile_id: &str,
+    ) -> Result<net_manager_core::daemon_protocol::MihomoStatusResult, String> {
+        self.ask(
+            method::MIHOMO_STATUS,
+            net_manager_core::daemon_protocol::MihomoProfileParams {
+                profile_id: profile_id.into(),
+            },
+        )
+    }
+
     pub fn disconnect(&self, profile: &Profile) -> Result<TunnelStatus, String> {
+        #[cfg(not(target_os = "linux"))]
+        if profile.backend == TunnelBackend::Mihomo {
+            return Err("Mihomo is only supported on Linux".into());
+        }
         let id = profile.id.clone();
         let stopped = match profile.backend {
             TunnelBackend::None => {
@@ -710,7 +825,7 @@ impl LinuxEngine {
                 true
             }
             #[cfg(target_os = "linux")]
-            TunnelBackend::Xray if profile.xray_mode == XrayMode::Socks => {
+            _ if local_proxy(profile) => {
                 self.local_request(crate::linux_session::Request::Disconnect {
                     id: profile.id.clone(),
                 })?;
@@ -741,6 +856,13 @@ impl LinuxEngine {
                 )?;
                 result.stopped
             }
+            TunnelBackend::Mihomo => {
+                let result: net_manager_core::daemon_protocol::MihomoDisconnectResult = self.ask(
+                    method::MIHOMO_DISCONNECT,
+                    net_manager_core::daemon_protocol::MihomoProfileParams { profile_id: id },
+                )?;
+                result.stopped
+            }
             _ if Self::handles(profile) => {
                 let result: XrayDisconnectResult = self.ask(
                     method::XRAY_DISCONNECT,
@@ -764,13 +886,15 @@ impl LinuxEngine {
     }
 
     pub fn status(&self, profile: &Profile) -> Result<TunnelStatus, String> {
+        #[cfg(not(target_os = "linux"))]
+        if profile.backend == TunnelBackend::Mihomo {
+            return Err("Mihomo is only supported on Linux".into());
+        }
         let id = profile.id.clone();
         match profile.backend {
             TunnelBackend::None => self.static_status(&profile.id, &profile.interface_name),
             #[cfg(target_os = "linux")]
-            TunnelBackend::Xray if profile.xray_mode == XrayMode::Socks => {
-                self.local_proxy_status(&profile.id)
-            }
+            _ if local_proxy(profile) => self.local_proxy_status(&profile.id),
             TunnelBackend::WireGuard => {
                 let status = self.wireguard_status_result(&id)?;
                 Ok(linux_wireguard_tunnel_status(status))
@@ -778,6 +902,10 @@ impl LinuxEngine {
             TunnelBackend::OpenVpn => {
                 let status = self.openvpn_status_result(&id)?;
                 Ok(linux_openvpn_tunnel_status(status))
+            }
+            TunnelBackend::Mihomo => {
+                let status = self.mihomo_status_result(&id)?;
+                Ok(linux_xray_tunnel_status(status, profile))
             }
             _ if Self::handles(profile) => {
                 let status = self.xray_status_result(&id)?;
@@ -947,6 +1075,100 @@ mod tests {
     fn engine(daemon: FakeDaemon) -> (LinuxEngine, Arc<FakeDaemon>) {
         let daemon = Arc::new(daemon);
         (LinuxEngine::with_privileged(daemon.clone()), daemon)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mihomo_status_uses_its_own_daemon_method() {
+        let mut daemon = FakeDaemon::default();
+        daemon.replies.insert(
+            method::MIHOMO_STATUS,
+            json!({
+                "profileId": "native", "state": "stopped", "interfaceName": null,
+                "dnsApplied": false, "ipv4Covered": false, "ipv6Covered": false,
+                "rxBytes": 0, "txBytes": 0
+            }),
+        );
+        let (engine, daemon) = engine(daemon);
+        let profile = Profile {
+            id: "native".into(),
+            backend: TunnelBackend::Mihomo,
+            ..Profile::default()
+        };
+        assert_eq!(engine.status(&profile).unwrap().state, TunnelState::Stopped);
+        assert_eq!(daemon.calls.lock().unwrap()[0].0, method::MIHOMO_STATUS);
+    }
+
+    #[test]
+    fn mihomo_local_proxy_only_requires_daemon_for_routes() {
+        let mut profile = Profile {
+            backend: TunnelBackend::Mihomo,
+            mihomo: Some(net_manager_core::models::MihomoProfileOptions {
+                mode: net_manager_core::models::MihomoMode::Proxy,
+                mixed_port: Some(10808),
+                ..Default::default()
+            }),
+            ..Profile::default()
+        };
+        assert!(!LinuxEngine::requires_daemon(&profile));
+        profile.mihomo.as_mut().unwrap().mode = net_manager_core::models::MihomoMode::Tun;
+        assert!(LinuxEngine::requires_daemon(&profile));
+    }
+
+    #[test]
+    fn mihomo_set_validation_calls_only_read_only_validate() {
+        let mut daemon = FakeDaemon::default();
+        daemon
+            .replies
+            .insert(method::MIHOMO_VALIDATE, json!({"valid":true,"issues":[]}));
+        let (engine, daemon) = engine(daemon);
+        let prepared = PreparedConnection {
+            profile: Profile {
+                id: "native".into(),
+                backend: TunnelBackend::Mihomo,
+                ..Profile::default()
+            },
+            request: PreparedRequest::Mihomo(
+                net_manager_core::daemon_protocol::MihomoConnectParams {
+                    profile_id: "native".into(),
+                    config: "{}".into(),
+                    routes: vec![],
+                    dns_servers: vec![],
+                    dns_domains: vec![],
+                    interface_name: None,
+                    role: Default::default(),
+                    group_selections: Default::default(),
+                },
+            ),
+        };
+        engine.validate_prepared_configuration(&prepared).unwrap();
+        assert_eq!(daemon.calls.lock().unwrap()[0].0, method::MIHOMO_VALIDATE);
+    }
+
+    #[test]
+    fn mihomo_connect_requires_daemon_capability_before_mutation() {
+        let (engine, daemon) = engine(FakeDaemon::default());
+        let prepared = PreparedConnection {
+            profile: Profile {
+                id: "native".into(),
+                backend: TunnelBackend::Mihomo,
+                ..Profile::default()
+            },
+            request: PreparedRequest::Mihomo(
+                net_manager_core::daemon_protocol::MihomoConnectParams {
+                    profile_id: "native".into(),
+                    config: "{}".into(),
+                    routes: vec![],
+                    dns_servers: vec![],
+                    dns_domains: vec![],
+                    interface_name: None,
+                    role: Default::default(),
+                    group_selections: Default::default(),
+                },
+            ),
+        };
+        assert!(engine.execute_prepared(&prepared).is_err());
+        assert!(daemon.calls.lock().unwrap().is_empty());
     }
 
     fn wireguard_profile(dir: &std::path::Path) -> (ConfigVault, Profile) {

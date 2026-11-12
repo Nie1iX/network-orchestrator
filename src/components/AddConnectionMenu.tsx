@@ -2,6 +2,7 @@ import Modal from "./Modal";
 import { backendIcon, ImportIcon } from "../icons";
 import { TunnelBackend } from "../types";
 import { TranslationKey, useT } from "../i18n";
+import { usePlatformCapabilities } from "../platform";
 
 const BACKEND_OPTIONS: { backend: TunnelBackend; titleKey: TranslationKey; descKey: TranslationKey }[] = [
   {
@@ -18,6 +19,11 @@ const BACKEND_OPTIONS: { backend: TunnelBackend; titleKey: TranslationKey; descK
     backend: "xray",
     titleKey: "backend.xray",
     descKey: "add.xrayDesc",
+  },
+  {
+    backend: "mihomo",
+    titleKey: "Mihomo",
+    descKey: "Import native YAML/JSON with proxy groups and balancing.",
   },
   {
     backend: "none",
@@ -44,8 +50,9 @@ export default function AddConnectionMenu({
   allowManaged = true,
 }: AddConnectionMenuProps) {
   const t = useT();
+  const caps = usePlatformCapabilities();
   const options = allowManaged
-    ? BACKEND_OPTIONS
+    ? BACKEND_OPTIONS.filter((opt) => opt.backend !== "mihomo" || caps?.managedMihomoInstall === true)
     : BACKEND_OPTIONS.filter((opt) => opt.backend === "none");
   return (
     <Modal open={open} title={t("add.title")} onClose={onClose} maxWidth="480px">

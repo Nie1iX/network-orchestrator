@@ -36,6 +36,7 @@ impl StartPolicy {
             TunnelBackend::WireGuard => "wireguard.connect",
             TunnelBackend::OpenVpn => "openvpn.connect",
             TunnelBackend::Xray => "xray.connect",
+            TunnelBackend::Mihomo => "mihomo.unsupported",
         };
         start_eligibility(
             mode,

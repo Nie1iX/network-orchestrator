@@ -7,6 +7,7 @@ export function requiresElevation(profile: Profile): boolean {
   return (
     profile.backend === "wireGuard" ||
     profile.backend === "openVpn" ||
+    (profile.backend === "mihomo" && (profile.mihomo?.mode ?? "tun") === "tun") ||
     profile.routes.length > 0
   );
 }

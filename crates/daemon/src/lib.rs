@@ -24,6 +24,9 @@ pub mod failover;
 pub mod intents;
 pub mod link_names;
 #[cfg(target_os = "linux")]
+pub mod mihomo;
+#[cfg(target_os = "linux")]
+pub mod mihomo_process;
 pub mod netlink;
 #[cfg(target_os = "linux")]
 pub mod nm;

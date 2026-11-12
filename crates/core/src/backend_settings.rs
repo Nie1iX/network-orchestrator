@@ -16,6 +16,8 @@ pub struct BackendSettingsDocument {
     pub open_vpn: Option<BackendExecutableSetting>,
     #[serde(default)]
     pub xray: Option<BackendExecutableSetting>,
+    #[serde(default)]
+    pub mihomo: Option<BackendExecutableSetting>,
 }
 
 impl Default for BackendSettingsDocument {
@@ -25,6 +27,7 @@ impl Default for BackendSettingsDocument {
             wire_guard: None,
             open_vpn: None,
             xray: None,
+            mihomo: None,
         }
     }
 }
@@ -92,6 +95,7 @@ impl BackendSettingsStore {
             TunnelBackend::WireGuard => document.wire_guard,
             TunnelBackend::OpenVpn => document.open_vpn,
             TunnelBackend::Xray => document.xray,
+            TunnelBackend::Mihomo => document.mihomo,
         })
     }
 
@@ -109,6 +113,7 @@ impl BackendSettingsStore {
             TunnelBackend::WireGuard => document.wire_guard = setting,
             TunnelBackend::OpenVpn => document.open_vpn = setting,
             TunnelBackend::Xray => document.xray = setting,
+            TunnelBackend::Mihomo => document.mihomo = setting,
         }
         self.save(&document)?;
         Ok(document)
@@ -122,9 +127,14 @@ fn validate_document(document: &BackendSettingsDocument) -> io::Result<()> {
             document.version
         )));
     }
-    for setting in [&document.wire_guard, &document.open_vpn, &document.xray]
-        .into_iter()
-        .flatten()
+    for setting in [
+        &document.wire_guard,
+        &document.open_vpn,
+        &document.xray,
+        &document.mihomo,
+    ]
+    .into_iter()
+    .flatten()
     {
         validate_setting(setting)?;
     }

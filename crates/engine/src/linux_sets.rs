@@ -11,6 +11,19 @@ use net_manager_core::{
 use serde::Serialize;
 use std::{collections::HashSet, path::Path};
 
+fn is_primary_tunnel(profile: &Profile) -> bool {
+    profile.tunnel_role == TunnelRole::Primary
+        && (matches!(
+            profile.backend,
+            TunnelBackend::WireGuard | TunnelBackend::OpenVpn
+        ) || profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Tun
+            || profile.backend == TunnelBackend::Mihomo
+                && profile
+                    .mihomo
+                    .as_ref()
+                    .is_none_or(|options| options.mode == MihomoMode::Tun))
+}
+
 fn preflight(set: &ConnectionSet, profiles: &[Profile], starting: bool) -> Result<(), String> {
     validate(set)?;
     validate_members(set, profiles)?;
@@ -24,15 +37,7 @@ fn preflight(set: &ConnectionSet, profiles: &[Profile], starting: bool) -> Resul
         profile
             .check_role()
             .map_err(|e| format!("Invalid member {id}: {e}"))?;
-        if profile.tunnel_role == TunnelRole::Primary
-            && matches!(
-                profile.backend,
-                TunnelBackend::WireGuard | TunnelBackend::OpenVpn
-            )
-            || profile.tunnel_role == TunnelRole::Primary
-                && profile.backend == TunnelBackend::Xray
-                && profile.xray_mode == XrayMode::Tun
-        {
+        if is_primary_tunnel(profile) {
             primaries += 1;
         }
     }
@@ -117,7 +122,7 @@ fn reconcile(
         store,
         ..
     } = *context;
-    let profiles = store.load().map_err(|_| "Cannot load profiles")?.profiles;
+    let profiles = linux_runtime::migrated_profiles(context.vault, store)?;
     preflight(set, &profiles, !down)?;
     if inputs.len() > 256 {
         return Err("Too many connection-set credential inputs".into());
@@ -390,6 +395,20 @@ mod tests {
     use net_manager_core::config_vault::ConfigVault;
     use net_manager_core::connection_sets::ConnectionSetCredentialInput;
     use std::fs;
+
+    #[test]
+    fn mihomo_primary_tun_counts_toward_set_limit_but_proxy_does_not() {
+        let mut profile = Profile {
+            backend: TunnelBackend::Mihomo,
+            mihomo: Some(MihomoProfileOptions::default()),
+            ..Profile::default()
+        };
+        assert!(is_primary_tunnel(&profile));
+        profile.mihomo.as_mut().unwrap().mode = MihomoMode::Proxy;
+        assert!(!is_primary_tunnel(&profile));
+        profile.tunnel_role = TunnelRole::Secondary;
+        assert!(!is_primary_tunnel(&profile));
+    }
 
     #[test]
     fn missing_references_and_invalid_secondary_are_preflight_errors() {

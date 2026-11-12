@@ -8,9 +8,47 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::net::Ipv4Addr;
 use std::path::Path;
 
+#[cfg(test)]
+mod mihomo_analysis_tests {
+    use super::*;
+
+    #[test]
+    fn native_analysis_reports_only_owned_loopback_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mihomo.yaml");
+        std::fs::write(
+            &path,
+            b"proxies: []\nproxy-groups: []\nrules: ['MATCH,DIRECT']\n",
+        )
+        .unwrap();
+        let profile = Profile {
+            id: "native".into(),
+            backend: TunnelBackend::Mihomo,
+            config_path: path,
+            mihomo: Some(crate::models::MihomoProfileOptions {
+                mixed_port: Some(7890),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = analyze_profile(&profile).unwrap();
+        assert_eq!(result.listeners[0].address, "127.0.0.1");
+        assert_eq!(result.listeners[0].port, 7890);
+        assert!(result
+            .os_routes
+            .iter()
+            .any(|r| r.destination.to_string() == "0.0.0.0/0"));
+        assert!(result
+            .os_routes
+            .iter()
+            .any(|r| r.destination.to_string() == "::/0"));
+        assert!(!result.route_knowledge_complete);
+    }
+}
 pub fn analyze_profile(profile: &Profile) -> io::Result<ConfigAnalysis> {
     analyze_with_xray_snapshot(profile, None)
 }
@@ -57,6 +95,41 @@ fn analyze_with_xray_snapshot(
             Some(bytes) => analyze_xray_bytes(profile, bytes, &mut analysis)?,
             None => analyze_xray(profile, &mut analysis)?,
         },
+        TunnelBackend::Mihomo => {
+            let mut source = Vec::new();
+            std::fs::File::open(&profile.config_path)?
+                .take(8 * 1024 * 1024 + 1)
+                .read_to_end(&mut source)?;
+            let config = crate::mihomo::parse_config(&source)?;
+            crate::mihomo::compile_config(&config, profile)?;
+            if let Some(port) = profile
+                .mihomo
+                .as_ref()
+                .and_then(|options| options.mixed_port)
+            {
+                analysis.listeners.push(LocalListener {
+                    address: "127.0.0.1".into(),
+                    port,
+                    protocol: "mixed".into(),
+                });
+            }
+            if profile.routes.is_empty()
+                && profile.tunnel_role == crate::models::TunnelRole::Primary
+                && profile
+                    .mihomo
+                    .as_ref()
+                    .is_none_or(|o| o.mode == crate::models::MihomoMode::Tun)
+            {
+                for destination in ["0.0.0.0/0", "::/0"] {
+                    analysis.os_routes.push(AnalyzedRoute {
+                        destination: destination.parse().expect("valid default route"),
+                        metric: None,
+                        source: "Mihomo TUN capture".into(),
+                    });
+                }
+            }
+            analysis.route_knowledge_complete = false;
+        }
     }
     if profile.tunnel_role == crate::models::TunnelRole::Secondary {
         // The privileged side installs exactly the listed networks and ignores

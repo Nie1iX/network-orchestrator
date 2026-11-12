@@ -72,6 +72,10 @@ pub(crate) fn resolve_backend_path(
         TunnelBackend::WireGuard => vpn::resolve_wireguard_executable(configured),
         TunnelBackend::OpenVpn => vpn::resolve_openvpn_executable(configured),
         TunnelBackend::Xray => vpn::resolve_xray_executable(configured),
+        TunnelBackend::Mihomo => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Mihomo is supported on Linux only",
+        )),
     }
 }
 

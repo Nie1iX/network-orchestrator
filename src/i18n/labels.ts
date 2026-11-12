@@ -10,6 +10,7 @@ export const BACKEND_LABEL_KEYS: Record<TunnelBackend, TranslationKey> = {
   wireGuard: "backend.wireGuard",
   openVpn: "backend.openVpn",
   xray: "backend.xray",
+  mihomo: "Mihomo",
 };
 
 export const SOURCE_LABEL_KEYS: Record<

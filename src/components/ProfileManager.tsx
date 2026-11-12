@@ -32,6 +32,7 @@ import Modal from "./Modal";
 import Page from "./Page";
 import ContextMenu from "./ui/ContextMenu";
 import ProfileDetail from "./profiles/ProfileDetail";
+import ProfileDocumentEditor from "./profiles/ProfileDocumentEditor";
 import ProfileRow from "./profiles/ProfileRow";
 import SetsBar from "./profiles/SetsBar";
 import {
@@ -201,6 +202,7 @@ export default function ProfileManager() {
   const [busy, setBusy] = useState<Set<string>>(new Set());
   const [editing, setEditing] = useState<ProfileFormState | null>(null);
   const [formOpen, setFormOpen] = useState(false);
+  const [documentEditorId, setDocumentEditorId] = useState<string | null>(null);
   const [inspections, setInspections] = useState<
     Record<string, ProfileInspection>
   >(listCache?.inspections ?? {});
@@ -208,6 +210,9 @@ export default function ProfileManager() {
     profileName: string;
     inspection: ProfileInspection;
   } | null>(null);
+  const [connectionFailures, setConnectionFailures] = useState<
+    Record<string, string>
+  >({});
   const [diagnostics, setDiagnostics] = useState<ProfileDiagnostics | null>(
     null,
   );
@@ -536,7 +541,7 @@ export default function ProfileManager() {
         const updated = await refreshAll();
         if (!updated) return;
         const next: Record<string, SubscriptionEndpointInfo[]> = {};
-        for (const profile of updated.filter((profile) => profile.subscription !== null)) {
+        for (const profile of updated.filter((profile) => profile.subscription !== null && profile.backend === "xray")) {
           try {
             next[profile.id] = await invoke<SubscriptionEndpointInfo[]>(
               "get_subscription_endpoints",
@@ -687,7 +692,7 @@ export default function ProfileManager() {
   };
 
   useEffect(() => {
-    const subProfiles = profiles.filter((p) => p.subscription !== null);
+    const subProfiles = profiles.filter((p) => p.subscription !== null && p.backend === "xray");
     if (subProfiles.length === 0) {
       if (Object.keys(endpoints).length > 0) setEndpoints({});
       return;
@@ -861,23 +866,34 @@ export default function ProfileManager() {
         id: profile.id,
       });
       if (status.state === "failed") {
+        setConnectionFailures((current) => ({
+          ...current,
+          [profile.id]:
+            status.message ??
+            t("profiles.connectFailedDiag", { name: profile.name }),
+        }));
         toast(
           "error",
           status.message ??
             t("profiles.connectFailedDiag", { name: profile.name }),
         );
       } else {
+        setConnectionFailures(({ [profile.id]: _failure, ...current }) => current);
         if (status.message) toast("info", status.message);
       }
     }, (err) => {
       if (caps?.os === "linux" && profile.backend === "openVpn" && String(err) === "OpenVPN credentials required") {
         setOpenVpnCredentialProfile(profile);
       } else {
-        toast("error", String(err));
+        const message = String(err);
+        setConnectionFailures((current) => ({
+          ...current,
+          [profile.id]: message,
+        }));
+        toast("error", message);
       }
     });
   };
-
   const onDisconnect = async (profile: Profile) => {
     if (requiresElevation(profile)) {
       try {
@@ -945,7 +961,7 @@ export default function ProfileManager() {
       });
       setProfiles(updated);
       const next: Record<string, SubscriptionEndpointInfo[]> = {};
-      for (const p of updated.filter((p) => p.subscription !== null)) {
+      for (const p of updated.filter((p) => p.subscription !== null && p.backend === "xray")) {
         try {
           next[p.id] = await invoke<SubscriptionEndpointInfo[]>(
             "get_subscription_endpoints",
@@ -994,7 +1010,7 @@ export default function ProfileManager() {
     setProfiles(updated);
     const fresh = await refreshAll();
     if (!fresh) throw new Error(t("The change was saved, but refreshing the displayed profile or endpoints failed. Refresh the profile before making another change."));
-    if (fresh.some((profile) => profile.id === profileId && profile.subscription)) {
+    if (fresh.some((profile) => profile.id === profileId && profile.subscription && profile.backend === "xray")) {
       const list = await invoke<SubscriptionEndpointInfo[]>(
         "get_subscription_endpoints", { profileId },
       );
@@ -1047,6 +1063,10 @@ export default function ProfileManager() {
         id: profile.id,
       });
       await refreshAll();
+      if (profile.backend === "mihomo") {
+        toast("info", t("Mihomo subscription refreshed; reconnect to apply."));
+        return;
+      }
       const updated = await invoke<SubscriptionEndpointInfo[]>(
         "get_subscription_endpoints",
         { profileId: profile.id },
@@ -1435,7 +1455,7 @@ export default function ProfileManager() {
     : profiles;
 
   const groups: ProfileGroup[] = (
-    ["wireGuard", "openVpn", "xray", "none"] as TunnelBackend[]
+    ["wireGuard", "openVpn", "xray", "mihomo", "none"] as TunnelBackend[]
   )
     .map((backend) => ({
       backend,
@@ -2173,6 +2193,13 @@ export default function ProfileManager() {
               key={selected.id}
               onPolicySaved={acceptPolicyProfiles}
               profile={selected}
+              connectionFailure={connectionFailures[selected.id] ?? null}
+              onDismissConnectionFailure={() =>
+                setConnectionFailures((current) => {
+                  const { [selected.id]: _failure, ...remaining } = current;
+                  return remaining;
+                })
+              }
               onRoleChanged={() => void refreshAll()}
               status={statusFor(selected.id)}
               rate={
@@ -2203,6 +2230,7 @@ export default function ProfileManager() {
               onConnect={() => void onConnect(selected)}
               onDisconnect={() => void onDisconnect(selected)}
               onEdit={() => openEdit(selected)}
+              onOpenDocument={() => setDocumentEditorId(selected.id)}
               onMoveUp={() =>
                 selGroup &&
                 moveProfileInGroup(selGroup.items, selected.id, -1)
@@ -2253,6 +2281,18 @@ export default function ProfileManager() {
           )}
         </div>
       </div>
+
+      {documentEditorId && <ProfileDocumentEditor
+        key={documentEditorId}
+        profileId={documentEditorId}
+        status={statuses.find((status) => status.profileId === documentEditorId)}
+        interfaces={interfaces}
+        onClose={() => setDocumentEditorId(null)}
+        onSaved={async (applied) => {
+          if (applied) setConnectionFailures(({ [documentEditorId]: _failure, ...remaining }) => remaining);
+          await refreshAll();
+        }}
+      />}
 
       <ProfileFormModal
         open={formOpen}
@@ -2313,7 +2353,8 @@ export default function ProfileManager() {
           setOpenVpnCredentialProfile(null);
           pending.resolve({ credentials, remember });
         } : undefined}
-        onConnected={(_profile, status) => {
+        onConnected={(profile, status) => {
+          setConnectionFailures(({ [profile.id]: _failure, ...current }) => current);
           if (status.message) toast("info", status.message);
           setOpenVpnCredentialProfile(null);
           void refreshAll();

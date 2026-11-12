@@ -235,7 +235,12 @@ impl Sandbox {
         )
         .unwrap();
         assert!(imported.errors.is_empty());
-        let key = subscription::endpoint_key(FIRST);
+        let key = self
+            .vault()
+            .read_subscription_endpoints(PROFILE_ID)
+            .unwrap()[0]
+            .id
+            .clone();
         let mut profile = self.profile(PROFILE_ID);
         profile.xray_mode = XrayMode::Tun;
         profile.private_lan_direct = true;
@@ -376,10 +381,7 @@ fn cached_subscription_import_preserves_original_hwid_and_only_valid_endpoints()
         endpoints.iter().map(|e| e.url.as_str()).collect::<Vec<_>>(),
         [FIRST, SECOND]
     );
-    assert_eq!(
-        meta.active_key.as_deref(),
-        Some(subscription::endpoint_key(FIRST).as_str())
-    );
+    assert_eq!(meta.active_key.as_deref(), Some(endpoints[0].id.as_str()));
     let config: Value = serde_json::from_slice(&fs::read(&profile.config_path).unwrap()).unwrap();
     assert_eq!(
         config["outbounds"][0]["settings"]["vnext"][0]["address"],

@@ -26,7 +26,11 @@ pub mod log_sanitize;
 #[cfg(target_os = "macos")]
 mod macos_inventory;
 pub mod macos_vpn;
+pub mod managed_mihomo;
 pub mod managed_xray;
+pub mod mihomo;
+#[cfg(unix)]
+pub mod mihomo_control;
 pub mod models;
 #[cfg(unix)]
 pub mod netbird;
@@ -45,6 +49,7 @@ pub mod route_plan;
 pub mod route_state;
 pub mod service_checks;
 pub mod subscription;
+mod subscription_identity;
 pub mod system_proxy;
 pub mod vpn;
 pub mod windows_job;

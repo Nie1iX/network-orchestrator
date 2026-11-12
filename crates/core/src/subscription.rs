@@ -1,4 +1,6 @@
 //! Bounded subscription loading and managed import shared by desktop clients.
+use crate::subscription_identity::reconcile_catalog_reserved;
+pub(crate) use crate::subscription_identity::{reconcile_catalog, validate_catalog};
 use crate::{
     config_vault::{ConfigVault, SubscriptionEndpoint},
     models::*,
@@ -10,6 +12,298 @@ use std::{
     io,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(test)]
+mod mihomo_subscription_tests {
+    #[test]
+    fn native_subscription_user_agent_is_recognized() {
+        assert!(super::MIHOMO_SUBSCRIPTION_USER_AGENT.starts_with("clash.meta"));
+    }
+
+    #[tokio::test]
+    async fn native_fetch_sends_client_identity_and_keeps_document() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let size = stream.read(&mut request).await.unwrap();
+            let body = "proxies: []\nproxy-groups: []\nrules: ['MATCH,DIRECT']\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request[..size].to_vec())
+                .unwrap()
+                .to_lowercase()
+        });
+        let (document, fetched) =
+            super::fetch_mihomo(&format!("http://{addr}/source"), "device-id")
+                .await
+                .unwrap();
+        let request = server.await.unwrap();
+        assert!(request.contains("user-agent: clash.meta/"));
+        assert!(request.contains("x-hwid: device-id"));
+        assert!(fetched.body.contains("proxy-groups:"));
+        assert!(document["proxy-groups"].is_array());
+    }
+
+    #[tokio::test]
+    async fn native_dataset_fetch_keeps_binary_bytes() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n\xff\x00",
+                )
+                .await
+                .unwrap();
+        });
+        let bytes = super::fetch_mihomo_dataset(&format!("http://{addr}/dataset"))
+            .await
+            .unwrap();
+        assert_eq!(bytes, [0xff, 0]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_headers_are_not_forwarded_across_origins() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut upstream, _) = source.accept().await.unwrap();
+            let mut request = [0; 8192];
+            let read = upstream.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read])
+                .to_lowercase()
+                .contains("x-token: secret"));
+            upstream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/data\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+            let (mut downstream, _) = target.accept().await.unwrap();
+            let read = downstream.read(&mut request).await.unwrap();
+            let forwarded = String::from_utf8_lossy(&request[..read]).to_lowercase();
+            downstream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx")
+                .await
+                .unwrap();
+            forwarded
+        });
+        let headers = std::collections::BTreeMap::from([("x-token".into(), vec!["secret".into()])]);
+        super::fetch_mihomo_dataset_with_headers(&format!("http://{source_addr}/data"), &headers)
+            .await
+            .unwrap();
+        assert!(!server.await.unwrap().contains("x-token"));
+    }
+}
+
+fn referenced_ids(profile: &Profile) -> std::collections::HashSet<String> {
+    let mut keys = profile.named_exit_keys();
+    if let Some(meta) = &profile.subscription {
+        keys.extend(meta.active_key.iter().cloned());
+        keys.extend(
+            meta.backup_keys
+                .iter()
+                .chain(&meta.pool_keys)
+                .map(|entry| entry.key.clone()),
+        );
+    }
+    keys.extend(
+        profile
+            .pinned_policies
+            .iter()
+            .map(|pin| pin.endpoint_key.clone()),
+    );
+    keys.extend(profile.xray_dns.outbound_key.iter().cloned());
+    keys.extend(
+        profile
+            .xray_service_checks
+            .iter()
+            .map(|check| check.endpoint_key.clone()),
+    );
+    keys
+}
+
+/// Migrate legacy URL-derived references before taking a profile snapshot.
+pub fn migrate_endpoint_ids(
+    vault: &ConfigVault,
+    store: &ProfileStore,
+    id: &str,
+) -> io::Result<Profile> {
+    let current = store
+        .load()?
+        .profiles
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| invalid("Profile not found"))?;
+    if current.subscription.is_none() {
+        return Ok(current);
+    }
+    let sidecar = vault.read_subscription_sidecar(id)?;
+    if sidecar.version != 0 && !sidecar.migration_pending {
+        return Ok(current);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::metadata(vault.root().join(id).join("subscription.json"))?.uid();
+        if unsafe { libc::geteuid() } == 0
+            && (owner != 0 || store.owner_uid()? != 0 || std::env::var_os("SUDO_UID").is_some())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "subscription identity migration must run as the profile owner",
+            ));
+        }
+    }
+    let _guard = store.lock()?;
+    let mut document = store.load()?;
+    let profile = document
+        .profiles
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or_else(|| invalid("Profile not found"))?;
+    if profile.subscription.is_none() {
+        return Ok(profile.clone());
+    }
+    let old = vault.read_subscription_sidecar(id)?;
+    if old.version != 0 && !old.migration_pending {
+        return Ok(profile.clone());
+    }
+    let mut new = if old.migration_pending {
+        old.clone()
+    } else {
+        let mut reserved = referenced_ids(profile);
+        reserved.extend(
+            old.endpoints
+                .iter()
+                .map(|endpoint| legacy_endpoint_key(&endpoint.url)),
+        );
+        reconcile_catalog_reserved(None, &old.endpoints, &reserved)?
+    };
+    new.migration_pending = true;
+    let resolve = |key: &str, name: Option<&str>| -> Option<String> {
+        let matches: Vec<_> = old
+            .endpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, endpoint)| legacy_endpoint_key(&endpoint.url) == key)
+            .collect();
+        let chosen = if matches.len() == 1 {
+            Some(matches[0].0)
+        } else if let Some(name) = name {
+            let named: Vec<_> = matches
+                .iter()
+                .filter(|(_, endpoint)| endpoint.name == name)
+                .collect();
+            if named.len() == 1 {
+                Some(named[0].0)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        chosen.map(|index| new.endpoints[index].id.clone())
+    };
+    let saved_config = crate::config_security::read_xray_config(&profile.config_path, &profile.id)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let selected_by_config = profile
+        .subscription
+        .as_ref()
+        .and_then(|meta| meta.active_key.as_ref())
+        .and_then(|key| {
+            let mut matches = old.endpoints.iter().enumerate().filter(|(_, endpoint)| {
+                legacy_endpoint_key(&endpoint.url) == *key
+                    && saved_config.as_ref().is_some_and(|saved| {
+                        xray::generate_share_link_config_with_http(
+                            &endpoint.url,
+                            profile.xray_socks_port.unwrap_or(10808),
+                            profile.xray_http_port.unwrap_or(10809),
+                        )
+                        .is_ok_and(|generated| &generated == saved)
+                    })
+            });
+            let (index, _) = matches.next()?;
+            if matches.next().is_none() {
+                Some(new.endpoints[index].id.clone())
+            } else {
+                None
+            }
+        });
+    let meta = profile.subscription.as_mut().expect("subscription checked");
+    if let Some(key) = meta.active_key.as_mut() {
+        if let Some(id) = resolve(key, None).or(selected_by_config) {
+            *key = id;
+        }
+    } else if let Some(endpoint) = new.endpoints.get(meta.active_index) {
+        meta.active_key = Some(endpoint.id.clone());
+    }
+    for reference in meta.backup_keys.iter_mut().chain(meta.pool_keys.iter_mut()) {
+        if let Some(id) = resolve(&reference.key, Some(&reference.name)) {
+            reference.key = id;
+        }
+    }
+    for pin in &mut profile.pinned_policies {
+        if let Some(id) = resolve(&pin.endpoint_key, None) {
+            pin.endpoint_key = id;
+        }
+    }
+    if let Some(key) = &mut profile.xray_dns.outbound_key {
+        if let Some(id) = resolve(key, None) {
+            *key = id;
+        }
+    }
+    for check in &mut profile.xray_service_checks {
+        if let Some(id) = resolve(&check.endpoint_key, None) {
+            check.endpoint_key = id;
+        }
+    }
+    for exit in &mut profile.xray_proxy_exits {
+        match &mut exit.target {
+            ProxyTarget::Node { endpoint_key } => {
+                if let Some(id) = resolve(endpoint_key, None) {
+                    *endpoint_key = id;
+                }
+            }
+            ProxyTarget::Pool { endpoint_keys } => {
+                for key in endpoint_keys {
+                    if let Some(id) = resolve(key, None) {
+                        *key = id;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    sync_endpoint_refs(profile, &new.endpoints);
+    let result = profile.clone();
+    if let Err(error) = vault.store_subscription_sidecar(id, &new) {
+        if vault.store_subscription_sidecar(id, &old).is_err() {
+            return Err(failure("subscription identity migration rollback failed"));
+        }
+        return Err(error);
+    }
+    if let Err(error) = store.save_locked(&document) {
+        if vault.store_subscription_sidecar(id, &old).is_err() {
+            return Err(failure("subscription identity migration rollback failed"));
+        }
+        return Err(error);
+    }
+    new.migration_pending = false;
+    vault
+        .store_subscription_sidecar(id, &new)
+        .map_err(|_| failure("subscription identity migration finalization failed"))?;
+    Ok(result)
+}
 
 /// Panels that serve full Xray JSON configs send ~20–40 KiB per server.
 pub const MAX_SUBSCRIPTION_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -24,6 +318,113 @@ fn failure(message: &str) -> io::Error {
 /// User-Agent and answer unknown clients with a placeholder server. v2rayN is
 /// universally recognized and receives the Base64 list of share links.
 pub const SUBSCRIPTION_USER_AGENT: &str = "v2rayN/7.13.8";
+pub const MIHOMO_SUBSCRIPTION_USER_AGENT: &str = "clash.meta/1.19.34";
+
+pub fn mihomo_http_client() -> io::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(MIHOMO_SUBSCRIPTION_USER_AGENT)
+        .build()
+        .map_err(|_| failure("Could not create the subscription HTTP client"))
+}
+
+pub async fn fetch_mihomo(
+    source: &str,
+    hwid: &str,
+) -> io::Result<(serde_json::Value, FetchedSubscription)> {
+    let client = mihomo_http_client()?;
+    let fetched = fetch(&client, source, hwid).await?;
+    let config = crate::mihomo::parse_config(fetched.body.as_bytes())?;
+    Ok((config, fetched))
+}
+
+pub async fn fetch_mihomo_dataset(source: &str) -> io::Result<Vec<u8>> {
+    fetch_mihomo_dataset_with_headers(source, &std::collections::BTreeMap::new()).await
+}
+
+pub async fn fetch_mihomo_dataset_with_headers(
+    source: &str,
+    headers: &std::collections::BTreeMap<String, Vec<String>>,
+) -> io::Result<Vec<u8>> {
+    async fn download(
+        source: &str,
+        headers: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> io::Result<Vec<u8>> {
+        let client = mihomo_http_client()?;
+        let mut url = validate_url(source)?;
+        let original = url.origin();
+        let mut forward_headers = true;
+        let mut safe_headers = reqwest::header::HeaderMap::new();
+        for (name, values) in headers {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| invalid("Invalid Mihomo provider header"))?;
+            if matches!(
+                name.as_str(),
+                "host"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "connection"
+                    | "proxy-authorization"
+            ) {
+                return Err(invalid("Unsafe Mihomo provider header"));
+            }
+            for value in values {
+                let mut value = reqwest::header::HeaderValue::from_str(value)
+                    .map_err(|_| invalid("Invalid Mihomo provider header"))?;
+                value.set_sensitive(true);
+                safe_headers.append(name.clone(), value);
+            }
+        }
+        for redirect in 0..=5 {
+            let mut request = client.get(url.clone());
+            if forward_headers {
+                request = request.headers(safe_headers.clone());
+            }
+            let mut response = request
+                .send()
+                .await
+                .map_err(|_| failure("Could not fetch the Mihomo dataset"))?;
+            if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                if redirect == 5 {
+                    return Err(failure("Mihomo dataset redirected too many times"));
+                }
+                let next = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|location| url.join(location).ok())
+                    .ok_or_else(|| invalid("Invalid Mihomo dataset redirect"))?;
+                validate_url(next.as_str())?;
+                if url.scheme() == "https" && next.scheme() != "https" {
+                    return Err(invalid("Insecure Mihomo dataset redirect was rejected"));
+                }
+                forward_headers &= next.origin() == original;
+                url = next;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(failure("Mihomo dataset request failed"));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| failure("Could not read the Mihomo dataset"))?
+            {
+                if chunk.len() > MAX_SUBSCRIPTION_BODY_BYTES - bytes.len() {
+                    return Err(invalid("Mihomo dataset exceeds the 4 MiB limit"));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            return Ok(bytes);
+        }
+        Err(failure("Mihomo dataset redirected too many times"))
+    }
+    tokio::time::timeout(Duration::from_secs(30), download(source, headers))
+        .await
+        .map_err(|_| failure("Mihomo dataset request timed out"))?
+}
 
 pub const UNSUPPORTED_CLIENT_MESSAGE: &str =
     "The subscription server returned a placeholder instead of servers. It may not recognize this app or require an HWID.";
@@ -584,7 +985,11 @@ pub fn import_body(
                 }
                 let name = xray::share_link_name(&uri)
                     .unwrap_or_else(|| format!("Endpoint {}", endpoints.len() + 1));
-                endpoints.push(SubscriptionEndpoint { url: uri, name });
+                endpoints.push(SubscriptionEndpoint {
+                    id: String::new(),
+                    url: uri,
+                    name,
+                });
             }
             Err(_) => errors.push(BatchImportError {
                 path: format!("Endpoint {}", index + 1),
@@ -592,12 +997,14 @@ pub fn import_body(
             }),
         }
     }
+    let sidecar = reconcile_catalog(None, &endpoints)?;
+    let endpoints = &sidecar.endpoints;
     let first_config =
         first_config.ok_or_else(|| invalid("Subscription contained no valid share links"))?;
     let body = serde_json::to_vec_pretty(&first_config)?;
     let imported = vault.store_generated_xray(request.id, &body)?;
     let result = (|| {
-        vault.store_subscription_endpoints(request.id, &endpoints)?;
+        vault.store_subscription_sidecar(request.id, &sidecar)?;
         let profile = Profile {
             id: request.id.into(),
             name: if request.name.trim().is_empty() {
@@ -630,7 +1037,7 @@ pub fn import_body(
                 web_page_url: meta.web_page_url,
                 update_interval_hours: meta.update_interval_hours,
                 skipped_protocols,
-                active_key: Some(endpoint_key(&endpoints[0].url)),
+                active_key: Some(endpoints[0].id.clone()),
                 backup_keys: Vec::new(),
                 auto_return_primary: None,
                 probe_url: None,
@@ -660,17 +1067,17 @@ pub fn switch_endpoint(
     index: usize,
     available: impl Fn(u16) -> bool,
 ) -> io::Result<ProfileDocument> {
+    migrate_endpoint_ids(vault, store, id)?;
     let endpoints = vault.read_subscription_endpoints(id)?;
-    let key = endpoint_key(
-        &endpoints
-            .get(index)
-            .ok_or_else(|| invalid("Invalid endpoint index"))?
-            .url,
-    );
+    let key = endpoints
+        .get(index)
+        .ok_or_else(|| invalid("Invalid endpoint index"))?
+        .id
+        .clone();
     switch_endpoint_key(vault, store, id, &key, available)
 }
 
-/// Select the primary endpoint by its stable key (see [`endpoint_key`]).
+/// Select the primary endpoint by its persisted ID.
 /// The key must resolve to a current endpoint — a key the refresh dropped
 /// is rejected instead of retargeted to whatever took its position.
 pub fn switch_endpoint_key(
@@ -680,6 +1087,7 @@ pub fn switch_endpoint_key(
     key: &str,
     available: impl Fn(u16) -> bool,
 ) -> io::Result<ProfileDocument> {
+    migrate_endpoint_ids(vault, store, id)?;
     let document = store.load()?;
     let profile = prepare_endpoint_switch(vault, &document.profiles, id, key, available)?;
     let old_path = &document
@@ -760,13 +1168,16 @@ pub fn list_endpoints(
     store: &ProfileStore,
     id: &str,
 ) -> io::Result<Vec<SubscriptionEndpointInfo>> {
-    let profile = subscription_profile(store, id)?;
-    let subscription = profile.subscription.as_ref().expect("checked above");
+    let profile = migrate_endpoint_ids(vault, store, id)?;
+    let subscription = profile
+        .subscription
+        .as_ref()
+        .ok_or_else(|| invalid("Profile is not a subscription"))?;
     let endpoints = vault.read_subscription_endpoints(id)?;
     let active_key = stored_active_key(&profile).or_else(|| {
         endpoints
             .get(subscription.active_index)
-            .map(|endpoint| endpoint_key(&endpoint.url))
+            .map(|endpoint| endpoint.id.clone())
     });
     let backup: std::collections::HashSet<&str> = subscription
         .backup_keys
@@ -793,7 +1204,7 @@ pub fn list_endpoints(
     let mut rows: Vec<SubscriptionEndpointInfo> = endpoints
         .iter()
         .map(|endpoint| {
-            let key = endpoint_key(&endpoint.url);
+            let key = endpoint.id.clone();
             SubscriptionEndpointInfo {
                 name: endpoint.name.clone(),
                 active: active_key.as_deref() == Some(key.as_str()),
@@ -852,7 +1263,10 @@ pub fn set_backup_endpoints(
     if keys.len() >= MAX_FAILOVER_NODES {
         return Err(invalid("At most seven backup endpoints can be selected"));
     }
-    let mut profile = subscription_profile(store, id)?;
+    let mut profile = migrate_endpoint_ids(vault, store, id)?;
+    if profile.subscription.is_none() {
+        return Err(invalid("Profile is not a subscription"));
+    }
     let endpoints = vault.read_subscription_endpoints(id)?;
     let mut refs = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -876,7 +1290,7 @@ pub fn set_backup_endpoints(
             .subscription
             .as_ref()
             .and_then(|subscription| endpoints.get(subscription.active_index))
-            .map(|endpoint| endpoint_key(&endpoint.url))
+            .map(|endpoint| endpoint.id.clone())
     });
     refs.retain(|reference| Some(reference.key.as_str()) != active.as_deref());
     profile
@@ -913,7 +1327,10 @@ pub fn set_pinned_routes(
     id: &str,
     routes: Vec<PinnedRoute>,
 ) -> io::Result<ProfileDocument> {
-    let mut profile = subscription_profile(store, id)?;
+    let mut profile = migrate_endpoint_ids(vault, store, id)?;
+    if profile.subscription.is_none() {
+        return Err(invalid("Profile is not a subscription"));
+    }
     let endpoints = vault.read_subscription_endpoints(id)?;
     for route in &routes {
         if !valid_endpoint_key(&route.endpoint_key) {
@@ -955,7 +1372,7 @@ pub fn failover_plan(
     let active_key = stored_active_key(profile).or_else(|| {
         endpoints
             .get(subscription.active_index)
-            .map(|endpoint| endpoint_key(&endpoint.url))
+            .map(|endpoint| endpoint.id.clone())
     });
     let primary_index = active_key
         .as_deref()
@@ -980,10 +1397,7 @@ pub fn failover_plan(
             break;
         }
         if let Some(index) = key_index(&endpoints, &backup.key) {
-            if !nodes
-                .iter()
-                .any(|node| endpoint_key(&node.url) == endpoint_key(&endpoints[index].url))
-            {
+            if !nodes.iter().any(|node| node.id == endpoints[index].id) {
                 nodes.push(endpoints[index].clone());
             }
         }
@@ -1066,19 +1480,8 @@ fn key_digest(identity: &str) -> String {
         .collect()
 }
 
-/// Secret-safe identity of an endpoint across refreshes and credential
-/// rotation: the transport the client actually dials, never the display
-/// name and never the userinfo (`uuid`/password) — rotating credentials
-/// keeps the same node while a genuinely different server or transport
-/// produces a different key. Two entries that hash identically are the
-/// same transport (duplicate lines collapse to the first match).
-///
-/// Share links reduce to `scheme|host:port|sorted query` (transport
-/// parameters like `sni`, `pbk`, `type` are part of the identity; a panel
-/// that rotates them yields a new, unavailable key rather than a silent
-/// retarget). Whole-config `xray-json:` entries reduce to
-/// `protocol|address:port|network|security` of their first outbound.
-pub fn endpoint_key(url: &str) -> String {
+/// Legacy URL-derived key, used only to migrate pre-identity profiles.
+pub fn legacy_endpoint_key(url: &str) -> String {
     let trimmed = url.trim();
     if trimmed.starts_with(xray::XRAY_JSON_PREFIX) {
         let identity = xray::xray_json_identity(trimmed).unwrap_or_else(|| trimmed.to_string());
@@ -1136,7 +1539,9 @@ pub fn refresh_body(
     if body.len() > MAX_SUBSCRIPTION_BODY_BYTES {
         return Err(invalid("Subscription response exceeds the 4 MiB limit"));
     }
-    let document = store.load()?;
+    migrate_endpoint_ids(vault, store, id)?;
+    let _guard = store.lock()?;
+    let mut document = store.load()?;
     let mut profile = document
         .profiles
         .iter()
@@ -1159,11 +1564,12 @@ pub fn refresh_body(
                 || available(port)
         },
     )?;
-    let previous = vault.read_subscription_endpoints(id)?;
+    let previous_sidecar = vault.read_subscription_sidecar(id)?;
+    let previous = &previous_sidecar.endpoints;
     // The stored key wins; a profile saved before `active_key` existed
     // resolves its index against the previous endpoint list instead.
-    let selected = stored_active_key(&profile)
-        .or_else(|| previous.get(old_index).map(|e| endpoint_key(&e.url)));
+    let selected =
+        stored_active_key(&profile).or_else(|| previous.get(old_index).map(|e| e.id.clone()));
 
     let (urls, mut skipped_count, skipped_protocols) = parse_subscription_body_detailed(body);
     if is_unsupported_client_placeholder(&urls) {
@@ -1176,7 +1582,11 @@ pub fn refresh_body(
             Ok(config) => {
                 let name = xray::share_link_name(&uri)
                     .unwrap_or_else(|| format!("Endpoint {}", endpoints.len() + 1));
-                endpoints.push(SubscriptionEndpoint { url: uri, name });
+                endpoints.push(SubscriptionEndpoint {
+                    id: String::new(),
+                    url: uri,
+                    name,
+                });
                 configs.push(config);
             }
             Err(_) => skipped_count += 1,
@@ -1187,11 +1597,14 @@ pub fn refresh_body(
             "subscription refresh contained no valid share links ({skipped_count} skipped)"
         )));
     }
-    // Duplicate transports collapse to the first match — the key identifies
-    // a node, not a list position, so two identical entries can never steer
-    // the selection to a different server.
-    let new_index = selected.as_ref().and_then(|key| key_index(&endpoints, key));
-    let keep_missing = preserve_selected && selected.is_some() && new_index.is_none();
+    let next_sidecar = reconcile_catalog_reserved(
+        Some(&previous_sidecar),
+        &endpoints,
+        &referenced_ids(&profile),
+    )?;
+    let endpoints = &next_sidecar.endpoints;
+    let new_index = selected.as_ref().and_then(|key| key_index(endpoints, key));
+    let keep_missing = selected.is_some() && new_index.is_none();
     let fallback_used = new_index.is_none() && !keep_missing;
     let active_index = new_index.unwrap_or_else(|| {
         if keep_missing {
@@ -1210,9 +1623,8 @@ pub fn refresh_body(
     };
     let rollback = || {
         let restored = vault
-            .read_subscription_endpoints(id)
-            .is_ok_and(|current| current == previous)
-            || vault.store_subscription_endpoints(id, &previous).is_ok();
+            .store_subscription_sidecar(id, &previous_sidecar)
+            .is_ok();
         let removed = new_path == old_path || vault.remove_revision_for_config(&new_path).is_ok();
         restored && removed
     };
@@ -1223,7 +1635,7 @@ pub fn refresh_body(
             failure("subscription refresh failed; rollback incomplete")
         }
     };
-    if vault.store_subscription_endpoints(id, &endpoints).is_err() {
+    if vault.store_subscription_sidecar(id, &next_sidecar).is_err() {
         return Err(failure_message("failed to store refreshed endpoints"));
     }
     // Missing headers keep the stored provider metadata.
@@ -1232,7 +1644,7 @@ pub fn refresh_body(
         .as_ref()
         .and_then(|s| s.provider_title.clone());
     let title = meta.provider_title.clone().or(stored_title.clone());
-    if !keep_missing && is_generated_name(&profile.name, stored_title.as_deref(), &previous) {
+    if !keep_missing && is_generated_name(&profile.name, stored_title.as_deref(), previous) {
         profile.name = subscription_profile_name(title.as_deref(), &endpoints[active_index].name);
     }
     profile.config_path = new_path.clone();
@@ -1244,7 +1656,7 @@ pub fn refresh_body(
     subscription.active_key = if keep_missing {
         selected
     } else {
-        Some(endpoint_key(&endpoints[active_index].url))
+        Some(endpoints[active_index].id.clone())
     };
     subscription.last_refresh_at_unix = Some(
         SystemTime::now()
@@ -1272,8 +1684,13 @@ pub fn refresh_body(
         subscription.update_interval_hours = meta.update_interval_hours;
     }
     subscription.skipped_protocols = skipped_protocols;
-    sync_endpoint_refs(&mut profile, &endpoints);
-    if store.upsert(profile).is_err() {
+    sync_endpoint_refs(&mut profile, endpoints);
+    *document
+        .profiles
+        .iter_mut()
+        .find(|stored| stored.id == id)
+        .expect("profile loaded") = profile;
+    if store.save_locked(&document).is_err() {
         return Err(failure_message("failed to store refreshed profile"));
     }
     let cleanup_failed = new_path != old_path
@@ -1287,21 +1704,26 @@ pub fn refresh_body(
         cleanup_failed,
     })
 }
-/// Index of the endpoint with this key; duplicates collapse to the first.
+/// Resolve only an unambiguous persisted identity.
 pub fn key_index(endpoints: &[SubscriptionEndpoint], key: &str) -> Option<usize> {
-    endpoints
+    let mut matches = endpoints
         .iter()
-        .position(|endpoint| endpoint_key(&endpoint.url) == key)
+        .enumerate()
+        .filter(|(_, endpoint)| endpoint.id == key);
+    let (index, _) = matches.next()?;
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(index)
+    }
 }
 
-/// The stored `active_key` when it is a well-formed key (legacy profiles
-/// fall back to `active_index`).
+/// Explicit keys, including malformed ones, must never fall back to an index.
 fn stored_active_key(profile: &Profile) -> Option<String> {
     profile
         .subscription
         .as_ref()
         .and_then(|subscription| subscription.active_key.clone())
-        .filter(|key| valid_endpoint_key(key))
 }
 
 /// Reconcile stored key references with a fresh endpoint list: backup refs
@@ -1345,17 +1767,56 @@ impl Drop for TemporaryXray {
     }
 }
 
-/// Spawn a temporary unprivileged Xray serving the caller's config on a
-/// free loopback SOCKS port, wait for the listener and return a proxied
-/// client. The caller retains ownership across timeouts and awaits stop before
-/// returning; Drop still kills on cancellation. Errors never echo configuration.
-/// Shared by delay, exit-country and explicit service probes.
+/// Maximum additional initialization time for a provider observer.
+pub(crate) const OBSERVATION_STARTUP_LIMIT: Duration = Duration::from_secs(60);
+
+pub(crate) fn observation_startup(config: &serde_json::Value) -> Result<Duration, String> {
+    fn interval(value: Option<&serde_json::Value>, default: &str) -> Result<Duration, String> {
+        let text = match value {
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| "unsupported observation interval".to_string())?,
+            None => default,
+        };
+        let (number, multiplier) = if let Some(n) = text.strip_suffix("ms") {
+            (n, 1u64)
+        } else if let Some(n) = text.strip_suffix('s') {
+            (n, 1000)
+        } else if let Some(n) = text.strip_suffix('m') {
+            (n, 60_000)
+        } else {
+            return Err("unsupported observation interval".into());
+        };
+        let millis = number
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(multiplier))
+            .filter(|n| *n > 0 && *n <= OBSERVATION_STARTUP_LIMIT.as_millis() as u64)
+            .ok_or_else(|| "unsupported observation interval".to_string())?;
+        Ok(Duration::from_millis(millis))
+    }
+    let mut startup = Duration::ZERO;
+    if let Some(observer) = config.get("observatory").filter(|value| !value.is_null()) {
+        startup = startup.max(interval(observer.get("probeInterval"), "10s")?);
+    }
+    if let Some(observer) = config
+        .get("burstObservatory")
+        .filter(|value| !value.is_null())
+    {
+        startup = startup.max(interval(observer["pingConfig"].get("interval"), "10s")?);
+    }
+    Ok(startup)
+}
+
+/// Spawn a temporary unprivileged Xray on a free loopback SOCKS port.
+/// Return its client and bounded observation warm-up separately so listener
+/// startup retains its own deadline. The caller owns and reaps the process.
 pub(crate) async fn temporary_socks_client(
     build_config: impl FnOnce(u16) -> Result<serde_json::Value, String>,
     mut command: tokio::process::Command,
     timeout: std::time::Duration,
     process: &mut Option<TemporaryXray>,
-) -> Result<reqwest::Client, String> {
+) -> Result<(reqwest::Client, Duration), String> {
     use tokio::io::AsyncWriteExt;
 
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -1365,6 +1826,7 @@ pub(crate) async fn temporary_socks_client(
         .map_err(|_| "failed to reserve delay probe port".to_string())?
         .port();
     let config = build_config(socks_port)?;
+    let observation_wait = observation_startup(&config)?;
     let config = serde_json::to_vec(&config)
         .map_err(|_| "failed to encode delay probe config".to_string())?;
     drop(listener);
@@ -1384,9 +1846,10 @@ pub(crate) async fn temporary_socks_client(
         .stdin
         .take()
         .ok_or_else(|| "failed to send delay probe config".to_string())?;
-    stdin
-        .write_all(&config)
+    let listener_deadline = tokio::time::Instant::now() + timeout;
+    tokio::time::timeout_at(listener_deadline, stdin.write_all(&config))
         .await
+        .map_err(|_| "delay probe listener timed out".to_string())?
         .map_err(|_| "failed to send delay probe config".to_string())?;
     drop(stdin);
     loop {
@@ -1403,6 +1866,9 @@ pub(crate) async fn temporary_socks_client(
         {
             return Err("delay probe process exited before proxy was ready".into());
         }
+        if tokio::time::Instant::now() >= listener_deadline {
+            return Err("delay probe listener timed out".into());
+        }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
     let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{socks_port}"))
@@ -1415,7 +1881,7 @@ pub(crate) async fn temporary_socks_client(
         .timeout(timeout)
         .build()
         .map_err(|_| "failed to build delay probe client".to_string())?;
-    Ok(client)
+    Ok((client, observation_wait))
 }
 
 /// Measure HTTP latency through a temporary Xray that runs one endpoint on a
@@ -1429,7 +1895,7 @@ pub async fn measure_delay_with_command(
 ) -> Result<u64, String> {
     measure_delay_with_config(
         |socks_port| {
-            xray::generate_share_link_config(uri, socks_port)
+            xray::endpoint_probe_config(uri, socks_port)
                 .map_err(|_| "invalid subscription endpoint".to_string())
         },
         command,
@@ -1449,24 +1915,35 @@ pub async fn measure_delay_with_config(
     timeout: std::time::Duration,
 ) -> Result<u64, String> {
     let mut process = None;
-    let result = tokio::time::timeout(timeout, async {
-        let client = temporary_socks_client(build_config, command, timeout, &mut process).await?;
-        let started = std::time::Instant::now();
-        let response = client
-            .get(probe_url)
-            .send()
-            .await
-            .map_err(|_| "delay probe request failed".to_string())?;
-        if response.status() != reqwest::StatusCode::NO_CONTENT {
-            return Err("delay probe returned an unexpected status".into());
-        }
-        Ok(started.elapsed().as_millis().max(1) as u64)
-    })
+    let deadline = tokio::time::Instant::now() + timeout;
+    let result = async {
+        let (client, observation_wait) = tokio::time::timeout_at(
+            deadline,
+            temporary_socks_client(build_config, command, timeout, &mut process),
+        )
+        .await
+        .map_err(|_| "delay probe timed out".to_string())??;
+        tokio::time::timeout_at(deadline + observation_wait, async {
+            tokio::time::sleep(observation_wait).await;
+            let started = std::time::Instant::now();
+            let response = client
+                .get(probe_url)
+                .send()
+                .await
+                .map_err(|_| "delay probe request failed".to_string())?;
+            if response.status() != reqwest::StatusCode::NO_CONTENT {
+                return Err("delay probe returned an unexpected status".into());
+            }
+            Ok(started.elapsed().as_millis().max(1) as u64)
+        })
+        .await
+        .map_err(|_| "delay probe timed out".to_string())?
+    }
     .await;
     if let Some(mut process) = process {
         process.stop().await?;
     }
-    result.map_err(|_| "delay probe timed out".to_string())?
+    result
 }
 
 /// Delay to one endpoint using the given Xray executable.
@@ -1492,6 +1969,26 @@ pub fn public_profiles(mut profiles: Vec<Profile>) -> Vec<Profile> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observation_startup_is_bounded_and_does_not_shorten_source_interval() {
+        use super::*;
+        assert_eq!(
+            observation_startup(&serde_json::json!({})).unwrap(),
+            Duration::ZERO
+        );
+        assert_eq!(
+            observation_startup(
+                &serde_json::json!({"burstObservatory":{"pingConfig":{"interval":"30s"}}})
+            )
+            .unwrap(),
+            Duration::from_secs(30)
+        );
+        assert!(observation_startup(
+            &serde_json::json!({"burstObservatory":{"pingConfig":{"interval":"120s"}}})
+        )
+        .is_err());
+    }
+
     fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
             .iter()
@@ -1635,6 +2132,333 @@ mod tests {
     }
 
     #[test]
+    fn distinct_full_configs_sharing_first_hop_have_distinct_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let store = ProfileStore::new(dir.path().join("profiles.json"));
+        let body = serde_json::json!([
+            {"remarks":"Auto","outbounds":[{"tag":"proxy","protocol":"vless",
+                "settings":{"vnext":[{"address":"same.test","port":443,"users":[{"id":"secret"}]}]}}],
+                "routing":{"rules":[{"type":"field","domain":["geosite:uk"],"outboundTag":"proxy"}]}},
+            {"remarks":"UK","outbounds":[{"tag":"proxy","protocol":"vless",
+                "settings":{"vnext":[{"address":"same.test","port":443,"users":[{"id":"secret"}]}]}}],
+                "routing":{"rules":[]}}
+        ]).to_string();
+        import_body(
+            &vault,
+            &store,
+            &SubscriptionImport {
+                id: "nodes",
+                url: "https://example.test/sub",
+                hwid: "",
+                name: "Nodes",
+                refresh_interval_minutes: None,
+            },
+            &body,
+            ResponseMeta::default(),
+            XrayMode::Socks,
+            |_| true,
+        )
+        .unwrap();
+        let rows = list_endpoints(&vault, &store, "nodes").unwrap();
+        assert_ne!(rows[0].key, rows[1].key);
+    }
+
+    #[test]
+    fn removed_endpoint_recovers_its_identity_when_it_reappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, store) = import_panel(dir.path(), &["Primary", "Backup"]);
+        let before = list_endpoints(&vault, &store, "panel").unwrap();
+        set_backup_endpoints(&vault, &store, "panel", &[before[1].key.clone()]).unwrap();
+        refresh_body(
+            &vault,
+            &store,
+            "panel",
+            &panel_body(&["Primary"]),
+            ResponseMeta::default(),
+            true,
+            |_| true,
+        )
+        .unwrap();
+        refresh_body(
+            &vault,
+            &store,
+            "panel",
+            &panel_body(&["Backup", "Primary"]),
+            ResponseMeta::default(),
+            true,
+            |_| true,
+        )
+        .unwrap();
+        let after = list_endpoints(&vault, &store, "panel").unwrap();
+        assert_eq!(after[0].key, before[1].key);
+        assert!(after[0].is_backup);
+    }
+
+    #[test]
+    fn identity_survives_address_and_credentials_rotation_under_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let store = ProfileStore::new(dir.path().join("profiles.json"));
+        let request = SubscriptionImport {
+            id: "nodes",
+            url: "https://example.test/sub",
+            hwid: "",
+            name: "Nodes",
+            refresh_interval_minutes: None,
+        };
+        import_body(&vault, &store, &request,
+            "vless://old@one.test:443?security=tls#Primary\nvless://old@two.test:443?security=tls#Backup",
+            ResponseMeta::default(), XrayMode::Socks, |_| true).unwrap();
+        let before = list_endpoints(&vault, &store, "nodes").unwrap();
+        set_backup_endpoints(&vault, &store, "nodes", &[before[1].key.clone()]).unwrap();
+        let key = before[1].key.clone();
+        store
+            .update_profile("nodes", |profile| {
+                profile.pinned_policies.push(PinnedRoute {
+                    selectors: vec!["domain:service.test".into()],
+                    endpoint_key: key.clone(),
+                    missing: false,
+                });
+                profile.xray_dns.outbound_key = Some(key.clone());
+                profile.xray_service_checks.push(ServiceCheck {
+                    id: "health".into(),
+                    name: "Health".into(),
+                    url: "https://service.test/health".into(),
+                    endpoint_key: key.clone(),
+                    background: false,
+                });
+                profile.xray_proxy_exits.push(NamedProxyExit {
+                    name: "work".into(),
+                    target: ProxyTarget::Node {
+                        endpoint_key: key.clone(),
+                    },
+                    no_proxy: Vec::new(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        refresh_body(&vault, &store, "nodes",
+            "vless://new@other.test:8443?security=tls#Backup\nvless://new@changed.test:8443?security=tls#Primary",
+            ResponseMeta::default(), true, |_| true).unwrap();
+        let after = list_endpoints(&vault, &store, "nodes").unwrap();
+        assert_eq!(after[0].key, before[1].key);
+        assert_eq!(after[1].key, before[0].key);
+        assert!(after[1].active);
+        assert!(after[0].is_backup);
+        let profile = store.load().unwrap().profiles.remove(0);
+        assert_eq!(profile.pinned_policies[0].endpoint_key, key);
+        assert!(!profile.pinned_policies[0].missing);
+        assert_eq!(profile.xray_dns.outbound_key.as_deref(), Some(key.as_str()));
+        assert_eq!(profile.xray_service_checks[0].endpoint_key, key);
+        assert_eq!(profile.xray_proxy_exits[0].target.endpoint_keys(), &[key]);
+    }
+
+    #[test]
+    fn ambiguous_legacy_collision_stays_unresolved_even_with_active_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let store = ProfileStore::new(dir.path().join("profiles.json"));
+        let body = serde_json::json!([
+            {"remarks":"Auto","outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"same.test","port":443,"users":[{"id":"a"}]}]}}],"routing":{"rules":[]}},
+            {"remarks":"UK","outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"same.test","port":443,"users":[{"id":"b"}]}]}}],"routing":{"rules":[{"type":"field","domain":["geosite:uk"],"outboundTag":"proxy"}]}}
+        ]).to_string();
+        import_body(
+            &vault,
+            &store,
+            &SubscriptionImport {
+                id: "nodes",
+                url: "https://example.test/sub",
+                hwid: "",
+                name: "Nodes",
+                refresh_interval_minutes: None,
+            },
+            &body,
+            ResponseMeta::default(),
+            XrayMode::Socks,
+            |_| true,
+        )
+        .unwrap();
+        let endpoints = vault.read_subscription_endpoints("nodes").unwrap();
+        let old = endpoint_key(&endpoints[0].url);
+        assert_eq!(old, endpoint_key(&endpoints[1].url));
+        store
+            .update_profile("nodes", |profile| {
+                let meta = profile.subscription.as_mut().unwrap();
+                meta.active_key = Some(old.clone());
+                meta.active_index = 1;
+                profile.pinned_policies = vec![PinnedRoute {
+                    selectors: vec!["domain:service.test".into()],
+                    endpoint_key: old.clone(),
+                    missing: false,
+                }];
+                Ok(())
+            })
+            .unwrap();
+        let profile = store.load().unwrap().profiles.remove(0);
+        std::fs::write(&profile.config_path, b"{}").unwrap();
+        std::fs::write(
+            vault.root().join("nodes/subscription.json"),
+            serde_json::json!({"endpoints":[
+                {"url": endpoints[0].url, "name": "Auto"}, {"url": endpoints[1].url, "name": "UK"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let migrated = migrate_endpoint_ids(&vault, &store, "nodes").unwrap();
+        assert_eq!(
+            migrated.subscription.unwrap().active_key.as_deref(),
+            Some(old.as_str())
+        );
+        assert_eq!(migrated.pinned_policies[0].endpoint_key, old);
+        assert!(migrated.pinned_policies[0].missing);
+    }
+
+    #[test]
+    fn migration_restores_sidecar_when_profile_commit_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vault, store) = import_panel(dir.path(), &["Primary"]);
+        let endpoint = vault
+            .read_subscription_endpoints("panel")
+            .unwrap()
+            .remove(0);
+        let old_key = endpoint_key(&endpoint.url);
+        store
+            .update_profile("panel", |profile| {
+                profile.subscription.as_mut().unwrap().active_key = Some(old_key.clone());
+                Ok(())
+            })
+            .unwrap();
+        let sidecar_path = vault.root().join("panel/subscription.json");
+        std::fs::write(
+            &sidecar_path,
+            serde_json::json!({"endpoints":[
+                {"url": endpoint.url, "name": endpoint.name}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let before = vault.read_subscription_sidecar("panel").unwrap();
+        let profile_before = store.load().unwrap();
+        std::fs::create_dir(dir.path().join("profiles.json.tmp")).unwrap();
+        assert!(migrate_endpoint_ids(&vault, &store, "panel").is_err());
+        assert_eq!(vault.read_subscription_sidecar("panel").unwrap(), before);
+        assert_eq!(store.load().unwrap(), profile_before);
+    }
+
+    #[test]
+    fn migration_translates_all_legacy_reference_types_without_changing_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(dir.path().join("configs"));
+        let store = ProfileStore::new(dir.path().join("profiles.json"));
+        let links = [
+            "vless://one@one.test:443?security=tls#Primary",
+            "vless://two@two.test:443?security=tls#Backup",
+        ];
+        import_body(
+            &vault,
+            &store,
+            &SubscriptionImport {
+                id: "nodes",
+                url: "https://example.test/sub",
+                hwid: "",
+                name: "Nodes",
+                refresh_interval_minutes: None,
+            },
+            &links.join("\n"),
+            ResponseMeta::default(),
+            XrayMode::Socks,
+            |_| true,
+        )
+        .unwrap();
+        let a = endpoint_key(links[0]);
+        let b = endpoint_key(links[1]);
+        store
+            .update_profile("nodes", |profile| {
+                let meta = profile.subscription.as_mut().unwrap();
+                meta.active_key = Some(a.clone());
+                meta.backup_keys = vec![EndpointRef {
+                    key: b.clone(),
+                    name: "Backup".into(),
+                }];
+                meta.pool_keys = vec![EndpointRef {
+                    key: b.clone(),
+                    name: "Backup".into(),
+                }];
+                profile.pinned_policies = vec![PinnedRoute {
+                    selectors: vec!["domain:service.test".into()],
+                    endpoint_key: b.clone(),
+                    missing: false,
+                }];
+                profile.xray_dns.outbound_key = Some(b.clone());
+                profile.xray_service_checks = vec![ServiceCheck {
+                    id: "health".into(),
+                    name: "Health".into(),
+                    url: "https://service.test/health".into(),
+                    endpoint_key: b.clone(),
+                    background: false,
+                }];
+                profile.xray_proxy_exits = vec![
+                    NamedProxyExit {
+                        name: "work".into(),
+                        target: ProxyTarget::Node {
+                            endpoint_key: b.clone(),
+                        },
+                        no_proxy: vec![],
+                    },
+                    NamedProxyExit {
+                        name: "pool".into(),
+                        target: ProxyTarget::Pool {
+                            endpoint_keys: vec![b.clone()],
+                        },
+                        no_proxy: vec![],
+                    },
+                ];
+                Ok(())
+            })
+            .unwrap();
+        let old_profile = store.load().unwrap().profiles.remove(0);
+        let snapshot = std::fs::read(&old_profile.config_path).unwrap();
+        std::fs::write(
+            vault.root().join("nodes/subscription.json"),
+            serde_json::json!({"endpoints":[
+                {"url": links[0], "name": "Primary"}, {"url": links[1], "name": "Backup"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let legacy = vault.read_subscription_sidecar("nodes").unwrap();
+        let mut pending = reconcile_catalog(None, &legacy.endpoints).unwrap();
+        pending.migration_pending = true;
+        vault.store_subscription_sidecar("nodes", &pending).unwrap();
+        let profile = migrate_endpoint_ids(&vault, &store, "nodes").unwrap();
+        let endpoints = vault.read_subscription_endpoints("nodes").unwrap();
+        assert_eq!(endpoints, pending.endpoints);
+        assert!(
+            !vault
+                .read_subscription_sidecar("nodes")
+                .unwrap()
+                .migration_pending
+        );
+        let meta = profile.subscription.as_ref().unwrap();
+        assert_eq!(meta.active_key.as_deref(), Some(endpoints[0].id.as_str()));
+        assert_eq!(meta.backup_keys[0].key, endpoints[1].id);
+        assert_eq!(meta.pool_keys[0].key, endpoints[1].id);
+        assert_eq!(profile.pinned_policies[0].endpoint_key, endpoints[1].id);
+        assert!(!profile.pinned_policies[0].missing);
+        assert_eq!(
+            profile.xray_dns.outbound_key.as_deref(),
+            Some(endpoints[1].id.as_str())
+        );
+        assert_eq!(profile.xray_service_checks[0].endpoint_key, endpoints[1].id);
+        assert!(profile
+            .xray_proxy_exits
+            .iter()
+            .all(|exit| exit.target.endpoint_keys() == [endpoints[1].id.clone()]));
+        assert_eq!(std::fs::read(&profile.config_path).unwrap(), snapshot);
+    }
+
+    #[test]
     fn endpoint_keys_survive_credentials_and_name_changes_but_not_server_changes() {
         let old = endpoint_key("vless://old@one.test:443?security=tls&type=tcp#Old");
         assert_eq!(
@@ -1694,8 +2518,9 @@ mod tests {
             |_| true,
         )
         .unwrap();
-        let backup = endpoint_key(links[1]);
-        let pinned = endpoint_key(links[2]);
+        let original = vault.read_subscription_endpoints("nodes").unwrap();
+        let backup = original[1].id.clone();
+        let pinned = original[2].id.clone();
         set_backup_endpoints(&vault, &store, "nodes", &[pinned.clone(), backup.clone()]).unwrap();
         set_pinned_routes(
             &vault,
@@ -1725,9 +2550,9 @@ mod tests {
         assert_eq!(
             candidates
                 .iter()
-                .map(|node| endpoint_key(&node.url))
+                .map(|node| node.id.clone())
                 .collect::<Vec<_>>(),
-            [endpoint_key(links[0]), backup]
+            [original[0].id.clone(), backup]
         );
         assert!(pins[0].missing);
     }
@@ -1747,8 +2572,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (vault, store) = import_panel(dir.path(), &["Primary", "Named", "Reserve"]);
         let endpoints = vault.read_subscription_endpoints("panel").unwrap();
-        let named_key = endpoint_key(&endpoints[1].url);
-        let reserve_key = endpoint_key(&endpoints[2].url);
+        let named_key = endpoints[1].id.clone();
+        let reserve_key = endpoints[2].id.clone();
         // The auto pool holds both nodes plus a manual backup on one of
         // them; the named exit pins the same node the backup uses.
         set_backup_endpoints(&vault, &store, "panel", std::slice::from_ref(&named_key)).unwrap();
@@ -1784,16 +2609,13 @@ mod tests {
             .unwrap();
         let profile = store.load().unwrap().profiles.remove(0);
         let (candidates, _) = failover_plan(&vault, &profile).unwrap();
-        let keys: Vec<String> = candidates
-            .iter()
-            .map(|node| endpoint_key(&node.url))
-            .collect();
+        let keys: Vec<String> = candidates.iter().map(|node| node.id.clone()).collect();
         // Primary + the manual backup stay; the named key is never also an
         // auto-pool member while an unrelated pooled node still joins.
         assert_eq!(
             keys.iter().map(String::as_str).collect::<Vec<_>>(),
             [
-                endpoint_key(&endpoints[0].url).as_str(),
+                endpoints[0].id.as_str(),
                 named_key.as_str(),
                 reserve_key.as_str()
             ]
@@ -1990,6 +2812,7 @@ mod tests {
         assert!(store.load().unwrap().profiles.is_empty());
     }
 
+    use super::legacy_endpoint_key as endpoint_key;
     use super::*;
     use base64::Engine;
     const BODY: &str = "vless://synthetic-id@one.test:443?security=tls#First\nhy2://synthetic-password@two.test:443#Second";

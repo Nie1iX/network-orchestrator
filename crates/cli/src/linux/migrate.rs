@@ -10,8 +10,6 @@ use net_manager_core::config_vault::SubscriptionEndpoint;
 use net_manager_core::models::TunnelState;
 use net_manager_core::models::{DomainRouteTarget, Profile, TunnelBackend};
 #[cfg(not(target_os = "linux"))]
-use net_manager_core::subscription;
-#[cfg(not(target_os = "linux"))]
 use net_manager_core::xray_migrate;
 use net_manager_core::xray_migrate::XrayPolicyMigration;
 #[cfg(not(target_os = "linux"))]
@@ -67,7 +65,7 @@ fn primary_key(profile: &Profile, endpoints: &[SubscriptionEndpoint]) -> Option<
     subscription.active_key.clone().or_else(|| {
         endpoints
             .get(subscription.active_index)
-            .map(|endpoint| subscription::endpoint_key(&endpoint.url))
+            .map(|endpoint| endpoint.id.clone())
     })
 }
 
@@ -229,7 +227,7 @@ fn apply(ctx: &Ctx, query: &str, path: &Path) -> Result<Output, String> {
             if current.subscription.is_some() {
                 let live = expected_endpoints
                     .iter()
-                    .map(|endpoint| subscription::endpoint_key(&endpoint.url))
+                    .map(|endpoint| endpoint.id.clone())
                     .collect::<std::collections::HashSet<_>>();
                 for pin in &mut current.pinned_policies {
                     pin.missing = !live.contains(&pin.endpoint_key);

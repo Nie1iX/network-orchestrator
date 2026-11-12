@@ -104,6 +104,28 @@ pub enum TunnelBackend {
     WireGuard,
     OpenVpn,
     Xray,
+    Mihomo,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MihomoMode {
+    #[default]
+    Tun,
+    Proxy,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MihomoProfileOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_group: Option<String>,
+    #[serde(default)]
+    pub mode: MihomoMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub group_selections: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,7 +212,7 @@ pub struct PinnedRoute {
     /// suffixes); IP selectors are not allowed — a pinned node is a domain
     /// policy, not a network route.
     pub selectors: Vec<String>,
-    /// [`crate::subscription::endpoint_key`] of the node, 16 lowercase hex.
+    /// Persisted endpoint ID, 16 lowercase hex.
     pub endpoint_key: String,
     /// Set when the key does not resolve to a current endpoint; persisted
     /// so the clients can grey the entry out, refreshed on every change.
@@ -641,6 +663,8 @@ pub struct Profile {
     pub id: String,
     pub name: String,
     pub backend: TunnelBackend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mihomo: Option<MihomoProfileOptions>,
     pub config_path: PathBuf,
     pub interface_name: String,
     pub routes: Vec<PolicyRoute>,
@@ -806,6 +830,7 @@ impl Default for Profile {
             id: String::new(),
             name: String::new(),
             backend: TunnelBackend::None,
+            mihomo: None,
             config_path: PathBuf::new(),
             interface_name: String::new(),
             routes: Vec::new(),
@@ -935,7 +960,7 @@ pub struct SubscriptionEndpointInfo {
     pub active: bool,
     #[serde(default)]
     pub protocol: Option<String>,
-    /// [`crate::subscription::endpoint_key`] of this endpoint.
+    /// Persisted endpoint ID.
     #[serde(default)]
     pub key: String,
     /// Listed in `SubscriptionMeta::backup_keys`.
@@ -1325,6 +1350,18 @@ pub struct BatchImportResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mihomo_profiles_round_trip_without_becoming_xray_profiles() {
+        let mut document = serde_json::to_value(Profile::default()).unwrap();
+        document["backend"] = serde_json::json!("mihomo");
+        document["mihomo"] = serde_json::json!({"mode":"tun","entryGroup":"Auto"});
+        let restored: Profile = serde_json::from_value(document).unwrap();
+        let saved = serde_json::to_value(restored).unwrap();
+        assert_eq!(saved["backend"], "mihomo");
+        assert_eq!(saved["mihomo"]["mode"], "tun");
+        assert_eq!(saved["mihomo"]["entryGroup"], "Auto");
+    }
 
     #[test]
     fn xray_platform_default_is_tun_only_on_linux() {

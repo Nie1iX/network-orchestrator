@@ -1311,6 +1311,7 @@ a:focus-visible,
 .backend-avatar-wireGuard { color: var(--wg-color); }
 .backend-avatar-openVpn { color: var(--ovpn-color); }
 .backend-avatar-xray { color: var(--xray-color); }
+.backend-avatar-mihomo { color: var(--cat-virtual); }
 .backend-avatar-none { color: var(--none-color); }
 .backend-avatar-service { color: var(--info); }
 
