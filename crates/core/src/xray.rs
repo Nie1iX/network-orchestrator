@@ -9,6 +9,20 @@ use std::io;
 use std::net::IpAddr;
 use std::str::FromStr;
 use url::Url;
+#[path = "endpoint_graph.rs"]
+mod endpoint_graph;
+pub use endpoint_graph::{append_endpoint_graph, multinode_endpoint, EndpointGraph};
+pub fn endpoint_probe_config(uri: &str, port: u16) -> io::Result<Value> {
+    let graph = multinode_endpoint(uri, "probe")?;
+    let mut config = json!({
+        "log":{"loglevel":"warning"},
+        "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":port,"protocol":"socks","settings":{"udp":true}}],
+        "outbounds":[],
+        "routing":{"domainStrategy":"AsIs","rules":[]}
+    });
+    append_endpoint_graph(&mut config, &graph)?;
+    Ok(config)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedVless {
@@ -313,10 +327,7 @@ fn decode_xray_json_entry(uri: &str) -> io::Result<Map<String, Value>> {
     }
 }
 
-/// Secret-free identity string for `xray-json:` entries (see
-/// [`crate::subscription::endpoint_key`]): the transport of the first
-/// outbound — `protocol|address:port|network|security`. `None` for entries
-/// that cannot be decoded.
+/// Legacy first-outbound identity used only for old subscription keys.
 pub fn xray_json_identity(uri: &str) -> Option<String> {
     let entry = decode_xray_json_entry(uri).ok()?;
     let outbound = entry.get("outbounds")?.as_array()?.first()?;
@@ -410,6 +421,9 @@ fn is_tun_shaped(object: &Map<String, Value>) -> bool {
             routing
                 .keys()
                 .all(|key| matches!(key.as_str(), "domainStrategy" | "domainMatcher" | "rules"))
+                && routing
+                    .get("rules")
+                    .is_none_or(|rules| rules.as_array().is_some_and(Vec::is_empty))
         })
 }
 
@@ -528,79 +542,20 @@ fn tun_stream_settings(stream: &Value, hysteria: bool) -> Value {
     out
 }
 
-/// Turns a complete Xray config from a subscription panel (see
-/// [`xray_json_entry`]) into the plain shape the Linux daemon runs as a
-/// system-wide tunnel: the panel's main VLESS or Hysteria2 server, a direct
-/// outbound and nothing else. The panel's own routing rules, DNS section,
-/// observatory and policy are left out; the profile's routing settings are
-/// applied on top afterwards. Configs already in the daemon's shape are
-/// returned unchanged. When a balancer only chooses between the server and a
-/// fallback relay, the server itself is used; an entry that is a pool of many
-/// servers ("automatic") cannot be reduced to one and is refused.
+/// Normalize the provider's default proxy graph without importing its policies.
 pub fn tun_compatible_config(base: &Value) -> Result<Value, &'static str> {
     let object = base.as_object().ok_or("The Xray config is invalid")?;
     if is_tun_shaped(object) {
         return Ok(base.clone());
     }
-    let outbounds = object
-        .get("outbounds")
-        .and_then(Value::as_array)
-        .ok_or("The Xray config has no outbounds")?;
-    let supported =
-        |outbound: &&Value| matches!(outbound["protocol"].as_str(), Some("vless" | "hysteria"));
-    // "proxy", "proxy-2", ...: several of them form a pool the panel picks
-    // from with a balancer (its "automatic" entry), which has no single server.
-    let pool = outbounds
-        .iter()
-        .filter(|outbound| {
-            supported(outbound)
-                && outbound["tag"]
-                    .as_str()
-                    .is_some_and(|tag| tag == "proxy" || tag.starts_with("proxy-"))
-        })
-        .count();
-    if pool > 1 {
-        return Err(
-            "This is an automatic entry that chooses between many servers, which a system-wide \
-             tunnel does not support. Choose a specific server.",
-        );
-    }
-    let proxy = outbounds
-        .iter()
-        .find(|outbound| outbound["tag"] == "proxy" && supported(outbound))
-        .or_else(|| outbounds.iter().find(supported))
-        .ok_or("The server uses a protocol a system-wide tunnel does not support")?;
-    let hysteria = proxy["protocol"] == "hysteria";
-    let settings = if hysteria {
-        keep_keys(&proxy["settings"], &["version", "address", "port"])
-    } else {
-        let server = proxy["settings"]["vnext"]
-            .as_array()
-            .and_then(|list| list.first())
-            .ok_or("The server has no address")?;
-        let user = server["users"]
-            .as_array()
-            .and_then(|list| list.first())
-            .ok_or("The server has no user")?;
-        json!({
-            "vnext": [{
-                "address": server["address"],
-                "port": server["port"],
-                "users": [keep_keys(user, &["id", "encryption", "flow"])],
-            }],
-        })
-    };
-    let mut clean = json!({
-        "tag": "proxy",
-        "protocol": proxy["protocol"],
-        "settings": settings,
-        "streamSettings": tun_stream_settings(&proxy["streamSettings"], hysteria),
-    });
-    if let Some(mux) = proxy.get("mux") {
-        clean["mux"] = tun_mux(mux);
-    }
-    let mut config = config_with_proxy(clean, 1);
+    let graph = endpoint_graph::source_graph(base, "proxy")?;
+    let mut config = config_with_proxy(graph.entry.clone(), 1);
     config["inbounds"] = object.get("inbounds").cloned().unwrap_or(json!([]));
+    config["outbounds"].as_array_mut().unwrap().remove(0);
+    append_endpoint_graph(&mut config, &graph).map_err(|_| "Invalid provider graph")?;
+    let outbounds = config["outbounds"].as_array_mut().unwrap();
+    let entry = outbounds.remove(1);
+    outbounds.insert(0, entry);
     Ok(config)
 }
 
@@ -646,28 +601,13 @@ pub const UNAVAILABLE_TAG: &str = "unavailable";
 /// runtime with `xray api bo`.
 pub const FAILOVER_BALANCER: &str = "failover";
 
-/// The proxy outbound of an endpoint's generated config, retagged to `tag`.
-/// Panel `xray-json:` entries are reduced to their server first, the same
-/// way a single-endpoint TUN connect treats them.
-pub fn multinode_outbound(url: &str, tag: &str) -> io::Result<Value> {
-    let config = generate_share_link_config(url, 1)?;
-    let config = tun_compatible_config(&config)
-        .map_err(|_| invalid_input("invalid or unsupported subscription endpoint"))?;
-    let mut outbound = config["outbounds"]
-        .as_array()
-        .and_then(|outbounds| outbounds.first().cloned())
-        .ok_or_else(|| invalid_input("endpoint produced no proxy outbound"))?;
-    outbound["tag"] = json!(tag);
-    Ok(outbound)
-}
-
 /// One resolved pinned route for [`apply_multinode_config`]: selectors plus
 /// either a real outbound (the endpoint is in the subscription) or a
 /// blackhole (it left — the pinned selectors drop, never reroute).
 pub struct PinnedOutbound {
     pub key: String,
     /// `None` → the outbound for this key is a blackhole.
-    pub outbound: Option<Value>,
+    pub outbound: Option<EndpointGraph>,
     pub selectors: Vec<String>,
 }
 
@@ -689,7 +629,7 @@ pub struct PinnedOutbound {
 pub fn apply_multinode_config(
     base: &Value,
     primary_key: &str,
-    backups: &[(String, Value)],
+    backups: &[(String, EndpointGraph)],
     pinned: &[PinnedOutbound],
 ) -> io::Result<Value> {
     let mut config = base.clone();
@@ -704,10 +644,10 @@ pub fn apply_multinode_config(
         .ok_or_else(|| invalid_data("xray primary outbound has no tag"))?
         .to_owned();
     outbounds[0]["tag"] = json!(node_tag(primary_key));
-    for (key, outbound) in backups {
-        let mut node = outbound.clone();
-        node["tag"] = json!(node_tag(key));
-        outbounds.push(node);
+    for (key, graph) in backups {
+        let mut graph = graph.clone();
+        graph.entry["tag"] = json!(node_tag(key));
+        append_endpoint_graph(&mut config, &graph)?;
     }
     let mut pinned_outbounds = HashMap::new();
     for route in pinned {
@@ -718,14 +658,17 @@ pub fn apply_multinode_config(
             }
             continue;
         }
-        outbounds.push(match &route.outbound {
-            Some(outbound) => {
-                let mut pinned_node = outbound.clone();
-                pinned_node["tag"] = json!(pin_tag(&route.key));
-                pinned_node
+        match &route.outbound {
+            Some(graph) => {
+                let mut graph = graph.clone();
+                graph.entry["tag"] = json!(pin_tag(&route.key));
+                append_endpoint_graph(&mut config, &graph)?;
             }
-            None => json!({"tag": pin_tag(&route.key), "protocol": "blackhole"}),
-        });
+            None => config["outbounds"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"tag":pin_tag(&route.key),"protocol":"blackhole"})),
+        }
     }
     let routing = config
         .as_object_mut()
@@ -763,13 +706,21 @@ pub fn apply_multinode_config(
     // Pins still precede ordinary domain/default policies.
     let guard_count = rules
         .iter()
-        .take_while(|rule| rule.get("port").is_some())
+        .take_while(|rule| {
+            rule.get("port").is_some()
+                || rule["inboundTag"].as_array().is_some_and(|tags| {
+                    tags.iter()
+                        .any(|tag| tag.as_str().is_some_and(|tag| tag.starts_with("src-")))
+                })
+        })
         .count();
     rules.splice(guard_count..guard_count, merged);
-    routing.insert(
-        "balancers".into(),
-        json!([{"tag": FAILOVER_BALANCER, "selector": [UNAVAILABLE_TAG]}]),
-    );
+    routing
+        .entry("balancers")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| invalid_data("xray balancers must be an array"))?
+        .push(json!({"tag": FAILOVER_BALANCER, "selector": [UNAVAILABLE_TAG]}));
     Ok(config)
 }
 
@@ -1597,10 +1548,12 @@ pub fn apply_profile_routing(
     };
 
     let direct_tag = if needs_direct {
-        let index = match outbounds
-            .iter()
-            .position(|outbound| outbound["protocol"].as_str() == Some("freedom"))
-        {
+        let index = match outbounds.iter().position(|outbound| {
+            outbound["protocol"].as_str() == Some("freedom")
+                && !outbound["tag"]
+                    .as_str()
+                    .is_some_and(|tag| tag.starts_with("src-"))
+        }) {
             Some(index) => index,
             None => {
                 outbounds.push(json!({ "protocol": "freedom" }));
@@ -1618,10 +1571,12 @@ pub fn apply_profile_routing(
     };
 
     let block_tag = if needs_block {
-        let index = match outbounds
-            .iter()
-            .position(|outbound| outbound["protocol"].as_str() == Some("blackhole"))
-        {
+        let index = match outbounds.iter().position(|outbound| {
+            outbound["protocol"].as_str() == Some("blackhole")
+                && !outbound["tag"]
+                    .as_str()
+                    .is_some_and(|tag| tag.starts_with("src-"))
+        }) {
             Some(index) => index,
             None => {
                 outbounds.push(json!({ "protocol": "blackhole" }));
@@ -1850,8 +1805,16 @@ pub fn apply_profile_routing(
             "outboundTag": direct_tag.as_deref().unwrap_or_default(),
         }));
     }
-    merged.append(rules);
-    *rules = merged;
+    let dispatch_count = rules
+        .iter()
+        .take_while(|rule| {
+            rule["inboundTag"].as_array().is_some_and(|tags| {
+                tags.iter()
+                    .any(|tag| tag.as_str().is_some_and(|tag| tag.starts_with("src-")))
+            })
+        })
+        .count();
+    rules.splice(dispatch_count..dispatch_count, merged);
 
     if dns_active {
         let mut hosts = Map::new();
@@ -4110,79 +4073,300 @@ mod tests {
     }
 
     #[test]
-    fn a_panel_vless_config_is_reduced_to_the_servers_plain_shape() {
-        let config = tun_compatible_config(&panel_vless()).unwrap();
-        let keys: Vec<&String> = config.as_object().unwrap().keys().collect();
-        assert!(
-            keys.iter().all(|key| TUN_TOP_LEVEL.contains(&key.as_str())),
-            "{keys:?}"
-        );
-        let outbounds = config["outbounds"].as_array().unwrap();
-        assert_eq!(outbounds.len(), 2);
-        assert_eq!(outbounds[0]["tag"], "proxy");
-        assert_eq!(outbounds[1]["protocol"], "freedom");
-        let server = &outbounds[0]["settings"]["vnext"][0];
-        assert_eq!(server["address"], "node.test");
-        assert!(server.get("level").is_none() && server["users"][0].get("level").is_none());
-        assert_eq!(server["users"][0]["flow"], "xtls-rprx-vision");
-        let stream = &outbounds[0]["streamSettings"];
-        assert_eq!(stream["realitySettings"]["publicKey"], "pk");
-        assert!(stream["realitySettings"].get("show").is_none());
-        assert!(stream.get("sockopt").is_none());
-        // The listeners the caller set up survive.
-        assert_eq!(config["inbounds"], panel_vless()["inbounds"]);
-        assert!(config["routing"]["rules"].as_array().unwrap().is_empty());
-        assert!(config.get("dns").is_none() && config.get("burstObservatory").is_none());
-    }
-
-    #[test]
-    fn a_hysteria_entry_keeps_its_auth_and_masking() {
+    fn provider_default_pool_preserves_proxy_fallback() {
         let mut panel = panel_vless();
-        panel["outbounds"][0] = json!({
-            "tag": "proxy", "protocol": "hysteria",
-            "settings": {"version": 2, "address": "h.test", "port": 443},
-            "streamSettings": {"network": "hysteria", "security": "tls",
-                "tlsSettings": {"serverName": "h.test", "alpn": ["h3"]},
-                "hysteriaSettings": {"version": 2, "auth": "secret", "udpIdleTimeout": 60},
-                "finalmask": {"udp": [{"type": "salamander", "settings": {"password": "p"}}]}}
+        let mut fallback = panel["outbounds"][0].clone();
+        fallback["tag"] = json!("backup");
+        fallback["settings"]["vnext"][0]["address"] = json!("backup.test");
+        panel["outbounds"].as_array_mut().unwrap().push(fallback);
+        panel["routing"] = json!({
+            "rules": [{"type": "field", "network": "tcp,udp", "balancerTag": "auto"}],
+            "balancers": [{"tag": "auto", "selector": ["proxy"], "fallbackTag": "backup",
+                "strategy": {"type": "leastPing"}}]
         });
         let config = tun_compatible_config(&panel).unwrap();
-        let stream = &config["outbounds"][0]["streamSettings"];
-        assert_eq!(
-            stream["hysteriaSettings"],
-            json!({"version": 2, "auth": "secret"})
+        let balancers = config["routing"]["balancers"].as_array().unwrap();
+        let fallback_tag = balancers[0]["fallbackTag"].as_str().unwrap();
+        assert!(config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|outbound| outbound["tag"] == fallback_tag
+                && outbound["settings"]["vnext"][0]["address"] == "backup.test"));
+    }
+
+    #[test]
+    fn provider_pool_rejects_direct_fallback_and_missing_transport() {
+        let mut panel = panel_vless();
+        panel["routing"] = json!({
+            "rules": [{"type": "field", "network": "tcp,udp", "balancerTag": "auto"}],
+            "balancers": [{"tag": "auto", "selector": ["proxy"], "fallbackTag": "direct"}]
+        });
+        assert!(tun_compatible_config(&panel).is_err());
+        panel["routing"]["balancers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("fallbackTag");
+        panel["outbounds"][0]["streamSettings"]["sockopt"] = json!({"dialerProxy": "missing"});
+        assert!(tun_compatible_config(&panel).is_err());
+    }
+
+    #[test]
+    fn provider_pool_rejects_cyclic_transport_dependencies() {
+        let mut panel = panel_vless();
+        panel["routing"] = json!({
+            "rules": [{"type": "field", "network": "tcp,udp", "balancerTag": "auto"}],
+            "balancers": [{"tag": "auto", "selector": ["proxy"]}]
+        });
+        panel["outbounds"][0]["streamSettings"]["sockopt"] = json!({"dialerProxy": "proxy"});
+        assert!(tun_compatible_config(&panel).is_err());
+    }
+
+    #[test]
+    fn implicit_default_uses_actual_first_outbound_only_when_proxy() {
+        let mut panel = panel_vless();
+        assert!(tun_compatible_config(&panel).is_ok());
+        panel["outbounds"].as_array_mut().unwrap().swap(0, 2);
+        assert!(tun_compatible_config(&panel).is_err());
+    }
+
+    #[test]
+    fn independent_graphs_preserve_transport_without_cross_scope_references() {
+        let mut panel = panel_vless();
+        panel["routing"] = json!({
+            "rules":[{"type":"field","network":"tcp,udp","balancerTag":"auto"}],
+            "balancers":[{"tag":"auto","selector":["proxy"]}]
+        });
+        panel["outbounds"][0]["streamSettings"]["sockopt"] = json!({"dialerProxy":"direct"});
+        let uri = xray_json_entry(&panel).unwrap();
+        let first = multinode_endpoint(&uri, "node-1111111111111111").unwrap();
+        let second = multinode_endpoint(&uri, "pin-2222222222222222").unwrap();
+        let first_dialer = first
+            .outbounds
+            .iter()
+            .find_map(|o| o["streamSettings"]["sockopt"]["dialerProxy"].as_str())
+            .unwrap();
+        assert!(first
+            .outbounds
+            .iter()
+            .any(|o| o["tag"] == first_dialer && o["protocol"] == "freedom"));
+        assert!(!second.outbounds.iter().any(|o| o["tag"] == first_dialer));
+        assert_ne!(first.rules[0]["inboundTag"], second.rules[0]["inboundTag"]);
+        assert_ne!(
+            first.balancers[0]["selector"],
+            second.balancers[0]["selector"]
         );
-        assert_eq!(stream["tlsSettings"], json!({"serverName": "h.test"}));
-        assert_eq!(stream["finalmask"]["udp"][0]["type"], "salamander");
     }
 
     #[test]
-    fn a_pool_of_servers_is_refused_with_advice() {
+    fn primary_observation_policy_covers_all_endpoint_graphs() {
         let mut panel = panel_vless();
-        let second = panel["outbounds"][0].clone();
-        panel["outbounds"].as_array_mut().unwrap().push(second);
-        panel["outbounds"][4]["tag"] = json!("proxy-2");
-        let error = tun_compatible_config(&panel).unwrap_err();
-        assert!(error.contains("Choose a specific server"), "{error}");
+        panel["routing"] = json!({
+            "rules":[{"type":"field","network":"tcp,udp","balancerTag":"auto"}],
+            "balancers":[{"tag":"auto","selector":["proxy"]}]
+        });
+        panel["burstObservatory"] = json!({"subjectSelector":["proxy"],"pingConfig":{
+            "interval":"30s","destination":"https://primary.example/probe","sampling":1
+        }});
+        let first =
+            multinode_endpoint(&xray_json_entry(&panel).unwrap(), "node-1111111111111111").unwrap();
+        panel["burstObservatory"]["pingConfig"]["interval"] = json!("20s");
+        panel["burstObservatory"]["pingConfig"]["destination"] =
+            json!("https://secondary.example/probe");
+        panel["burstObservatory"]["pingConfig"]["sampling"] = json!(3);
+        let second =
+            multinode_endpoint(&xray_json_entry(&panel).unwrap(), "pin-2222222222222222").unwrap();
+        let mut config = json!({"outbounds":[],"routing":{"rules":[]}});
+        append_endpoint_graph(&mut config, &first).unwrap();
+        append_endpoint_graph(&mut config, &second).unwrap();
+        assert_eq!(config["burstObservatory"]["pingConfig"]["interval"], "30s");
+        assert_eq!(
+            config["burstObservatory"]["pingConfig"]["destination"],
+            "https://primary.example/probe"
+        );
+        assert_eq!(config["burstObservatory"]["pingConfig"]["sampling"], 1);
+        let subjects = config["burstObservatory"]["subjectSelector"]
+            .as_array()
+            .unwrap();
+        assert_eq!(subjects.len(), 2);
+        assert_ne!(subjects[0], subjects[1]);
+        assert!(subjects.iter().all(|subject| config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|outbound| outbound["tag"] == *subject)));
     }
 
     #[test]
-    fn a_balancer_between_a_server_and_its_fallback_uses_the_server() {
+    fn distinct_observation_implementations_do_not_silently_override_each_other() {
         let mut panel = panel_vless();
-        panel["routing"]["balancers"] =
-            json!([{"tag": "auto", "selector": ["proxy", "bridge"], "fallbackTag": "bridge"}]);
+        let first =
+            multinode_endpoint(&xray_json_entry(&panel).unwrap(), "node-1111111111111111").unwrap();
+        panel["observatory"] = json!({"subjectSelector":["proxy"],"probeInterval":"30s"});
+        assert!(
+            multinode_endpoint(&xray_json_entry(&panel).unwrap(), "pin-2222222222222222").is_err()
+        );
+        panel.as_object_mut().unwrap().remove("burstObservatory");
+        let second =
+            multinode_endpoint(&xray_json_entry(&panel).unwrap(), "pin-2222222222222222").unwrap();
+        let mut config = json!({"outbounds":[],"routing":{"rules":[]}});
+        append_endpoint_graph(&mut config, &first).unwrap();
+        assert!(append_endpoint_graph(&mut config, &second).is_err());
+    }
+
+    #[test]
+    fn cyclic_balancer_fallback_is_rejected() {
+        let mut panel = panel_vless();
+        panel["routing"] = json!({
+            "rules":[{"type":"field","network":"tcp,udp","balancerTag":"a"}],
+            "balancers":[
+                {"tag":"a","selector":["proxy"],"fallbackTag":"b"},
+                {"tag":"b","selector":["proxy"],"fallbackTag":"a"}
+            ]
+        });
+        assert!(tun_compatible_config(&panel).is_err());
+    }
+
+    #[test]
+    fn graph_debug_redacts_credentials() {
+        let graph =
+            multinode_endpoint("vless://secret-id@node.test:443?security=tls", "probe").unwrap();
+        assert!(!format!("{graph:?}").contains("secret-id"));
+    }
+
+    #[test]
+    fn provider_selection_rejects_routing_scripts() {
+        let mut panel = panel_vless();
+        panel["routing"]["script"] = json!("selection.lua");
+        let uri = xray_json_entry(&panel).unwrap();
+        assert!(multinode_endpoint(&uri, "probe").is_err());
+    }
+
+    #[test]
+    fn provider_transport_traversal_has_a_bounded_depth() {
+        let mut panel = panel_vless();
+        panel["outbounds"][0]["streamSettings"]["sockopt"] = json!({"dialerProxy":"hop-0"});
+        for index in 0..65 {
+            let mut hop = json!({"tag":format!("hop-{index}"),"protocol":"freedom","settings":{}});
+            if index < 64 {
+                hop["streamSettings"] =
+                    json!({"sockopt":{"dialerProxy":format!("hop-{}", index + 1)}});
+            }
+            panel["outbounds"].as_array_mut().unwrap().push(hop);
+        }
+        let uri = xray_json_entry(&panel).unwrap();
+        assert!(multinode_endpoint(&uri, "probe").is_err());
+    }
+
+    #[test]
+    fn provider_health_strategy_requires_observation_and_rejects_unmapped_costs() {
+        let mut panel = panel_vless();
+        panel.as_object_mut().unwrap().remove("burstObservatory");
+        panel.as_object_mut().unwrap().remove("observatory");
+        panel["routing"] = json!({
+            "rules":[{"type":"field","network":"tcp,udp","balancerTag":"auto"}],
+            "balancers":[{"tag":"auto","selector":["proxy"],"strategy":{"type":"leastPing"}}]
+        });
+        assert!(multinode_endpoint(&xray_json_entry(&panel).unwrap(), "probe").is_err());
+        panel["burstObservatory"] =
+            json!({"subjectSelector":["proxy"],"pingConfig":{"interval":"1ms"}});
+        panel["routing"]["balancers"][0]["strategy"] = json!({
+            "type":"leastLoad","settings":{"costs":[{"regexp":false,"match":"proxy","value":1}]}
+        });
+        assert!(multinode_endpoint(&xray_json_entry(&panel).unwrap(), "probe").is_err());
+    }
+
+    #[test]
+    fn null_observation_sections_do_not_delay_probe_startup() {
+        let config = json!({"observatory":null,"burstObservatory":null});
+        assert_eq!(
+            crate::subscription::observation_startup(&config).unwrap(),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn nested_pool_terminal_fallback_fails_closed() {
+        let mut panel = panel_vless();
+        panel["routing"] = json!({
+            "rules":[{"type":"field","network":"tcp,udp","balancerTag":"main"}],
+            "balancers":[
+                {"tag":"main","selector":["proxy"],"fallbackTag":"reserve","strategy":{"type":"leastLoad","settings":{"expected":1}}},
+                {"tag":"reserve","selector":["proxy"],"fallbackTag":"missing","strategy":{"type":"leastPing"}}
+            ]
+        });
         let config = tun_compatible_config(&panel).unwrap();
-        assert_eq!(
-            config["outbounds"][0]["settings"]["vnext"][0]["address"],
-            "node.test"
-        );
-        assert!(config["routing"].get("balancers").is_none());
+        let balancers = config["routing"]["balancers"].as_array().unwrap();
+        assert_eq!(balancers.len(), 2);
+        let alias = &balancers[0]["fallbackTag"];
+        let outbounds = config["outbounds"].as_array().unwrap();
+        assert!(outbounds
+            .iter()
+            .any(|o| &o["tag"] == alias && o["protocol"] == "loopback"));
+        assert!(outbounds
+            .iter()
+            .any(|o| o["tag"] == balancers[1]["fallbackTag"] && o["protocol"] == "blackhole"));
+        assert!(!balancers[1]["selector"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn mux_counts_outside_the_daemons_range_are_dropped() {
-        let config = tun_compatible_config(&panel_vless()).unwrap();
-        assert_eq!(config["outbounds"][0]["mux"], json!({"enabled": false}));
+    fn profile_routing_keeps_scoped_dispatch_before_policy_and_multinode_pins() {
+        let mut panel = panel_vless();
+        panel["routing"] = json!({
+            "rules":[
+                {"type":"field","domain":["domain:provider-bypass.test"],"outboundTag":"direct"},
+                {"type":"field","network":"tcp,udp","balancerTag":"main"}
+            ],
+            "balancers":[{"tag":"main","selector":["proxy"]}]
+        });
+        let normalized = tun_compatible_config(&panel).unwrap();
+        let policies = [DomainPolicy {
+            domains: vec!["domain:profile.test".into()],
+            target: DomainRouteTarget::Direct,
+        }];
+        let routed =
+            apply_profile_routing(&normalized, &policies, &ProfileRoutingOptions::default())
+                .unwrap();
+        assert_eq!(
+            routed["routing"]["rules"][0]["inboundTag"],
+            json!(["src-proxy-in"])
+        );
+        assert!(routed["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["domain"] == json!(["domain:profile.test"])));
+        assert!(!routed.to_string().contains("provider-bypass.test"));
+        assert_eq!(
+            routed["routing"]["balancers"],
+            normalized["routing"]["balancers"]
+        );
+        assert_eq!(routed["burstObservatory"], normalized["burstObservatory"]);
+        let pins = [PinnedOutbound {
+            key: "1111111111111111".into(),
+            outbound: None,
+            selectors: vec!["domain:pin.test".into()],
+        }];
+        let multi = apply_multinode_config(&routed, "2222222222222222", &[], &pins).unwrap();
+        assert_eq!(
+            multi["routing"]["rules"][0]["inboundTag"],
+            json!(["src-proxy-in"])
+        );
+        assert_eq!(
+            multi["routing"]["rules"][1]["outboundTag"],
+            "pin-1111111111111111"
+        );
+        assert!(multi["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["tag"] == "pin-1111111111111111" && o["protocol"] == "blackhole"));
+        assert!(multi["routing"]["balancers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["tag"] == "failover"));
+        assert_eq!(multi["burstObservatory"], normalized["burstObservatory"]);
     }
 
     #[test]
@@ -4214,7 +4398,14 @@ mod tests {
         let pins = [PinnedOutbound {
             key: "1111111111111111".into(),
             selectors: vec!["domain:example.test".into()],
-            outbound: Some(json!({"protocol":"vless"})),
+            outbound: Some(EndpointGraph {
+                entry: json!({"protocol":"vless"}),
+                outbounds: vec![],
+                rules: vec![],
+                balancers: vec![],
+                observatory: None,
+                burst_observatory: None,
+            }),
         }];
         let config = apply_multinode_config(&base, "2222222222222222", &[], &pins).unwrap();
         let rules = config["routing"]["rules"].as_array().unwrap();
@@ -4230,7 +4421,14 @@ mod tests {
         let pins = ["domain:first.test", "domain:second.test"].map(|selector| PinnedOutbound {
             key: "1111111111111111".into(),
             selectors: vec![selector.into()],
-            outbound: Some(json!({"protocol":"vless"})),
+            outbound: Some(EndpointGraph {
+                entry: json!({"protocol":"vless"}),
+                outbounds: vec![],
+                rules: vec![],
+                balancers: vec![],
+                observatory: None,
+                burst_observatory: None,
+            }),
         });
         let config = apply_multinode_config(&base, "2222222222222222", &[], &pins).unwrap();
         let tags: Vec<_> = config["outbounds"]

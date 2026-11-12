@@ -42,7 +42,7 @@ fn panel(proxy: Value) -> Value {
             {"tag": "at4pda", "protocol": "freedom"},
             {"tag": "direct", "protocol": "freedom"},
             {"tag": "block", "protocol": "blackhole"}],
-        "routing": {"domainStrategy": "IPIfNonMatch", "rules": []},
+        "routing": {"domainStrategy": "IPIfNonMatch", "rules": [{"type":"field","network":"tcp,udp","outboundTag":"proxy"}]},
     })
 }
 
@@ -81,12 +81,66 @@ fn a_reduced_panel_hysteria_config_passes_the_daemon_validator() {
 }
 
 #[test]
+fn provider_balancer_survives_core_to_daemon_preparation() {
+    let node = |tag: &str, host: &str| {
+        json!({
+            "tag":tag, "protocol":"vless",
+            "settings":{"vnext":[{"address":host,"port":443,"users":[{"id":"u","encryption":"none"}]}]},
+            "streamSettings":{"network":"tcp","security":"none"}
+        })
+    };
+    let config = json!({
+        "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"udp":true}}],
+        "outbounds":[node("node-a", "a.example"), node("node-b", "b.example"), {"tag":"blocked","protocol":"blackhole"}],
+        "routing":{"rules":[{"type":"field","network":"tcp,udp","balancerTag":"pool"}],
+            "balancers":[{"tag":"pool","selector":["node-a","node-b"],"fallbackTag":"blocked","strategy":{"type":"leastPing"}}]},
+        "burstObservatory":{"subjectSelector":["node-a","node-b"],"pingConfig":{"destination":"https://www.google.com/generate_204","interval":"30s","timeout":"5s","sampling":2}}
+    });
+    let normalized = xray::tun_compatible_config(&config).unwrap();
+    let plan = prepare_xray(1000, params(&normalized), 51820).unwrap();
+    assert!(plan.server_hosts.contains(&"a.example".to_owned()));
+    assert!(plan.server_hosts.contains(&"b.example".to_owned()));
+    let running: Value = serde_json::from_str(&plan.config).unwrap();
+    assert!(running["routing"]["balancers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["strategy"]["type"] == "leastPing"));
+    assert!(running["burstObservatory"].is_object());
+    let key = "1111111111111111";
+    let pin = "2222222222222222";
+    let source = xray::xray_json_entry(&config).unwrap();
+    let graph = xray::multinode_endpoint(&source, &xray::pin_tag(pin)).unwrap();
+    let multinode = xray::apply_multinode_config(
+        &normalized,
+        key,
+        &[],
+        &[xray::PinnedOutbound {
+            key: pin.into(),
+            selectors: vec!["domain:pinned.test".into()],
+            outbound: Some(graph),
+        }],
+    )
+    .unwrap();
+    let mut request = params(&multinode);
+    request.failover = Some(net_manager_core::daemon_protocol::XrayFailoverParams {
+        nodes: vec![net_manager_core::daemon_protocol::XrayFailoverNode { key: key.into() }],
+        primary_key: key.into(),
+        auto_return_primary: true,
+        probe_url: "https://example.test/check".into(),
+        interval_secs: 10,
+    });
+    let plan = prepare_xray(1000, request, 51820).expect("scoped primary and pinned graph");
+    assert_eq!(plan.pinned_keys, [pin]);
+}
+
+#[test]
 fn multinode_preserves_proxy_policies_and_accepts_missing_pinned_nodes() {
     use net_manager_core::daemon_protocol::{XrayFailoverNode, XrayFailoverParams};
     use net_manager_core::models::{DomainPolicy, DomainRouteTarget};
     let uri =
         "vless://00000000-0000-0000-0000-000000000001@primary.test:443?security=none&type=tcp";
-    let key = net_manager_core::subscription::endpoint_key(uri);
+    let key = "1111111111111111".to_string();
     let base = xray::generate_share_link_config_with_http(uri, 10808, 10809).unwrap();
     let routed = xray::apply_profile_routing(
         &base,
@@ -124,4 +178,81 @@ fn multinode_preserves_proxy_policies_and_accepts_missing_pinned_nodes() {
         .iter()
         .any(|outbound| outbound["tag"] == "pin-ffffffffffffffff"
             && outbound["protocol"] == "blackhole"));
+}
+
+#[test]
+fn profile_interface_policy_survives_provider_graph_preparation() {
+    use net_manager_core::models::XrayInterfaceRoute;
+    let source = panel(json!({
+        "tag":"proxy", "protocol":"vless",
+        "settings":{"vnext":[{"address":"node.test","port":443,"users":[{"id":"u","encryption":"none"}]}]},
+        "streamSettings":{"network":"tcp","security":"none","sockopt":{"dialerProxy":"at4pda"}}
+    }));
+    let normalized = xray::tun_compatible_config(&source).unwrap();
+    let routed = xray::apply_profile_routing(
+        &normalized,
+        &[],
+        &xray::ProfileRoutingOptions {
+            interface_routes: vec![XrayInterfaceRoute {
+                interface_name: "wt0".into(),
+                selectors: vec!["domain:corp.example".into()],
+                domain_strategy: None,
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let plan = prepare_xray(1000, params(&routed), 51820).unwrap();
+    let running: Value = serde_json::from_str(&plan.config).unwrap();
+    let bound = running["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|outbound| outbound["streamSettings"]["sockopt"]["interface"] == "wt0")
+        .unwrap();
+    assert!(running["routing"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|rule| rule["domain"] == json!(["domain:corp.example"])
+            && rule["outboundTag"] == bound["tag"]));
+    let mut forged = routed.clone();
+    let scoped = forged["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|outbound| {
+            outbound["protocol"] == "freedom"
+                && outbound["tag"]
+                    .as_str()
+                    .is_some_and(|tag| tag.starts_with("src-"))
+        })
+        .unwrap();
+    scoped["streamSettings"]["sockopt"]["interface"] = json!("wt0");
+    assert!(prepare_xray(1000, params(&forged), 51820).is_err());
+    let mut malformed = routed;
+    let bound = malformed["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|outbound| outbound["streamSettings"]["sockopt"]["interface"] == "wt0")
+        .unwrap();
+    bound["streamSettings"]["sockopt"]["interface"] = json!("../wt0");
+    assert!(prepare_xray(1000, params(&malformed), 51820).is_err());
+}
+
+#[test]
+fn daemon_rejects_conflicting_observation_implementations() {
+    let source = panel(json!({
+        "tag":"proxy", "protocol":"vless",
+        "settings":{"vnext":[{"address":"node.test","port":443,"users":[{"id":"u","encryption":"none"}]}]},
+        "streamSettings":{"network":"tcp","security":"none"}
+    }));
+    let mut normalized = xray::tun_compatible_config(&source).unwrap();
+    prepare_xray(1000, params(&normalized), 51820).unwrap();
+    normalized["observatory"] = json!({
+        "subjectSelector":normalized["burstObservatory"]["subjectSelector"],
+        "probeURL":"https://probe.example/check","probeInterval":"30s"
+    });
+    assert!(prepare_xray(1000, params(&normalized), 51820).is_err());
 }

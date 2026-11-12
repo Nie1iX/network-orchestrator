@@ -108,7 +108,7 @@ pub enum NodePoolVerdict {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolProbeEntry {
-    /// [`subscription::endpoint_key`] of the endpoint.
+    /// Persisted endpoint ID.
     pub key: String,
     pub name: String,
     pub verdict: NodePoolVerdict,
@@ -266,16 +266,11 @@ fn explicit_keys(
         for backup in &subscription.backup_keys {
             explicit.insert(backup.key.clone());
         }
-        if let Some(key) = subscription
-            .active_key
-            .clone()
-            .filter(|key| subscription::valid_endpoint_key(key))
-            .or_else(|| {
-                endpoints
-                    .get(subscription.active_index)
-                    .map(|endpoint| subscription::endpoint_key(&endpoint.url))
-            })
-        {
+        if let Some(key) = subscription.active_key.clone().or_else(|| {
+            endpoints
+                .get(subscription.active_index)
+                .map(|endpoint| endpoint.id.clone())
+        }) {
             explicit.insert(key);
         }
     }
@@ -339,7 +334,7 @@ pub async fn measure_exit_country(
     }
     measure_exit_country_with_config(
         |socks_port| {
-            xray::generate_share_link_config(uri, socks_port)
+            xray::endpoint_probe_config(uri, socks_port)
                 .map_err(|_| "invalid subscription endpoint".to_string())
         },
         command,
@@ -362,28 +357,37 @@ pub async fn measure_exit_country_with_config(
         return Err("no exit-country probes configured".into());
     }
     let mut process = None;
-    let result = tokio::time::timeout(timeout, async {
-        let client =
-            subscription::temporary_socks_client(build_config, command, timeout, &mut process)
-                .await?;
-        let per_request = timeout
-            .checked_div(2)
-            .unwrap_or(timeout)
-            .max(Duration::from_secs(1));
-        for _ in 0..EXIT_PROBE_ATTEMPTS {
-            for probe in probes {
-                if let Some(exit) = probe_once(&client, probe, per_request).await {
-                    return Ok(exit);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let result = async {
+        let (client, observation_wait) = tokio::time::timeout_at(
+            deadline,
+            subscription::temporary_socks_client(build_config, command, timeout, &mut process),
+        )
+        .await
+        .map_err(|_| "exit-country probe timed out".to_string())??;
+        tokio::time::timeout_at(deadline + observation_wait, async {
+            tokio::time::sleep(observation_wait).await;
+            let per_request = timeout
+                .checked_div(2)
+                .unwrap_or(timeout)
+                .max(Duration::from_secs(1));
+            for _ in 0..EXIT_PROBE_ATTEMPTS {
+                for probe in probes {
+                    if let Some(exit) = probe_once(&client, probe, per_request).await {
+                        return Ok(exit);
+                    }
                 }
             }
-        }
-        Err("exit-country probe failed".to_string())
-    })
+            Err("exit-country probe failed".to_string())
+        })
+        .await
+        .map_err(|_| "exit-country probe timed out".to_string())?
+    }
     .await;
     if let Some(mut process) = process {
         process.stop().await?;
     }
-    result.map_err(|_| "exit-country probe timed out".to_string())?
+    result
 }
 
 /// Rebuild the auto candidate pool for a subscription profile.
@@ -430,6 +434,7 @@ where
     Probe: Fn(&SubscriptionEndpoint) -> ProbeFuture + Sync,
     ProbeFuture: Future<Output = Result<ExitCountry, String>> + Send,
 {
+    subscription::migrate_endpoint_ids(vault, store, id)?;
     let document = store.load()?;
     let profile = document
         .profiles
@@ -454,7 +459,7 @@ where
     let mut candidates: Vec<(SubscriptionEndpoint, Vec<String>)> = Vec::new();
     let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     for endpoint in &endpoints {
-        let key = subscription::endpoint_key(&endpoint.url);
+        let key = endpoint.id.clone();
         if !seen_keys.insert(key.clone()) {
             continue;
         }
@@ -492,7 +497,7 @@ where
         .enumerate()
         .map(|(index, (endpoint, expected))| {
             let probing = verify.then(|| probe(&endpoint));
-            let key = subscription::endpoint_key(&endpoint.url);
+            let key = endpoint.id.clone();
             let name = endpoint.name;
             async move {
                 let (verdict, exit_country) = match probing {
@@ -567,7 +572,7 @@ where
                     })
                     && endpoints
                         .iter()
-                        .find(|endpoint| subscription::endpoint_key(&endpoint.url) == node.key)
+                        .find(|endpoint| endpoint.id == node.key)
                         .is_none_or(|endpoint| !matching_filters(endpoint, &settings).is_empty())
             })
             .take(capacity)

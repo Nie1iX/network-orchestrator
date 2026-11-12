@@ -59,7 +59,16 @@ impl ProfileService {
         ConfigVault::new(self.root.join("configs"))
     }
     pub fn profiles(&self) -> Result<Vec<Profile>, String> {
-        self.store().load().map(|doc| doc.profiles).map_err(failed)
+        let store = self.store();
+        let vault = self.vault();
+        let mut profiles = store.load().map_err(failed)?.profiles;
+        for profile in &mut profiles {
+            if profile.backend == TunnelBackend::Xray && profile.subscription.is_some() {
+                *profile = subscription::migrate_endpoint_ids(&vault, &store, &profile.id)
+                    .map_err(failed)?;
+            }
+        }
+        Ok(profiles)
     }
     pub fn profile(&self, id: &str) -> Result<Profile, String> {
         self.profiles()?
@@ -681,6 +690,7 @@ impl ProfileService {
         &self,
         id: &str,
     ) -> Result<Vec<SubscriptionEndpointInfo>, String> {
+        self.subscription_profile(id)?;
         subscription::list_endpoints(&self.vault(), &self.store(), id).map_err(failed)
     }
 
@@ -1169,7 +1179,7 @@ impl ProfileService {
             meta.active_key.clone().or_else(|| {
                 endpoints
                     .get(meta.active_index)
-                    .map(|endpoint| subscription::endpoint_key(&endpoint.url))
+                    .map(|endpoint| endpoint.id.clone())
             })
         });
         let migration = net_manager_core::xray_migrate::plan_xray_policy_migration(
@@ -1219,7 +1229,7 @@ impl ProfileService {
                     .map_err(|_| invalid("Policy could not be applied"))?;
                 let live: std::collections::HashSet<_> = endpoints
                     .iter()
-                    .map(|endpoint| subscription::endpoint_key(&endpoint.url))
+                    .map(|endpoint| endpoint.id.clone())
                     .collect();
                 for pin in &mut current.pinned_policies {
                     pin.missing = !live.contains(&pin.endpoint_key);
@@ -1268,7 +1278,7 @@ impl ProfileService {
                     .acquire_owned()
                     .await
                     .map_err(|_| "Exit verification was cancelled")?;
-                let key = subscription::endpoint_key(&endpoint.url);
+                let key = endpoint.id.clone();
                 let mut command = tokio::process::Command::new(executable);
                 command.args(["run", "-config", "stdin:"]);
                 let outcome = net_manager_core::node_pool::measure_exit_country(

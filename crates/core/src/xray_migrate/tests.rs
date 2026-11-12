@@ -1,6 +1,5 @@
 use super::*;
 use crate::models::Profile;
-use crate::subscription::endpoint_key;
 
 const PRIMARY_LINK: &str = "vless://u@ca1.test:443?security=tls&sni=a.test&type=tcp#Canada";
 const NL_LINK: &str = "vless://u@nl1.test:443?security=tls&sni=a.test&type=tcp#Netherlands";
@@ -8,10 +7,12 @@ const NL_LINK: &str = "vless://u@nl1.test:443?security=tls&sni=a.test&type=tcp#N
 fn endpoints() -> Vec<SubscriptionEndpoint> {
     vec![
         SubscriptionEndpoint {
+            id: "1111111111111111".into(),
             url: PRIMARY_LINK.into(),
             name: "Canada".into(),
         },
         SubscriptionEndpoint {
+            id: "2222222222222222".into(),
             url: NL_LINK.into(),
             name: "Netherlands".into(),
         },
@@ -100,17 +101,19 @@ fn invalid_direct_migration_does_not_mutate_profile() {
 #[test]
 fn outbound_signature_maps_rotated_credentials_and_rejects_transport_drift() {
     let same_key = SubscriptionEndpoint {
+        id: "1111111111111111".into(),
         url: PRIMARY_LINK.into(),
         name: "Canada".into(),
     };
     let rotated = SubscriptionEndpoint {
+        id: "1111111111111111".into(),
         url: PRIMARY_LINK.replace("u@", "rotated@"),
         name: "Canada".into(),
     };
     let rotated_out = outbound_for(&rotated.url, "proxy");
     assert_eq!(
         endpoint_key_for_outbound(&rotated_out, std::slice::from_ref(&same_key)),
-        Some(endpoint_key(&same_key.url))
+        Some(same_key.id.clone())
     );
     let mut drifted = rotated_out;
     drifted["streamSettings"]["network"] = json!("grpc");
@@ -120,8 +123,8 @@ fn outbound_signature_maps_rotated_credentials_and_rejects_transport_drift() {
 #[test]
 fn personal_policy_shape_preserves_dns_guards_pins_and_runtime_settings() {
     let endpoints = endpoints();
-    let primary = endpoint_key(PRIMARY_LINK);
-    let pinned = endpoint_key(NL_LINK);
+    let primary = endpoints[0].id.clone();
+    let pinned = endpoints[1].id.clone();
     let mut node = outbound_for(PRIMARY_LINK, "proxy");
     node["streamSettings"]["sockopt"] = json!({
         "tcpNoDelay": true, "tcpKeepAliveIdle": 30,
@@ -254,7 +257,7 @@ fn unknown_and_nonequivalent_constructs_refuse_not_drop() {
 #[test]
 fn explicit_primary_domain_route_stays_pinned_when_default_can_fail_over() {
     let endpoints = endpoints();
-    let primary = endpoint_key(PRIMARY_LINK);
+    let primary = endpoints[0].id.clone();
     let source = json!({
         "outbounds": [outbound_for(PRIMARY_LINK, "proxy"), {"tag": "direct", "protocol": "freedom"}],
         "routing": {"rules": [

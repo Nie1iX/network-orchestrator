@@ -3,7 +3,7 @@ use crate::{
     config_vault::ConfigVault,
     models::{NodePoolFilter, PinnedRoute, SubscriptionMeta, TunnelBackend},
     profiles::ProfileStore,
-    subscription::{self, endpoint_key},
+    subscription,
 };
 use std::collections::HashMap;
 
@@ -18,13 +18,15 @@ fn fixture(dir: &std::path::Path, endpoints: &[(&str, u16, &str)]) -> (ConfigVau
     let store = ProfileStore::new(dir.join("profiles.json"));
     let stored: Vec<SubscriptionEndpoint> = endpoints
         .iter()
-        .map(|(host, port, name)| SubscriptionEndpoint {
+        .enumerate()
+        .map(|(index, (host, port, name))| SubscriptionEndpoint {
+            id: format!("{index:016x}"),
             url: vless(host, *port, name),
             name: name.to_string(),
         })
         .collect();
     vault.store_subscription_endpoints("sub", &stored).unwrap();
-    let primary_key = endpoint_key(&stored[0].url);
+    let primary_key = stored[0].id.clone();
     store
         .upsert(crate::models::Profile {
             id: "sub".into(),
@@ -106,7 +108,7 @@ fn disabled_pool_members_cannot_activate_failover() {
     store
         .update_profile("sub", |profile| {
             profile.subscription.as_mut().unwrap().pool_keys = vec![EndpointRef {
-                key: endpoint_key(&endpoints[1].url),
+                key: endpoints[1].id.clone(),
                 name: endpoints[1].name.clone(),
             }];
             Ok(())
@@ -208,7 +210,7 @@ fn country_mismatch_rejects_healthy_node_and_explicits_never_join() {
     );
     // Primary is endpoints[0]; pin endpoints[1] explicitly; keep 3+4 for pool.
     let endpoints = vault.read_subscription_endpoints("sub").unwrap();
-    let pinned = endpoint_key(&endpoints[1].url);
+    let pinned = endpoints[1].id.clone();
     subscription::set_backup_endpoints(&vault, &store, "sub", std::slice::from_ref(&pinned))
         .unwrap();
     subscription::set_pinned_routes(
@@ -241,7 +243,7 @@ fn country_mismatch_rejects_healthy_node_and_explicits_never_join() {
     // Only the verified CA node is a member.
     let meta = load_meta(&store);
     assert_eq!(meta.pool_keys.len(), 1);
-    assert_eq!(meta.pool_keys[0].key, endpoint_key(&endpoints[2].url));
+    assert_eq!(meta.pool_keys[0].key, endpoints[2].id);
     assert!(report.pool_changed && !report.kept_previous);
     // Verdicts: primary + pinned reported Explicit, wrong country rejected.
     let verdict = |name: &str| {
@@ -367,15 +369,15 @@ fn retained_pool_cannot_reintroduce_new_explicit_domain_or_dns_nodes() {
         ))
         .unwrap();
     let endpoints = vault.read_subscription_endpoints("sub").unwrap();
-    let keep = endpoint_key(&endpoints[3].url);
+    let keep = endpoints[3].id.clone();
     store
         .update_profile("sub", |profile| {
             profile.pinned_policies.push(PinnedRoute {
                 selectors: vec!["full:fixed.test".into()],
-                endpoint_key: endpoint_key(&endpoints[1].url),
+                endpoint_key: endpoints[1].id.clone(),
                 missing: false,
             });
-            profile.xray_dns.outbound_key = Some(endpoint_key(&endpoints[2].url));
+            profile.xray_dns.outbound_key = Some(endpoints[2].id.clone());
             Ok(())
         })
         .unwrap();
@@ -385,7 +387,7 @@ fn retained_pool_cannot_reintroduce_new_explicit_domain_or_dns_nodes() {
         chain
             .iter()
             .skip(1)
-            .map(|endpoint| endpoint_key(&endpoint.url))
+            .map(|endpoint| endpoint.id.clone())
             .collect::<Vec<_>>(),
         vec![keep.clone()]
     );
@@ -429,9 +431,9 @@ fn pool_extends_failover_after_manual_backups_and_survives_reorder_rotation() {
         ],
     );
     let endpoints = vault.read_subscription_endpoints("sub").unwrap();
-    let manual = endpoint_key(&endpoints[1].url);
-    let pool_a = endpoint_key(&endpoints[2].url);
-    let pool_b = endpoint_key(&endpoints[3].url);
+    let manual = endpoints[1].id.clone();
+    let pool_a = endpoints[2].id.clone();
+    let pool_b = endpoints[3].id.clone();
     subscription::set_backup_endpoints(&vault, &store, "sub", std::slice::from_ref(&manual))
         .unwrap();
     set_node_pool(&store, "sub", Some(canada_pool())).unwrap();
@@ -450,7 +452,7 @@ fn pool_extends_failover_after_manual_backups_and_survives_reorder_rotation() {
     // Ordered failover: primary, manual backups, then pool order.
     let profile = store.load().unwrap().profiles.remove(0);
     let (nodes, _) = subscription::failover_plan(&vault, &profile).unwrap();
-    let order: Vec<String> = nodes.iter().map(|n| endpoint_key(&n.url)).collect();
+    let order: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     assert_eq!(
         order,
         vec![
@@ -466,6 +468,7 @@ fn pool_extends_failover_after_manual_backups_and_survives_reorder_rotation() {
         .iter()
         .rev()
         .map(|endpoint| SubscriptionEndpoint {
+            id: endpoint.id.clone(),
             url: endpoint.url.replacen("uuid", "rotated", 1),
             name: endpoint.name.clone(),
         })
@@ -474,7 +477,7 @@ fn pool_extends_failover_after_manual_backups_and_survives_reorder_rotation() {
         .store_subscription_endpoints("sub", &reordered)
         .unwrap();
     let (nodes, _) = subscription::failover_plan(&vault, &profile).unwrap();
-    let order: Vec<String> = nodes.iter().map(|n| endpoint_key(&n.url)).collect();
+    let order: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     assert_eq!(order[1..], [manual.clone(), pool_a.clone(), pool_b.clone()]);
     // list_endpoints flags: pool members are not manual backups.
     let rows = subscription::list_endpoints(&vault, &store, "sub").unwrap();

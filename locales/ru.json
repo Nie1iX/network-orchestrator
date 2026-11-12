@@ -1013,6 +1013,7 @@
     "profiles.armedHint": "Маршруты управляются для этого профиля и будут (пере)установлены, пока существует {iface}.",
     "profiles.connectFailedDiag": "{name}: подключение не удалось. Подробности — в диагностике.",
     "profiles.connecting": "Подключение {name}",
+    "profiles.diagnose": "Диагностика",
     "profiles.copyProxyUri": "Копировать URI",
     "profiles.delayCheckFailed": "Замер задержки не удался",
     "profiles.delayTitle": "Задержка до активного эндпоинта",

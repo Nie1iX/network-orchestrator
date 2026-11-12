@@ -117,7 +117,7 @@ fn reconcile(
         store,
         ..
     } = *context;
-    let profiles = store.load().map_err(|_| "Cannot load profiles")?.profiles;
+    let profiles = linux_runtime::migrated_profiles(context.vault, store)?;
     preflight(set, &profiles, !down)?;
     if inputs.len() > 256 {
         return Err("Too many connection-set credential inputs".into());

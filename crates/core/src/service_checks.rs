@@ -287,72 +287,39 @@ pub fn service_check_is_bound(profile: &Profile, key: &str) -> bool {
         || profile.xray_dns.outbound_key.as_deref() == Some(key)
 }
 
-/// Build a dedicated single-node config from the current endpoint.
-///
-/// Reuse the existing endpoint reduction and profile sockopt helpers, but
-/// never apply profile routing policies. Imported routing, DNS, balancers,
-/// direct outbounds, and observatories cannot influence these requests.
+/// Build an isolated endpoint graph without importing profile routing.
 fn node_probe_config(
     uri: &str,
     socks_port: u16,
     sockopts: Option<&XraySockopts>,
 ) -> Result<serde_json::Value, String> {
     use serde_json::json;
-
-    let mut outbound = xray::multinode_outbound(uri, "service-check-node")
+    let mut graph = xray::multinode_endpoint(uri, "service-check-node")
         .map_err(|_| "Service check endpoint is invalid".to_string())?;
-
-    if !matches!(outbound["protocol"].as_str(), Some("vless" | "hysteria")) {
-        return Err("Service check endpoint is invalid".into());
-    }
-
-    // Keep no imported outbound-chaining references. The selected endpoint
-    // itself is the only possible application-traffic outbound.
-    let object = outbound
-        .as_object_mut()
-        .ok_or_else(|| "Service check endpoint is invalid".to_string())?;
-    object.remove("proxySettings");
-
-    if let Some(stream) = object.get_mut("streamSettings") {
-        let stream = stream
-            .as_object_mut()
-            .ok_or_else(|| "Service check endpoint is invalid".to_string())?;
-        if let Some(options) = stream.get_mut("sockopt") {
-            let options = options
-                .as_object_mut()
-                .ok_or_else(|| "Service check endpoint is invalid".to_string())?;
-            options.remove("dialerProxy");
-        }
-    }
-
     if let Some(sockopts) = sockopts {
-        xray::apply_stream_sockopts(&mut outbound, sockopts)
-            .map_err(|_| "Service check socket settings are invalid".to_string())?;
-    }
-
-    Ok(json!({
-        "log": { "loglevel": "none" },
-        "inbounds": [{
-            "tag": "service-check-in",
-            "listen": "127.0.0.1",
-            "port": socks_port,
-            "protocol": "socks",
-            "settings": {
-                "auth": "noauth",
-                "udp": false
+        for outbound in std::iter::once(&mut graph.entry).chain(graph.outbounds.iter_mut()) {
+            if matches!(
+                outbound["protocol"].as_str(),
+                Some("vless" | "hysteria" | "freedom")
+            ) {
+                xray::apply_stream_sockopts(outbound, sockopts)
+                    .map_err(|_| "Service check socket settings are invalid".to_string())?;
             }
-        }],
-        "outbounds": [outbound],
-        "routing": {
-            "domainStrategy": "AsIs",
-            "rules": [{
-                "type": "field",
-                "inboundTag": ["service-check-in"],
-                "network": "tcp",
-                "outboundTag": "service-check-node"
-            }]
         }
-    }))
+    }
+    let mut config = json!({
+        "log": {"loglevel": "none"},
+        "inbounds": [{"tag":"service-check-in","listen":"127.0.0.1","port":socks_port,
+            "protocol":"socks","settings":{"auth":"noauth","udp":false}}],
+        "outbounds": [],
+        "routing": {"domainStrategy":"AsIs","rules":[{
+            "type":"field","inboundTag":["service-check-in"],"network":"tcp",
+            "outboundTag":"service-check-node"
+        }]}
+    });
+    xray::append_endpoint_graph(&mut config, &graph)
+        .map_err(|_| "Service check endpoint is invalid".to_string())?;
+    Ok(config)
 }
 
 struct EndpointGroup<'a> {
@@ -436,7 +403,8 @@ async fn run_endpoint_group(
     .await;
 
     let results = match startup {
-        Ok(Ok(client)) => {
+        Ok(Ok((client, observation_wait))) => {
+            tokio::time::sleep(observation_wait).await;
             let mut results = Vec::with_capacity(group.checks.len());
             for &(index, check) in &group.checks {
                 results.push((index, probe_service_check(check, &client).await));
@@ -566,6 +534,12 @@ mod tests {
 
     fn endpoint(host: &str) -> SubscriptionEndpoint {
         SubscriptionEndpoint {
+            id: if host.starts_with("missing") {
+                "2222222222222222"
+            } else {
+                "1111111111111111"
+            }
+            .into(),
             url: format!("vless://synthetic-id@{host}:443?security=tls#Synthetic"),
             name: "Synthetic node".into(),
         }
@@ -784,7 +758,7 @@ mod tests {
         let vault = ConfigVault::new(dir.path().join("configs"));
         let active = endpoint("active.example.test");
         let missing = endpoint("missing.example.test");
-        let missing_key = subscription::endpoint_key(&missing.url);
+        let missing_key = missing.id.clone();
 
         let mut profile = profile(vec![check("missing", &missing_key)]);
         pin(&mut profile, &missing_key);
@@ -802,6 +776,31 @@ mod tests {
         assert_eq!(results[0].endpoint_key, missing_key);
         assert_eq!(results[0].outcome, ServiceCheckOutcome::Unavailable);
         assert_eq!(results[0].http_status, None);
+    }
+
+    #[test]
+    fn service_probe_keeps_provider_pool_but_not_provider_bypass() {
+        let panel = serde_json::json!({
+            "outbounds":[
+                {"tag":"p","protocol":"vless","settings":{"vnext":[{"address":"node.test","port":443,"users":[{"id":"id","encryption":"none"}]}]}},
+                {"tag":"direct","protocol":"freedom"}
+            ],
+            "routing":{"rules":[
+                {"type":"field","domain":["domain:bypass.test"],"outboundTag":"direct"},
+                {"type":"field","network":"tcp,udp","balancerTag":"auto"}
+            ],"balancers":[{"tag":"auto","selector":["p"]}]}
+        });
+        let uri = xray::xray_json_entry(&panel).unwrap();
+        let config = node_probe_config(&uri, 12345, None).unwrap();
+        assert_eq!(config["outbounds"][0]["protocol"], "loopback");
+        assert_eq!(
+            config["routing"]["rules"][0]["inboundTag"],
+            serde_json::json!(["src-service-check-node-in"])
+        );
+        assert!(!config.to_string().contains("bypass.test"));
+        assert!(config["routing"]["balancers"]
+            .as_array()
+            .is_some_and(|b| !b.is_empty()));
     }
 
     #[test]
@@ -982,7 +981,7 @@ mod tests {
     #[tokio::test]
     async fn actual_temporary_child_startup_is_bounded_and_cleanup_is_awaited() {
         let endpoint = endpoint("selected.example.test");
-        let check = check("one", &subscription::endpoint_key(&endpoint.url));
+        let check = check("one", &endpoint.id);
         let group = EndpointGroup {
             endpoint: &endpoint,
             checks: vec![(0, &check)],

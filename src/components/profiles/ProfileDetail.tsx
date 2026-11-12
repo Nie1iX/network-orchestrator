@@ -79,6 +79,8 @@ function delayClass(
 interface ProfileDetailProps {
   profile: Profile;
   status: TunnelStatus;
+  connectionFailure: string | null;
+  onDismissConnectionFailure: () => void;
   rate: { rxRate: number; txRate: number } | null;
   isBusy: boolean;
   backendLabel: string;
@@ -125,6 +127,8 @@ interface ProfileDetailProps {
 export default function ProfileDetail({
   profile,
   status,
+  connectionFailure,
+  onDismissConnectionFailure,
   rate,
   isBusy: profileBusy,
   backendLabel,
@@ -407,6 +411,24 @@ export default function ProfileDetail({
       </div>
 
       <div className="profile-detail-body">
+        {connectionFailure && (
+          <div className="save-notice" role="alert">
+            <div className="diagnostics-head">
+              <span>{connectionFailure}</span>
+              <button type="button" onClick={onDismissConnectionFailure}>
+                {t("common.dismiss")}
+              </button>
+            </div>
+            <div className="diagnostics-head">
+              <button type="button" onClick={onEdit}>
+                {t("common.edit")}
+              </button>
+              <button type="button" onClick={onDiagnose} disabled={diagBusy}>
+                {t("profiles.diagnose")}
+              </button>
+            </div>
+          </div>
+        )}
         <div className="interface-row">
           <span className="row-label">{t("detail.backend")}</span>
           <span className="row-value">{backendLabel}</span>

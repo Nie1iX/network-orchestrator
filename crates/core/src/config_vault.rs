@@ -20,14 +20,29 @@ pub struct ConfigImport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionEndpoint {
+    #[serde(default)]
+    pub id: String,
     pub url: String,
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct SubscriptionSidecar {
-    endpoints: Vec<SubscriptionEndpoint>,
+pub(crate) struct SubscriptionSidecar {
+    #[serde(default)]
+    pub version: u32,
+    pub endpoints: Vec<SubscriptionEndpoint>,
+    #[serde(default)]
+    pub history: Vec<SubscriptionIdentity>,
+    #[serde(default)]
+    pub migration_pending: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SubscriptionIdentity {
+    pub id: String,
+    pub name_hash: String,
+    pub fingerprint: String,
 }
 
 pub struct ConfigVault {
@@ -331,16 +346,29 @@ impl ConfigVault {
         profile_id: &str,
         endpoints: &[SubscriptionEndpoint],
     ) -> io::Result<PathBuf> {
+        let previous = match self.read_subscription_sidecar(profile_id) {
+            Ok(sidecar) => Some(sidecar),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let sidecar = crate::subscription::reconcile_catalog(previous.as_ref(), endpoints)?;
+        self.store_subscription_sidecar(profile_id, &sidecar)
+    }
+
+    pub(crate) fn store_subscription_sidecar(
+        &self,
+        profile_id: &str,
+        sidecar: &SubscriptionSidecar,
+    ) -> io::Result<PathBuf> {
         let safe = sanitize_profile_id(profile_id)?;
         let profile_dir = self.root.join(&safe);
         self.ensure_root_protected()?;
         fs::create_dir_all(&profile_dir)?;
         protect_path(&profile_dir)?;
         let path = profile_dir.join("subscription.json");
-        let json = serde_json::to_string_pretty(&SubscriptionSidecar {
-            endpoints: endpoints.to_vec(),
-        })
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let json = serde_json::to_string_pretty(sidecar).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid subscription sidecar")
+        })?;
         let mut temp = path.clone().into_os_string();
         temp.push(".tmp");
         let temp_path = PathBuf::from(temp);
@@ -356,12 +384,21 @@ impl ConfigVault {
         &self,
         profile_id: &str,
     ) -> io::Result<Vec<SubscriptionEndpoint>> {
+        Ok(self.read_subscription_sidecar(profile_id)?.endpoints)
+    }
+
+    pub(crate) fn read_subscription_sidecar(
+        &self,
+        profile_id: &str,
+    ) -> io::Result<SubscriptionSidecar> {
         let safe = sanitize_profile_id(profile_id)?;
         let path = self.root.join(&safe).join("subscription.json");
         let raw = fs::read_to_string(&path)?;
-        let sidecar: SubscriptionSidecar = serde_json::from_str(&raw)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(sidecar.endpoints)
+        let sidecar: SubscriptionSidecar = serde_json::from_str(&raw).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid subscription sidecar")
+        })?;
+        crate::subscription::validate_catalog(&sidecar)?;
+        Ok(sidecar)
     }
 
     pub fn remove_revision_for_config(&self, config_path: &Path) -> io::Result<()> {

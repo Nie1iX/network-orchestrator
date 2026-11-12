@@ -19,6 +19,23 @@ pub struct Context<'a> {
     pub vault: &'a ConfigVault,
     pub store: &'a ProfileStore,
 }
+pub(crate) fn migrated_profiles(
+    vault: &ConfigVault,
+    store: &ProfileStore,
+) -> Result<Vec<Profile>, String> {
+    let mut profiles = store
+        .load()
+        .map_err(|_| "Profiles could not be loaded")?
+        .profiles;
+    for profile in &mut profiles {
+        if profile.backend == TunnelBackend::Xray && profile.subscription.is_some() {
+            *profile =
+                net_manager_core::subscription::migrate_endpoint_ids(vault, store, &profile.id)
+                    .map_err(|_| "Subscription identities could not be migrated")?;
+        }
+    }
+    Ok(profiles)
+}
 
 pub fn connect(
     context: &Context<'_>,
@@ -55,10 +72,7 @@ pub fn connect_with_credentials(
             return Err("Remembered credentials are unavailable for this caller".into());
         }
         stage = "load_profile";
-        let mut profiles = store
-            .load()
-            .map_err(|_| "Profiles could not be loaded")?
-            .profiles;
+        let mut profiles = migrated_profiles(vault, store)?;
         let mut profile = profiles
             .iter()
             .find(|p| p.id == profile_id)
@@ -160,6 +174,27 @@ pub fn prepare_connection(
         store,
         ..
     } = *context;
+    let migrated;
+    let profile = if profile.backend == TunnelBackend::Xray && profile.subscription.is_some() {
+        let before = store
+            .load()
+            .map_err(|_| "Profiles could not be loaded")?
+            .profiles
+            .into_iter()
+            .find(|stored| stored.id == profile.id)
+            .ok_or("Profile not found")?;
+        migrated = net_manager_core::subscription::migrate_endpoint_ids(vault, store, &profile.id)
+            .map_err(|_| "Subscription identities could not be migrated")?;
+        if &before == profile {
+            &migrated
+        } else if before != migrated {
+            return Err("The subscription changed; reload the profile before connecting".into());
+        } else {
+            profile
+        }
+    } else {
+        profile
+    };
     if supplied.is_some() && profile.backend != TunnelBackend::OpenVpn {
         return Err("Credentials require an OpenVPN profile".into());
     }
@@ -174,10 +209,7 @@ pub fn prepare_connection(
     let retained = if remember { supplied.clone() } else { None };
     let mut candidate = None;
     let notice = if prepare_ports && profile.backend == TunnelBackend::Xray {
-        let mut profiles = store
-            .load()
-            .map_err(|_| "Profiles could not be loaded")?
-            .profiles;
+        let mut profiles = migrated_profiles(vault, store)?;
         let snapshot = candidate.insert(profile.clone());
         prepare_listener_ports(vault, store, snapshot, &mut profiles, root)?
     } else {
@@ -342,10 +374,14 @@ pub fn status(engine: &LinuxEngine, profile: &Profile) -> Result<TunnelStatus, S
 }
 
 pub fn statuses(engine: &LinuxEngine, store: &ProfileStore) -> Result<Vec<TunnelStatus>, String> {
-    let profiles = store
-        .load()
-        .map_err(|_| "Profiles could not be loaded")?
-        .profiles;
+    let profiles = if let Some(root) = engine.data_root() {
+        migrated_profiles(&ConfigVault::new(root.join("configs")), store)?
+    } else {
+        store
+            .load()
+            .map_err(|_| "Profiles could not be loaded")?
+            .profiles
+    };
     statuses_for(engine, &profiles)
 }
 
@@ -593,9 +629,9 @@ pub fn run_auto_connect(
         vault,
         store,
     };
-    let result = match store.load() {
-        Ok(document) => execute_auto_connect(
-            &document.profiles,
+    let result = match migrated_profiles(vault, store) {
+        Ok(profiles) => execute_auto_connect(
+            &profiles,
             |profile| engine.status(profile).map(|status| status.state),
             |profile| connect(&context, &profile.id, None, remembered, None).map(|_| ()),
         ),

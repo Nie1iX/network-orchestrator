@@ -45,6 +45,7 @@ pub mod route_plan;
 pub mod route_state;
 pub mod service_checks;
 pub mod subscription;
+mod subscription_identity;
 pub mod system_proxy;
 pub mod vpn;
 pub mod windows_job;

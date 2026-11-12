@@ -162,10 +162,9 @@ pub fn validate_profile_proxy_exits(profile: &Profile) -> io::Result<()> {
 /// pin outbound; a key that no longer resolves produces a blackhole
 /// `pin-<key>` — fail-closed, never retargeted. A `pin-<key>` outbound the
 /// profile routing already created (domain pin or DNS egress) is reused as
-/// is. Outbound chaining (`proxySettings`, `dialerProxy`) is stripped so a
-/// fixed alias cannot silently detour through another node, the profile
-/// sockopts apply, and no profile routing touches these dedicated
-/// outbounds. Rules/direct exits need no sidecar and read nothing.
+/// is. Each graph retains its own transport dependencies and observations;
+/// profile socket options apply without importing provider application routes.
+/// Rules/direct exits need no sidecar and read nothing.
 pub fn append_named_proxy_outbounds(
     vault: &ConfigVault,
     profile: &Profile,
@@ -182,11 +181,10 @@ pub fn append_named_proxy_outbounds(
     if needed.is_empty() {
         return Ok(());
     }
-    let outbounds = config
-        .get_mut("outbounds")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| "invalid Xray config".to_string())?;
-    let mut present: HashSet<String> = outbounds
+    let mut present: HashSet<String> = config
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "invalid Xray config".to_string())?
         .iter()
         .filter_map(|outbound| outbound["tag"].as_str().map(str::to_string))
         .collect();
@@ -201,33 +199,31 @@ pub fn append_named_proxy_outbounds(
         let url = endpoints.as_ref().and_then(|endpoints| {
             crate::subscription::key_index(endpoints, key).map(|index| endpoints[index].url.clone())
         });
-        let outbound = match url {
+        match url {
             Some(url) => {
-                let mut outbound = crate::xray::multinode_outbound(&url, &tag)
+                let mut graph = crate::xray::multinode_endpoint(&url, &tag)
                     .map_err(|_| "A named proxy exit endpoint is invalid".to_string())?;
-                // A fixed alias never chains into another outbound.
-                let object = outbound
-                    .as_object_mut()
-                    .ok_or_else(|| "A named proxy exit endpoint is invalid".to_string())?;
-                object.remove("proxySettings");
-                if let Some(sockopt) = object
-                    .get_mut("streamSettings")
-                    .and_then(Value::as_object_mut)
-                    .and_then(|stream| stream.get_mut("sockopt"))
-                    .and_then(Value::as_object_mut)
-                {
-                    sockopt.remove("dialerProxy");
-                }
                 if let Some(sockopts) = &profile.xray_sockopts {
-                    crate::xray::apply_stream_sockopts(&mut outbound, sockopts)
-                        .map_err(|_| "Invalid Xray socket settings".to_string())?;
+                    for outbound in
+                        std::iter::once(&mut graph.entry).chain(graph.outbounds.iter_mut())
+                    {
+                        if matches!(
+                            outbound["protocol"].as_str(),
+                            Some("vless" | "hysteria" | "freedom")
+                        ) {
+                            crate::xray::apply_stream_sockopts(outbound, sockopts)
+                                .map_err(|_| "Invalid Xray socket settings".to_string())?;
+                        }
+                    }
                 }
-                outbound
+                crate::xray::append_endpoint_graph(config, &graph)
+                    .map_err(|_| "A named proxy exit endpoint is invalid".to_string())?;
             }
-            // Missing key: blackhole, never another endpoint.
-            None => json!({"tag": tag, "protocol": "blackhole"}),
-        };
-        outbounds.push(outbound);
+            None => config["outbounds"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"tag": tag, "protocol": "blackhole"})),
+        }
     }
     Ok(())
 }
@@ -239,6 +235,7 @@ mod tests {
 
     fn endpoint(host: &str) -> SubscriptionEndpoint {
         SubscriptionEndpoint {
+            id: "1111111111111111".into(),
             url: format!("vless://uuid@{host}:443?security=tls&sni=a.test&type=tcp#{host}"),
             name: host.into(),
         }
@@ -262,7 +259,7 @@ mod tests {
         vault
             .store_subscription_endpoints("p", std::slice::from_ref(&node))
             .unwrap();
-        let node_key = crate::subscription::endpoint_key(&node.url);
+        let node_key = node.id.clone();
         let gone_key = "deadbeefdeadbeef".to_string();
 
         let mut profile = Profile {

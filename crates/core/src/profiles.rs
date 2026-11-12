@@ -31,6 +31,11 @@ impl ProfileStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
+    #[cfg(unix)]
+    pub(crate) fn owner_uid(&self) -> io::Result<u32> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(fs::metadata(&self.path)?.uid())
+    }
 
     pub fn load(&self) -> io::Result<ProfileDocument> {
         let raw = match fs::read_to_string(&self.path) {
@@ -71,7 +76,7 @@ impl ProfileStore {
     /// A separate file survives atomic replacement of the document. Each
     /// transaction opens its own handle, so threads and other processes use
     /// the same OS lock; dropping the handle releases it even on errors.
-    fn lock(&self) -> io::Result<fs::File> {
+    pub(crate) fn lock(&self) -> io::Result<fs::File> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
             crate::config_security::protect_path(parent)?;
@@ -95,7 +100,7 @@ impl ProfileStore {
         Ok(file)
     }
 
-    fn save_locked(&self, document: &ProfileDocument) -> io::Result<()> {
+    pub(crate) fn save_locked(&self, document: &ProfileDocument) -> io::Result<()> {
         for profile in &document.profiles {
             crate::service_checks::validate_profile_service_checks(profile)?;
             crate::proxy_exits::validate_profile_proxy_exits(profile)?;

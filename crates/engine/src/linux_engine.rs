@@ -172,6 +172,10 @@ impl LinuxEngine {
         self
     }
 
+    pub(crate) fn data_root(&self) -> Option<&std::path::Path> {
+        self.data_root.as_deref()
+    }
+
     #[cfg(target_os = "linux")]
     fn local_request(
         &self,
@@ -425,6 +429,36 @@ impl LinuxEngine {
         remembered: &dyn CredentialSource,
         prepare_local_ports: bool,
     ) -> Result<PreparedConnection, String> {
+        let migrated;
+        let profile = if profile.subscription.is_some() && profile.backend == TunnelBackend::Xray {
+            let root = self
+                .data_root
+                .as_deref()
+                .or_else(|| vault.root().parent())
+                .ok_or("The application data directory is required")?;
+            let store = net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
+            let before = store
+                .load()
+                .map_err(|_| "Profiles could not be loaded")?
+                .profiles
+                .into_iter()
+                .find(|stored| stored.id == profile.id)
+                .ok_or("Profile not found")?;
+            migrated =
+                net_manager_core::subscription::migrate_endpoint_ids(vault, &store, &profile.id)
+                    .map_err(|_| "Subscription identities could not be migrated")?;
+            if &before == profile {
+                &migrated
+            } else if before != migrated {
+                return Err(
+                    "The subscription changed; reload the profile before connecting".into(),
+                );
+            } else {
+                profile
+            }
+        } else {
+            profile
+        };
         #[cfg(not(target_os = "linux"))]
         let _ = prepare_local_ports;
         profile.check_role()?;
@@ -647,6 +681,36 @@ impl LinuxEngine {
         vault: &ConfigVault,
         profile: &Profile,
     ) -> Result<TunnelStatus, String> {
+        let migrated;
+        let profile = if profile.subscription.is_some() {
+            let root = self
+                .data_root
+                .as_deref()
+                .or_else(|| vault.root().parent())
+                .ok_or("The application data directory is required")?;
+            let store = net_manager_core::profiles::ProfileStore::new(root.join("profiles.json"));
+            let before = store
+                .load()
+                .map_err(|_| "Profiles could not be loaded")?
+                .profiles
+                .into_iter()
+                .find(|stored| stored.id == profile.id)
+                .ok_or("Profile not found")?;
+            migrated =
+                net_manager_core::subscription::migrate_endpoint_ids(vault, &store, &profile.id)
+                    .map_err(|_| "Subscription identities could not be migrated")?;
+            if &before == profile {
+                &migrated
+            } else if before != migrated {
+                return Err(
+                    "The subscription changed; reload the profile before connecting".into(),
+                );
+            } else {
+                profile
+            }
+        } else {
+            profile
+        };
         profile.check_role()?;
         if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Tun {
             return Err("Reload requires an Xray TUN profile".into());

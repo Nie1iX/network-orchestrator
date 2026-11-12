@@ -10,6 +10,22 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Accept validated socket options on Hysteria TUN outbounds instead of rejecting
+  profiles produced by the shared connection planner.
+- Keep connection failures visible on the selected profile with edit/diagnose
+  actions until dismissal or a successful retry. Invalid transport errors identify
+  the generated outbound location without exposing configuration values.
+- Identify rejected backup, pinned and DNS endpoints by record ID and preserve safe
+  conversion advice for unrepresentable provider graph options.
+- Use persistent subscription record IDs throughout connection planning and probes
+  so provider address changes do not discard selections or merge distinct records.
+- Independently validate scoped provider selection graphs, transport dependencies
+  and observation subjects without flattening multi-server subscription sources.
+- Accept explicit profile interface bindings on validated non-source freedom
+  outbounds; keep source-injected bindings and conflicting observer types blocked.
+
 ## [0.18.1] - 2026-11-10
 
 Core 0.18.1.

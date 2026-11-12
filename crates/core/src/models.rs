@@ -190,7 +190,7 @@ pub struct PinnedRoute {
     /// suffixes); IP selectors are not allowed — a pinned node is a domain
     /// policy, not a network route.
     pub selectors: Vec<String>,
-    /// [`crate::subscription::endpoint_key`] of the node, 16 lowercase hex.
+    /// Persisted endpoint ID, 16 lowercase hex.
     pub endpoint_key: String,
     /// Set when the key does not resolve to a current endpoint; persisted
     /// so the clients can grey the entry out, refreshed on every change.
@@ -935,7 +935,7 @@ pub struct SubscriptionEndpointInfo {
     pub active: bool,
     #[serde(default)]
     pub protocol: Option<String>,
-    /// [`crate::subscription::endpoint_key`] of this endpoint.
+    /// Persisted endpoint ID.
     #[serde(default)]
     pub key: String,
     /// Listed in `SubscriptionMeta::backup_keys`.

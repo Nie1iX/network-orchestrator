@@ -715,7 +715,7 @@ async fn handle<A: Authorizer>(
             let params: XrayConnectParams = from_value(request.params)
                 .map_err(|_| invalid("invalid Xray connect parameters".into()))?;
             prepare_xray(uid, params.clone(), 1)
-                .map_err(|_| invalid("unsupported generated Xray TUN config".into()))?;
+                .map_err(|error| invalid(crate::xray::validation_message(&error)))?;
             net_manager_core::models::validate_secondary(
                 params.role,
                 &params.routes,

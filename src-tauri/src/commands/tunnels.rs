@@ -147,7 +147,12 @@ async fn connect_profile_inner(
         Ok(status)
     }
     #[cfg(not(target_os = "linux"))]
-    let mut profile = find_profile(&state.profiles, &id)?;
+    let mut profile = net_manager_core::subscription::migrate_endpoint_ids(
+        &state.config_vault,
+        &state.profiles,
+        &id,
+    )
+    .map_err(|_| "Subscription identities could not be migrated")?;
     #[cfg(not(target_os = "linux"))]
     profile.check_role()?;
     #[cfg(not(target_os = "linux"))]
@@ -539,7 +544,17 @@ pub(crate) async fn collect_tunnel_statuses(
 pub(crate) async fn get_tunnel_statuses(
     state: State<'_, AppState>,
 ) -> Result<Vec<TunnelStatus>, String> {
-    let profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+    let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+    for profile in &mut profiles {
+        if profile.subscription.is_some() {
+            *profile = net_manager_core::subscription::migrate_endpoint_ids(
+                &state.config_vault,
+                &state.profiles,
+                &profile.id,
+            )
+            .map_err(|_| "Subscription identities could not be migrated")?;
+        }
+    }
     collect_tunnel_statuses(state.inner(), &profiles).await
 }
 
@@ -586,7 +601,12 @@ pub(crate) async fn reload_xray_profile(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<TunnelStatus, String> {
-    let profile = find_profile(&state.profiles, &id)?;
+    let profile = net_manager_core::subscription::migrate_endpoint_ids(
+        &state.config_vault,
+        &state.profiles,
+        &id,
+    )
+    .map_err(|_| "Subscription identities could not be migrated")?;
     if profile.backend != TunnelBackend::Xray || profile.xray_mode != XrayMode::Tun {
         return Err("reload is only supported for Xray TUN profiles".into());
     }

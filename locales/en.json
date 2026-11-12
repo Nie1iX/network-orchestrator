@@ -948,6 +948,7 @@
     "profiles.armedHint": "Routes are managed for this profile and will be (re)installed whenever {iface} exists.",
     "profiles.connectFailedDiag": "{name} failed to connect. Run Diagnostics for details.",
     "profiles.connecting": "Connecting {name}",
+    "profiles.diagnose": "Diagnose",
     "profiles.copyProxyUri": "Copy URI",
     "profiles.delayCheckFailed": "Delay check failed",
     "profiles.delayTitle": "Delay to the active endpoint",

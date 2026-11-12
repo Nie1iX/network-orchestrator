@@ -1219,7 +1219,7 @@ pub struct XrayServiceChecksParams {
 }
 
 /// One ordered failover candidate; `key` is the stable subscription
-/// endpoint key ([`crate::subscription::endpoint_key`], 16 lowercase hex)
+/// endpoint ID (16 lowercase hex)
 /// and doubles as the suffix of the config's `node-<key>` outbound tag.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

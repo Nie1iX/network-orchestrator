@@ -331,14 +331,14 @@ fn build_multinode(
     String,
 > {
     use net_manager_core::daemon_protocol::{XrayFailoverNode, XrayFailoverParams};
-    use net_manager_core::xray::{multinode_outbound, PinnedOutbound};
+    use net_manager_core::xray::{multinode_endpoint, PinnedOutbound};
 
     let (nodes, pinned) = net_manager_core::subscription::failover_plan(vault, profile)
         .map_err(|_| "The subscription's failover endpoints could not be resolved".to_string())?;
-    let primary_url = nodes[0].url.clone();
-    let primary_key = net_manager_core::subscription::endpoint_key(&primary_url);
+    let primary_url = &nodes[0].url;
+    let primary_key = nodes[0].id.clone();
     let mut primary_config = net_manager_core::xray::tun_compatible_config(
-        &net_manager_core::xray::generate_share_link_config(&primary_url, 1)
+        &net_manager_core::xray::generate_share_link_config(primary_url, 1)
             .map_err(|_| "The selected endpoint is invalid".to_string())?,
     )
     .map_err(str::to_string)?;
@@ -349,12 +349,12 @@ fn build_multinode(
     )
     .map_err(|_| "invalid Xray routing rules".to_string())?;
     let mut backups = Vec::new();
-    for node in &nodes[1..] {
-        let key = net_manager_core::subscription::endpoint_key(&node.url);
+    for (index, node) in nodes[1..].iter().enumerate() {
+        let key = node.id.clone();
         backups.push((
             key.clone(),
-            multinode_outbound(&node.url, &net_manager_core::xray::node_tag(&key))
-                .map_err(|_| "A backup endpoint is invalid".to_string())?,
+            multinode_endpoint(&node.url, &net_manager_core::xray::node_tag(&key))
+                .map_err(|error| format!("Backup {} ({key}) is invalid: {error}", index + 1))?,
         ));
     }
     let mut pinned_outbounds = Vec::new();
@@ -371,8 +371,10 @@ fn build_multinode(
                 });
             match endpoint {
                 Some(url) => Some(
-                    multinode_outbound(&url, &net_manager_core::xray::pin_tag(&route.endpoint_key))
-                        .map_err(|_| "A pinned endpoint is invalid".to_string())?,
+                    multinode_endpoint(&url, &net_manager_core::xray::pin_tag(&route.endpoint_key))
+                        .map_err(|error| {
+                            format!("Pinned endpoint {} is invalid: {error}", route.endpoint_key)
+                        })?,
                 ),
                 // Resolution disagreed with the plan — fail closed.
                 None => None,
@@ -391,14 +393,12 @@ fn build_multinode(
                 .map_err(|_| "cannot read subscription endpoints".to_string())?;
             let outbound = endpoints
                 .iter()
-                .find(|endpoint| {
-                    net_manager_core::subscription::endpoint_key(&endpoint.url) == *key
-                })
+                .find(|endpoint| endpoint.id == *key)
                 .map(|endpoint| {
-                    multinode_outbound(&endpoint.url, &net_manager_core::xray::pin_tag(key))
+                    multinode_endpoint(&endpoint.url, &net_manager_core::xray::pin_tag(key))
                 })
                 .transpose()
-                .map_err(|_| "The DNS endpoint is invalid".to_string())?;
+                .map_err(|error| format!("DNS endpoint {key} is invalid: {error}"))?;
             pinned_outbounds.push(PinnedOutbound {
                 key: key.clone(),
                 outbound,
@@ -412,7 +412,7 @@ fn build_multinode(
         &backups,
         &pinned_outbounds,
     )
-    .map_err(|_| "cannot encode the multinode Xray config".to_string())?;
+    .map_err(|error| format!("cannot compose the multinode Xray config: {error}"))?;
     if let Some(sockopts) = &profile.xray_sockopts {
         for outbound in config["outbounds"]
             .as_array_mut()
@@ -432,7 +432,7 @@ fn build_multinode(
         nodes: nodes
             .iter()
             .map(|node| XrayFailoverNode {
-                key: net_manager_core::subscription::endpoint_key(&node.url),
+                key: node.id.clone(),
             })
             .collect(),
         primary_key,
@@ -773,6 +773,62 @@ mod tests {
         let mut profile = store.load().unwrap().profiles.remove(0);
         profile.xray_mode = XrayMode::Tun;
         (directory, vault, profile)
+    }
+
+    #[test]
+    fn reference_errors_identify_the_record_without_exposing_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = ConfigVault::new(directory.path().join("configs"));
+        let store = ProfileStore::new(directory.path().join("profiles.json"));
+        net_manager_core::subscription::import_body(
+            &vault,
+            &store,
+            &net_manager_core::subscription::SubscriptionImport {
+                id: "subscription",
+                url: "https://example.test/list",
+                hwid: "device",
+                name: "Example",
+                refresh_interval_minutes: None,
+            },
+            "vless://one@first.test:443?security=none#First\nvless://two@second.test:443?security=none#Second",
+            net_manager_core::subscription::ResponseMeta::default(),
+            XrayMode::Tun,
+            |_| true,
+        ).unwrap();
+        let mut endpoints = vault.read_subscription_endpoints("subscription").unwrap();
+        let id = endpoints[1].id.clone();
+        endpoints[1].url = "unsupported://private-secret".into();
+        vault
+            .store_subscription_endpoints("subscription", &endpoints)
+            .unwrap();
+        let profile = store.load().unwrap().profiles.remove(0);
+        for role in ["Backup", "Pinned", "DNS"] {
+            let mut candidate = profile.clone();
+            match role {
+                "Backup" => {
+                    candidate
+                        .subscription
+                        .as_mut()
+                        .unwrap()
+                        .backup_keys
+                        .push(EndpointRef {
+                            key: id.clone(),
+                            name: "Second".into(),
+                        })
+                }
+                "Pinned" => candidate.pinned_policies.push(PinnedRoute {
+                    endpoint_key: id.clone(),
+                    selectors: vec!["domain:example.test".into()],
+                    missing: false,
+                }),
+                "DNS" => candidate.xray_dns.outbound_key = Some(id.clone()),
+                _ => unreachable!(),
+            }
+            let error = build_multinode(&vault, &candidate).unwrap_err();
+            assert!(error.contains(&id), "{role}: {error}");
+            assert!(error.contains(role), "{role}: {error}");
+            assert!(!error.contains("private-secret"), "{role}");
+        }
     }
 
     fn route(destination: &str) -> PolicyRoute {

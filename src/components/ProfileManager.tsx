@@ -208,6 +208,9 @@ export default function ProfileManager() {
     profileName: string;
     inspection: ProfileInspection;
   } | null>(null);
+  const [connectionFailures, setConnectionFailures] = useState<
+    Record<string, string>
+  >({});
   const [diagnostics, setDiagnostics] = useState<ProfileDiagnostics | null>(
     null,
   );
@@ -861,23 +864,34 @@ export default function ProfileManager() {
         id: profile.id,
       });
       if (status.state === "failed") {
+        setConnectionFailures((current) => ({
+          ...current,
+          [profile.id]:
+            status.message ??
+            t("profiles.connectFailedDiag", { name: profile.name }),
+        }));
         toast(
           "error",
           status.message ??
             t("profiles.connectFailedDiag", { name: profile.name }),
         );
       } else {
+        setConnectionFailures(({ [profile.id]: _failure, ...current }) => current);
         if (status.message) toast("info", status.message);
       }
     }, (err) => {
       if (caps?.os === "linux" && profile.backend === "openVpn" && String(err) === "OpenVPN credentials required") {
         setOpenVpnCredentialProfile(profile);
       } else {
-        toast("error", String(err));
+        const message = String(err);
+        setConnectionFailures((current) => ({
+          ...current,
+          [profile.id]: message,
+        }));
+        toast("error", message);
       }
     });
   };
-
   const onDisconnect = async (profile: Profile) => {
     if (requiresElevation(profile)) {
       try {
@@ -2173,6 +2187,13 @@ export default function ProfileManager() {
               key={selected.id}
               onPolicySaved={acceptPolicyProfiles}
               profile={selected}
+              connectionFailure={connectionFailures[selected.id] ?? null}
+              onDismissConnectionFailure={() =>
+                setConnectionFailures((current) => {
+                  const { [selected.id]: _failure, ...remaining } = current;
+                  return remaining;
+                })
+              }
               onRoleChanged={() => void refreshAll()}
               status={statusFor(selected.id)}
               rate={
@@ -2313,7 +2334,8 @@ export default function ProfileManager() {
           setOpenVpnCredentialProfile(null);
           pending.resolve({ credentials, remember });
         } : undefined}
-        onConnected={(_profile, status) => {
+        onConnected={(profile, status) => {
+          setConnectionFailures(({ [profile.id]: _failure, ...current }) => current);
           if (status.message) toast("info", status.message);
           setOpenVpnCredentialProfile(null);
           void refreshAll();

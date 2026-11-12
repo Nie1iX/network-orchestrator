@@ -1071,7 +1071,7 @@ pub fn verify(ctx: &Ctx, target: &str) -> Result<Output, String> {
                     .acquire_owned()
                     .await
                     .map_err(|_| "Exit verification was cancelled".to_string())?;
-                let key = subscription::endpoint_key(&endpoint.url);
+                let key = endpoint.id.clone();
                 let mut command = tokio::process::Command::new(&executable);
                 command.args(["run", "-config", "stdin:"]);
 

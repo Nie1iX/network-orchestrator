@@ -294,11 +294,18 @@ async fn ensure_profile_stopped(
 #[cfg(not(target_os = "linux"))]
 #[tauri::command]
 pub(crate) async fn get_profiles(state: State<'_, AppState>) -> Result<Vec<Profile>, String> {
-    state
-        .profiles
-        .load()
-        .map(|doc| redact_profiles_for_ipc(doc.profiles))
-        .map_err(|e| e.to_string())
+    let mut profiles = state.profiles.load().map_err(|e| e.to_string())?.profiles;
+    for profile in &mut profiles {
+        if profile.subscription.is_some() {
+            *profile = net_manager_core::subscription::migrate_endpoint_ids(
+                &state.config_vault,
+                &state.profiles,
+                &profile.id,
+            )
+            .map_err(|_| "Subscription identities could not be migrated")?;
+        }
+    }
+    Ok(redact_profiles_for_ipc(profiles))
 }
 
 #[derive(serde::Serialize)]
@@ -313,12 +320,12 @@ pub(crate) async fn get_profile_for_edit(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<ProfileForEdit, String> {
-    let document = state.profiles.load().map_err(|e| e.to_string())?;
-    let profile = document
-        .profiles
-        .into_iter()
-        .find(|p| p.id == id)
-        .ok_or_else(|| "profile not found".to_string())?;
+    let profile = net_manager_core::subscription::migrate_endpoint_ids(
+        &state.config_vault,
+        &state.profiles,
+        &id,
+    )
+    .map_err(|_| "Profile could not be loaded")?;
     let revision =
         net_manager_core::profiles::profile_edit_revision(&profile).map_err(|e| e.to_string())?;
     let profile = redact_profiles_for_ipc(vec![profile]).remove(0);
@@ -348,7 +355,17 @@ pub(crate) async fn save_profile(
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
     let document = state.profiles.load().map_err(|e| e.to_string())?;
-    let stored = existing_profile_for_update(&document, &profile.id).cloned();
+    let stored = match existing_profile_for_update(&document, &profile.id) {
+        Some(existing) if existing.subscription.is_some() => Some(
+            net_manager_core::subscription::migrate_endpoint_ids(
+                &state.config_vault,
+                &state.profiles,
+                &profile.id,
+            )
+            .map_err(|_| "Subscription identities could not be migrated")?,
+        ),
+        existing => existing.cloned(),
+    };
     preserve_canonical_subscription(&mut profile, stored.as_ref());
     preserve_pinned_policies(&mut profile, stored.as_ref());
     preserve_service_checks(&mut profile, stored.as_ref());
@@ -803,6 +820,13 @@ fn subscription_profile(
 }
 
 #[cfg(not(target_os = "linux"))]
+fn migrated_subscription_profile(state: &AppState, id: &str) -> Result<Profile, String> {
+    net_manager_core::subscription::migrate_endpoint_ids(&state.config_vault, &state.profiles, id)
+        .map_err(|_| "Subscription identities could not be migrated")?;
+    subscription_profile(&state.profiles, id)
+}
+
+#[cfg(not(target_os = "linux"))]
 async fn refresh_subscription_into(
     vault: &ConfigVault,
     store: &net_manager_core::profiles::ProfileStore,
@@ -820,6 +844,8 @@ async fn refresh_subscription_into_with_ports(
     id: &str,
     available: impl Fn(u16) -> bool,
 ) -> Result<SubscriptionRefreshResult, String> {
+    net_manager_core::subscription::migrate_endpoint_ids(vault, store, id)
+        .map_err(|_| "Subscription identities could not be migrated")?;
     let profile = subscription_profile(store, id)?;
     let subscription = profile.subscription.as_ref().unwrap();
     let response = client
@@ -870,6 +896,8 @@ fn refresh_subscription_body_into_with_metadata(
     available: impl Fn(u16) -> bool,
     meta: SubscriptionResponseMeta,
 ) -> Result<SubscriptionRefreshResult, String> {
+    net_manager_core::subscription::migrate_endpoint_ids(vault, store, id)
+        .map_err(|_| "Subscription identities could not be migrated")?;
     subscription_profile(store, id)?;
     let outcome = net_manager_core::subscription::refresh_body(
         vault, store, id, body, meta, false, available,
@@ -891,7 +919,7 @@ async fn finish_subscription_refresh(
     id: &str,
     mut result: SubscriptionRefreshResult,
 ) -> Result<SubscriptionRefreshResult, String> {
-    let refreshed = subscription_profile(&state.profiles, id)?;
+    let refreshed = migrated_subscription_profile(state, id)?;
     match rebuild_pool_report(state, id).await {
         Ok(report) => {
             result.pool_report = report;
@@ -1050,6 +1078,7 @@ pub(crate) async fn set_subscription_refresh_interval(
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
+    migrated_subscription_profile(&state, &profile_id)?;
     set_subscription_refresh_interval_into(
         &state.profiles,
         &profile_id,
@@ -1065,7 +1094,7 @@ pub(crate) async fn refresh_subscription(
     state: State<'_, AppState>,
 ) -> Result<SubscriptionRefreshResult, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-    let profile = subscription_profile(&state.profiles, &id)?;
+    let profile = migrated_subscription_profile(&state, &id)?;
     ensure_profile_stopped(&state, &profile, "refreshing subscription").await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -1116,7 +1145,7 @@ pub(crate) async fn run_subscription_refresh_loop(app: tauri::AppHandle) {
                 continue;
             }
             let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-            let selected = subscription_profile(&state.profiles, &profile.id);
+            let selected = migrated_subscription_profile(&state, &profile.id);
             let Ok(current) = selected else {
                 continue;
             };
@@ -1198,7 +1227,7 @@ pub(crate) async fn measure_subscription_endpoint_delay(
     endpoint_index: usize,
     state: State<'_, AppState>,
 ) -> Result<SubscriptionDelayResult, String> {
-    let _profile = subscription_profile(&state.profiles, &profile_id)?;
+    let _profile = migrated_subscription_profile(&state, &profile_id)?;
     let endpoints = state
         .config_vault
         .read_subscription_endpoints(&profile_id)
@@ -1238,7 +1267,7 @@ pub(crate) async fn get_subscription_endpoints(
     profile_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<SubscriptionEndpointInfo>, String> {
-    let _profile = find_profile(&state.profiles, &profile_id)?;
+    let _profile = migrated_subscription_profile(&state, &profile_id)?;
     net_manager_core::subscription::list_endpoints(
         &state.config_vault,
         &state.profiles,
@@ -1256,7 +1285,7 @@ pub(crate) async fn switch_subscription_endpoint(
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-    let profile = find_profile(&state.profiles, &profile_id)?;
+    let profile = migrated_subscription_profile(&state, &profile_id)?;
     ensure_profile_stopped(&state, &profile, "switching endpoint").await?;
     switch_subscription_endpoint_into(
         &state.config_vault,
@@ -1296,7 +1325,7 @@ pub(crate) async fn set_subscription_backups(
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-    let profile = subscription_profile(&state.profiles, &profile_id)?;
+    let profile = migrated_subscription_profile(&state, &profile_id)?;
     if profile.backend != TunnelBackend::Xray {
         return Err("failover backups need an Xray subscription".into());
     }
@@ -1320,7 +1349,7 @@ pub(crate) async fn set_subscription_auto_return(
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-    subscription_profile(&state.profiles, &profile_id)?;
+    migrated_subscription_profile(&state, &profile_id)?;
     let doc = net_manager_core::subscription::set_auto_return_primary(
         &state.profiles,
         &profile_id,
@@ -1340,7 +1369,7 @@ pub(crate) async fn set_pinned_routes(
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-    let profile = subscription_profile(&state.profiles, &profile_id)?;
+    let profile = migrated_subscription_profile(&state, &profile_id)?;
     if profile.backend != TunnelBackend::Xray {
         return Err("node-pinned rules need an Xray subscription".into());
     }
@@ -1369,8 +1398,12 @@ pub(crate) async fn set_pinned_routes(
 
 #[cfg(not(target_os = "linux"))]
 fn service_check_profile(state: &AppState, profile_id: &str) -> Result<Profile, String> {
-    let profile = find_profile(&state.profiles, profile_id)
-        .map_err(|_| "The requested profile could not be selected".to_string())?;
+    let profile = net_manager_core::subscription::migrate_endpoint_ids(
+        &state.config_vault,
+        &state.profiles,
+        profile_id,
+    )
+    .map_err(|_| "The requested profile could not be selected".to_string())?;
     if profile.backend != TunnelBackend::Xray {
         return Err("Service checks require an Xray profile".into());
     }
@@ -1511,7 +1544,7 @@ pub(crate) async fn set_subscription_node_pool(
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-    let profile = subscription_profile(&state.profiles, &profile_id)?;
+    let profile = migrated_subscription_profile(&state, &profile_id)?;
     if profile.backend != TunnelBackend::Xray {
         return Err("the backup pool needs an Xray subscription".into());
     }
@@ -1529,7 +1562,7 @@ async fn rebuild_pool_report(
     state: &AppState,
     profile_id: &str,
 ) -> Result<Option<net_manager_core::node_pool::NodePoolReport>, String> {
-    let profile = subscription_profile(&state.profiles, profile_id)?;
+    let profile = migrated_subscription_profile(state, profile_id)?;
     if profile
         .subscription
         .as_ref()
@@ -1625,7 +1658,7 @@ pub(crate) async fn verify_subscription_exits(
     state: State<'_, AppState>,
 ) -> Result<Vec<SubscriptionExitCheck>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-    let profile = subscription_profile(&state.profiles, &profile_id)?;
+    let profile = migrated_subscription_profile(&state, &profile_id)?;
     let (nodes, _) = net_manager_core::subscription::failover_plan(&state.config_vault, &profile)
         .map_err(|_| "The failover endpoints could not be resolved".to_string())?;
     if nodes.is_empty() {
@@ -1671,7 +1704,7 @@ pub(crate) async fn verify_subscription_exits(
                 .acquire_owned()
                 .await
                 .map_err(|_| "Exit verification was cancelled".to_string())?;
-            let key = net_manager_core::subscription::endpoint_key(&endpoint.url);
+            let key = endpoint.id.clone();
             let mut command = tokio::process::Command::new(&executable);
             command.args(["run", "-config", "stdin:"]);
             let outcome = net_manager_core::node_pool::measure_exit_country(
@@ -1701,7 +1734,7 @@ pub(crate) async fn verify_subscription_exits(
     }
     results.sort_by_key(|(index, _, _, _)| *index);
 
-    if subscription_profile(&state.profiles, &profile_id)? != profile {
+    if migrated_subscription_profile(&state, &profile_id)? != profile {
         return Err("The profile changed during verification; verify again".into());
     }
     let (current_nodes, _) =
@@ -1868,7 +1901,7 @@ fn plan_migration(
         subscription.active_key.clone().or_else(|| {
             endpoints
                 .get(subscription.active_index)
-                .map(|endpoint| net_manager_core::subscription::endpoint_key(&endpoint.url))
+                .map(|endpoint| endpoint.id.clone())
         })
     });
 
@@ -1894,7 +1927,12 @@ pub(crate) async fn preview_xray_policy_migration(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<XrayPolicyPreview, String> {
-    let profile = find_profile(&state.profiles, &profile_id)?;
+    let profile = net_manager_core::subscription::migrate_endpoint_ids(
+        &state.config_vault,
+        &state.profiles,
+        &profile_id,
+    )
+    .map_err(|_| "The requested profile could not be selected")?;
     if profile.backend != TunnelBackend::Xray {
         return Err("policy migration targets Xray profiles".into());
     }
@@ -1912,7 +1950,12 @@ pub(crate) async fn apply_xray_policy_migration(
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-    let expected = find_profile(&state.profiles, &profile_id)?;
+    let expected = net_manager_core::subscription::migrate_endpoint_ids(
+        &state.config_vault,
+        &state.profiles,
+        &profile_id,
+    )
+    .map_err(|_| "The requested profile could not be selected")?;
     if expected.backend != TunnelBackend::Xray {
         return Err("Policy migration requires an Xray profile".into());
     }
@@ -1953,7 +1996,7 @@ pub(crate) async fn apply_xray_policy_migration(
             if current.subscription.is_some() {
                 let live = expected_endpoints
                     .iter()
-                    .map(|endpoint| net_manager_core::subscription::endpoint_key(&endpoint.url))
+                    .map(|endpoint| endpoint.id.clone())
                     .collect::<HashSet<_>>();
                 for pin in &mut current.pinned_policies {
                     pin.missing = !live.contains(&pin.endpoint_key);
