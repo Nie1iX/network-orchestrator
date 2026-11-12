@@ -2855,7 +2855,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-core"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -2878,7 +2878,7 @@ dependencies = [
 
 [[package]]
 name = "net-manager-engine"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "base64 0.22.1",
  "core-foundation 0.10.1",
@@ -2990,7 +2990,7 @@ dependencies = [
 
 [[package]]
 name = "network-orchestrator-daemon"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "base64 0.22.1",
  "futures",
