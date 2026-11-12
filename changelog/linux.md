@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-11-12
+
+Core 0.19.1.
+
 ### Fixed
 
 - Keep all profiles and tunnel statuses visible in the GUI when a native Mihomo
