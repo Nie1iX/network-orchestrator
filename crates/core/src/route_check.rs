@@ -572,6 +572,12 @@ pub struct RouteCheckResult {
     pub policy_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_selector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_key: Option<String>,
     pub certainty: RouteCheckCertainty,
     pub steps: Vec<RouteCheckStep>,
     pub notes: Vec<String>,
@@ -629,6 +635,7 @@ pub fn check_route(
             "resolved-ip-recheck" => {
                 "domainStrategy resolves unmatched names, so IP rules may still decide this target"
             }
+            "traffic-protocol-unknown" => "traffic-rule transport protocol was not provided",
             _ => return,
         };
         if !notes.iter().any(|n| n == text) {
@@ -642,6 +649,83 @@ pub fn check_route(
         Option<usize>,
         Option<String>,
     )> = None;
+
+    let mut interface_name: Option<String> = None;
+    let mut policy_path: Option<String> = None;
+    let mut endpoint_key: Option<String> = None;
+    let resolves = matches!(
+        options.domain_strategy,
+        Some(XrayDomainStrategy::IpIfNonMatch | XrayDomainStrategy::IpOnDemand)
+    );
+
+    // Traffic guards precede DNS capture. The offline target has no transport
+    // protocol, so a matching IP/port guard remains uncertain rather than a verdict.
+    if verdict.is_none() {
+        for (index, rule) in options.traffic_rules.iter().enumerate() {
+            if port.is_some_and(|target_port| target_port != rule.port) {
+                steps.push(RouteCheckStep {
+                    label: format!("traffic rule #{}", index + 1),
+                    selector: None,
+                    outcome: RouteCheckStepOutcome::Miss,
+                });
+                continue;
+            }
+            let mut candidate = false;
+            let mut selector = None;
+            for ip_selector in &rule.ips {
+                let ip_selector = ip_selector.trim();
+                if ip_selector.is_empty() || ip_selector.starts_with('#') {
+                    continue;
+                }
+                let is_ip = matches!(
+                    crate::xray::classify_routing_selector(ip_selector),
+                    Ok(Some(("ip", _)))
+                );
+                let outcome = match (&target, is_ip) {
+                    (RouteTarget::Domain(_), true) if resolves => {
+                        SelectorEval::Unknown("resolved-ip-recheck")
+                    }
+                    (RouteTarget::Domain(_), true) | (RouteTarget::Ip(_), false) => {
+                        SelectorEval::Miss
+                    }
+                    (RouteTarget::Ip(ip), true) => eval_ip_selector(ip_selector, *ip, geo),
+                    (RouteTarget::Domain(_), false) => SelectorEval::Unknown("regexp-unsupported"),
+                };
+                match outcome {
+                    SelectorEval::Match => {
+                        candidate = true;
+                        selector = Some(ip_selector.to_string());
+                        break;
+                    }
+                    SelectorEval::Unknown(reason) => {
+                        candidate = true;
+                        note(reason);
+                        selector = Some(ip_selector.to_string());
+                    }
+                    SelectorEval::Miss => {}
+                }
+            }
+            let unknown = candidate;
+            if candidate {
+                note("traffic-protocol-unknown");
+            }
+            if unknown {
+                saw_unknown = true;
+                if policy_path.is_none() {
+                    policy_path = Some(format!("/profile/xrayTrafficRules/{index}"));
+                }
+            }
+            steps.push(RouteCheckStep {
+                label: format!("traffic rule #{} (protocol unavailable)", index + 1),
+                selector,
+                outcome: if unknown {
+                    RouteCheckStepOutcome::Unknown
+                } else {
+                    RouteCheckStepOutcome::Miss
+                },
+            });
+        }
+    }
 
     // 1. DNS capture: the generated chain starts with `port:53 → dns-out`
     // whenever the profile configures split DNS.
@@ -665,13 +749,171 @@ pub fn check_route(
             ));
         }
     }
-
-    // 2. Domain policies, in generated order (domain rule before ip rule —
-    // same verdict at policy granularity).
-    let resolves = matches!(
-        options.domain_strategy,
-        Some(XrayDomainStrategy::IpIfNonMatch | XrayDomainStrategy::IpOnDemand)
-    );
+    // Explicit domain choices are exceptions to broad and pinned policies.
+    if verdict.is_none() && !options.pinned_routes.is_empty() {
+        if let RouteTarget::Domain(host) = &target {
+            for (index, policy) in policies.iter().enumerate() {
+                let hit = policy.domains.iter().find(|selector| {
+                    crate::xray::is_explicit_domain_selector(selector)
+                        && matches!(
+                            eval_domain_selector(selector.trim(), host, geo),
+                            SelectorEval::Match
+                        )
+                });
+                let Some(selector) = hit else { continue };
+                steps.push(RouteCheckStep {
+                    label: format!("explicit domain rules #{}", index + 1),
+                    selector: Some(selector.trim().to_string()),
+                    outcome: RouteCheckStepOutcome::Match,
+                });
+                let outbound = match policy.target {
+                    DomainRouteTarget::Proxy => RouteCheckOutbound::Proxy,
+                    DomainRouteTarget::Direct => RouteCheckOutbound::Direct,
+                    DomainRouteTarget::Block => RouteCheckOutbound::Block,
+                };
+                verdict = Some((
+                    outbound,
+                    RouteCheckSource::Policy,
+                    Some(index),
+                    Some(selector.trim().to_string()),
+                ));
+                break;
+            }
+        }
+    }
+    // Pins follow transport guards, DNS capture and explicit domain choices.
+    for (index, pin) in options.pinned_routes.iter().enumerate() {
+        if verdict.is_some() {
+            break;
+        }
+        let mut hit = None;
+        let mut unknown = false;
+        for selector in &pin.selectors {
+            let selector = selector.trim();
+            if selector.is_empty() || selector.starts_with('#') {
+                continue;
+            }
+            let outcome = match &target {
+                RouteTarget::Domain(host) => eval_domain_selector(selector, host, geo),
+                RouteTarget::Ip(_) => SelectorEval::Miss,
+            };
+            match outcome {
+                SelectorEval::Match => {
+                    hit = Some(selector.to_string());
+                    break;
+                }
+                SelectorEval::Unknown(reason) => {
+                    unknown = true;
+                    note(reason);
+                }
+                SelectorEval::Miss => {}
+            }
+        }
+        if let Some(selector) = hit {
+            steps.push(RouteCheckStep {
+                label: format!("pinned route #{}", index + 1),
+                selector: Some(selector.clone()),
+                outcome: RouteCheckStepOutcome::Match,
+            });
+            if !saw_unknown {
+                endpoint_key = Some(pin.endpoint_key.clone());
+                policy_path = Some(format!("/profile/pinnedPolicies/{index}"));
+            }
+            verdict = Some((
+                RouteCheckOutbound::Proxy,
+                RouteCheckSource::Policy,
+                None,
+                Some(selector),
+            ));
+            break;
+        }
+        if unknown {
+            saw_unknown = true;
+            if policy_path.is_none() {
+                policy_path = Some(format!("/profile/pinnedPolicies/{index}"));
+            }
+        }
+        steps.push(RouteCheckStep {
+            label: format!("pinned route #{}", index + 1),
+            selector: None,
+            outcome: if unknown {
+                RouteCheckStepOutcome::Unknown
+            } else {
+                RouteCheckStepOutcome::Miss
+            },
+        });
+    }
+    // Interface routes follow DNS capture and precede domain policies.
+    if verdict.is_none() {
+        for (index, route) in options.interface_routes.iter().enumerate() {
+            let mut hit = None;
+            let mut unknown = false;
+            for selector in &route.selectors {
+                let selector = selector.trim();
+                if selector.is_empty() || selector.starts_with('#') {
+                    continue;
+                }
+                let is_ip = matches!(
+                    crate::xray::classify_routing_selector(selector),
+                    Ok(Some(("ip", _)))
+                );
+                let outcome = match (&target, is_ip) {
+                    (RouteTarget::Domain(host), false) => eval_domain_selector(selector, host, geo),
+                    (RouteTarget::Domain(_), true) if resolves => {
+                        SelectorEval::Unknown("resolved-ip-recheck")
+                    }
+                    (RouteTarget::Domain(_), true) | (RouteTarget::Ip(_), false) => {
+                        SelectorEval::Miss
+                    }
+                    (RouteTarget::Ip(ip), true) => eval_ip_selector(selector, *ip, geo),
+                };
+                match outcome {
+                    SelectorEval::Match => {
+                        hit = Some(selector.to_string());
+                        break;
+                    }
+                    SelectorEval::Unknown(reason) => {
+                        unknown = true;
+                        note(reason);
+                    }
+                    SelectorEval::Miss => {}
+                }
+            }
+            if let Some(selector) = hit {
+                steps.push(RouteCheckStep {
+                    label: format!("interface route #{}", index + 1),
+                    selector: Some(selector.clone()),
+                    outcome: RouteCheckStepOutcome::Match,
+                });
+                interface_name = Some(route.interface_name.clone());
+                if !saw_unknown {
+                    policy_path = Some(format!("/profile/xrayInterfaceRoutes/{index}"));
+                }
+                verdict = Some((
+                    RouteCheckOutbound::Direct,
+                    RouteCheckSource::Policy,
+                    None,
+                    Some(selector),
+                ));
+                break;
+            }
+            if unknown {
+                saw_unknown = true;
+                if policy_path.is_none() {
+                    policy_path = Some(format!("/profile/xrayInterfaceRoutes/{index}"));
+                }
+            }
+            steps.push(RouteCheckStep {
+                label: format!("interface route #{}", index + 1),
+                selector: None,
+                outcome: if unknown {
+                    RouteCheckStepOutcome::Unknown
+                } else {
+                    RouteCheckStepOutcome::Miss
+                },
+            });
+        }
+    }
     if verdict.is_none() {
         for (index, policy) in policies.iter().enumerate() {
             let mut policy_hit: Option<String> = None;
@@ -742,6 +984,9 @@ pub fn check_route(
             }
             if policy_unknown {
                 saw_unknown = true;
+                if policy_path.is_none() {
+                    policy_path = Some(format!("/profile/domainPolicies/{index}"));
+                }
             }
             steps.push(RouteCheckStep {
                 label,
@@ -757,7 +1002,7 @@ pub fn check_route(
 
     // 3. Resolver pins keep each DNS server reachable on its own side.
     if verdict.is_none() {
-        for server in &options.dns.servers {
+        for (index, server) in options.dns.servers.iter().enumerate() {
             let tag = match server.route {
                 XrayDnsRoute::Proxy => RouteCheckOutbound::Proxy,
                 XrayDnsRoute::Direct => RouteCheckOutbound::Direct,
@@ -787,10 +1032,13 @@ pub fn check_route(
             if let SelectorEval::Unknown(reason) = outcome {
                 note(reason);
                 saw_unknown = true;
+                if policy_path.is_none() {
+                    policy_path = Some(format!("/profile/xrayDns/servers/{index}"));
+                }
             }
             steps.push(RouteCheckStep {
-                label: format!("resolver pin {}", server.address.trim()),
-                selector: Some(value),
+                label: format!("resolver pin #{}", index + 1),
+                selector: Some(value.clone()),
                 outcome: match outcome {
                     SelectorEval::Match => RouteCheckStepOutcome::Match,
                     SelectorEval::Miss => RouteCheckStepOutcome::Miss,
@@ -798,19 +1046,21 @@ pub fn check_route(
                 },
             });
             if outcome == SelectorEval::Match {
-                verdict = Some((
-                    tag,
-                    RouteCheckSource::ResolverPin,
-                    None,
-                    Some(server.address.trim().to_string()),
-                ));
+                if policy_path.is_none() {
+                    policy_path = Some(format!("/profile/xrayDns/servers/{index}"));
+                }
+                verdict = Some((tag, RouteCheckSource::ResolverPin, None, Some(value)));
                 break;
             }
         }
     }
 
     // 4. Built-in rules, emitted only when some rule surface exists.
-    let rules_emitted = !policies.is_empty() || options.private_lan_direct || dns_active;
+    let rules_emitted = !policies.is_empty()
+        || options.private_lan_direct
+        || dns_active
+        || !options.traffic_rules.is_empty()
+        || !options.interface_routes.is_empty();
     if verdict.is_none() && rules_emitted {
         if let RouteTarget::Ip(ip) = target {
             if any_net_contains(MULTICAST_NETS, ip) {
@@ -851,7 +1101,11 @@ pub fn check_route(
         steps.push(RouteCheckStep {
             label: "default".to_string(),
             selector: None,
-            outcome: RouteCheckStepOutcome::Match,
+            outcome: if saw_unknown {
+                RouteCheckStepOutcome::Unknown
+            } else {
+                RouteCheckStepOutcome::Match
+            },
         });
         verdict = Some((
             RouteCheckOutbound::Proxy,
@@ -880,19 +1134,24 @@ pub fn check_route(
     }
 
     let (outbound, source, policy_index, matched_selector) = verdict.unwrap();
+    let certainty = if saw_unknown {
+        RouteCheckCertainty::Probable
+    } else {
+        RouteCheckCertainty::Certain
+    };
     Ok(RouteCheckResult {
         target: target_label,
         port,
         target_kind: kind,
         outbound,
         source,
+        policy_path: policy_path
+            .or_else(|| policy_index.map(|index| format!("/profile/domainPolicies/{index}"))),
+        interface_name,
+        endpoint_key,
         policy_index,
         matched_selector,
-        certainty: if saw_unknown {
-            RouteCheckCertainty::Probable
-        } else {
-            RouteCheckCertainty::Certain
-        },
+        certainty,
         steps,
         notes,
     })
@@ -927,6 +1186,93 @@ mod tests {
         assert_eq!(result.source, RouteCheckSource::Default);
         assert_eq!(result.target_kind, RouteCheckTargetKind::Domain);
         assert_eq!(result.certainty, RouteCheckCertainty::Certain);
+    }
+
+    #[test]
+    fn interface_route_precedes_domain_policy() {
+        let policies = policies(&[(&["domain:example.com"], DomainRouteTarget::Block)]);
+        let options = ProfileRoutingOptions {
+            interface_routes: vec![crate::models::XrayInterfaceRoute {
+                selectors: vec!["domain:example.com".into()],
+                interface_name: "wg-test".into(),
+                domain_strategy: None,
+            }],
+            ..ProfileRoutingOptions::default()
+        };
+        let result = check(&policies, &options, "example.com");
+        assert_eq!(result.interface_name.as_deref(), Some("wg-test"));
+        assert_eq!(
+            result.policy_path.as_deref(),
+            Some("/profile/xrayInterfaceRoutes/0")
+        );
+        assert_eq!(result.steps[0].outcome, RouteCheckStepOutcome::Match);
+    }
+    #[test]
+    fn explicit_domain_policy_overrides_pinned_category() {
+        let options = ProfileRoutingOptions {
+            pinned_routes: vec![crate::models::PinnedRoute {
+                selectors: vec!["geosite:category-dev".into()],
+                endpoint_key: "aabb001122334455".into(),
+                missing: true,
+            }],
+            ..ProfileRoutingOptions::default()
+        };
+        let policies = policies(&[(
+            &["geosite:private", "domain:github.com"],
+            DomainRouteTarget::Direct,
+        )]);
+        for host in ["github.com", "api.github.com"] {
+            let result = check(&policies, &options, host);
+            assert_eq!(result.outbound, RouteCheckOutbound::Direct);
+            assert_eq!(result.certainty, RouteCheckCertainty::Certain);
+            assert_eq!(
+                result.policy_path.as_deref(),
+                Some("/profile/domainPolicies/0")
+            );
+            assert_eq!(result.endpoint_key, None);
+        }
+        let other = check(&policies, &options, "other.test");
+        assert_eq!(other.outbound, RouteCheckOutbound::Proxy);
+        assert_eq!(other.certainty, RouteCheckCertainty::Probable);
+    }
+
+    #[test]
+    fn explicit_block_policy_precedes_pinned_route() {
+        let mut options = ProfileRoutingOptions::default();
+        options.pinned_routes.push(crate::models::PinnedRoute {
+            selectors: vec!["domain:example.com".into()],
+            endpoint_key: "aabb001122334455".into(),
+            missing: false,
+        });
+        let policies = policies(&[(&["domain:example.com"], DomainRouteTarget::Block)]);
+        let result = check(&policies, &options, "example.com");
+        assert_eq!(
+            result.policy_path.as_deref(),
+            Some("/profile/domainPolicies/0")
+        );
+        assert_eq!(result.endpoint_key, None);
+        assert_eq!(result.outbound, RouteCheckOutbound::Block);
+    }
+
+    #[test]
+    fn traffic_rule_is_unknown_without_transport_protocol() {
+        let options = ProfileRoutingOptions {
+            traffic_rules: vec![crate::models::XrayTrafficRule {
+                ips: vec!["10.0.0.0/8".into()],
+                port: 443,
+                network: "tcp".into(),
+                target: DomainRouteTarget::Block,
+            }],
+            ..ProfileRoutingOptions::default()
+        };
+        let policies = policies(&[(&["10.0.0.0/8"], DomainRouteTarget::Direct)]);
+        let result = check(&policies, &options, "10.1.2.3:443");
+        assert_eq!(result.certainty, RouteCheckCertainty::Probable);
+        assert_eq!(
+            result.policy_path.as_deref(),
+            Some("/profile/xrayTrafficRules/0")
+        );
+        assert_eq!(result.steps[0].outcome, RouteCheckStepOutcome::Unknown);
     }
 
     #[test]
@@ -1237,6 +1583,21 @@ mod tests {
         // Category absent from the db → probable.
         let ghost = policies(&[(&["geosite:ghost"], DomainRouteTarget::Direct)]);
         let result = check_route(&ghost, &opts, "qq.com", &geo).unwrap();
+        assert_eq!(result.certainty, RouteCheckCertainty::Probable);
+        assert_eq!(
+            result.steps.last().unwrap().outcome,
+            RouteCheckStepOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn unknown_earlier_rule_does_not_claim_later_match_is_certain() {
+        let policies = policies(&[
+            (&["geosite:not-loaded"], DomainRouteTarget::Block),
+            (&["domain:example.com"], DomainRouteTarget::Direct),
+        ]);
+        let result = check(&policies, &ProfileRoutingOptions::default(), "example.com");
+        assert_eq!(result.steps[0].outcome, RouteCheckStepOutcome::Unknown);
         assert_eq!(result.certainty, RouteCheckCertainty::Probable);
     }
 

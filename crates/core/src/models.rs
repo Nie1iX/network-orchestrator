@@ -199,11 +199,10 @@ pub struct DomainPolicy {
 
 /// A domain-selector route pinned to a specific subscription endpoint.
 ///
-/// Pinned routes are fail-closed by construction: the selectors may only
-/// leave through the named node — never directly and never through another
-/// endpoint. When the endpoint disappears from the subscription the rule is
-/// kept (`missing` is recomputed at connect/list time) and its selectors are
-/// dropped instead of retargeted.
+/// Explicit `domain:`/`full:` profile policies take precedence. Otherwise pins
+/// are fail-closed: matching traffic may leave only through the named node.
+/// When the endpoint disappears, the rule is kept (`missing` is recomputed at
+/// connect/list time) and its selectors are dropped instead of retargeted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PinnedRoute {
@@ -671,8 +670,9 @@ pub struct Profile {
     pub auto_connect: bool,
     #[serde(default)]
     pub domain_policies: Vec<DomainPolicy>,
-    /// Domain selectors pinned to specific subscription endpoints. Always
-    /// fail-closed: selectors exit through the named node or are dropped.
+    /// Domain selectors pinned to specific subscription endpoints, unless an
+    /// explicit domain policy overrides them. Otherwise fail-closed: the named
+    /// node is used or matching traffic is dropped.
     #[serde(default)]
     pub pinned_policies: Vec<PinnedRoute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

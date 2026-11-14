@@ -167,6 +167,9 @@ It verifies primary preference, ordered backups, automatic primary return,
 independent pinned routing, fail-closed pins/all-down, owned QUIC rejection,
 unchanged-DHCP stream preservation, gateway/source/interface migration,
 offline crash deferral and recovery of a `SIGSTOP`-stalled child.
+Explicit `domain:`/`full:` profile policies override pinned routes after
+transport guards and DNS capture. Broad GeoSite/GeoIP policies remain below
+pins; unmatched pinned traffic still fails closed, including missing nodes.
 Real unprivileged CLI commands import a synthetic subscription, rebuild
 verified/name-only pools, reject advertised-country mismatches and apply a
 policy without changing its source. Local HTTPS country fixtures are reached

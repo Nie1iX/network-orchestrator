@@ -686,45 +686,21 @@ fn check(ctx: &Ctx, target: &str, query: &str, geo_dir: &Path) -> Result<Output,
         .map_err(|error| error.to_string())?;
     let mut value =
         serde_json::to_value(&result).map_err(|_| "The route check failed".to_string())?;
-    let mut uncertain_pin = false;
-    for route in &profile.pinned_policies {
-        let pinned = check_route(
-            &[DomainPolicy {
-                domains: route.selectors.clone(),
-                target: DomainRouteTarget::Proxy,
-            }],
-            &ProfileRoutingOptions::default(),
-            &result.target,
-            &geo,
-        )
-        .map_err(|error| error.to_string())?;
-        if pinned.matched_selector.is_some() {
-            value =
-                serde_json::to_value(&pinned).map_err(|_| "The route check failed".to_string())?;
-            value
-                .as_object_mut()
-                .expect("route result")
-                .remove("policyIndex");
-            value["endpointKey"] = json!(route.endpoint_key);
-            value["source"] = json!("pinned");
-            value["outbound"] = if route.missing {
-                json!("block")
-            } else {
-                json!(net_manager_core::xray::pin_tag(&route.endpoint_key))
-            };
-            break;
-        }
-        uncertain_pin |=
-            pinned.certainty == net_manager_core::route_check::RouteCheckCertainty::Probable;
-    }
-    if uncertain_pin {
-        value["certainty"] = json!("probable");
-        value["notes"]
-            .as_array_mut()
-            .expect("route notes")
-            .push(json!(
-                "An earlier pinned selector could not be evaluated locally"
-            ));
+    if let Some(route) = profile
+        .pinned_policies
+        .iter()
+        .find(|route| Some(route.endpoint_key.as_str()) == result.endpoint_key.as_deref())
+    {
+        value
+            .as_object_mut()
+            .expect("route result")
+            .remove("policyIndex");
+        value["source"] = json!("pinned");
+        value["outbound"] = if route.missing {
+            json!("block")
+        } else {
+            json!(net_manager_core::xray::pin_tag(&route.endpoint_key))
+        };
     }
     let text = describe_check(&value);
     Ok((value, text))
@@ -967,6 +943,29 @@ mod tests {
             "{text}"
         );
         assert_eq!(text.matches("note:").count(), 1);
+    }
+
+    #[test]
+    fn check_respects_explicit_exception_without_replaying_pins() {
+        let (_dir, ctx) = setup(vec![policy(
+            DomainRouteTarget::Direct,
+            &["domain:github.com"],
+        )]);
+        let mut profile = ctx.find("x1").unwrap();
+        profile.pinned_policies.push(PinnedRoute {
+            selectors: vec!["domain:com".into()],
+            endpoint_key: "aabb001122334455".into(),
+            missing: true,
+        });
+        ctx.store().upsert(profile).unwrap();
+        let nowhere = Path::new("/nonexistent/geo");
+        let (github, _) = check(&ctx, "api.github.com", "x1", nowhere).unwrap();
+        assert_eq!(github["outbound"], "direct");
+        assert_eq!(github["policyPath"], "/profile/domainPolicies/0");
+        assert!(github.get("endpointKey").is_none());
+        let (other, _) = check(&ctx, "other.com", "x1", nowhere).unwrap();
+        assert_eq!(other["outbound"], "block");
+        assert_eq!(other["endpointKey"], "aabb001122334455");
     }
 
     #[test]

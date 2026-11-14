@@ -615,9 +615,8 @@ pub struct PinnedOutbound {
 ///
 /// - `base`'s primary outbound is retagged `node-<primary>` and the ordered
 ///   `backups` join it (same order → strict priority);
-/// - each resolved pinned route adds a `pin-<key>` outbound and prepends a
-///   domain rule pinned to it — these rules sit before every other rule so
-///   a pinned name can never escape to direct or another node;
+/// - each resolved pinned route adds a `pin-<key>` outbound and a domain
+///   rule after explicit domain policies, but before broad/default policies;
 /// - a missing pinned key adds only a blackhole `pin-<key>` outbound —
 ///   fail-closed;
 /// - routing gets `balancers: [{tag: failover, selector: [unavailable]}]`:
@@ -702,8 +701,8 @@ pub fn apply_multinode_config(
             object.insert("balancerTag".into(), json!(FAILOVER_BALANCER));
         }
     }
-    // Port-scoped transport guards and DNS capture precede domain pins.
-    // Pins still precede ordinary domain/default policies.
+    // Explicit domain choices override pins; broad GeoSite policies do not.
+    // Port guards, DNS capture and scoped dispatch keep their precedence.
     let guard_count = rules
         .iter()
         .take_while(|rule| {
@@ -712,6 +711,15 @@ pub fn apply_multinode_config(
                     tags.iter()
                         .any(|tag| tag.as_str().is_some_and(|tag| tag.starts_with("src-")))
                 })
+                || (!rule["outboundTag"]
+                    .as_str()
+                    .is_some_and(|tag| tag.starts_with("network-orchestrator-interface"))
+                    && rule["domain"].as_array().is_some_and(|domains| {
+                        !domains.is_empty()
+                            && domains.iter().all(|value| {
+                                value.as_str().is_some_and(is_explicit_domain_selector)
+                            })
+                    }))
         })
         .count();
     rules.splice(guard_count..guard_count, merged);
@@ -962,6 +970,7 @@ pub struct ProfileRoutingOptions {
     /// `streamSettings.sockopt` keepalive/timeouts applied to the node and
     /// direct outbounds (`None` keeps xray defaults).
     pub sockopts: Option<XraySockopts>,
+    pub pinned_routes: Vec<crate::models::PinnedRoute>,
     pub traffic_rules: Vec<XrayTrafficRule>,
     pub interface_routes: Vec<crate::models::XrayInterfaceRoute>,
     pub connection_idle_secs: Option<u32>,
@@ -976,6 +985,7 @@ impl From<&crate::models::Profile> for ProfileRoutingOptions {
             domain_matcher: profile.xray_domain_matcher,
             dns: profile.xray_dns.clone(),
             sockopts: profile.xray_sockopts.clone(),
+            pinned_routes: profile.pinned_policies.clone(),
             traffic_rules: profile.xray_traffic_rules.clone(),
             interface_routes: profile.xray_interface_routes.clone(),
             connection_idle_secs: profile.xray_connection_idle_secs,
@@ -998,6 +1008,10 @@ pub fn validate_routing_policy_selectors(policies: &[DomainPolicy]) -> io::Resul
         }
     }
     Ok(())
+}
+pub(crate) fn is_explicit_domain_selector(selector: &str) -> bool {
+    let selector = selector.trim();
+    selector.starts_with("domain:") || selector.starts_with("full:")
 }
 
 /// Returns `Ok(None)` for comments (`# …`) and blank selectors so the UI can
@@ -1722,6 +1736,25 @@ pub fn apply_profile_routing(
     if let Some(tag) = dns_tag.as_deref() {
         merged.push(json!({"type": "field", "port": "53", "outboundTag": tag}));
     }
+    if !options.pinned_routes.is_empty() {
+        for policy in policies {
+            let domains: Vec<_> = policy
+                .domains
+                .iter()
+                .map(|selector| selector.trim())
+                .filter(|selector| is_explicit_domain_selector(selector))
+                .collect();
+            if domains.is_empty() {
+                continue;
+            }
+            let tag = match policy.target {
+                DomainRouteTarget::Proxy => proxy_tag.as_deref().unwrap_or_default(),
+                DomainRouteTarget::Direct => direct_tag.as_deref().unwrap_or_default(),
+                DomainRouteTarget::Block => block_tag.as_deref().unwrap_or_default(),
+            };
+            merged.push(json!({"type": "field", "domain": domains, "outboundTag": tag}));
+        }
+    }
     for route in &options.interface_routes {
         let tag = &interface_tags[&(
             route.interface_name.as_str(),
@@ -1754,6 +1787,9 @@ pub fn apply_profile_routing(
         let mut domains = Vec::new();
         let mut ips = Vec::new();
         for selector in &policy.domains {
+            if !options.pinned_routes.is_empty() && is_explicit_domain_selector(selector) {
+                continue;
+            }
             let Some((kind, value)) = classify_routing_selector(selector)? else {
                 continue;
             };
@@ -4353,7 +4389,7 @@ mod tests {
             json!(["src-proxy-in"])
         );
         assert_eq!(
-            multi["routing"]["rules"][1]["outboundTag"],
+            multi["routing"]["rules"][2]["outboundTag"],
             "pin-1111111111111111"
         );
         assert!(multi["outbounds"]
@@ -4388,6 +4424,48 @@ mod tests {
     }
 
     #[test]
+    fn explicit_domain_policy_overrides_pinned_category_without_unpinning_others() {
+        let base = json!({"outbounds":[{"tag":"proxy","protocol":"vless"}]});
+        let options = ProfileRoutingOptions {
+            pinned_routes: vec![crate::models::PinnedRoute {
+                endpoint_key: "1111111111111111".into(),
+                selectors: vec!["geosite:category-dev".into()],
+                missing: true,
+            }],
+            ..ProfileRoutingOptions::default()
+        };
+        let policies = [DomainPolicy {
+            domains: vec!["geosite:private".into(), "domain:github.com".into()],
+            target: DomainRouteTarget::Direct,
+        }];
+        let routed = apply_profile_routing(&base, &policies, &options).unwrap();
+        let pins = [PinnedOutbound {
+            key: "1111111111111111".into(),
+            selectors: vec!["geosite:category-dev".into()],
+            outbound: None,
+        }];
+        let config = apply_multinode_config(&routed, "2222222222222222", &[], &pins).unwrap();
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        let direct = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|outbound| outbound["protocol"] == "freedom")
+            .unwrap();
+        assert_eq!(rules[0]["domain"], json!(["domain:github.com"]));
+        assert_eq!(rules[0]["outboundTag"], direct["tag"]);
+        assert_eq!(rules[1]["domain"], json!(["geosite:category-dev"]));
+        assert_eq!(rules[1]["outboundTag"], pin_tag(&pins[0].key));
+        assert_eq!(rules[2]["domain"], json!(["geosite:private"]));
+        assert!(config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|outbound| outbound["tag"] == pin_tag(&pins[0].key)
+                && outbound["protocol"] == "blackhole"));
+    }
+
+    #[test]
     fn fixed_domain_routes_do_not_override_port_guards_or_dns_capture() {
         let base = json!({"outbounds":[{"tag":"proxy","protocol":"vless"}],
         "routing":{"rules":[
@@ -4411,8 +4489,8 @@ mod tests {
         let rules = config["routing"]["rules"].as_array().unwrap();
         assert_eq!(rules[0]["port"], 853);
         assert_eq!(rules[1]["port"], 53);
-        assert_eq!(rules[2]["outboundTag"], pin_tag(&pins[0].key));
-        assert_eq!(rules[3]["balancerTag"], FAILOVER_BALANCER);
+        assert_eq!(rules[2]["balancerTag"], FAILOVER_BALANCER);
+        assert_eq!(rules[3]["outboundTag"], pin_tag(&pins[0].key));
     }
 
     #[test]

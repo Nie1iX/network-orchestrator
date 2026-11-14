@@ -10,6 +10,16 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Fixed
+
+- Let explicit `domain:` and `full:` profile rules override pinned Xray
+  categories; keep unrelated pinned traffic fail-closed and report the same
+  priority in offline route explanations.
+
+- Replay pinned, traffic, DNS, interface and domain-rule precedence in offline
+  Xray explanations; unresolved earlier selectors prevent a certain fallback.
+
+
 ## [0.19.2] - 2026-11-12
 
 ### Fixed

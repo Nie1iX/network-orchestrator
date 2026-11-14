@@ -249,7 +249,7 @@ pub enum RouteCommand {
         #[arg(long)]
         profile: String,
     },
-    /// Send domains through one named server, nowhere else (fail-closed)
+    /// Pin domains to one server (fail-closed unless an explicit domain/full policy overrides)
     Pin {
         profile: String,
         /// Server number, part of its name, or a raw 16-hex key
