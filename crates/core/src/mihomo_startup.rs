@@ -297,8 +297,7 @@ mod tests {
         let mut probe = StartupProbe::prepare(&mut config).unwrap();
         assert_eq!(config["rules"][1], "MATCH,Proxy");
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-        probe.release_proxy_reservation();
-        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, probe.proxy_port)).unwrap();
+        let proxy = probe.proxy_reservation.take().unwrap();
         let origin_port = probe.origin_port;
         let server = thread::spawn(move || {
             for attempt in 0..2 {

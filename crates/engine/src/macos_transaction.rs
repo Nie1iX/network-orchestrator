@@ -388,18 +388,22 @@ mod tests {
         let root = temp.path().to_path_buf();
         let other = root.clone();
         let ready = barrier.clone();
+        let (release, held) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             with_root_lock(&other, || {
                 ready.wait();
-                std::thread::sleep(std::time::Duration::from_millis(80));
+                held.recv().unwrap();
                 Ok(())
             })
             .unwrap()
         });
         barrier.wait();
         assert!(try_root_lock(&root).unwrap().is_none());
+        release.send(()).unwrap();
         thread.join().unwrap();
-        assert!(try_root_lock(&root).unwrap().is_some());
+        // A concurrent fork may briefly inherit this CLOEXEC descriptor.
+        // Reacquire after all inherited copies have closed, not just our thread.
+        with_root_lock(&root, || Ok(())).unwrap();
     }
     #[test]
     fn rejects_root_and_changed_effective_identity_before_any_filesystem_access() {
