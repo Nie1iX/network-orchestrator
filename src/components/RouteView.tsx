@@ -3,28 +3,42 @@ import { invoke } from "@tauri-apps/api/core";
 import Page from "./Page";
 import IntentsPanel from "./IntentsPanel";
 import PanelBoundary from "./PanelBoundary";
-import RouteFlow from "./RouteFlow";
+import NetworkScheme from "./NetworkScheme";
+import type { NetworkEditorState } from "../profileEditing";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import RouteMap from "./RouteMap";
 import RouteTable from "./RouteTable";
 import SystemTables from "./SystemTables";
 import { RouteLookupResult, RouteMap as RouteMapData } from "../types";
-import { TranslationKey, useT } from "../i18n";
+import { TranslationKey, tr, useT } from "../i18n";
 import { setRoutesPrefs, useRoutesPrefs } from "../prefs";
 
 type RouteTab = "intents" | "flow" | "tree" | "table" | "system";
 
 const TABS: { id: RouteTab; labelKey: TranslationKey }[] = [
-  { id: "intents", labelKey: "routes.intents" },
   { id: "flow", labelKey: "routes.flow" },
+  { id: "intents", labelKey: "routes.intents" },
   { id: "tree", labelKey: "routes.tree" },
   { id: "table", labelKey: "routes.table" },
   { id: "system", labelKey: "routes.system" },
 ];
 
-export default function RouteView() {
+export default function RouteView({ focusProfileId, onFocusProfile, onEditorState }: {
+  focusProfileId: string | null;
+  onFocusProfile: (id: string | null) => void;
+  onEditorState: (state: NetworkEditorState) => void;
+}) {
   const t = useT();
   const prefs = useRoutesPrefs();
-  const [tab, setTab] = useState<RouteTab>("intents");
+  const [tab, setTab] = useState<RouteTab>("flow");
+  const [schemeState, setSchemeState] = useState<NetworkEditorState>({ dirty: false, busy: false });
+  const schemeChanged = useCallback((state: NetworkEditorState) => { setSchemeState(state); onEditorState(state); }, [onEditorState]);
+  useEffect(() => { if (focusProfileId) setTab("flow"); }, [focusProfileId]);
+  const changeView = async (next: RouteTab) => {
+    if (next === tab || schemeState.busy) return;
+    if (tab === "flow" && schemeState.dirty && !await confirm(tr("Discard unsaved profile changes?"), { kind: "warning" })) return;
+    setTab(next);
+  };
   const [map, setMap] = useState<RouteMapData | null>(null);
   const [lookupDest, setLookupDest] = useState("");
   const [lookupResult, setLookupResult] = useState<RouteLookupResult | null>(
@@ -45,11 +59,12 @@ export default function RouteView() {
   }, []);
 
   useEffect(() => {
+    if (tab === "flow") return;
     void loadSummary();
     const handler = () => void loadSummary();
     window.addEventListener("route-changed", handler);
     return () => window.removeEventListener("route-changed", handler);
-  }, [loadSummary]);
+  }, [loadSummary, tab]);
 
   const lookup = async () => {
     const target = lookupDest.trim();
@@ -83,13 +98,13 @@ export default function RouteView() {
               key={item.id}
               type="button"
               className={`route-tab ${tab === item.id ? "active" : ""}`}
-              onClick={() => setTab(item.id)}
+              onClick={() => { void changeView(item.id); }}
             >
               {t(item.labelKey)}
             </button>
           ))}
         </nav>
-        {map && (
+        {tab !== "flow" && map && (
           <div className="routes-summary">
             <span className="route-stat">
               {t("routes.activeCount", { n: activeCount ?? 0 })}
@@ -112,7 +127,7 @@ export default function RouteView() {
             </button>
           </div>
         )}
-        <div className="routes-options">
+        {tab !== "flow" && <div className="routes-options">
           <label className="route-map-toggle">
             <input
               type="checkbox"
@@ -133,8 +148,8 @@ export default function RouteView() {
               {t("routes.includeStopped")}
             </label>
           )}
-        </div>
-        <form
+        </div>}
+        {tab !== "flow" && <form
           className="lookup-input"
           title={t("routes.lookupHint")}
           onSubmit={(e) => {
@@ -156,11 +171,11 @@ export default function RouteView() {
           >
             {lookupLoading ? "…" : t("routes.lookup")}
           </button>
-        </form>
+        </form>}
       </div>
 
-      {lookupError && <p className="error">{lookupError}</p>}
-      {lookupResult && (
+      {tab !== "flow" && lookupError && <p className="error">{lookupError}</p>}
+      {tab !== "flow" && lookupResult && (
         <div className="lookup-result routes-lookup-result">
           <div className="lookup-result-head">
             <span>
@@ -201,7 +216,7 @@ export default function RouteView() {
       <div className="route-tab-content">
         <PanelBoundary key={tab}>
           {tab === "intents" && <IntentsPanel />}
-          {tab === "flow" && <RouteFlow hideIpv6={prefs.hideIpv6} />}
+          {tab === "flow" && <NetworkScheme focusProfileId={focusProfileId} onFocusProfile={onFocusProfile} onEditorState={schemeChanged} />}
           {tab === "tree" && (
             <RouteMap
               hideIpv6={prefs.hideIpv6}

@@ -149,6 +149,8 @@ pub fn run() {
             parse_bulk_cidrs,
             parse_happ_routing,
             xray_test_route,
+            explain_profile_document,
+            probe_current_path,
             lookup_destination,
             set_interface_state,
             stop_external_tunnel,

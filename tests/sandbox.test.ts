@@ -3,6 +3,64 @@ import test from "node:test";
 import { SandboxBackend } from "../src/sandbox/backend.ts";
 import type { BackendAvailability, Profile, RouteEntry, RouteLookupResult, ServiceCheck, ServiceCheckResult, TunnelStatus } from "../src/types.ts";
 
+import { explainProfileDocument } from "../src/sandbox/routeExplanation.ts";
+import type { ProfileDocument } from "../src/profileDocument.ts";
+
+const routeDocument = (profile: ProfileDocument["profile"]): ProfileDocument =>
+  ({ version: 1, profile: { backend: "xray", ...profile } });
+
+test("offline explanation matches literal suffix and IP prefix rules", () => {
+  const document = routeDocument({
+    domainPolicies: [
+      { domains: ["domain:example.test"], target: "direct" },
+      { domains: ["10.4.0.0/16"], target: "block" },
+    ],
+  });
+  assert.equal(explainProfileDocument(document, "www.example.test").outbound, "direct");
+  assert.equal(explainProfileDocument(document, "10.4.2.1").outbound, "block");
+  assert.equal(explainProfileDocument(document, "10.5.2.1").source, "default");
+});
+
+test("offline explanation leaves a later match probable after unknown earlier selector", () => {
+  const result = explainProfileDocument(routeDocument({
+    domainPolicies: [
+      { domains: ["geosite:not-cached"], target: "block" },
+      { domains: ["domain:example.test"], target: "direct" },
+    ],
+  }), "example.test");
+  assert.equal(result.outbound, "direct");
+  assert.equal(result.certainty, "probable");
+  assert.equal(result.steps[0]?.outcome, "unknown");
+});
+test("explicit domain policy overrides pinned route selectors", () => {
+  const document = routeDocument({
+    pinnedPolicies: [{ selectors: ["geosite:category-dev"], endpointKey: "dev" }],
+    domainPolicies: [{ domains: ["domain:github.com"], target: "direct" }],
+  });
+  const exact = explainProfileDocument(document, "github.com");
+  assert.equal(exact.outbound, "direct");
+  assert.equal(exact.certainty, "certain");
+  assert.equal(exact.policyPath, "/profile/domainPolicies/0");
+
+  const suffix = explainProfileDocument(document, "api.github.com");
+  assert.equal(suffix.outbound, "direct");
+  assert.equal(suffix.certainty, "certain");
+  assert.equal(suffix.policyPath, "/profile/domainPolicies/0");
+
+  const other = explainProfileDocument(document, "example.com");
+  assert.equal(other.certainty, "probable");
+  assert.equal(other.source, "default");
+  assert.equal(explainProfileDocument(routeDocument({
+    domainPolicies: [{ domains: ["domain:github.com"], target: "direct" }],
+  }), "github.com").certainty, "certain");
+});
+
+test("offline explanation does not invent Xray routing for other backends", () => {
+  assert.throws(() => explainProfileDocument(routeDocument({
+    backend: "mihomo",
+    domainPolicies: [{ domains: ["domain:example.test"], target: "direct" }],
+  }), "example.test"), Error);
+});
 test("share-link import derives a name and keeps networking unchanged", () => {
   const backend = new SandboxBackend();
   const routes = backend.invoke("get_routes");

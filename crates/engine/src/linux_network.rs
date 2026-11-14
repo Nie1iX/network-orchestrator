@@ -226,6 +226,30 @@ pub fn test_route(root: &Path, request: RouteCheckRequest) -> Result<RouteCheckR
         .map_err(|_| "Invalid route-check request".into())
 }
 
+pub fn explain_profile_route(
+    root: &Path,
+    profile: &Profile,
+    target: &str,
+) -> Result<RouteCheckResult, String> {
+    let dirs = geo_asset_dirs(
+        root,
+        profile.xray_geoip_url.as_deref(),
+        profile.xray_geosite_url.as_deref(),
+    );
+    let (geo_site, geo_ip) = load_geo_assets(&dirs);
+    let geo = GeoDbs {
+        geo_site: geo_site.as_ref(),
+        geo_ip: geo_ip.as_ref(),
+    };
+    check_route(
+        &profile.domain_policies,
+        &ProfileRoutingOptions::from(profile),
+        target,
+        &geo,
+    )
+    .map_err(|_| "Invalid route-check request".into())
+}
+
 pub fn select_route_profiles(
     profiles: &[Profile],
     statuses: &[TunnelStatus],

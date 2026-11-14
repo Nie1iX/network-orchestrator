@@ -2015,7 +2015,7 @@ pub(crate) async fn apply_xray_policy_migration(
 }
 
 #[cfg(target_os = "linux")]
-async fn linux_profiles_operation<R: Send + 'static>(
+pub(super) async fn linux_profiles_operation<R: Send + 'static>(
     state: &AppState,
     operation: impl FnOnce(net_manager_engine::linux_profiles::ProfileService) -> Result<R, String>
         + Send

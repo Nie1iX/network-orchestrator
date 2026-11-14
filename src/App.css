@@ -2570,36 +2570,6 @@ a:focus-visible,
   margin-bottom: var(--sp-4);
 }
 
-/* ── Flow diagram ───────────────────────────────────────────────────── */
-
-.route-flow {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-3);
-}
-
-.flow-hint {
-  font-size: var(--fs-sm);
-  color: var(--text-secondary);
-}
-
-.flow-hint strong {
-  color: var(--text-primary);
-  font-weight: var(--fw-strong);
-}
-
-.flow-container {
-  overflow: auto;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  padding: var(--sp-3);
-}
-
-.flow-svg {
-  display: block;
-}
-
 /* ── Modal (blocking confirmation) ──────────────────────────────────── */
 
 .modal-overlay {

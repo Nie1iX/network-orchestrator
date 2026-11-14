@@ -152,3 +152,22 @@ test("Mihomo graph shows configured selections without exposing unused groups or
   assert.ok(!labels.includes("Unused"));
   assert.ok(!JSON.stringify(graph).includes("password"));
 });
+
+test("routing blocks identify their selectors and retain individual edit paths", () => {
+  const source = document({ domainPolicies: [
+    { domains: ["domain:work.test"], target: "proxy" },
+    { domains: ["domain:local.test"], target: "direct" },
+  ] });
+  const graph = buildProfileGraph(source, []);
+  const rules = graph.nodes.filter((node) => node.kind === "selector");
+  assert.deepEqual(rules.map((node) => node.path), [
+    "/profile/domainPolicies/0", "/profile/domainPolicies/1",
+  ]);
+  assert.equal(rules[0]!.detail, "domain:work.test");
+  assert.equal(rules[1]!.detail, "domain:local.test");
+  const changed = connectDocumentNode(source, rules[1]!.path, "block");
+  assert.deepEqual(changed.profile.domainPolicies, [
+    { domains: ["domain:work.test"], target: "proxy" },
+    { domains: ["domain:local.test"], target: "block" },
+  ]);
+});

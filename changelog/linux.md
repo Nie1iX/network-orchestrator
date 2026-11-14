@@ -10,6 +10,29 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Replace Traffic flow and the JSON-shaped node view with one network scheme:
+  a full-network overview, connection drilldown and separate Setup/Applied modes.
+- Add guided site/network rules and movable condition/output cards, with explicit
+  output rewiring and a shared JSON draft. DNS stays separate from packet routing.
+- Explain Xray draft decisions offline, including unresolved earlier conditions;
+  probe the current DNS/kernel/HTTPS path only on an explicit user action.
+
+### Changed
+
+- Open the same scheme from a profile's Nodes / JSON action. Saving keeps the
+  running connection untouched; reconnecting the saved revision remains explicit.
+- Applied mode uses observed kernel routes and service status, not predicted
+  routes presented as live traffic. Unavailable running rules remain unknown.
+
+### Fixed
+
+- Keep dragged condition/output cards at their displayed size without a browser
+  drag preview, and preserve invalid JSON and drafts when navigation is canceled.
+- Compute fixed-card wire geometry directly during dragging instead of measuring
+  every connection in the DOM and triggering a second render per pointer move.
+
 ## [0.19.3] - 2026-11-12
 
 Core 0.19.2.

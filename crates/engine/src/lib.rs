@@ -55,6 +55,8 @@ pub mod macos_session;
 pub mod macos_state;
 #[cfg(unix)]
 pub mod macos_transaction;
+#[cfg(target_os = "linux")]
+pub mod network_probe;
 #[cfg(unix)]
 pub mod privileged;
 #[cfg(unix)]

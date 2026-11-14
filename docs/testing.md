@@ -1,5 +1,61 @@
 # E2E testing
 
+## Unified network scheme
+
+Use `npm run dev:sandbox` for the synthetic browser surface; it must not change
+host VPNs, routes, DNS or proxy settings.
+
+- Routes opens Network scheme. A profile's Nodes / JSON action opens the same
+  screen focused on that connection, not a second modal editor.
+- In Setup, add a site/network and choose an output. Rewire a condition to a
+  different output on the canvas or through its inspector. Check the JSON:
+  native fields, unrelated values and protected references must be preserved.
+  Moving either card changes layout only; priority changes use explicit controls.
+- Show only referenced outputs and the connection default. DNS settings are a
+  separate collapsed service, not an obligatory traffic hop.
+- Check/save a draft without connecting. Applying a saved revision requires a
+  separate review/confirmation. Invalid JSON retains the last valid diagram and
+  disables diagram edits and saving. Canceling a navigation confirmation keeps
+  the draft; Applied mode must not discard it.
+- Enter a site or IP in the explanation panel. Typing and Enter may perform only
+  offline explanation or an IP-only kernel lookup, never DNS/HTTPS probes.
+  Earlier unresolved selectors must produce uncertainty, not a certain default.
+- Check current path is explicit and tests the running network, not the draft.
+  Linux checks current proxy ownership/settings before using it; foreign/stale
+  ownership is an error, never a silent direct fallback. Direct DNS resolves
+  once and HTTPS uses that same address with hostname/TLS validation intact.
+  Proxy DNS is remote and is not labeled as an observed local DNS success.
+  HTTPS HEAD does not follow redirects or read bodies; a response proves
+  transport/TLS reachability, not application health.
+- Applied mode shows observed kernel prefixes/interfaces and service state.
+  Predicted routes are not evidence of installed routes or measured traffic.
+  An unknown running revision must remain unknown.
+- Native Mihomo rules remain in their native configuration. The semantic editor
+  must not add unsupported Xray domain fields to a Mihomo profile. Offline Xray
+  explanation and current-path probing report unsupported on other platforms.
+
+Verified in the browser sandbox: profile-to-scheme navigation, literal URL rule
+creation, pointer rewiring and native rule-kind conversion, protected-reference
+preservation, invalid-JSON recovery, canceled navigation and explicit discard,
+save without connection changes, separate apply review, and explicit-only probes.
+Observed-prefix views keep the physical interface distinct from static profiles.
+Light/dark desktop and 960px layouts were inspected without page-level horizontal
+overflow; a held card remained 240×72 CSS pixels at DPR 1.25.
+The drag-performance fixture (36 conditions, 300 subscription choices) measured
+40 pointer moves before/after direct wire geometry: DOM rectangle reads fell from
+2,960 to zero and canvas commits from 80 to 40. Condition/output wire attachment,
+fixed card sizes and pointer rewiring were checked in Chromium; this is not a
+native WebKit frame-time guarantee.
+
+The production frontend build, frontend tests, version checks, workspace format,
+check and strict Clippy passed on Linux. Workspace Rust tests passed with
+`--test-threads=1`; the default parallel run still failed in the shared-runtime
+tests `crash_releases_flock_but_retains_unrestored_cross_root_claim` and
+`helper_transport_activation_survives_frontend_and_user_owner_exit`. This is not
+an unqualified parallel quality-gate pass. Native tunnel/proxy operations and
+macOS/Windows runtime behavior were not exercised by the browser verification.
+
+
 ## Linux CLI-first architecture acceptance
 
 ```bash

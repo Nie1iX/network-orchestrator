@@ -10,6 +10,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+### Added
+
+- Add revision-checked offline profile explanations and bounded, unprivileged
+  current-path probes shared through the Linux engine.
+
 ### Fixed
 
 - Let explicit `domain:` and `full:` profile rules override pinned Xray

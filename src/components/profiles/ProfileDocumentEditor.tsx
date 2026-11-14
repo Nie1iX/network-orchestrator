@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import Modal from "../Modal";
+import type { ProfileEditorSession } from "../../profileEditing";
 import Skeleton from "../ui/Skeleton";
-import { ProfileGraph } from "./ProfileGraph";
+import ConnectionRuleEditor from "./ConnectionRuleEditor";
 import { tr, useLanguage } from "../../i18n";
 import { buildProfileGraph, documentDiff, parseProfileDocument, type DocumentIssue, type ProfileDocument } from "../../profileDocument";
 import { locateDocumentPointer } from "../../profileDocumentLocation";
@@ -28,11 +28,11 @@ interface Props {
   profileId: string;
   status: TunnelStatus | undefined;
   interfaces: NetworkInterface[];
-  onClose: () => void;
   onSaved: (applied?: boolean) => Promise<void>;
+  onSessionChange?: (session: ProfileEditorSession | null) => void;
 }
 
-export default function ProfileDocumentEditor({ profileId, status, interfaces, onClose, onSaved }: Props) {
+export default function ProfileDocumentEditor({ profileId, status, interfaces, onSaved, onSessionChange }: Props) {
   useLanguage();
   const [snapshot, setSnapshot] = useState<EditorSnapshot | null>(null);
   const [draft, setDraft] = useState<{ text: string; lastValid: ProfileDocument } | null>(null);
@@ -58,6 +58,12 @@ export default function ProfileDocumentEditor({ profileId, status, interfaces, o
   const isRunning = status ? status.state === "running" : snapshot?.running ?? false;
 
   useEffect(() => {
+    onSessionChange?.({ profileId, document: parsed.document, revision: snapshot?.revision ?? null,
+      runningRevision: appliedRevision, endpoints: snapshot?.endpoints ?? [], dirty, busy });
+  }, [profileId, parsed.document, snapshot?.revision, snapshot?.endpoints, appliedRevision, dirty, busy, onSessionChange]);
+  useEffect(() => () => onSessionChange?.(null), [profileId, onSessionChange]);
+
+  useEffect(() => {
     let cancelled = false;
     setError(null);
     invoke<EditorSnapshot>("get_profile_document", { id: profileId }).then((value) => {
@@ -68,7 +74,7 @@ export default function ProfileDocumentEditor({ profileId, status, interfaces, o
       setPreview(null);
       setSavedPaths([]);
       setNeedsApply(false);
-      setSelectedPath("/profile");
+      setSelectedPath(null);
       setConfirmApply(false);
     }).catch((failure: unknown) => { if (!cancelled) setError(String(failure)); });
     return () => { cancelled = true; };
@@ -101,10 +107,6 @@ export default function ProfileDocumentEditor({ profileId, status, interfaces, o
       textInput.current.setSelectionRange(range.start, range.end);
       pendingTextJump.current = false;
     }
-  };
-  const close = async () => {
-    if (busy) return;
-    if (!dirty || await confirm(tr("Discard unsaved profile changes?"), { title: tr("Profile constructor"), kind: "warning" })) onClose();
   };
   const validate = async () => {
     if (!snapshot || !parsed.document || busy) return;
@@ -151,17 +153,17 @@ export default function ProfileDocumentEditor({ profileId, status, interfaces, o
     finally { setBusy(false); }
   };
 
-  return <Modal open title={tr("Profile constructor")} maxWidth="min(1600px, 96vw)" onClose={() => { void close(); }} footer={<>
+  return <section className="profile-document-session" aria-label={tr("Connection configuration")}>
+    <header className="profile-editor-toolbar"><h3>{tr("Connection configuration")}</h3><div className="profile-editor-session-actions">
     <span className="profile-editor-footer-note">{busy ? tr("Working…") : tr("Saving never reconnects the tunnel.")}</span>
-    <button type="button" disabled={busy} onClick={() => { void close(); }}>{tr("Close")}</button>
     <button type="button" disabled={busy || !parsed.document || (graph?.issues.some((issue) => issue.severity === "error") ?? true)} onClick={() => { void validate(); }}>{tr("Check draft")}</button>
     <button type="button" className="btn-primary" disabled={busy || !dirty || !currentPreview?.valid || hasErrors} onClick={() => { void save(); }}>{tr("Save profile")}</button>
-  </>}>
+    </div></header>
     {error && <div className="save-notice" role="alert">{error}{!snapshot && <button type="button" onClick={() => setReload((value) => value + 1)}>{tr("Retry")}</button>}</div>}
     {!snapshot || !draft ? !error && <Skeleton height="320px" /> : <div className="profile-document-editor">
       <div className="profile-editor-toolbar">
         <div className="segmented" aria-label={tr("Editor view")}>
-          {([ ["graph", "Nodes"], ["json", "JSON"], ["split", "Nodes and JSON"] ] as const).map(([value, label]) => <button key={value} type="button" className="btn-sm" aria-pressed={mode === value} onClick={() => setMode(value)}>{tr(label)}</button>)}
+          {([ ["graph", "Rules"], ["json", "JSON"], ["split", "Rules and JSON"] ] as const).map(([value, label]) => <button key={value} type="button" className="btn-sm" aria-pressed={mode === value} onClick={() => setMode(value)}>{tr(label)}</button>)}
         </div>
         <button type="button" className="btn-sm" disabled={busy} onClick={async () => {
           if (!dirty || await confirm(tr("Discard unsaved profile changes?"), { kind: "warning" })) setReload((value) => value + 1);
@@ -172,21 +174,21 @@ export default function ProfileDocumentEditor({ profileId, status, interfaces, o
         <div><dt>{tr("Saved revision")}</dt><dd><code>{snapshot.revision.slice(0, 12)}</code></dd></div>
         <div><dt>{tr("Running revision")}</dt><dd>{isRunning ? appliedRevision ? <code>{appliedRevision.slice(0, 12)}</code> : tr("Unknown — reconnect to apply the saved profile") : tr("Not running")}</dd></div>
       </dl>
-      <p className="row-hint">{tr("JSON and nodes edit the same profile. Node positions do not change rule order. Formatting is normalized by node edits and saving.")}</p>
+      <p className="row-hint">{tr("Rules and JSON edit the same connection. Moving blocks does not change routing priority.")}</p>
       {!parsed.document && <div className="save-notice" role="alert">{tr("Invalid JSON: the graph shows the last valid draft and cannot be edited or saved.")}</div>}
-      <div className={`profile-editor-workspace profile-editor-${mode}`}>
-        <div className="profile-editor-graph" hidden={mode === "json"}><ProfileGraph document={draft.lastValid} endpoints={snapshot.endpoints} issues={[...parsed.issues, ...(currentPreview?.issues ?? [])]} selectedPath={selectedPath} onSelect={setSelectedPath} onChange={(document) => updateText(JSON.stringify(document, null, 2))} disabled={busy || !parsed.document} /></div>
-        {mode !== "graph" && <section className="profile-editor-source">
-          <div className="profile-editor-source-head"><label htmlFor="profile-document-json">{tr("Profile JSON")}</label>{selectedPath && <code>{selectedPath}</code>}</div>
-          <textarea ref={textInput} id="profile-document-json" aria-label={tr("Profile JSON")} spellCheck={false} value={text} disabled={busy} onChange={(event) => updateText(event.target.value)} />
-        </section>}
-      </div>
-      {selectedPath && mode === "graph" && <button type="button" className="btn-sm" onClick={() => selectTextPath(selectedPath)}>{tr("Show selected node in JSON")}</button>}
       {issues.length > 0 && <section className="profile-editor-issues" aria-label={tr("Validation issues")}>
         {issues.map((issue, index) => <div key={`${issue.path}-${index}`} className={issue.severity === "error" ? "save-notice" : "runtime-notice"} role={issue.severity === "error" ? "alert" : undefined}>
           <button type="button" className="btn-ghost btn-sm mono" onClick={() => selectTextPath(issue.path)}>{issue.path || "/"}</button><span>{tr(issue.message)}</span>
         </div>)}
       </section>}
+      <div className={`profile-editor-workspace profile-editor-${mode}`}>
+        <div className="profile-editor-graph" hidden={mode === "json"}><ConnectionRuleEditor document={draft.lastValid} endpoints={snapshot.endpoints} interfaces={interfaces} selectedPath={selectedPath} onSelect={setSelectedPath} onChange={(document) => updateText(JSON.stringify(document, null, 2))} disabled={busy || !parsed.document} /></div>
+        {mode !== "graph" && <section className="profile-editor-source">
+          <div className="profile-editor-source-head"><label htmlFor="profile-document-json">{tr("Profile JSON")}</label>{selectedPath && <code>{selectedPath}</code>}</div>
+          <textarea ref={textInput} id="profile-document-json" aria-label={tr("Profile JSON")} spellCheck={false} value={text} disabled={busy} onChange={(event) => updateText(event.target.value)} />
+        </section>}
+      </div>
+      {selectedPath && mode === "graph" && <button type="button" className="btn-sm" onClick={() => selectTextPath(selectedPath)}>{tr("Show selected rule in JSON")}</button>}
       {currentPreview && <div className="runtime-notice" role="status">{currentPreview.valid ? currentPreview.daemonValidated ? tr("The daemon accepted the generated configuration.") : draft.lastValid.profile.backend === "mihomo" ? tr("Local profile validation passed; privileged validation was not performed.") : tr("Local profile validation passed. Privileged Xray validation was not performed for this backend.") : tr("The draft was rejected. Nothing was saved or reconnected.")}</div>}
       <details className="profile-editor-diff"><summary>{tr("Changed JSON paths")} ({(currentPreview?.changedPaths ?? documentDiff(snapshot.document, draft.lastValid)).length})</summary>
         <ul>{(currentPreview?.changedPaths ?? documentDiff(snapshot.document, draft.lastValid)).map((path) => <li key={path}><button type="button" className="btn-ghost btn-sm mono" onClick={() => selectTextPath(path)}>{path}</button></li>)}</ul>
@@ -206,5 +208,5 @@ export default function ProfileDocumentEditor({ profileId, status, interfaces, o
         </div>}
       </div>
     </div>}
-  </Modal>;
+  </section>;
 }

@@ -10,6 +10,13 @@ export function installSandbox() {
     if (Array.isArray(args) || args instanceof ArrayBuffer || ArrayBuffer.isView(args)) {
       throw new Error("Binary IPC is disabled in sandbox");
     }
+    if (command === "plugin:dialog|message" && (args?.buttons === "YesNo" || args?.buttons === "OkCancel")) {
+      const accepted = window.confirm(String(args.message ?? ""));
+      return args.buttons === "YesNo" ? accepted ? "Yes" : "No" : accepted ? "Ok" : "Cancel";
+    }
+    if (command === "plugin:dialog|confirm" || command === "plugin:dialog|ask") {
+      return window.confirm(String(args?.message ?? ""));
+    }
     const result = backend.invoke(command, args);
     if (/^(connect_|disconnect_|save_|delete_|switch_|refresh_|import_)/.test(command)) {
       queueMicrotask(() => void emit("route-changed"));

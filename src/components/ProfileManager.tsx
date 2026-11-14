@@ -32,7 +32,6 @@ import Modal from "./Modal";
 import Page from "./Page";
 import ContextMenu from "./ui/ContextMenu";
 import ProfileDetail from "./profiles/ProfileDetail";
-import ProfileDocumentEditor from "./profiles/ProfileDocumentEditor";
 import ProfileRow from "./profiles/ProfileRow";
 import SetsBar from "./profiles/SetsBar";
 import {
@@ -176,7 +175,7 @@ let listCache: {
   inspections: Record<string, ProfileInspection>;
 } | null = null;
 
-export default function ProfileManager() {
+export default function ProfileManager({ onOpenScheme }: { onOpenScheme: (id: string) => void }) {
   const caps = usePlatformCapabilities();
   const toast = useToast();
   const t = useT();
@@ -202,7 +201,6 @@ export default function ProfileManager() {
   const [busy, setBusy] = useState<Set<string>>(new Set());
   const [editing, setEditing] = useState<ProfileFormState | null>(null);
   const [formOpen, setFormOpen] = useState(false);
-  const [documentEditorId, setDocumentEditorId] = useState<string | null>(null);
   const [inspections, setInspections] = useState<
     Record<string, ProfileInspection>
   >(listCache?.inspections ?? {});
@@ -2230,7 +2228,7 @@ export default function ProfileManager() {
               onConnect={() => void onConnect(selected)}
               onDisconnect={() => void onDisconnect(selected)}
               onEdit={() => openEdit(selected)}
-              onOpenDocument={() => setDocumentEditorId(selected.id)}
+              onOpenDocument={() => onOpenScheme(selected.id)}
               onMoveUp={() =>
                 selGroup &&
                 moveProfileInGroup(selGroup.items, selected.id, -1)
@@ -2282,17 +2280,6 @@ export default function ProfileManager() {
         </div>
       </div>
 
-      {documentEditorId && <ProfileDocumentEditor
-        key={documentEditorId}
-        profileId={documentEditorId}
-        status={statuses.find((status) => status.profileId === documentEditorId)}
-        interfaces={interfaces}
-        onClose={() => setDocumentEditorId(null)}
-        onSaved={async (applied) => {
-          if (applied) setConnectionFailures(({ [documentEditorId]: _failure, ...remaining }) => remaining);
-          await refreshAll();
-        }}
-      />}
 
       <ProfileFormModal
         open={formOpen}

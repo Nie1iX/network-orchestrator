@@ -367,6 +367,9 @@ export interface RouteCheckResult {
   policyIndex?: number;
   matchedSelector?: string;
   certainty: "certain" | "probable";
+  policyPath?: string;
+  interfaceName?: string;
+  endpointKey?: string;
   steps: RouteCheckStep[];
   notes: string[];
 }

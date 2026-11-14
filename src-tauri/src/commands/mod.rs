@@ -8,6 +8,8 @@ pub(crate) mod happ_routing;
 pub(crate) mod logs;
 pub(crate) mod net_tables;
 pub(crate) mod netbird;
+pub(crate) mod network_explain;
+pub(crate) mod network_probe;
 pub(crate) mod nm;
 pub(crate) mod profiles;
 pub(crate) mod proxies;
@@ -39,6 +41,8 @@ pub(crate) use net_tables::{
     net_intent_set, net_route_add, net_route_del, net_rule_add, net_rule_del,
 };
 pub(crate) use netbird::{netbird_down, netbird_status, netbird_up};
+pub(crate) use network_explain::explain_profile_document;
+pub(crate) use network_probe::probe_current_path;
 pub(crate) use nm::{nm_list_connections, nm_set_active};
 pub(crate) use profiles::{
     apply_profile_document, get_mihomo_groups, get_profile_document, import_mihomo_subscription,

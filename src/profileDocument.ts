@@ -71,11 +71,15 @@ export function buildProfileGraph(document: ProfileDocument, endpoints: Subscrip
   };
   const routing = (value: JsonValue, path: string, label: string, kind = "selector", editable = true) => {
     if (Array.isArray(value) && value.length === 0) return;
-    add(path, kind, label, editable, 1);
-    if (!Array.isArray(value)) return;
+    if (!Array.isArray(value)) { add(path, kind, label, editable, 1); return; }
     value.forEach((entry, index) => {
       const item = `${path}/${index}`;
-      add(item, kind, label, editable && isObject(entry), 1, index, String(index + 1));
+      const selectors = isObject(entry) ? entry.domains ?? entry.selectors ?? entry.ips : null;
+      const summary = Array.isArray(selectors)
+        ? selectors.filter((selector): selector is string => typeof selector === "string").slice(0, 2).map(safeLabel).join(", ")
+        : isObject(entry) && typeof entry.destination === "string" ? safeLabel(entry.destination) : "";
+      const remaining = Array.isArray(selectors) ? Math.max(0, selectors.length - 2) : 0;
+      add(item, kind, label, editable && isObject(entry), 1, index, summary + (remaining ? ` +${remaining}` : ""));
       if (!isObject(entry)) return;
       if (entry.target === "proxy" || entry.target === "direct" || entry.target === "block") edge(item, target(entry.target), `${item}/target`, entry.target);
       if ("endpointKey" in entry) reference(item, entry.endpointKey, `${item}/endpointKey`, "endpoint");

@@ -268,6 +268,25 @@ impl ProfileService {
         Ok(self.editor_preview(&stored, &document))
     }
 
+    pub fn explain_document_route(
+        &self,
+        id: &str,
+        document: Value,
+        expected_revision: &str,
+        target: &str,
+    ) -> Result<net_manager_core::route_check::RouteCheckResult, String> {
+        let _lock = self.mutation()?;
+        let stored = self.profile(id)?;
+        if self.editor_revision(&stored)? != expected_revision {
+            return Err(profiles::PROFILE_EDIT_CONFLICT.into());
+        }
+        let (candidate, _) = self.editor_candidate(&stored, &document)?;
+        if candidate.backend != TunnelBackend::Xray {
+            return Err("Offline route explanation is unavailable for this profile backend".into());
+        }
+        crate::linux_network::explain_profile_route(&self.root, &candidate, target)
+    }
+
     pub fn save_document(
         &self,
         id: &str,

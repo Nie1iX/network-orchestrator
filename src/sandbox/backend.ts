@@ -8,6 +8,8 @@ import type {
 } from "../types.ts";
 import type { ConnectionSnippet } from "../components/profiles/sets";
 import { buildProfileGraph, documentDiff, parseProfileDocument, type ProfileDocument, type JsonValue } from "../profileDocument.ts";
+import { explainProfileDocument } from "./routeExplanation.ts";
+import type { NetworkPathProbe } from "../networkProbe.ts";
 
 const CONNECTION_SETS_KEY = "netmanager.sandbox.connectionSets";
 
@@ -903,6 +905,22 @@ export class SandboxBackend {
         return [{ name: "Auto", kind: "select", members: ["Netherlands", "Germany"], selected: p.mihomo?.groupSelections.Auto ?? null }];
       }
       case "get_profile_document": return this.editorSnapshot(args.id);
+      case "explain_profile_document": {
+        const candidate = this.editorCandidate(args);
+        return explainProfileDocument({ ...candidate.document, profile: candidate.profile as unknown as Record<string, JsonValue> }, String(args.target ?? ""));
+      }
+      case "probe_current_path": {
+        const raw = String(args.target ?? "");
+        const url = new URL(raw.includes("://") ? raw : `https://${raw}`);
+        if (url.protocol !== "https:" || url.username || url.password) throw new Error("Enter an HTTPS site or IP without credentials.");
+        const proxy = this.dispatch("system_proxy_status", {}) as { ownerProfileId: string | null };
+        return {
+          target: url.origin, scope: proxy.ownerProfileId ? "systemProxy" : "system",
+          stages: (["dns", "route", "https"] as const).map((stage) => ({
+            stage, outcome: "unknown", message: "Sandbox simulation: no network request was sent.", durationMs: null,
+          })),
+        } satisfies NetworkPathProbe;
+      }
       case "preview_profile_document": {
         const candidate = this.editorCandidate(args);
         const endpoints = (candidate.profile.subscription ? this.dispatch("get_subscription_endpoints", { profileId: args.id }) : []) as SubscriptionEndpointInfo[];

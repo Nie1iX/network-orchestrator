@@ -22,7 +22,7 @@
 .profile-editor-apply .save-notice { align-self: stretch; }
 .profile-editor-apply .save-notice button + button { margin-left: var(--sp-2); }
 .profile-editor-footer-note { margin-right: auto; align-self: center; font-size: var(--fs-xs); color: var(--text-muted); }
-.modal-dialog:has(.profile-document-editor) .modal-footer { flex-wrap: wrap; }
+.profile-document-session > header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: var(--sp-3); }
 @media (max-width: 1100px) { .profile-editor-split { grid-template-columns: minmax(0, 1fr); } .profile-editor-source textarea { min-height: 260px; } }
 @media (max-width: 600px) { .profile-editor-revisions { gap: var(--sp-2); flex-direction: column; } .profile-editor-footer-note { width: 100%; } }
 .profile-document-entry { align-self: flex-start; }
