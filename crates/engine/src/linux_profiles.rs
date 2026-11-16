@@ -161,7 +161,14 @@ impl ProfileService {
             preserve_form_settings(&mut profile, existing, source.is_none());
         } else {
             profile.subscription = None;
-            profile.pinned_policies.clear();
+            profile
+                .routing
+                .base
+                .retain(|rule| rule.target.endpoint_key().is_none());
+            profile
+                .routing
+                .user
+                .retain(|rule| rule.target.endpoint_key().is_none());
             profile.xray_service_checks.clear();
             profile.xray_proxy_exits.clear();
         }
@@ -181,7 +188,10 @@ impl ProfileService {
             return Err("A profile with that identifier already exists".into());
         }
         if profile.subscription.is_some()
-            || !profile.pinned_policies.is_empty()
+            || profile
+                .routing
+                .iter()
+                .any(|rule| rule.target.endpoint_key().is_some())
             || !profile.xray_service_checks.is_empty()
             || !profile.xray_proxy_exits.is_empty()
         {
@@ -476,18 +486,18 @@ impl ProfileService {
                 Err("Cached subscription data requires a subscription profile".into())
             };
         }
-        let expected = self.subscription_profile(id)?;
+        let mut expected = self.subscription_profile(id)?;
         let refresh_lock =
             crate::linux_session::lock_file(&self.root.join("subscription-refresh.lock"))
                 .map_err(failed)?;
         refresh_lock
             .try_lock()
             .map_err(|_| "A subscription refresh is already in progress".to_string())?;
-        let meta = expected
-            .subscription
-            .as_ref()
-            .expect("subscription checked");
         let refreshed = async {
+            let meta = expected
+                .subscription
+                .as_ref()
+                .expect("subscription checked");
             let fetched;
             let (body, response_meta) = if let Some(body) = cached {
                 (body, subscription::response_meta(&[], body))
@@ -499,7 +509,14 @@ impl ProfileService {
                 (fetched.body.as_str(), fetched.meta.clone())
             };
             let _lock = self.mutation()?;
-            if self.profile(id)? != expected {
+            let mut current = self.profile(id)?;
+            // Ignore User rows for source identity without copying their selectors.
+            // refresh_body reloads and reconciles the latest rows under the store lock.
+            let expected_user = std::mem::take(&mut expected.routing.user);
+            current.routing.user.clear();
+            let unchanged = current == expected;
+            expected.routing.user = expected_user;
+            if !unchanged {
                 return Err("The subscription changed during refresh; retry".into());
             }
             subscription::refresh_body(
@@ -627,13 +644,59 @@ impl ProfileService {
     pub fn set_routing(
         &self,
         id: &str,
-        policies: Vec<DomainPolicy>,
+        routing: RoutingPolicy,
         private_lan_direct: bool,
+        expected_revision: &str,
     ) -> Result<ProfileDocument, String> {
-        self.update_xray(id, |profile| {
-            profile.domain_policies = policies;
-            profile.private_lan_direct = private_lan_direct;
-        })
+        let _lock = self.mutation()?;
+        let expected = self.profile(id)?;
+        if profiles::profile_edit_revision(&expected).map_err(failed)? != expected_revision {
+            return Err(profiles::PROFILE_EDIT_CONFLICT.into());
+        }
+        if expected.backend != TunnelBackend::Xray {
+            return Err("This setting requires an Xray profile".into());
+        }
+        let endpoints = self.endpoints(&expected)?;
+        let mut routing = routing;
+        for rule in routing.iter_mut() {
+            if let RoutingTarget::Node {
+                endpoint_key,
+                missing,
+            } = &mut rule.target
+            {
+                let count = endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.id == *endpoint_key)
+                    .count();
+                if count > 1
+                    || (count == 0
+                        && !expected
+                            .routing
+                            .iter()
+                            .any(|old| old.target.endpoint_key() == Some(endpoint_key.as_str())))
+                {
+                    return Err("A referenced endpoint is missing or ambiguous".into());
+                }
+                *missing = count == 0;
+            }
+        }
+        let mut candidate = expected.clone();
+        candidate.routing = routing;
+        candidate.private_lan_direct = private_lan_direct;
+        validate(&candidate).map_err(failed)?;
+        self.sync_background(&candidate, &candidate.xray_service_checks)?;
+        let result = self.store().update_profile(id, |profile| {
+            if *profile != expected || self.endpoints(profile).map_err(invalid_owned)? != endpoints
+            {
+                return Err(invalid("The profile or endpoint selection changed"));
+            }
+            *profile = candidate.clone();
+            Ok(())
+        });
+        if result.is_err() {
+            self.sync_background(&expected, &expected.xray_service_checks)?;
+        }
+        result.map_err(failed)
     }
 
     pub fn set_quic(&self, id: &str, enabled: bool) -> Result<ProfileDocument, String> {
@@ -1126,7 +1189,20 @@ impl ProfileService {
         let _lock = self.mutation()?;
         let expected = self.subscription_profile(id)?;
         let mut candidate = expected.clone();
-        candidate.pinned_policies = routes.clone();
+        let mut routes_iter = routes.iter().cloned().map(RoutingRule::from);
+        candidate.routing.user.retain_mut(|rule| {
+            if rule.target.endpoint_key().is_some() {
+                if let Some(next) = routes_iter.next() {
+                    *rule = next;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            }
+        });
+        candidate.routing.user.extend(routes_iter);
         profiles::validate_profile(&candidate).map_err(failed)?;
         self.sync_background(&candidate, &candidate.xray_service_checks)?;
         let saved = subscription::set_pinned_routes(&self.vault(), &self.store(), id, routes);
@@ -1349,8 +1425,14 @@ impl ProfileService {
                     .iter()
                     .map(|endpoint| endpoint.id.clone())
                     .collect();
-                for pin in &mut current.pinned_policies {
-                    pin.missing = !live.contains(&pin.endpoint_key);
+                for rule in current.routing.iter_mut() {
+                    if let RoutingTarget::Node {
+                        endpoint_key,
+                        missing,
+                    } = &mut rule.target
+                    {
+                        *missing = !live.contains(endpoint_key);
+                    }
                 }
                 validate(current)
             })
@@ -1542,8 +1624,6 @@ fn merge_profile(profile: &Profile, patch: &Value) -> io::Result<Profile> {
         "xrayDomainMatcher",
         "xrayDns",
         "xraySockopts",
-        "xrayTrafficRules",
-        "xrayInterfaceRoutes",
         "xrayConnectionIdleSecs",
         "xrayTunMtu",
         "xrayTunDnsServers",
@@ -1608,13 +1688,11 @@ fn preserve_form_settings(profile: &mut Profile, stored: &Profile, same_source: 
         if profile.backend != TunnelBackend::Mihomo || stored.backend != TunnelBackend::Mihomo {
             profile.subscription = None;
         }
-        profile.pinned_policies.clear();
+        profile.routing = RoutingPolicy::default();
         profile.xray_service_checks.clear();
         profile.xray_proxy_exits.clear();
         if profile.backend != TunnelBackend::Xray {
             profile.xray_sockopts = None;
-            profile.xray_traffic_rules.clear();
-            profile.xray_interface_routes.clear();
             profile.xray_connection_idle_secs = None;
             profile.xray_tun_mtu = None;
             profile.xray_tun_dns_servers.clear();
@@ -1624,12 +1702,10 @@ fn preserve_form_settings(profile: &mut Profile, stored: &Profile, same_source: 
         return;
     }
     profile.subscription = stored.subscription.clone();
-    profile.pinned_policies = stored.pinned_policies.clone();
+    profile.routing = stored.routing.clone();
     profile.xray_service_checks = stored.xray_service_checks.clone();
     profile.xray_proxy_exits = stored.xray_proxy_exits.clone();
     profile.xray_sockopts = stored.xray_sockopts.clone();
-    profile.xray_traffic_rules = stored.xray_traffic_rules.clone();
-    profile.xray_interface_routes = stored.xray_interface_routes.clone();
     profile.xray_connection_idle_secs = stored.xray_connection_idle_secs;
     profile.xray_tun_mtu = stored.xray_tun_mtu;
     profile.xray_tun_dns_servers = stored.xray_tun_dns_servers.clone();
@@ -1997,8 +2073,17 @@ fn editor_nested_fields(value: &Value, path: &str) -> Result<(), String> {
     let allowed: Option<&[&str]> = match shape.as_str() {
         "/profile/mihomo" => Some(&["mode", "entryGroup", "mixedPort", "groupSelections"]),
         "/profile/routes/*" => Some(&["destination", "metric", "via"]),
-        "/profile/domainPolicies/*" => Some(&["domains", "target"]),
-        "/profile/pinnedPolicies/*" => Some(&["selectors", "endpointKey", "missing"]),
+        "/profile/routing" => Some(&["base", "user"]),
+        "/profile/routing/base/*" | "/profile/routing/user/*" => {
+            Some(&["selectors", "target", "port", "network"])
+        }
+        "/profile/routing/base/*/target" | "/profile/routing/user/*/target" => Some(&[
+            "kind",
+            "endpointKey",
+            "missing",
+            "interfaceName",
+            "domainStrategy",
+        ]),
         "/profile/subscription" => Some(&[
             "url",
             "hwid",
@@ -2057,8 +2142,6 @@ fn editor_nested_fields(value: &Value, path: &str) -> Result<(), String> {
             "tcpUserTimeout",
             "tcpNoDelay",
         ]),
-        "/profile/xrayTrafficRules/*" => Some(&["ips", "port", "network", "target"]),
-        "/profile/xrayInterfaceRoutes/*" => Some(&["selectors", "interfaceName", "domainStrategy"]),
         _ => None,
     };
     match value {
@@ -2113,8 +2196,6 @@ fn editor_restore(profile: &Profile, document: &Value) -> Result<Profile, String
         "xrayDomainMatcher",
         "xrayDns",
         "xraySockopts",
-        "xrayTrafficRules",
-        "xrayInterfaceRoutes",
         "xrayConnectionIdleSecs",
         "xrayTunMtu",
         "xrayTunDnsServers",
@@ -2319,6 +2400,82 @@ pub use net_manager_core::mihomo::MihomoGroupInfo;
 mod editor_document_tests {
     use super::*;
 
+    #[test]
+    fn editor_round_trips_ordered_routing_and_rejects_legacy_fields() {
+        let profile = Profile::default();
+        let mut document = editor_view(&profile).unwrap();
+        document["profile"]["routing"] = json!({
+            "base": [{"selectors":["geoip:us"],"target":{"kind":"proxy"}}],
+            "user": [
+                {"selectors":["domain:a.test"],"target":{"kind":"direct"},"port":443,"network":"tcp"},
+                {"selectors":["domain:b.test"],"target":{"kind":"block"}}
+            ]
+        });
+        let restored = editor_restore(&profile, &document).unwrap();
+        assert_eq!(restored.routing.user[0].port, Some(443));
+        assert_eq!(restored.routing.user[1].target, RoutingTarget::Block);
+        assert_eq!(restored.routing.base.len(), 1);
+        document["profile"]["domainPolicies"] = json!([]);
+        assert!(editor_restore(&profile, &document).is_err());
+    }
+
+    #[test]
+    fn form_edits_preserve_both_ordered_routing_layers() {
+        let mut stored = Profile {
+            backend: TunnelBackend::Xray,
+            ..Default::default()
+        };
+        stored.routing.base.push(
+            DomainPolicy {
+                domains: vec!["geoip:us".into()],
+                target: DomainRouteTarget::Proxy,
+            }
+            .into(),
+        );
+        for target in [DomainRouteTarget::Direct, DomainRouteTarget::Block] {
+            stored.routing.user.push(
+                DomainPolicy {
+                    domains: vec!["domain:example.test".into()],
+                    target,
+                }
+                .into(),
+            );
+        }
+        let mut form = Profile {
+            backend: TunnelBackend::Xray,
+            ..Default::default()
+        };
+        preserve_form_settings(&mut form, &stored, false);
+        assert_eq!(form.routing, stored.routing);
+    }
+
+    #[test]
+    fn routing_setter_rejects_stale_client_revision_without_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProfileService::new(dir.path().into(), LinuxEngine::new("routing-test"));
+        let mut profile = Profile {
+            id: "routing".into(),
+            name: "Routing".into(),
+            config_path: "routing.json".into(),
+            backend: TunnelBackend::Xray,
+            ..Default::default()
+        };
+        service.store().upsert(profile.clone()).unwrap();
+        let revision = profiles::profile_edit_revision(&profile).unwrap();
+        profile.routing.base.push(
+            DomainPolicy {
+                domains: vec!["geosite:example".into()],
+                target: DomainRouteTarget::Proxy,
+            }
+            .into(),
+        );
+        service.store().upsert(profile.clone()).unwrap();
+        let error = service
+            .set_routing("routing", RoutingPolicy::default(), false, &revision)
+            .unwrap_err();
+        assert_eq!(error, profiles::PROFILE_EDIT_CONFLICT);
+        assert_eq!(service.profile("routing").unwrap().routing, profile.routing);
+    }
     #[test]
     fn mihomo_selection_patch_and_editor_reject_unknown_fields() {
         let profile = Profile {

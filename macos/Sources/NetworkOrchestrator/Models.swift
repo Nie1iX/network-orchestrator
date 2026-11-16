@@ -143,13 +143,79 @@ struct Profile: Decodable, Identifiable, Sendable {
   /// Started once when the app launches.
   var autoConnect: Bool? = nil
   var connectsOnLaunch: Bool { autoConnect == true }
-  var domainPolicies: [DomainPolicy]? = nil
+  var routing: RoutingPolicy? = nil
   var privateLanDirect: Bool? = nil
   var xrayDns: DnsSummary? = nil
-  /// Rule lines of one target (block / proxy / direct), comments included.
-  func rules(_ target: String) -> [String] {
-    (domainPolicies ?? []).filter { $0.target == target }.flatMap(\.domains)
+  var rules: [RoutingRule] { (routing?.user ?? []) + (routing?.base ?? []) }
+}
+
+struct RoutingPolicy: Codable, Sendable, Equatable {
+  var base: [RoutingRule] = []
+  var user: [RoutingRule] = []
+  mutating func moveRule(
+    at index: Int, from source: RoutingLayer, to destination: RoutingLayer,
+    insertionIndex: Int? = nil
+  ) {
+    let sourceRules = source == .base ? base : user
+    guard sourceRules.indices.contains(index) else { return }
+    let rule = sourceRules[index]
+    if source == .base {
+      base.remove(at: index)
+    } else {
+      user.remove(at: index)
+    }
+    let destinationCount = destination == .base ? base.count : user.count
+    let targetIndex = min(max(insertionIndex ?? destinationCount, 0), destinationCount)
+    if destination == .base {
+      base.insert(rule, at: targetIndex)
+    } else {
+      user.insert(rule, at: targetIndex)
+    }
   }
+}
+enum RoutingTarget: Codable, Sendable, Equatable {
+  case proxy, direct, block
+  case node(endpointKey: String, missing: Bool)
+  case interface(interfaceName: String, domainStrategy: String?)
+
+  private enum CodingKeys: String, CodingKey { case kind, endpointKey, missing, interfaceName, domainStrategy }
+  private enum Kind: String, Codable { case proxy, direct, block, node, interface }
+  init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    switch try c.decode(Kind.self, forKey: .kind) {
+    case .proxy: self = .proxy
+    case .direct: self = .direct
+    case .block: self = .block
+    case .node: self = .node(endpointKey: try c.decode(String.self, forKey: .endpointKey), missing: try c.decodeIfPresent(Bool.self, forKey: .missing) ?? false)
+    case .interface: self = .interface(interfaceName: try c.decode(String.self, forKey: .interfaceName), domainStrategy: try c.decodeIfPresent(String.self, forKey: .domainStrategy))
+    }
+  }
+  func encode(to encoder: Encoder) throws {
+    var c = encoder.container(keyedBy: CodingKeys.self)
+    switch self {
+    case .proxy: try c.encode(Kind.proxy, forKey: .kind)
+    case .direct: try c.encode(Kind.direct, forKey: .kind)
+    case .block: try c.encode(Kind.block, forKey: .kind)
+    case let .node(key, missing):
+      try c.encode(Kind.node, forKey: .kind); try c.encode(key, forKey: .endpointKey)
+      if missing { try c.encode(true, forKey: .missing) }
+    case let .interface(name, strategy):
+      try c.encode(Kind.interface, forKey: .kind); try c.encode(name, forKey: .interfaceName)
+      try c.encodeIfPresent(strategy, forKey: .domainStrategy)
+    }
+  }
+}
+
+struct RoutingRule: Codable, Sendable, Equatable, Identifiable {
+  var id: String { selectors.joined(separator: ",") + String(describing: target) }
+  var selectors: [String]
+  var target: RoutingTarget
+  var port: UInt16?
+  var network: String?
+}
+
+enum RoutingLayer: String, Codable, Sendable { case base, user }
+extension Profile {
   /// Name shown for the profile: a generated "{provider} - {server}" name
   /// reads as the provider group, a user-chosen name is shown as typed.
   var groupName: String {
@@ -841,11 +907,9 @@ struct DnsSummary: Decodable, Sendable {
   var hostCount: Int { hosts?.count ?? 0 }
 }
 struct DnsServerStub: Decodable, Sendable {}
-/// Editor state of a profile's Xray routing options, as plain text fields.
+/// Editor state of a profile's Xray routing settings.
 struct RoutingOptions: Decodable, Sendable {
-  var block = ""
-  var proxy = ""
-  var direct = ""
+  var routing = RoutingPolicy()
   var privateLanDirect = false
   var domainStrategy = ""
   var domainMatcher = ""
@@ -853,26 +917,13 @@ struct RoutingOptions: Decodable, Sendable {
   var dnsHosts = ""
   var fakeDns = false
   var queryStrategy = ""
-  /// Custom geo data (https), empty for the managed files.
   var geoipUrl = ""
   var geositeUrl = ""
+  var editRevision: String? = nil
 }
-/// Fields recovered from a pasted Happ/Incy routing export; absent fields
-/// were not mentioned and keep their current value in the editor.
 struct HappRouting: Decodable, Sendable {
   let name: String?
-  let block: String
-  let proxy: String
-  let direct: String
-  let privateLanDirect: Bool?
-  let domainStrategy: String?
-  let domainMatcher: String?
-  let dnsServers: String?
-  let dnsHosts: String?
-  let fakeDns: Bool?
-  let queryStrategy: String?
-  let geoipUrl: String?
-  let geositeUrl: String?
+  let routing: RoutingPolicy
   let warnings: [String]
 }
 struct RouteCheckResult: Decodable, Sendable {
@@ -887,8 +938,9 @@ struct RouteCheckResult: Decodable, Sendable {
 
 extension RoutingOptions {
   var bridgeArgs: [String: String] {
-    [
-      "block": block, "proxy": proxy, "direct": direct,
+    let data = try! JSONEncoder().encode(routing)
+    return [
+      "routing": String(decoding: data, as: UTF8.self),
       "privateLanDirect": privateLanDirect ? "true" : "false",
       "domainStrategy": domainStrategy, "domainMatcher": domainMatcher,
       "dnsServers": dnsServers, "dnsHosts": dnsHosts,
@@ -896,19 +948,7 @@ extension RoutingOptions {
       "geoipUrl": geoipUrl, "geositeUrl": geositeUrl,
     ]
   }
-  /// Applies the fields a Happ export mentions and keeps the rest.
   mutating func apply(_ happ: HappRouting) {
-    block = happ.block
-    proxy = happ.proxy
-    direct = happ.direct
-    if let value = happ.privateLanDirect { privateLanDirect = value }
-    if let value = happ.domainStrategy { domainStrategy = value }
-    if let value = happ.domainMatcher { domainMatcher = value }
-    if let value = happ.dnsServers { dnsServers = value }
-    if let value = happ.dnsHosts { dnsHosts = value }
-    if let value = happ.fakeDns { fakeDns = value }
-    if let value = happ.queryStrategy { queryStrategy = value }
-    if let value = happ.geoipUrl { geoipUrl = value }
-    if let value = happ.geositeUrl { geositeUrl = value }
+    routing.base = happ.routing.base
   }
 }

@@ -46,12 +46,18 @@ export function buildProfileGraph(document: ProfileDocument, endpoints: Subscrip
   const edge = (from: string, to: string, path: string, label: string) => edges.push({ id: `${from}:${path}->${to}`, from, to, path, label });
   const reference = (from: string, key: unknown, path: string, label: string) => {
     const candidates = typeof key === "string" ? matches.get(key) ?? [] : [];
-    if (candidates.length !== 1 || candidates[0]?.endpoint.isMissing) {
+    if (candidates.length !== 1) {
       issues.push({ path, message: candidates.length > 1 ? "Endpoint reference is ambiguous" : "Endpoint reference is missing", severity: "error" });
       const id = `/unresolved${path}`;
       add(id, "endpoint", "Unresolved endpoint", false, 3);
       edge(from, id, path, label);
-    } else edge(from, candidates[0]!.id, path, label);
+    } else {
+      const match = candidates[0]!;
+      if (match.endpoint.isMissing) {
+        issues.push({ path, message: "The saved server is unavailable. Its explicit rules remain blocked.", severity: "warning" });
+      }
+      edge(from, match.id, path, label);
+    }
   };
   endpoints.forEach((endpoint, index) => {
     const id = `/endpoints/${encodeURIComponent(endpoint.key)}:${index}`;
@@ -74,27 +80,32 @@ export function buildProfileGraph(document: ProfileDocument, endpoints: Subscrip
     if (!Array.isArray(value)) { add(path, kind, label, editable, 1); return; }
     value.forEach((entry, index) => {
       const item = `${path}/${index}`;
-      const selectors = isObject(entry) ? entry.domains ?? entry.selectors ?? entry.ips : null;
+      const selectors = isObject(entry) ? entry.selectors : null;
       const summary = Array.isArray(selectors)
         ? selectors.filter((selector): selector is string => typeof selector === "string").slice(0, 2).map(safeLabel).join(", ")
         : isObject(entry) && typeof entry.destination === "string" ? safeLabel(entry.destination) : "";
       const remaining = Array.isArray(selectors) ? Math.max(0, selectors.length - 2) : 0;
       add(item, kind, label, editable && isObject(entry), 1, index, summary + (remaining ? ` +${remaining}` : ""));
       if (!isObject(entry)) return;
-      if (entry.target === "proxy" || entry.target === "direct" || entry.target === "block") edge(item, target(entry.target), `${item}/target`, entry.target);
-      if ("endpointKey" in entry) reference(item, entry.endpointKey, `${item}/endpointKey`, "endpoint");
-      if (typeof entry.interfaceName === "string") {
-        const target = `/interfaces/${encodeURIComponent(entry.interfaceName)}`;
-        if (!nodes.some((node) => node.id === target)) add(target, "interface", entry.interfaceName, false, 3);
-        edge(item, target, `${item}/interfaceName`, "interface");
+      const output = isObject(entry.target) ? entry.target : entry;
+      if (output.kind === "proxy" || output.kind === "direct" || output.kind === "block") edge(item, target(output.kind), `${item}/target`, output.kind);
+      if (output.kind === "node") reference(item, output.endpointKey, `${item}/target/endpointKey`, "endpoint");
+      if (output.kind === "interface" && typeof output.interfaceName === "string") {
+        const targetId = `/interfaces/${encodeURIComponent(output.interfaceName)}`;
+        if (!nodes.some((node) => node.id === targetId)) add(targetId, "interface", output.interfaceName, false, 3);
+        edge(item, targetId, `${item}/target/interfaceName`, "interface");
       }
     });
   };
+  const routingValue = document.profile.routing;
+  if (isObject(routingValue)) {
+    if (Array.isArray(routingValue.user)) routing(routingValue.user as JsonValue, "/profile/routing/user", "User rule");
+    if (Array.isArray(routingValue.base)) routing(routingValue.base as JsonValue, "/profile/routing/base", "Base rule");
+  }
   const settings: Record<string, true> = { name: true, interfaceName: true, autoConnect: true, privateLanDirect: true, xraySocksPort: true, xrayHttpPort: true, useSystemProxy: true, proxyBypass: true, xrayMode: true, xrayTunInterface: true, xrayTunIp: true, xrayTunMtu: true, waitForInterface: true, endpointBypasses: true, xrayDomainStrategy: true, xrayDomainMatcher: true, xrayDirectDomainStrategy: true, xraySplitDefault: true, xrayQuicReject: true, xraySockopts: true, xrayConnectionIdleSecs: true, xrayTunDnsServers: true, tunnelRole: true, tunnelNetworks: true, tunnelDnsDomains: true };
   for (const [key, value] of Object.entries(document.profile)) {
     const path = `/profile/${escape(key)}`;
-    if (value === null) continue;
-    if (key === "routing" && isObject(value) && Object.entries(value).every(([field, item]) => field === "rules" && Array.isArray(item) && item.length === 0)) continue;
+    if (value === null || key === "routing") continue;
     if (key === "mihomo" && isObject(value)) {
       add(path, "setting", "Mihomo", true, 0);
       if (typeof value.entryGroup === "string" && value.entryGroup) {
@@ -135,11 +146,7 @@ export function buildProfileGraph(document: ProfileDocument, endpoints: Subscrip
         if (isObject(pool) && Array.isArray(pool.filters)) pool.filters.forEach((filter, index) => add(`${path}/nodePool/filters/${index}`, "pool", "Pool filter", isObject(filter), 1, index));
       }
       for (const field of ["autoReturnPrimary", "refreshIntervalMinutes"]) if (value[field] != null) add(`${path}/${field}`, "setting", field, true, 0);
-    } else if (key === "domainPolicies") routing(value, path, "Domain policy");
-    else if (key === "pinnedPolicies") routing(value, path, "Pinned selector");
-    else if (key === "xrayTrafficRules") routing(value, path, "Traffic rule");
-    else if (key === "xrayInterfaceRoutes") routing(value, path, "Interface route", "interface");
-    else if (key === "routes") routing(value, path, "Policy route", "routing");
+    } else if (key === "routes") routing(value, path, "Policy route", "routing");
     else if (key === "xrayServiceChecks") routing(value, path, "Service check", "selector");
     else if (key === "xrayDns" && isObject(value)) {
       const configured = Object.entries(value).some(([field, item]) => {
@@ -207,12 +214,43 @@ function patch(document: ProfileDocument, path: string, value: JsonValue | undef
 }
 export function setDocumentValue(document: ProfileDocument, path: string, value: JsonValue): ProfileDocument { return patch(document, path, value); }
 export function removeDocumentValue(document: ProfileDocument, path: string): ProfileDocument { return patch(document, path, undefined); }
+export function moveRoutingRule(document: ProfileDocument, layer: "base" | "user", index: number, offset: number): ProfileDocument {
+  const routing = document.profile.routing;
+  if (!isObject(routing) || !Array.isArray(routing[layer])) return document;
+  const rows = [...routing[layer]];
+  const destination = index + offset;
+  if (index < 0 || index >= rows.length || destination < 0 || destination >= rows.length) return document;
+  [rows[index], rows[destination]] = [rows[destination], rows[index]];
+  return setDocumentValue(document, `/profile/routing/${layer}`, rows);
+}
+export function changeRoutingRuleLayer(document: ProfileDocument, layer: "base" | "user", index: number, destination: "base" | "user"): ProfileDocument {
+  const routing = document.profile.routing;
+  if (!isObject(routing) || !Array.isArray(routing[layer]) || layer === destination) return document;
+  const source = [...routing[layer]];
+  const [row] = source.splice(index, 1);
+  if (row === undefined) return document;
+  const targetRows = Array.isArray(routing[destination]) ? [...routing[destination]] : [];
+  targetRows.push(row);
+  let next = setDocumentValue(document, `/profile/routing/${destination}`, targetRows);
+  next = setDocumentValue(next, `/profile/routing/${layer}`, source);
+  return next;
+}
 export function connectDocumentNode(document: ProfileDocument, path: string, target: string): ProfileDocument {
   const keys = parts(path);
   const node = getAt(document, keys);
   const endpointKey = target.startsWith("node:") ? target.slice(5) : null;
   const unsupported = () => new Error("Unsupported connection target");
   if (endpointKey !== null && !endpointKey) throw new Error("Endpoint reference is missing");
+  if (/^\/profile\/routing\/(base|user)\/\d+$/.test(path) && isObject(node)) {
+    const output: Record<string, JsonValue> | null = target.startsWith("node:") ? { kind: "node", endpointKey: target.slice(5) }
+      : target.startsWith("interface:") ? {
+        ...(isObject(node.target) && node.target.kind === "interface" ? node.target : {}),
+        kind: "interface", interfaceName: target.slice(10),
+      }
+      : ["proxy", "direct", "block"].includes(target) ? { kind: target } : null;
+    if (!output) throw unsupported();
+    return setDocumentValue(document, `${path}/target`, output);
+  }
   if (path === "/profile/subscription/activeKey") {
     if (endpointKey === null) throw unsupported();
     return setDocumentValue(document, path, endpointKey);
@@ -221,13 +259,9 @@ export function connectDocumentNode(document: ProfileDocument, path: string, tar
     if (endpointKey === null) throw unsupported();
     return setDocumentValue(document, `${path}/key`, endpointKey);
   }
-  if (/^\/profile\/(?:pinnedPolicies|xrayServiceChecks)\/\d+$/.test(path) && isObject(node)) {
+  if (/^\/profile\/xrayServiceChecks\/\d+$/.test(path) && isObject(node)) {
     if (endpointKey === null) throw unsupported();
     return setDocumentValue(document, `${path}/endpointKey`, endpointKey);
-  }
-  if (/^\/profile\/(?:domainPolicies|xrayTrafficRules)\/\d+$/.test(path) && isObject(node)) {
-    if (!["proxy", "direct", "block"].includes(target)) throw unsupported();
-    return setDocumentValue(document, `${path}/target`, target);
   }
   if (path === "/profile/xrayDns" && isObject(node)) {
     if (endpointKey === null) throw unsupported();
@@ -245,11 +279,6 @@ export function connectDocumentNode(document: ProfileDocument, path: string, tar
     if (endpointKey !== null) return setDocumentValue(document, path, { ...rest, kind: "node", endpointKey } as JsonValue);
     if (target !== "proxy" && target !== "direct") throw unsupported();
     return setDocumentValue(document, path, { ...rest, kind: target === "proxy" ? "rules" : "direct" } as JsonValue);
-  }
-  if (target.startsWith("interface:") && /^\/profile\/xrayInterfaceRoutes\/\d+$/.test(path) && isObject(node)) {
-    const name = target.slice(10);
-    if (!name) throw new Error("Interface name is required");
-    return setDocumentValue(document, `${path}/interfaceName`, name);
   }
   throw unsupported();
 }

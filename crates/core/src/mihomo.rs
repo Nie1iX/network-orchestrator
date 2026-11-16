@@ -1,4 +1,4 @@
-use crate::models::{DomainRouteTarget, MihomoMode, MihomoProfileOptions, Profile};
+use crate::models::{MihomoMode, MihomoProfileOptions, Profile};
 use serde::Serialize;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -209,20 +209,31 @@ pub fn compile_config(source: &Value, profile: &Profile) -> io::Result<Value> {
         .map(str::to_owned)
         .or_else(|| options.entry_group.clone());
     let mut policy_rules = Vec::new();
-    for policy in &profile.domain_policies {
-        let target = match policy.target {
-            DomainRouteTarget::Direct => "DIRECT",
-            DomainRouteTarget::Block => "REJECT",
-            DomainRouteTarget::Proxy => default_target
+    for rule in profile.routing.iter() {
+        if rule.port.is_some() || rule.network.is_some() {
+            return Err(invalid(
+                "Mihomo profile routing does not support port or network conditions",
+            ));
+        }
+        let target = match &rule.target {
+            crate::models::RoutingTarget::Direct => "DIRECT",
+            crate::models::RoutingTarget::Block => "REJECT",
+            crate::models::RoutingTarget::Proxy => default_target
                 .as_deref()
                 .filter(|target| !RESERVED_PROXY_NAMES.contains(target))
                 .ok_or_else(|| {
                     invalid(
-                        "Proxy domain policy requires a native proxy target or Mihomo entry group",
+                        "Proxy routing rule requires a native proxy target or Mihomo entry group",
                     )
                 })?,
+            crate::models::RoutingTarget::Node { .. } => {
+                return Err(invalid("Mihomo does not support node routing targets"))
+            }
+            crate::models::RoutingTarget::Interface { .. } => {
+                return Err(invalid("Mihomo does not support interface routing targets"))
+            }
         };
-        for selector in &policy.domains {
+        for selector in &rule.selectors {
             if let Some(selector) = mihomo_selector(selector)? {
                 policy_rules.push(format!("{selector},{target}"));
             }
@@ -293,8 +304,7 @@ fn validate_profile_options(profile: &Profile) -> io::Result<()> {
             "The system proxy is supported only in Mihomo proxy mode",
         ));
     }
-    if !profile.pinned_policies.is_empty()
-        || !profile.xray_service_checks.is_empty()
+    if !profile.xray_service_checks.is_empty()
         || !profile.xray_proxy_exits.is_empty()
         || profile.xray_socks_port.is_some()
         || profile.xray_http_port.is_some()
@@ -309,8 +319,6 @@ fn validate_profile_options(profile: &Profile) -> io::Result<()> {
         || profile.xray_split_default
         || profile.xray_quic_reject
         || profile.xray_sockopts.is_some()
-        || !profile.xray_traffic_rules.is_empty()
-        || !profile.xray_interface_routes.is_empty()
         || profile.xray_connection_idle_secs.is_some()
         || profile.xray_tun_mtu.is_some()
         || !profile.xray_tun_dns_servers.is_empty()
@@ -1393,6 +1401,7 @@ fn group_info_inner<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::DomainRouteTarget;
     use serde_json::json;
 
     #[test]
@@ -1470,10 +1479,14 @@ mod tests {
         let mut config = source();
         config["rules"] = json!(["MATCH,DIRECT"]);
         let mut p = profile(MihomoMode::Tun, None, &[]);
-        p.domain_policies.push(crate::models::DomainPolicy {
-            domains: vec!["full:example.org".into()],
-            target: DomainRouteTarget::Proxy,
-        });
+        p.routing.user.push(
+            crate::models::DomainPolicy {
+                domains: vec!["full:example.org".into()],
+                target: DomainRouteTarget::Proxy,
+            }
+            .into(),
+        );
+
         assert!(compile_config(&config, &p).is_err());
         p.mihomo.as_mut().unwrap().entry_group = Some("Auto".into());
         let compiled = compile_config(&config, &p).unwrap();
@@ -1587,13 +1600,16 @@ mod tests {
     }
 
     #[test]
-    fn domain_policies_precede_native_routing_and_private_lan_directs() {
+    fn routing_rules_precede_native_routing_and_private_lan_directs() {
         let mut p = profile(MihomoMode::Tun, None, &[]);
         p.private_lan_direct = true;
-        p.domain_policies.push(crate::models::DomainPolicy {
-            domains: vec!["domain:example.org".into()],
-            target: DomainRouteTarget::Block,
-        });
+        p.routing.user.push(
+            crate::models::DomainPolicy {
+                domains: vec!["domain:example.org".into()],
+                target: DomainRouteTarget::Block,
+            }
+            .into(),
+        );
         let compiled = compile_config(&source(), &p).unwrap();
         assert_eq!(compiled["rules"][0], "DOMAIN-SUFFIX,example.org,REJECT");
         let rules = compiled["rules"].as_array().unwrap();
@@ -1634,14 +1650,17 @@ mod tests {
     #[test]
     fn profile_policies_accept_shared_ip_selectors_and_annotations() {
         let mut p = profile(MihomoMode::Tun, None, &[]);
-        p.domain_policies.push(crate::models::DomainPolicy {
-            domains: vec![
-                " # annotation".into(),
-                "10.24.0.0/16".into(),
-                "fc00::1".into(),
-            ],
-            target: DomainRouteTarget::Block,
-        });
+        p.routing.user.push(
+            crate::models::DomainPolicy {
+                domains: vec![
+                    " # annotation".into(),
+                    "10.24.0.0/16".into(),
+                    "fc00::1".into(),
+                ],
+                target: DomainRouteTarget::Block,
+            }
+            .into(),
+        );
         let compiled = compile_config(&source(), &p).unwrap();
         assert_eq!(compiled["rules"][0], "IP-CIDR,10.24.0.0/16,REJECT");
         assert_eq!(compiled["rules"][1], "IP-CIDR6,fc00::1/128,REJECT");

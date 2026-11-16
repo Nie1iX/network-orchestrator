@@ -1,20 +1,16 @@
-//! Routing rules of Xray profiles: which domains, geosite/geoip lists and
-//! addresses go direct, through the tunnel or nowhere. The rules live in the
-//! profile (`domainPolicies`), so the app and the daemon see what is saved
-//! here; a connected profile picks the change up when it reconnects.
+//! Ordered routing rules of Xray profiles.
 use super::args::{RouteCommand, RuleArgs};
 use super::commands::Output;
 use super::ctx::Ctx;
 use super::endpoints;
 use super::library::require_user;
+use net_manager_core::models::{DomainPolicy, DomainRouteTarget};
 use net_manager_core::models::{
-    DomainPolicy, DomainRouteTarget, PinnedRoute, Profile, TunnelBackend, TunnelState,
+    Profile, RoutingLayer, RoutingPolicy, RoutingRule, RoutingTarget, TunnelBackend, TunnelState,
 };
 use net_manager_core::route_check::{check_route, GeoDbs};
 #[cfg(not(target_os = "linux"))]
 use net_manager_core::route_check::{GeoIpDb, GeoSiteDb};
-#[cfg(not(target_os = "linux"))]
-use net_manager_core::subscription;
 use net_manager_core::xray::{self, ProfileRoutingOptions};
 use net_manager_engine::linux_engine::LinuxEngine;
 use serde_json::{json, Value};
@@ -28,7 +24,6 @@ const XRAY_VERSION: &str = "v26.10.31";
 #[cfg(not(target_os = "linux"))]
 const MAX_GEO_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Xray takes the first matching rule, so blocks win over proxy over direct.
 const LISTS: [(&str, DomainRouteTarget); 3] = [
     ("block", DomainRouteTarget::Block),
     ("proxy", DomainRouteTarget::Proxy),
@@ -61,6 +56,18 @@ pub fn run(ctx: &Ctx, command: RouteCommand) -> Result<Output, String> {
             via,
             selector,
         } => unpin(ctx, &profile, &via, &selector),
+        RouteCommand::Move {
+            profile,
+            layer,
+            from,
+            to,
+        } => move_rule(ctx, &profile, layer.into(), from, to),
+        RouteCommand::Layer {
+            profile,
+            index,
+            from,
+            to,
+        } => change_layer(ctx, &profile, index, from.into(), to.into()),
         RouteCommand::Quic { profile, enabled } => quic(ctx, &profile, enabled),
     }
 }
@@ -73,11 +80,20 @@ fn xray_profile(ctx: &Ctx, query: &str) -> Result<Profile, String> {
     Ok(profile)
 }
 
-fn selectors_of(policies: &[DomainPolicy], target: DomainRouteTarget) -> Vec<String> {
+fn target_of(target: DomainRouteTarget) -> RoutingTarget {
+    match target {
+        DomainRouteTarget::Block => RoutingTarget::Block,
+        DomainRouteTarget::Proxy => RoutingTarget::Proxy,
+        DomainRouteTarget::Direct => RoutingTarget::Direct,
+    }
+}
+
+#[cfg(test)]
+fn selectors_of(policies: &[RoutingRule], target: DomainRouteTarget) -> Vec<String> {
     policies
         .iter()
-        .filter(|policy| policy.target == target)
-        .flat_map(|policy| policy.domains.iter().cloned())
+        .filter(|row| row.target == target_of(target))
+        .flat_map(|row| row.selectors.iter().cloned())
         .collect()
 }
 
@@ -85,15 +101,9 @@ fn rules_json(profile: &Profile) -> Value {
     json!({
         "id": profile.id,
         "name": profile.name,
-        "block": selectors_of(&profile.domain_policies, DomainRouteTarget::Block),
-        "proxy": selectors_of(&profile.domain_policies, DomainRouteTarget::Proxy),
-        "direct": selectors_of(&profile.domain_policies, DomainRouteTarget::Direct),
+        "routing": profile.routing,
         "privateLanDirect": profile.private_lan_direct,
-        "quicReject": profile.xray_quic_reject,
-        "pinned": profile.pinned_policies.iter().map(|route| {
-            json!({"endpointKey": route.endpoint_key,
-                "missing": route.missing, "selectors": route.selectors})
-        }).collect::<Vec<_>>(),
+        "quicReject": profile.xray_quic_reject
     })
 }
 
@@ -103,48 +113,27 @@ fn rules_text(rules: &Value) -> String {
         rules["name"].as_str().unwrap_or_default(),
         rules["id"].as_str().unwrap_or_default()
     );
-    for (key, _) in LISTS {
-        let list: Vec<&str> = rules[key]
+    for layer in ["user", "base"] {
+        out.push_str(&format!("\n  {layer}:"));
+        for (index, row) in rules["routing"][layer]
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        out.push_str(&format!(
-            "\n  {key:<7}{}",
-            if list.is_empty() {
-                "-".to_string()
-            } else {
-                list.join(", ")
-            }
-        ));
+            .enumerate()
+        {
+            out.push_str(&format!(
+                "\n    {}. {} -> {}",
+                index + 1,
+                row["selectors"],
+                row["target"]
+            ));
+        }
     }
     out.push_str(&format!(
-        "\n  lan-direct  {}",
-        rules["privateLanDirect"].as_bool().unwrap_or(false)
-    ));
-    out.push_str(&format!(
-        "\n  quic-reject {}",
+        "\n  lan-direct  {}\n  quic-reject {}",
+        rules["privateLanDirect"].as_bool().unwrap_or(false),
         rules["quicReject"].as_bool().unwrap_or(false)
     ));
-    for pinned in rules["pinned"].as_array().into_iter().flatten() {
-        let selectors: Vec<&str> = pinned["selectors"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        out.push_str(&format!(
-            "\n  pinned {}  {}{}",
-            pinned["endpointKey"].as_str().unwrap_or_default(),
-            selectors.join(", "),
-            if pinned["missing"].as_bool().unwrap_or(false) {
-                "  (node gone from the subscription)"
-            } else {
-                ""
-            }
-        ));
-    }
     out
 }
 
@@ -204,23 +193,6 @@ fn hints(selectors: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// A selector already pinned to one node cannot join a routing rule: both
-/// decisions are first-match, and the pinned one is fail-closed.
-fn check_not_pinned(profile: &Profile, selectors: &[String]) -> Result<(), String> {
-    for selector in selectors {
-        if let Some(route) = profile
-            .pinned_policies
-            .iter()
-            .find(|route| route.selectors.contains(selector))
-        {
-            return Err(format!(
-                "{selector} is pinned to {}; unpin it first (`netorch route unpin`)",
-                route.endpoint_key
-            ));
-        }
-    }
-    Ok(())
-}
 /// The selectors of one list given on the command line, checked and unique.
 struct Wanted {
     target: DomainRouteTarget,
@@ -254,30 +226,28 @@ fn wanted(rules: &RuleArgs) -> Result<Vec<Wanted>, String> {
 
 fn save(
     ctx: &Ctx,
-    profile: Profile,
-    policies: Vec<DomainPolicy>,
+    profile: &Profile,
+    routing: RoutingPolicy,
+    private_lan_direct: bool,
     extra: Vec<String>,
 ) -> Result<Output, String> {
+    let revision = net_manager_core::profiles::profile_edit_revision(profile)
+        .map_err(|error| error.to_string())?;
     #[cfg(target_os = "linux")]
     let document = net_manager_engine::linux_profiles::ProfileService::new(
         ctx.root.clone(),
         ctx.engine.clone(),
     )
-    .set_routing(&profile.id, policies, profile.private_lan_direct)?;
+    .set_routing(&profile.id, routing, private_lan_direct, &revision)?;
     #[cfg(not(target_os = "linux"))]
-    let document = ctx
-        .store()
-        .update_profile(&profile.id, |stored| {
-            for policy in &policies {
-                check_not_pinned(stored, &policy.domains).map_err(std::io::Error::other)?;
-            }
-            stored.domain_policies = policies;
-            stored.private_lan_direct = profile.private_lan_direct;
-            Ok(())
-        })
-        .map_err(|_| {
-            "The rules could not be saved. Check the selectors and file permissions.".to_string()
-        })?;
+    let document = {
+        let mut candidate = profile.clone();
+        candidate.routing = routing;
+        candidate.private_lan_direct = private_lan_direct;
+        ctx.store()
+            .compare_upsert(candidate, Some(&revision))
+            .map_err(|error| error.to_string())?
+    };
     let saved = document
         .profiles
         .into_iter()
@@ -299,26 +269,27 @@ fn saved_output(profile: &Profile, extra: Vec<String>) -> Output {
     (rules, text)
 }
 
-/// Replaces every list, like the macOS command and the app's editor.
+/// Replace only the user layer.
 fn set(ctx: &Ctx, query: &str, rules: &RuleArgs, lan_direct: bool) -> Result<Output, String> {
     require_user(ctx)?;
-    let mut profile = xray_profile(ctx, query)?;
-    let mut policies = Vec::new();
+    let profile = xray_profile(ctx, query)?;
+    let mut routing = profile.routing.clone();
+    routing.user.clear();
     let mut notes = Vec::new();
     for Wanted {
-        target,
-        selectors: domains,
-        ..
+        target, selectors, ..
     } in wanted(rules)?
     {
-        check_not_pinned(&profile, &domains)?;
-        notes.extend(hints(&domains));
-        if !domains.is_empty() {
-            policies.push(DomainPolicy { domains, target });
+        notes.extend(hints(&selectors));
+        if !selectors.is_empty() {
+            routing.user.push(RoutingRule {
+                selectors,
+                target: target_of(target),
+                ..Default::default()
+            });
         }
     }
-    profile.private_lan_direct = lan_direct;
-    save(ctx, profile, policies, notes)
+    save(ctx, &profile, routing, lan_direct, notes)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -327,7 +298,7 @@ enum Edit {
     Remove,
 }
 
-/// Adds or removes single selectors and leaves the rest, in its order, alone.
+/// Adds or removes selectors in the user layer without regrouping existing rows.
 fn edit(ctx: &Ctx, query: &str, rules: &RuleArgs, how: Edit) -> Result<Output, String> {
     require_user(ctx)?;
     let profile = xray_profile(ctx, query)?;
@@ -335,35 +306,7 @@ fn edit(ctx: &Ctx, query: &str, rules: &RuleArgs, how: Edit) -> Result<Output, S
     if lists.iter().all(|list| list.selectors.is_empty()) {
         return Err("Name at least one selector with --block, --proxy or --direct".into());
     }
-    let mut notes = Vec::new();
-    let document = ctx
-        .store()
-        .update_profile(&profile.id, |stored| {
-            notes = edit_policies(stored, lists, how)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-            Ok(())
-        })
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::InvalidInput {
-                error.to_string()
-            } else {
-                "The rules could not be saved. Check the selectors and file permissions.".into()
-            }
-        })?;
-    let saved = document
-        .profiles
-        .into_iter()
-        .find(|stored| stored.id == profile.id)
-        .ok_or("Profile not found")?;
-    Ok(saved_output(&saved, notes))
-}
-
-fn edit_policies(
-    profile: &mut Profile,
-    lists: Vec<Wanted>,
-    how: Edit,
-) -> Result<Vec<String>, String> {
-    let mut policies = std::mem::take(&mut profile.domain_policies);
+    let mut routing = profile.routing.clone();
     let mut notes = Vec::new();
     for Wanted {
         target,
@@ -371,45 +314,99 @@ fn edit_policies(
         selectors,
     } in lists
     {
+        let target = target_of(target);
         for selector in selectors {
-            let holder = LISTS.iter().find(|(_, other)| {
-                *other != target && selectors_of(&policies, *other).contains(&selector)
-            });
-            let present = selectors_of(&policies, target).contains(&selector);
             match how {
                 Edit::Add => {
-                    check_not_pinned(profile, std::slice::from_ref(&selector))?;
-                    if let Some((other, _)) = holder {
-                        return Err(format!(
-                            "{selector} is already in the {other} list; remove it there first"
-                        ));
-                    }
-                    if present {
+                    if routing.user.iter().any(|row| {
+                        row.target == target
+                            && row.port.is_none()
+                            && row.network.is_none()
+                            && row.selectors.contains(&selector)
+                    }) {
                         continue;
                     }
                     notes.extend(hints(std::slice::from_ref(&selector)));
-                    match policies.iter_mut().find(|policy| policy.target == target) {
-                        Some(policy) => policy.domains.push(selector),
-                        None => policies.push(DomainPolicy {
-                            domains: vec![selector],
-                            target,
-                        }),
-                    }
+                    routing.user.push(RoutingRule {
+                        selectors: vec![selector],
+                        target: target.clone(),
+                        ..Default::default()
+                    });
                 }
                 Edit::Remove => {
-                    if !present {
+                    let mut found = false;
+                    for row in routing.user.iter_mut().filter(|row| row.target == target) {
+                        let before = row.selectors.len();
+                        row.selectors.retain(|s| s != &selector);
+                        found |= before != row.selectors.len();
+                    }
+                    if !found {
                         return Err(format!("{selector} is not in the {name} list"));
                     }
-                    for policy in policies.iter_mut().filter(|policy| policy.target == target) {
-                        policy.domains.retain(|domain| *domain != selector);
-                    }
+                    routing.user.retain(|row| !row.selectors.is_empty());
                 }
             }
         }
     }
-    policies.retain(|policy| !policy.domains.is_empty());
-    profile.domain_policies = policies;
-    Ok(notes)
+    save(ctx, &profile, routing, profile.private_lan_direct, notes)
+}
+
+fn row_index(index: usize, len: usize) -> Result<usize, String> {
+    if index == 0 || index > len {
+        Err("Row index is out of range".into())
+    } else {
+        Ok(index - 1)
+    }
+}
+
+fn move_rule(
+    ctx: &Ctx,
+    query: &str,
+    layer: RoutingLayer,
+    from: usize,
+    to: usize,
+) -> Result<Output, String> {
+    require_user(ctx)?;
+    let profile = xray_profile(ctx, query)?;
+    let mut routing = profile.routing.clone();
+    let rows = routing.layer_mut(layer);
+    let from = row_index(from, rows.len())?;
+    let to = row_index(to, rows.len())?;
+    let row = rows.remove(from);
+    rows.insert(to, row);
+    save(
+        ctx,
+        &profile,
+        routing,
+        profile.private_lan_direct,
+        Vec::new(),
+    )
+}
+
+fn change_layer(
+    ctx: &Ctx,
+    query: &str,
+    index: usize,
+    from: RoutingLayer,
+    to: RoutingLayer,
+) -> Result<Output, String> {
+    require_user(ctx)?;
+    if from == to {
+        return Err("Choose different layers".into());
+    }
+    let profile = xray_profile(ctx, query)?;
+    let mut routing = profile.routing.clone();
+    let rows = routing.layer_mut(from);
+    let index = row_index(index, rows.len())?;
+    let row = rows.remove(index);
+    routing.layer_mut(to).push(row);
+    save(
+        ctx,
+        &profile,
+        routing,
+        profile.private_lan_direct,
+        Vec::new(),
+    )
 }
 
 /// The node a pin targets: a server of the subscription (number, name part)
@@ -427,43 +424,6 @@ fn pin_key(ctx: &Ctx, profile: &Profile, via: &str) -> Result<(String, String), 
         .map(|row| row.name.clone())
         .unwrap_or_else(|| key.clone());
     Ok((key, name))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn save_pins(ctx: &Ctx, profile: &Profile, routes: Vec<PinnedRoute>) -> Result<(), String> {
-    let candidate = if profile
-        .xray_service_checks
-        .iter()
-        .any(|check| check.background)
-    {
-        let mut candidate = profile.clone();
-        candidate.pinned_policies = routes.clone();
-        net_manager_core::profiles::validate_profile(&candidate)
-            .map_err(|_| "The pinned-route configuration is invalid".to_string())?;
-        super::checks::sync_background(ctx, &candidate, &candidate.xray_service_checks)?;
-        Some(candidate)
-    } else {
-        None
-    };
-    let saved = subscription::set_pinned_routes(&ctx.vault(), &ctx.store(), &profile.id, routes);
-    if saved.is_err() {
-        if let Some(candidate) = candidate {
-            super::checks::sync_background(ctx, &candidate, &[])?;
-        }
-    }
-    saved
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::InvalidInput => error.to_string(),
-            _ => "The pinned rules could not be saved. Check file permissions.".into(),
-        })
-        .map(|_| ())
-}
-
-#[cfg(target_os = "linux")]
-fn save_pins(ctx: &Ctx, profile: &Profile, routes: Vec<PinnedRoute>) -> Result<(), String> {
-    net_manager_engine::linux_profiles::ProfileService::new(ctx.root.clone(), ctx.engine.clone())
-        .set_pinned_routes(&profile.id, routes)
-        .map(|_| ())
 }
 
 /// Whether the tunnel is up: changes are stored either way, the notice tells
@@ -497,53 +457,33 @@ fn pin(ctx: &Ctx, query: &str, via: &str, selectors: &[String]) -> Result<Output
     let mut checked = Vec::new();
     for selector in selectors {
         let selector = valid_selector(selector)?;
-        if is_address(&selector) || selector.starts_with("geoip:") {
-            return Err(format!(
-                "Pinned rules take domain selectors only ({selector}); send addresses \
-                 through --proxy/--direct/--block instead"
-            ));
-        }
         if !checked.contains(&selector) {
             checked.push(selector);
         }
     }
-    let mut routes = profile.pinned_policies.clone();
+    let mut routing = profile.routing.clone();
     for selector in &checked {
-        if let Some(other) = routes
-            .iter()
-            .find(|route| route.endpoint_key != key && route.selectors.contains(selector))
-        {
-            return Err(format!(
-                "{selector} is pinned to {}; remove it there first (`netorch route unpin`)",
-                other.endpoint_key
-            ));
+        if !routing.user.iter().any(|row| {
+            row.target.endpoint_key() == Some(key.as_str()) && row.selectors.contains(selector)
+        }) {
+            routing.user.push(RoutingRule {
+                selectors: vec![selector.clone()],
+                target: RoutingTarget::Node {
+                    endpoint_key: key.clone(),
+                    missing: false,
+                },
+                ..Default::default()
+            });
         }
-        if profile
-            .domain_policies
-            .iter()
-            .any(|policy| policy.domains.contains(selector))
-        {
-            return Err(format!(
-                "{selector} is already a routing rule; remove it there first (`netorch route rm`)"
-            ));
-        }
-    }
-    match routes.iter_mut().find(|route| route.endpoint_key == key) {
-        Some(route) => {
-            for selector in &checked {
-                if !route.selectors.contains(selector) {
-                    route.selectors.push(selector.clone());
-                }
-            }
-        }
-        None => routes.push(PinnedRoute {
-            selectors: checked.clone(),
-            endpoint_key: key,
-            missing: false,
-        }),
     }
     let running = running(ctx, &profile);
-    save_pins(ctx, &profile, routes)?;
+    save(
+        ctx,
+        &profile,
+        routing,
+        profile.private_lan_direct,
+        Vec::new(),
+    )?;
     Ok((
         json!({"id": profile.id, "server": name, "selectors": checked,
             "requiresReconnect": running}),
@@ -562,30 +502,43 @@ fn unpin(ctx: &Ctx, query: &str, via: &str, selectors: &[String]) -> Result<Outp
     require_user(ctx)?;
     let profile = xray_profile(ctx, query)?;
     let (key, name) = pin_key(ctx, &profile, via)?;
-    let mut routes = profile.pinned_policies.clone();
-    let Some(position) = routes.iter().position(|route| route.endpoint_key == key) else {
+    let mut routing = profile.routing.clone();
+    if !routing
+        .user
+        .iter()
+        .any(|row| row.target.endpoint_key() == Some(key.as_str()))
+    {
         return Err(format!("Nothing is pinned to {name}"));
-    };
-    if selectors.is_empty() {
-        routes.remove(position);
-    } else {
-        let mut removed = Vec::new();
-        for selector in selectors {
-            let selector = selector.trim();
-            if !routes[position].selectors.iter().any(|s| s == selector) {
-                return Err(format!("{selector} is not pinned to {name}"));
-            }
-            removed.push(selector.to_string());
-        }
-        routes[position]
-            .selectors
-            .retain(|selector| !removed.contains(selector));
-        if routes[position].selectors.is_empty() {
-            routes.remove(position);
+    }
+    for selector in selectors {
+        if !routing.user.iter().any(|row| {
+            row.target.endpoint_key() == Some(key.as_str())
+                && row.selectors.iter().any(|s| s == selector.trim())
+        }) {
+            return Err(format!("{selector} is not pinned to {name}"));
         }
     }
+    for row in routing
+        .user
+        .iter_mut()
+        .filter(|row| row.target.endpoint_key() == Some(key.as_str()))
+    {
+        if selectors.is_empty() {
+            row.selectors.clear();
+        } else {
+            row.selectors
+                .retain(|s| !selectors.iter().any(|selected| selected.trim() == s));
+        }
+    }
+    routing.user.retain(|row| !row.selectors.is_empty());
     let running = running(ctx, &profile);
-    save_pins(ctx, &profile, routes)?;
+    save(
+        ctx,
+        &profile,
+        routing,
+        profile.private_lan_direct,
+        Vec::new(),
+    )?;
     Ok((
         json!({"id": profile.id, "server": name, "requiresReconnect": running}),
         format!(
@@ -682,26 +635,9 @@ fn check(ctx: &Ctx, target: &str, query: &str, geo_dir: &Path) -> Result<Output,
         geo_ip: geo_ip.as_ref(),
     };
     let options = ProfileRoutingOptions::from(&profile);
-    let result = check_route(&profile.domain_policies, &options, target, &geo)
-        .map_err(|error| error.to_string())?;
-    let mut value =
-        serde_json::to_value(&result).map_err(|_| "The route check failed".to_string())?;
-    if let Some(route) = profile
-        .pinned_policies
-        .iter()
-        .find(|route| Some(route.endpoint_key.as_str()) == result.endpoint_key.as_deref())
-    {
-        value
-            .as_object_mut()
-            .expect("route result")
-            .remove("policyIndex");
-        value["source"] = json!("pinned");
-        value["outbound"] = if route.missing {
-            json!("block")
-        } else {
-            json!(net_manager_core::xray::pin_tag(&route.endpoint_key))
-        };
-    }
+    let result =
+        check_route(&profile.routing, &options, target, &geo).map_err(|error| error.to_string())?;
+    let value = serde_json::to_value(&result).map_err(|_| "The route check failed".to_string())?;
     let text = describe_check(&value);
     Ok((value, text))
 }
@@ -752,7 +688,10 @@ mod tests {
                 xray_socks_port: Some(10808),
                 xray_http_port: Some(10809),
                 config_path: "x1.json".into(),
-                domain_policies: policies,
+                routing: RoutingPolicy {
+                    user: policies.into_iter().map(Into::into).collect(),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .unwrap();
@@ -778,35 +717,24 @@ mod tests {
 
     fn direct_of(ctx: &Ctx) -> Vec<String> {
         selectors_of(
-            &ctx.find("x1").unwrap().domain_policies,
+            &ctx.find("x1").unwrap().routing.user,
             DomainRouteTarget::Direct,
         )
     }
 
     #[test]
-    fn concurrent_selector_additions_preserve_every_edit() {
+    fn stale_routing_edit_is_rejected() {
         let (_dir, ctx) = setup(Vec::new());
-        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
-        std::thread::scope(|scope| {
-            for worker in 0..8 {
-                let ctx = &ctx;
-                let start = start.clone();
-                scope.spawn(move || {
-                    start.wait();
-                    for step in 0..8 {
-                        let selector = format!("domain:host-{worker}-{step}.test");
-                        edit(ctx, "x1", &rules(&[], &[], &[&selector]), Edit::Add).unwrap();
-                    }
-                });
-            }
-        });
-        let mut actual = direct_of(&ctx);
-        let mut expected: Vec<_> = (0..8)
-            .flat_map(|worker| (0..8).map(move |step| format!("domain:host-{worker}-{step}.test")))
-            .collect();
-        actual.sort();
-        expected.sort();
-        assert_eq!(actual, expected);
+        let snapshot = ctx.find("x1").unwrap();
+        edit(
+            &ctx,
+            "x1",
+            &rules(&[], &[], &["domain:new.test"]),
+            Edit::Add,
+        )
+        .unwrap();
+        assert!(save(&ctx, &snapshot, snapshot.routing.clone(), false, vec![]).is_err());
+        assert_eq!(direct_of(&ctx), vec!["domain:new.test"]);
     }
 
     #[test]
@@ -817,9 +745,12 @@ mod tests {
         )]);
         let (value, text) = show(&ctx, None).unwrap();
         assert_eq!(value.as_array().unwrap().len(), 1);
-        assert_eq!(value[0]["direct"], json!(["domain:a.test", "10.0.0.0/8"]));
-        assert!(text.contains("direct") && text.contains("domain:a.test, 10.0.0.0/8"));
-        assert!(text.contains("block  -"));
+        assert_eq!(
+            value[0]["routing"]["user"][0]["selectors"],
+            json!(["domain:a.test", "10.0.0.0/8"])
+        );
+        assert!(text.contains("direct") && text.contains("domain:a.test"));
+        assert!(text.contains("base:"));
         assert!(show(&ctx, Some("static1")).is_err());
     }
 
@@ -836,11 +767,14 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(value["direct"], json!([]));
-        assert_eq!(value["block"], json!(["geosite:category-ads"]));
+        assert_eq!(
+            value["routing"]["user"][0]["selectors"],
+            json!(["geosite:category-ads"])
+        );
+        assert_eq!(value["routing"]["user"].as_array().unwrap().len(), 2);
         assert_eq!(value["privateLanDirect"], true);
         let saved = ctx.find("x1").unwrap();
-        assert_eq!(saved.domain_policies.len(), 2);
+        assert_eq!(saved.routing.user.len(), 2);
         assert!(saved.private_lan_direct);
     }
 
@@ -858,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn add_appends_in_place_skips_duplicates_and_refuses_the_other_list() {
+    fn add_appends_without_reordering_and_allows_explicit_conflicts() {
         let (_dir, ctx) = setup(vec![
             policy(DomainRouteTarget::Direct, &["domain:a.test"]),
             policy(DomainRouteTarget::Proxy, &["domain:p.test"]),
@@ -869,9 +803,12 @@ mod tests {
             vec!["domain:a.test".to_string(), "178.72.138.220".into()]
         );
         let saved = ctx.find("x1").unwrap();
-        assert_eq!(saved.domain_policies[1].target, DomainRouteTarget::Proxy);
-        let error = edit(&ctx, "x1", &rules(&[], &[], &["domain:p.test"]), Edit::Add).unwrap_err();
-        assert!(error.contains("already in the proxy list"), "{error}");
+        assert_eq!(saved.routing.user[1].target, RoutingTarget::Proxy);
+        edit(&ctx, "x1", &rules(&[], &[], &["domain:p.test"]), Edit::Add).unwrap();
+        assert_eq!(
+            ctx.find("x1").unwrap().routing.user.last().unwrap().target,
+            RoutingTarget::Direct
+        );
     }
 
     fn add_direct(ctx: &Ctx, selectors: &[&str]) {
@@ -899,7 +836,7 @@ mod tests {
             Edit::Remove,
         )
         .unwrap();
-        assert!(ctx.find("x1").unwrap().domain_policies.is_empty());
+        assert!(ctx.find("x1").unwrap().routing.user.is_empty());
         let error = edit(
             &ctx,
             "x1",
@@ -952,20 +889,26 @@ mod tests {
             &["domain:github.com"],
         )]);
         let mut profile = ctx.find("x1").unwrap();
-        profile.pinned_policies.push(PinnedRoute {
+        profile.routing.user.push(RoutingRule {
             selectors: vec!["domain:com".into()],
-            endpoint_key: "aabb001122334455".into(),
-            missing: true,
+            target: RoutingTarget::Node {
+                endpoint_key: "aabb001122334455".into(),
+                missing: true,
+            },
+            ..Default::default()
         });
         ctx.store().upsert(profile).unwrap();
         let nowhere = Path::new("/nonexistent/geo");
         let (github, _) = check(&ctx, "api.github.com", "x1", nowhere).unwrap();
         assert_eq!(github["outbound"], "direct");
-        assert_eq!(github["policyPath"], "/profile/domainPolicies/0");
+        assert_eq!(github["layer"], "user");
         assert!(github.get("endpointKey").is_none());
         let (other, _) = check(&ctx, "other.com", "x1", nowhere).unwrap();
         assert_eq!(other["outbound"], "block");
         assert_eq!(other["endpointKey"], "aabb001122334455");
+        assert_eq!(other["layer"], "user");
+        assert_eq!(other["ruleIndex"], 1);
+        assert_eq!(other["policyPath"], "/profile/routing/user/1");
     }
 
     #[test]
@@ -981,6 +924,9 @@ mod tests {
         let (value, _) = check(&ctx, "178.72.138.220", "x1", nowhere).unwrap();
         assert_eq!(value["outbound"], "direct");
         let (value, _) = check(&ctx, "example.com", "x1", nowhere).unwrap();
-        assert_eq!(value["outbound"], "proxy");
+        assert_eq!(value["outbound"], "unknown");
+        assert_eq!(value["layer"], "user");
+        assert_eq!(value["ruleIndex"], 0);
+        assert_eq!(value["policyPath"], "/profile/routing/user/0");
     }
 }

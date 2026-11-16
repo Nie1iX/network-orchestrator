@@ -125,6 +125,7 @@ pub fn inject(config: &mut Value, exits: &[ProxyExitBinding], mark: u32) -> io::
                         tag == "api-in"
                             || tag.starts_with("probe-")
                             || tag.starts_with("pin-probe-")
+                            || tag == crate::xray::FAILOVER_DEFAULT_INBOUND
                             || tag.starts_with("src-")
                     })
             })

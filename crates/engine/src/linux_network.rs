@@ -130,7 +130,7 @@ pub fn parse_happ_routing(input: &str) -> Result<HappRoutingImport, String> {
 pub struct RouteCheckRequest {
     pub target: String,
     #[serde(default)]
-    pub domain_policies: Vec<DomainPolicy>,
+    pub routing: RoutingPolicy,
     #[serde(default)]
     pub private_lan_direct: bool,
     #[serde(default)]
@@ -222,7 +222,7 @@ pub fn test_route(root: &Path, request: RouteCheckRequest) -> Result<RouteCheckR
         dns: request.dns,
         ..ProfileRoutingOptions::default()
     };
-    check_route(&request.domain_policies, &options, &request.target, &geo)
+    check_route(&request.routing, &options, &request.target, &geo)
         .map_err(|_| "Invalid route-check request".into())
 }
 
@@ -242,7 +242,7 @@ pub fn explain_profile_route(
         geo_ip: geo_ip.as_ref(),
     };
     check_route(
-        &profile.domain_policies,
+        &profile.routing,
         &ProfileRoutingOptions::from(profile),
         target,
         &geo,

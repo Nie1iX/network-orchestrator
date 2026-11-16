@@ -190,6 +190,61 @@ pub struct WireGuardFields {
     pub persistent_keepalive: Option<u16>,
 }
 
+/// Ordered source layers: user decisions always precede imported defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoutingPolicy {
+    #[serde(default)]
+    pub base: Vec<RoutingRule>,
+    #[serde(default)]
+    pub user: Vec<RoutingRule>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RoutingLayer {
+    Base,
+    #[default]
+    User,
+}
+
+/// Selectors are ORed; optional transport conditions are ANDed with them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoutingRule {
+    pub selectors: Vec<String>,
+    pub target: RoutingTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RoutingTarget {
+    #[default]
+    Proxy,
+    Direct,
+    Block,
+    Node {
+        endpoint_key: String,
+        #[serde(default)]
+        missing: bool,
+    },
+    Interface {
+        interface_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        domain_strategy: Option<String>,
+    },
+}
+
+/// Import DTO; persisted profile rules use [`RoutingPolicy`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DomainPolicy {
@@ -197,12 +252,8 @@ pub struct DomainPolicy {
     pub target: DomainRouteTarget,
 }
 
-/// A domain-selector route pinned to a specific subscription endpoint.
-///
-/// Explicit `domain:`/`full:` profile policies take precedence. Otherwise pins
-/// are fail-closed: matching traffic may leave only through the named node.
-/// When the endpoint disappears, the rule is kept (`missing` is recomputed at
-/// connect/list time) and its selectors are dropped instead of retargeted.
+/// Import DTO for a fixed subscription endpoint. Persisted node rules use
+/// [`RoutingTarget::Node`]; absence never changes the selected destination.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PinnedRoute {
@@ -668,13 +719,8 @@ pub struct Profile {
     pub interface_name: String,
     pub routes: Vec<PolicyRoute>,
     pub auto_connect: bool,
-    #[serde(default)]
-    pub domain_policies: Vec<DomainPolicy>,
-    /// Domain selectors pinned to specific subscription endpoints, unless an
-    /// explicit domain policy overrides them. Otherwise fail-closed: the named
-    /// node is used or matching traffic is dropped.
-    #[serde(default)]
-    pub pinned_policies: Vec<PinnedRoute>,
+    #[serde(flatten, with = "crate::routing_policy::profile_serde")]
+    pub routing: RoutingPolicy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub xray_service_checks: Vec<ServiceCheck>,
     /// Named `netorch proxy` exits: extra loopback listener pairs the daemon
@@ -737,10 +783,6 @@ pub struct Profile {
     pub xray_quic_reject: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xray_sockopts: Option<XraySockopts>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub xray_traffic_rules: Vec<XrayTrafficRule>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub xray_interface_routes: Vec<XrayInterfaceRoute>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xray_connection_idle_secs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -835,7 +877,7 @@ impl Default for Profile {
             interface_name: String::new(),
             routes: Vec::new(),
             auto_connect: false,
-            domain_policies: Vec::new(),
+            routing: RoutingPolicy::default(),
             private_lan_direct: false,
             xray_socks_port: None,
             xray_http_port: None,
@@ -853,8 +895,6 @@ impl Default for Profile {
             xray_split_default: false,
             xray_quic_reject: false,
             xray_sockopts: None,
-            xray_traffic_rules: Vec::new(),
-            xray_interface_routes: Vec::new(),
             xray_connection_idle_secs: None,
             xray_tun_mtu: None,
             xray_tun_dns_servers: Vec::new(),
@@ -864,7 +904,6 @@ impl Default for Profile {
             tunnel_role: TunnelRole::Primary,
             tunnel_dns_domains: Vec::new(),
             tunnel_networks: Vec::new(),
-            pinned_policies: Vec::new(),
             xray_service_checks: Vec::new(),
             xray_proxy_exits: Vec::new(),
         }

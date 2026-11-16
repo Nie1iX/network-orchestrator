@@ -1,4 +1,4 @@
-use super::{object, rejected, string, valid_node_key};
+use super::{object, rejected, string, valid_node_key, POLICY_DNS_RELAY_TAG, POLICY_DNS_TAG};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -226,6 +226,12 @@ pub(super) fn validate(config: &Value) -> io::Result<()> {
         .iter()
         .map(|v| Ok((string(&v["tag"])?, v)))
         .collect::<io::Result<_>>()?;
+    let relay = outbounds.contains_key(POLICY_DNS_RELAY_TAG);
+    if config["dns"]["tag"] == POLICY_DNS_RELAY_TAG
+        || (config["dns"]["tag"] == POLICY_DNS_TAG) != relay
+    {
+        return Err(rejected());
+    }
     let mut entries = HashMap::new();
     for (tag, outbound) in &outbounds {
         if tag.starts_with("src-") && scoped(tag, "-o-").is_none() {
@@ -240,6 +246,9 @@ pub(super) fn validate(config: &Value) -> io::Result<()> {
             return Err(rejected());
         }
         if outbound["protocol"] == "loopback" {
+            if *tag == POLICY_DNS_RELAY_TAG {
+                continue;
+            }
             let inbound = string(&outbound["settings"]["inboundTag"])?;
             let scope = if let Some(scope) = scoped(tag, "-o-") {
                 let index = tag.rsplit_once("-o-").ok_or_else(rejected)?.1;
@@ -269,6 +278,23 @@ pub(super) fn validate(config: &Value) -> io::Result<()> {
     let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
     for (tag, outbound) in &outbounds {
         let scope = scoped(tag, "-o-");
+        if relay
+            && outbound["protocol"] == "dns"
+            && (outbound
+                .pointer("/streamSettings/sockopt/dialerProxy")
+                .and_then(Value::as_str)
+                != Some(POLICY_DNS_RELAY_TAG)
+                || outbound.get("proxySettings").is_some())
+        {
+            return Err(rejected());
+        }
+        if outbound
+            .pointer("/proxySettings/tag")
+            .and_then(Value::as_str)
+            == Some(POLICY_DNS_RELAY_TAG)
+        {
+            return Err(rejected());
+        }
         for value in [
             outbound.pointer("/streamSettings/sockopt/dialerProxy"),
             outbound.pointer("/proxySettings/tag"),
@@ -277,6 +303,9 @@ pub(super) fn validate(config: &Value) -> io::Result<()> {
         .flatten()
         {
             let target = string(value)?;
+            if target == POLICY_DNS_RELAY_TAG && outbound["protocol"] != "dns" {
+                return Err(rejected());
+            }
             if !outbounds.contains_key(target)
                 || (scope.is_some() && scoped(target, "-o-") != scope)
                 || (scope.is_none() && target.starts_with("src-"))
@@ -340,11 +369,62 @@ pub(super) fn validate(config: &Value) -> io::Result<()> {
     let rules = config["routing"]["rules"].as_array().ok_or_else(rejected)?;
     let mut dispatched = HashSet::new();
     let mut seen_other = false;
+    let mut dns_dispatched = false;
     for rule in rules {
         let inbound =
             rule["inboundTag"]
                 .as_array()
                 .and_then(|v| if v.len() == 1 { v[0].as_str() } else { None });
+        let mentions_dns = rule["inboundTag"].as_array().is_some_and(|tags| {
+            tags.iter()
+                .any(|tag| tag == POLICY_DNS_TAG || tag == POLICY_DNS_RELAY_TAG)
+        });
+        if rule["outboundTag"] == POLICY_DNS_RELAY_TAG {
+            return Err(rejected());
+        }
+        if mentions_dns {
+            let map = object(rule, &["type", "inboundTag", "outboundTag", "balancerTag"])?;
+            if !relay
+                || seen_other
+                || dns_dispatched
+                || inbound != Some(POLICY_DNS_TAG)
+                || map.get("type").is_some_and(|v| v != "field")
+            {
+                return Err(rejected());
+            }
+            let target = if let Some(target) = map.get("outboundTag") {
+                if map.contains_key("balancerTag") {
+                    return Err(rejected());
+                }
+                let target = string(target)?;
+                if target.starts_with("src-")
+                    || !outbounds
+                        .get(target)
+                        .is_some_and(|v| match v["protocol"].as_str() {
+                            Some("vless" | "hysteria") => true,
+                            Some("loopback" | "blackhole") => {
+                                target == "proxy"
+                                    || target.starts_with("node-")
+                                    || target.starts_with("pin-")
+                            }
+                            _ => false,
+                        })
+                {
+                    return Err(rejected());
+                }
+                target
+            } else {
+                let target = string(map.get("balancerTag").ok_or_else(rejected)?)?;
+                if target != "failover" || !balancers.contains_key(target) {
+                    return Err(rejected());
+                }
+                target
+            };
+            edges.entry(POLICY_DNS_RELAY_TAG).or_default().push(target);
+            dns_dispatched = true;
+            seen_other = true;
+            continue;
+        }
         if let Some((inbound, (scope, entry))) =
             inbound.and_then(|tag| entries.get(tag).map(|entry| (tag, *entry)))
         {
@@ -400,6 +480,9 @@ pub(super) fn validate(config: &Value) -> io::Result<()> {
         }
     }
     if entries.len() != dispatched.len() {
+        return Err(rejected());
+    }
+    if relay && !dns_dispatched {
         return Err(rejected());
     }
     let mut visited = HashSet::new();

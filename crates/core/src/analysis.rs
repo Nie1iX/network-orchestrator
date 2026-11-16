@@ -144,10 +144,10 @@ fn analyze_with_xray_snapshot(
             })
             .collect();
     }
-    for policy in &profile.domain_policies {
+    for rule in profile.routing.iter() {
         analysis
             .domain_patterns
-            .extend(policy.domains.iter().cloned());
+            .extend(rule.selectors.iter().cloned());
     }
     dedup(&mut analysis.os_routes);
     dedup(&mut analysis.internal_routes);
@@ -1227,10 +1227,13 @@ mod tests {
         )
         .unwrap();
         let mut p = profile(TunnelBackend::Xray, &cfg);
-        p.domain_policies.push(DomainPolicy {
-            domains: vec!["full:api.example.com".into()],
-            target: DomainRouteTarget::Proxy,
-        });
+        p.routing.user.push(
+            DomainPolicy {
+                domains: vec!["full:api.example.com".into()],
+                target: DomainRouteTarget::Proxy,
+            }
+            .into(),
+        );
         let result = analyze_profile(&p).unwrap();
 
         assert_eq!(result.listeners.len(), 1);

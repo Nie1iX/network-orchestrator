@@ -172,7 +172,10 @@ impl ProfileService {
         }
         if profile.backend != TunnelBackend::Mihomo
             || profile.subscription.is_some()
-            || !profile.pinned_policies.is_empty()
+            || profile
+                .routing
+                .iter()
+                .any(|rule| rule.target.endpoint_key().is_some())
             || !profile.xray_service_checks.is_empty()
             || !profile.xray_proxy_exits.is_empty()
         {

@@ -18,6 +18,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   output rewiring and a shared JSON draft. DNS stays separate from packet routing.
 - Explain Xray draft decisions offline, including unresolved earlier conditions;
   probe the current DNS/kernel/HTTPS path only on an explicit user action.
+- Store routing as ordered User/Base layers, with explicit row ordering and layer
+  transfer in the GUI/CLI. Manual GeoIP/GeoSite rules remain User on refresh.
 
 ### Changed
 
@@ -25,9 +27,17 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   running connection untouched; reconnecting the saved revision remains explicit.
 - Applied mode uses observed kernel routes and service status, not predicted
   routes presented as live traffic. Unavailable running rules remain unknown.
+- Migrate legacy profiles to schema 2 on their next atomic save; imported policy
+  replaces Base without discarding User overrides.
+- Derive IPOnDemand for IP selectors and block indeterminate higher-priority User
+  IP decisions instead of falling through to direct. Protect controlled DNS
+  forwarding through the configured proxy/node, including legacy rewrite rules.
 
 ### Fixed
 
+- Let `IPIfNonMatch` resolve names and evaluate GeoIP before default failover.
+  A loopback default replaces the unconditional catch-all while preserving
+  explicit domain/pin rules and the unhealthy-node blackhole.
 - Use in-app DOM menus on Linux to avoid a Tauri native-menu resource-lock
   deadlock when overlapping popup/create requests block the GTK event loop.
   Keep context menus compact and inside the viewport before their first paint.

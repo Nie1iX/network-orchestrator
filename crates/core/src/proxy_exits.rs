@@ -135,9 +135,9 @@ pub fn validate_profile_proxy_exits(profile: &Profile) -> io::Result<()> {
         ));
     }
     let mut distinct: HashSet<&str> = profile
-        .pinned_policies
+        .routing
         .iter()
-        .map(|route| route.endpoint_key.as_str())
+        .filter_map(|rule| rule.target.endpoint_key())
         .collect();
     if let Some(key) = &profile.xray_dns.outbound_key {
         distinct.insert(key.as_str());

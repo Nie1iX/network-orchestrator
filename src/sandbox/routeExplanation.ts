@@ -11,7 +11,17 @@ function ipBytes(text: string): number[] | null {
     if (halves.length > 2) return null;
     const left = halves[0] ? halves[0].split(":") : [];
     const right = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
-    const words = [...left, ...Array(8 - left.length - right.length).fill("0"), ...right];
+    const tail = halves.length === 2 ? right : left;
+    const last = tail[tail.length - 1];
+    if (last?.includes(".")) {
+      const bytes = ipBytes(last);
+      if (!bytes || bytes.length !== 4) return null;
+      tail.pop();
+      tail.push(((bytes[0] << 8) | bytes[1]).toString(16), ((bytes[2] << 8) | bytes[3]).toString(16));
+    }
+    const missing = 8 - left.length - right.length;
+    if (missing < 0 || (halves.length === 1 ? missing !== 0 : missing === 0)) return null;
+    const words = [...left, ...Array(missing).fill("0"), ...right];
     if (words.length !== 8 || words.some((word) => !/^[0-9a-f]{1,4}$/i.test(word))) return null;
     return words.flatMap((word) => { const value = Number.parseInt(word, 16); return [value >> 8, value & 255]; });
   }
@@ -36,14 +46,16 @@ function ipMatch(selector: string, target: string): Match {
   return "match";
 }
 
-function selectorMatch(selector: string, target: string, resolveIp: boolean): Match {
+function selectorMatch(selector: string, target: string): Match {
   const index = selector.indexOf(":");
-  const value = (index < 0 ? selector : selector.slice(index + 1)).toLowerCase().replace(/\.$/, "");
-  const kind = index < 0 ? (ipBytes(value.split("/")[0]) ? "ip" : "domain") : selector.slice(0, index);
+  const literalIp = ipBytes(selector.split("/")[0]) !== null;
+  const kind = literalIp ? "ip" : index < 0 ? "keyword" : selector.slice(0, index);
+  const value = (literalIp || index < 0 ? selector : selector.slice(index + 1)).toLowerCase().replace(/\.$/, "");
   const host = target.toLowerCase().replace(/\.$/, "");
   const targetIp = ipBytes(host) !== null;
-  if (kind === "ip") return targetIp ? ipMatch(value, host) : resolveIp ? "unknown" : "miss";
-  if (kind === "geoip") return targetIp ? "unknown" : resolveIp ? "unknown" : "miss";
+  // IP selectors derive IPOnDemand, independently of the saved preference.
+  if (kind === "ip") return targetIp ? ipMatch(value, host) : "unknown";
+  if (kind === "geoip") return "unknown";
   if (kind === "geosite" || kind === "regexp") return targetIp ? "miss" : "unknown";
   if (targetIp) return "miss";
   if (kind === "full") return host === value ? "match" : "miss";
@@ -54,19 +66,57 @@ function selectorMatch(selector: string, target: string, resolveIp: boolean): Ma
 
 
 function parseTarget(value: string): { host: string; port?: number } {
-  const bracketed = value.match(/^\[([^\]]+)\](?::(\d+))?$/);
-  if (bracketed) return { host: bracketed[1], ...(bracketed[2] ? { port: Number(bracketed[2]) } : {}) };
-  const ordinary = value.match(/^([^:]+)(?::(\d+))?$/);
-  return ordinary ? { host: ordinary[1], ...(ordinary[2] ? { port: Number(ordinary[2]) } : {}) } : { host: value };
+  const input = value.trim();
+  const scheme = input.indexOf("://");
+  const authority = (scheme < 0 ? input : input.slice(scheme + 3)).split(/[/?#]/, 1)[0].split("@").pop()!.trim();
+  let host = authority;
+  let portText: string | undefined;
+  if (authority.startsWith("[")) {
+    const end = authority.indexOf("]");
+    if (end < 0) throw new Error("Route check target has a malformed bracket");
+    host = authority.slice(1, end);
+    const tail = authority.slice(end + 1);
+    if (tail.startsWith(":")) portText = tail.slice(1).trim();
+    else if (tail) throw new Error("Route check target has a malformed bracket");
+  } else if (authority.split(":").length === 2) {
+    const separator = authority.indexOf(":");
+    host = authority.slice(0, separator).trim();
+    portText = authority.slice(separator + 1).trim();
+  }
+  host = host.toLowerCase().replace(/\.+$/, "");
+  if (!host || (!ipBytes(host) && (host.length > 253 || !/^[a-z0-9._*-]+$/.test(host)))) {
+    throw new Error("Route check target has an invalid host");
+  }
+  if (portText !== undefined && (!/^\+?\d+$/.test(portText) || Number(portText) > 65535)) {
+    throw new Error("Route check target has an invalid port");
+  }
+  return { host, ...(portText === undefined ? {} : { port: Number(portText) }) };
 }
 export function explainProfileDocument(document: ProfileDocument, target: string): RouteCheckResult {
   const parsedTarget = parseTarget(target);
   const host = parsedTarget.host;
   const profile = document.profile;
-  const strategy = profile.xrayDomainStrategy;
-  const resolveIp = strategy === "ipIfNonMatch" || strategy === "ipOnDemand";
+  const routing = record(profile.routing);
+  if (profile.routing !== undefined && !routing) throw new Error("Invalid routing policy");
+  const layers = ["user", "base"] as const;
+  const rulesFor = (layer: typeof layers[number]): unknown[] => {
+    const rules = routing?.[layer];
+    if (rules === undefined) return [];
+    if (!Array.isArray(rules)) throw new Error("Invalid routing layer");
+    return rules;
+  };
+  const protectsDns = layers.some((layer) => rulesFor(layer).some((value) => {
+    const rule = record(value);
+    const output = record(rule?.target);
+    const selectors = Array.isArray(rule?.selectors) ? rule.selectors : [];
+    const effective = selectors.some((selector) => typeof selector === "string" && selector.trim() && !selector.trim().startsWith("#"));
+    return effective && (output?.kind === "node" || layer === "user" && (
+      output?.kind === "proxy" || selectors.some((selector) => typeof selector === "string" && (
+        selector.trim().startsWith("geoip:") || ipBytes(selector.trim().split("/")[0]) !== null
+      ))
+    ));
+  }));
   const steps: RouteCheckResult["steps"] = [];
-  let unknownBefore = false;
   const targetKind = ipBytes(host) ? "ip" : "domain";
   const result = (
     outbound: RouteCheckResult["outbound"],
@@ -76,11 +126,7 @@ export function explainProfileDocument(document: ProfileDocument, target: string
   ): RouteCheckResult => ({
     target: host,
     ...(parsedTarget.port === undefined ? {} : { port: parsedTarget.port }),
-    targetKind,
-    outbound,
-    source,
-    certainty,
-    steps,
+    targetKind, outbound, source, certainty, steps,
     notes: certainty === "probable"
       ? ["An earlier selector could not be evaluated; no route is claimed as certain."]
       : [],
@@ -88,30 +134,11 @@ export function explainProfileDocument(document: ProfileDocument, target: string
   });
   if (profile.backend !== "xray") throw new Error("Offline route explanation is unavailable for this profile backend");
 
-  const pins = Array.isArray(profile.pinnedPolicies) ? profile.pinnedPolicies : [];
-
-  const trafficRules = Array.isArray(profile.xrayTrafficRules) ? profile.xrayTrafficRules : [];
-  for (const ruleValue of trafficRules) {
-    const rule = record(ruleValue);
-    if (typeof rule?.port !== "number" || (parsedTarget.port !== undefined && parsedTarget.port !== rule.port)) continue;
-    const selectors = Array.isArray(rule?.ips) ? rule.ips.filter((item): item is string => typeof item === "string") : [];
-    let candidate = false;
-    for (const selector of selectors) {
-      const match = selectorMatch(selector, host, resolveIp);
-      if (match !== "miss") candidate = true;
-    }
-    if (candidate) {
-      unknownBefore = true;
-      steps.push({ label: "traffic rule (transport unavailable)", outcome: "unknown" });
-    }
-  }
-
   const dns = record(profile.xrayDns);
-  const dnsActive = !!dns && (
+  const dnsActive = protectsDns || !!dns && (
     (Array.isArray(dns.servers) && dns.servers.length > 0) ||
     (record(dns.hosts) !== null && Object.keys(record(dns.hosts) ?? {}).length > 0) ||
-    dns.fakeDns === true ||
-    typeof dns.queryStrategy === "string" ||
+    dns.fakeDns === true || typeof dns.queryStrategy === "string" ||
     typeof dns.enableParallelQuery === "boolean" ||
     (typeof dns.outboundKey === "string" && dns.outboundKey.length > 0) ||
     (record(dns.outbound) !== null && Object.keys(record(dns.outbound) ?? {}).length > 0)
@@ -119,126 +146,81 @@ export function explainProfileDocument(document: ProfileDocument, target: string
   if (dnsActive) {
     const hit = parsedTarget.port === 53;
     steps.push({ label: "dns capture (port 53)", selector: "port:53", outcome: hit ? "match" : "miss" });
-    if (hit) return result("dns", "dnsCapture", unknownBefore ? "probable" : "certain");
+    if (hit) return result("dns", "dnsCapture", "certain");
   }
-  const policies = Array.isArray(profile.domainPolicies) ? profile.domainPolicies : [];
-  if (pins.length > 0) {
-    for (let index = 0; index < policies.length; index++) {
-      const policy = record(policies[index]);
-      const selectors = Array.isArray(policy?.domains) ? policy.domains.filter((item): item is string =>
-        typeof item === "string" && /^(domain|full):/.test(item.trim()),
-      ) : [];
+
+  for (const layer of layers) {
+    const rules = rulesFor(layer);
+    for (let index = 0; index < rules.length; index++) {
+      const rule = record(rules[index]);
+      if (!rule) throw new Error("Invalid routing rule");
+      const label = `${layer} rule #${index + 1}`;
+      if (typeof rule.port === "number" && parsedTarget.port !== undefined && parsedTarget.port !== rule.port) {
+        steps.push({ label, outcome: "miss" });
+        continue;
+      }
+      const selectors = Array.isArray(rule.selectors)
+        ? rule.selectors.filter((item): item is string => typeof item === "string") : [];
+      let matched: string | undefined;
+      let unknown: string | undefined;
       for (const selector of selectors) {
-        const match = selectorMatch(selector.trim(), host, resolveIp);
-        if (match !== "match") continue;
-        steps.push({ label: `policy #${index + 1}`, selector, outcome: "match" });
-        return result(policy?.target === "direct" ? "direct" : policy?.target === "block" ? "block" : "proxy", "policy", unknownBefore ? "probable" : "certain", {
-          policyIndex: index,
-          matchedSelector: selector,
-          policyPath: `/profile/domainPolicies/${index}`,
-        });
+        const value = selector.trim();
+        if (!value || value.startsWith("#")) continue;
+        const match = selectorMatch(value, host);
+        if (match === "unknown") unknown ??= selector;
+        if (match === "match") { matched = selector; break; }
       }
-    }
-  }
-  for (let index = 0; index < pins.length; index++) {
-    const pin = record(pins[index]);
-    const selectors = Array.isArray(pin?.selectors) ? pin.selectors.filter((item): item is string => typeof item === "string") : [];
-    let unknown = false;
-    for (const selector of selectors) {
-      if (!selector.trim() || selector.trim().startsWith("#")) continue;
-      const match = selectorMatch(selector.trim(), host, resolveIp);
-      if (match === "match") {
-        steps.push({ label: `pinned route #${index + 1}`, selector, outcome: "match" });
-        if (unknownBefore) return result("proxy", "default", "probable");
-        return result("proxy", "policy", "certain", {
-          policyPath: `/profile/pinnedPolicies/${index}`,
-          ...(typeof pin?.endpointKey === "string" ? { endpointKey: pin.endpointKey } : {}),
-          matchedSelector: selector,
-        });
+      const selector = matched ?? unknown;
+      if (selector === undefined) {
+        steps.push({ label, outcome: "miss" });
+        continue;
       }
-      if (match === "unknown") unknown = true;
-    }
-    unknownBefore ||= unknown;
-    steps.push({ label: `pinned route #${index + 1}`, outcome: unknown ? "unknown" : "miss" });
-  }
-
-  const interfaces = Array.isArray(profile.xrayInterfaceRoutes) ? profile.xrayInterfaceRoutes : [];
-  for (let index = 0; index < interfaces.length; index++) {
-    const route = record(interfaces[index]);
-    const selectors = Array.isArray(route?.selectors) ? route.selectors.filter((item): item is string => typeof item === "string") : [];
-    const routeStrategy = route?.domainStrategy;
-    const routeResolveIp = routeStrategy === "ipIfNonMatch" || routeStrategy === "ipOnDemand" || (routeStrategy == null && resolveIp);
-    let unknown = false;
-    for (const selector of selectors) {
-      const match = selectorMatch(selector, host, routeResolveIp);
-      if (match === "match") {
-        steps.push({ label: `interface route #${index + 1}`, selector, outcome: "match" });
-        return result("direct", "policy", unknownBefore ? "probable" : "certain", {
-          policyPath: `/profile/xrayInterfaceRoutes/${index}`,
-          ...(typeof route?.interfaceName === "string" ? { interfaceName: route.interfaceName } : {}),
-          matchedSelector: selector,
-        });
+      const location = { layer, ruleIndex: index, matchedSelector: selector, policyPath: `/profile/routing/${layer}/${index}` };
+      const conditionsUnknown = typeof rule.network === "string" || typeof rule.port === "number" && parsedTarget.port === undefined;
+      if (matched === undefined || conditionsUnknown) {
+        steps.push({ label, selector, outcome: "unknown" });
+        return result("unknown", "policy", "probable", location);
       }
-      if (match === "unknown") unknown = true;
-    }
-    unknownBefore ||= unknown;
-    steps.push({ label: `interface route #${index + 1}`, outcome: unknown ? "unknown" : "miss" });
-  }
-
-  for (let index = 0; index < policies.length; index++) {
-    const policy = record(policies[index]);
-    const selectors = Array.isArray(policy?.domains) ? policy.domains.filter((item): item is string => typeof item === "string") : [];
-    let unknown = false;
-    for (const selector of selectors) {
-      if (!selector.trim() || selector.trim().startsWith("#")) continue;
-      const match = selectorMatch(selector.trim(), host, resolveIp);
-      if (match === "match") {
-        steps.push({ label: `policy #${index + 1}`, selector, outcome: "match" });
-        return result(policy?.target === "direct" ? "direct" : policy?.target === "block" ? "block" : "proxy", "policy", unknownBefore ? "probable" : "certain", {
-          policyIndex: index,
-          matchedSelector: selector,
-          policyPath: `/profile/domainPolicies/${index}`,
-        });
+      const routeTarget = record(rule.target);
+      const kind = routeTarget?.kind;
+      if (typeof kind !== "string" || !["proxy", "direct", "block", "node", "interface"].includes(kind)) {
+        throw new Error("Unsupported routing target");
       }
-      if (match === "unknown") unknown = true;
-    }
-    unknownBefore ||= unknown;
-    steps.push({ label: `policy #${index + 1}`, outcome: unknown ? "unknown" : "miss" });
-  }
-
-  const dnsServers = Array.isArray(dns?.servers) ? dns.servers : [];
-  for (let index = 0; index < dnsServers.length; index++) {
-    const server = record(dnsServers[index]);
-    if (server?.route !== "proxy" && server?.route !== "direct") continue;
-    const address = typeof server.address === "string" ? server.address.trim() : "";
-    if (!address || /^(localhost|fakedns)(?::|$)/i.test(address)) continue;
-    const authority = (address.includes("://") ? address.slice(address.indexOf("://") + 3) : address)
-      .split(/[/?#]/, 1)[0]!
-      .split("@").pop()!;
-    const resolver = authority.startsWith("[")
-      ? authority.slice(1, authority.indexOf("]"))
-      : authority.replace(/:\d+$/, "");
-    if (!resolver) continue;
-    const resolverIp = ipBytes(resolver) !== null;
-    const match = resolverIp
-      ? selectorMatch(`ip:${resolver}`, host, resolveIp)
-      : selectorMatch(`domain:${resolver}`, host, resolveIp);
-    if (match === "match") {
-      steps.push({ label: `resolver pin #${index + 1}`, selector: resolver, outcome: "match" });
-      return result(server.route, "resolverPin", unknownBefore ? "probable" : "certain", {
-        policyPath: `/profile/xrayDns/servers/${index}`,
-        matchedSelector: resolver,
+      steps.push({ label, selector, outcome: "match" });
+      const missingNode = kind === "node" && routeTarget?.missing === true;
+      const outbound = missingNode || kind === "block" ? "block" : kind === "direct" || kind === "interface" ? "direct" : "proxy";
+      return result(outbound, "policy", "certain", {
+        ...location,
+        ...(kind === "node" && typeof routeTarget?.endpointKey === "string"
+          ? { endpointKey: routeTarget.endpointKey } : {}),
+        ...(kind === "interface" && typeof routeTarget?.interfaceName === "string"
+          ? { interfaceName: routeTarget.interfaceName } : {}),
       });
     }
-    if (match === "unknown") unknownBefore = true;
-    steps.push({ label: `resolver pin #${index + 1}`, selector: resolver, outcome: match });
   }
-  const rulesEmitted = policies.length > 0 || interfaces.length > 0 || trafficRules.length > 0 || dnsActive || profile.privateLanDirect === true;
-  if (rulesEmitted) {
+  if (!protectsDns && Array.isArray(dns?.servers)) {
+    for (let index = 0; index < dns.servers.length; index++) {
+      const server = record(dns.servers[index]);
+      if (!server || (server.route !== "proxy" && server.route !== "direct") || typeof server.address !== "string") continue;
+      if (["localhost", "fakedns"].includes(server.address)) continue;
+      const address = parseTarget(server.address).host;
+      const literalIp = ipBytes(address) !== null;
+      const resolveIp = profile.xrayDomainStrategy === "ipIfNonMatch" || profile.xrayDomainStrategy === "ipOnDemand";
+      const match = literalIp
+        ? targetKind === "ip" ? ipMatch(address, host) : resolveIp ? "unknown" : "miss"
+        : selectorMatch(`domain:${address}`, host);
+      steps.push({ label: `resolver pin #${index + 1}`, selector: address, outcome: match });
+      if (match !== "miss") return result(match === "unknown" ? "unknown" : server.route, "resolverPin", match === "unknown" ? "probable" : "certain", {
+        matchedSelector: address, policyPath: `/profile/xrayDns/servers/${index}`,
+      });
+    }
+  }
+  const hasRouting = layers.some((layer) => Array.isArray(routing?.[layer]) && (routing[layer] as unknown[]).length > 0);
+  if (hasRouting || dnsActive || profile.privateLanDirect === true) {
     const multicast = ["224.0.0.0/4", "ff00::/8"];
     if (multicast.some((network) => ipMatch(network, host) === "match")) {
       steps.push({ label: "multicast", selector: multicast.join(", "), outcome: "match" });
-      return result("block", "multicast", unknownBefore ? "probable" : "certain", { matchedSelector: "multicast" });
+      return result("block", "multicast", "certain", { matchedSelector: "multicast" });
     }
     steps.push({ label: "multicast", selector: multicast.join(", "), outcome: "miss" });
   }
@@ -246,13 +228,11 @@ export function explainProfileDocument(document: ProfileDocument, target: string
     const privateNetworks = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "fc00::/7", "fe80::/10", "::1/128"];
     if (privateNetworks.some((network) => ipMatch(network, host) === "match")) {
       steps.push({ label: "private LAN", selector: "private ranges", outcome: "match" });
-      return result("direct", "privateLan", unknownBefore ? "probable" : "certain", { matchedSelector: "privateLanDirect" });
+      return result("direct", "privateLan", "certain", { matchedSelector: "privateLanDirect" });
     }
     steps.push({ label: "private LAN", selector: "private ranges", outcome: "miss" });
   }
-
-  const unknown = unknownBefore;
-  steps.push({ label: "default", outcome: unknown ? "unknown" : "match" });
-  return result("proxy", "default", unknown ? "probable" : "certain");
+  steps.push({ label: "default", outcome: "match" });
+  return result("proxy", "default", "certain");
 }
 

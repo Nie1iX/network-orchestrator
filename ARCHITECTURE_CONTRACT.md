@@ -114,6 +114,37 @@ autostart or broader privileges to hide session lifetime limitations.
   mid-operation does not leave untracked changes. An ambiguous mutation response
   MUST NOT be treated as proof that no resources were created.
 
+## Ordered Xray policy
+
+- Profiles persist one `routing` object with ordered `user` and `base` arrays.
+  Service dispatch (DNS, probes, API and provider-internal graph controls) stays
+  separate. Ordinary traffic evaluates User, then Base, then connection default;
+  the first matching row wins. Changing an output never moves the row.
+- Native/provider policy imports replace Base only. Manual additions, including
+  GeoIP/GeoSite selectors, start in User; changing source/layer is explicit.
+  Subscription refresh preserves User content/order and resolves node references
+  in both layers. An unavailable explicit node remains fail-closed.
+- Profile-store schema 2 writes only canonical routing. Schema 1 loads with a
+  one-way migration: legacy geo selectors become Base, other selectors User,
+  preserving each layer's legacy effective order. This heuristic never applies
+  to new manual rules. Mixed legacy/canonical fields are rejected. Reads do not
+  rewrite the store; the next protected atomic mutation writes schema 2.
+- IP selectors derive effective `IPOnDemand`, independently of the saved strategy
+  preference. An indeterminate applicable User IP check cannot fall through to a
+  later Base/direct choice. Port/protocol conditions still distinguish a known
+  miss from required missing evidence.
+- Explicit node pins in either layer, User proxy choices, and User IP checks
+  protect app-controlled DNS via the selected DNS node or default proxy.
+  Forwarding uses a dedicated service relay, not physical forwarding; local
+  resolver modes that bypass that relay
+  are rejected. There is no silent DNS/direct fallback or implicit host-wide
+  kill switch. Control endpoint bootstrap and uncaptured external traffic are
+  outside this guarantee.
+- Full routing saves compare the revision of the displayed snapshot under the
+  profile-store lock; an editor must not refresh only the token before saving an
+  older policy. Offline explanations report layer, canonical row path and
+  uncertainty, not observed traffic.
+
 ## Acceptance scenarios
 
 1. Given CLI-only installation, connect a supported profile, exit CLI, then query

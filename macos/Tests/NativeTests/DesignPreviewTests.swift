@@ -33,10 +33,14 @@ import Testing
     [
       "id": "design-xray", "name": "Personal proxy", "backend": "xray", "interfaceName": "",
       "routes": [], "xraySocksPort": 10808, "xrayHttpPort": 10809,
-      "domainPolicies": [
-        ["domains": ["geosite:category-ads-all"], "target": "block"],
-        ["domains": ["domain:youtube.com", "geosite:google", "# video"], "target": "proxy"],
-        ["domains": ["geoip:ru", "domain:example.ru"], "target": "direct"],
+      "routing": [
+        "base": [
+          ["selectors": ["geosite:category-ads-all"], "target": ["kind": "block"]],
+          ["selectors": ["geoip:ru", "domain:example.ru"], "target": ["kind": "direct"]],
+        ],
+        "user": [
+          ["selectors": ["domain:youtube.com", "geosite:google", "# video"], "target": ["kind": "proxy"]],
+        ],
       ],
       "privateLanDirect": true,
       "subscription": [

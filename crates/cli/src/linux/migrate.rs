@@ -229,8 +229,14 @@ fn apply(ctx: &Ctx, query: &str, path: &Path) -> Result<Output, String> {
                     .iter()
                     .map(|endpoint| endpoint.id.clone())
                     .collect::<std::collections::HashSet<_>>();
-                for pin in &mut current.pinned_policies {
-                    pin.missing = !live.contains(&pin.endpoint_key);
+                for rule in current.routing.iter_mut() {
+                    if let RoutingTarget::Node {
+                        endpoint_key,
+                        missing,
+                    } = &mut rule.target
+                    {
+                        *missing = !live.contains(endpoint_key);
+                    }
                 }
             }
             Ok(())

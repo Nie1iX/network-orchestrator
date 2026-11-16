@@ -271,18 +271,54 @@ fn subscriptions_refetch_hwid_record_failures_redact_and_validate_probes() {
     assert!(!s.subscription_import_log().contains("Private Panel"));
 }
 #[test]
+fn routing_rejects_stale_profile_revision_without_overwriting_newer_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = service(dir.path());
+    share(&s, "p");
+    let revision =
+        net_manager_core::profiles::profile_edit_revision(&s.profile("p").unwrap()).unwrap();
+    let newer = RoutingPolicy {
+        user: vec![DomainPolicy {
+            domains: vec!["domain:newer.test".into()],
+            target: DomainRouteTarget::Direct,
+        }
+        .into()],
+        ..Default::default()
+    };
+    s.set_profile_routing(
+        "p",
+        &revision,
+        ProfileRoutingUpdate {
+            routing: newer.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let error = s
+        .set_profile_routing("p", &revision, ProfileRoutingUpdate::default())
+        .unwrap_err();
+    assert_eq!(error, net_manager_core::profiles::PROFILE_EDIT_CONFLICT);
+    assert_eq!(s.profile("p").unwrap().routing, newer);
+}
+
+#[test]
 fn routing_preserves_omitted_options_and_replays_actual_policy() {
     let dir = tempfile::tempdir().unwrap();
     let s = service(dir.path());
     share(&s, "p");
-    let policies = vec![DomainPolicy {
-        domains: vec!["domain:blocked.test".into()],
-        target: DomainRouteTarget::Block,
-    }];
+    let policies = RoutingPolicy {
+        user: vec![DomainPolicy {
+            domains: vec!["domain:blocked.test".into()],
+            target: DomainRouteTarget::Block,
+        }
+        .into()],
+        ..Default::default()
+    };
     s.set_profile_routing(
         "p",
+        &s.profile_routing("p").unwrap().edit_revision,
         ProfileRoutingUpdate {
-            policies: policies.clone(),
+            routing: policies.clone(),
             private_lan_direct: true,
             advanced: Some(AdvancedRouting {
                 domain_strategy: Some(XrayDomainStrategy::AsIs),
@@ -298,8 +334,9 @@ fn routing_preserves_omitted_options_and_replays_actual_policy() {
     .unwrap();
     s.set_profile_routing(
         "p",
+        &s.profile_routing("p").unwrap().edit_revision,
         ProfileRoutingUpdate {
-            policies,
+            routing: policies,
             private_lan_direct: false,
             ..Default::default()
         },
@@ -316,6 +353,7 @@ fn routing_preserves_omitted_options_and_replays_actual_policy() {
     assert!(s
         .set_profile_routing(
             "p",
+            &routing.edit_revision,
             ProfileRoutingUpdate {
                 geo_urls: Some(GeoUrls {
                     geoip_url: Some("http://bad.test/secret".into()),
@@ -505,8 +543,16 @@ fn happ_import_merges_only_fields_present_in_the_export() {
     share(&s, "p");
     s.set_profile_routing(
         "p",
+        &s.profile_routing("p").unwrap().edit_revision,
         ProfileRoutingUpdate {
-            policies: vec![],
+            routing: RoutingPolicy {
+                user: vec![DomainPolicy {
+                    domains: vec!["domain:override.test".into()],
+                    target: DomainRouteTarget::Direct,
+                }
+                .into()],
+                ..Default::default()
+            },
             private_lan_direct: true,
             advanced: Some(AdvancedRouting {
                 domain_strategy: Some(XrayDomainStrategy::AsIs),
@@ -526,6 +572,9 @@ fn happ_import_merges_only_fields_present_in_the_export() {
     )
     .unwrap();
     let routing = s.profile_routing("p").unwrap();
+    assert_eq!(routing.routing.user.len(), 1);
+    assert_eq!(routing.routing.user[0].selectors, ["domain:override.test"]);
+    assert_eq!(routing.routing.base.len(), 1);
     assert!(routing.private_lan_direct);
     assert_eq!(routing.domain_matcher, Some(XrayDomainMatcher::Hybrid));
     assert_eq!(

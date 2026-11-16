@@ -1051,8 +1051,25 @@ export default function ProfileManager({ onOpenScheme }: { onOpenScheme: (id: st
     saveFailover(profile, "set_subscription_backups", { backupKeys: keys });
   const onSetAutoReturn = (profile: Profile, enabled: boolean) =>
     saveFailover(profile, "set_subscription_auto_return", { enabled });
-  const onSetPinnedRoutes = (profile: Profile, routes: Profile["pinnedPolicies"]) =>
-    saveFailover(profile, "set_pinned_routes", { routes });
+  const onSetPinnedRoutes = async (profile: Profile, routing: Profile["routing"]) => {
+    setFailoverBusy(profile.id);
+    try {
+      const snapshot = await invoke<{ revision: string; document: { profile: { routing: Profile["routing"]; privateLanDirect: boolean } } }>(
+        "get_profile_document", { id: profile.id },
+      );
+      if (JSON.stringify(snapshot.document.profile.routing) !== JSON.stringify(profile.routing)
+        || snapshot.document.profile.privateLanDirect !== profile.privateLanDirect) {
+        throw new Error(t("Routing changed elsewhere. Refresh the connection before editing."));
+      }
+      await saveFailover(profile, "set_routing_policy", {
+        routing, privateLanDirect: profile.privateLanDirect, expectedRevision: snapshot.revision,
+      });
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setFailoverBusy(null);
+    }
+  };
 
   const onRefreshSubscription = async (profile: Profile) => {
     setRefreshingSubscription(profile.id);

@@ -212,7 +212,11 @@ fn dispatch(root: &Path, method: &str, args: &Value) -> Result<Value, String> {
         })?),
         "import_log" => encode(service.subscription_import_log()),
         "set_routing_rules" => profile_array(&service, || {
-            service.set_profile_routing(text_arg(args, "id")?, routing::draft(args)?)
+            service.set_profile_routing(
+                text_arg(args, "id")?,
+                text_arg(args, "expectedRevision")?,
+                routing::draft(args)?,
+            )
         }),
         "import_happ_routing" => profile_array(&service, || {
             service.import_happ_routing(text_arg(args, "id")?, text_arg(args, "payload")?)

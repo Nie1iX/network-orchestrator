@@ -4,19 +4,17 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import Modal from "./Modal";
 import {
   AnalyzedRoute,
-  DomainPolicy,
-  DomainRouteTarget,
   HappRoutingImport,
   NetworkInterface,
   MihomoGroupInfo,
   MihomoProfileOptions,
-  PinnedRoute,
-  PolicyRoute,
-  Profile,
-  ProfileInspection,
   RouteCheckOutbound,
   RouteCheckResult,
   RouteCheckSource,
+  PolicyRoute,
+  Profile,
+  ProfileInspection,
+  RoutingPolicy,
   TunnelBackend,
   WireGuardFields,
   XrayDnsConfig,
@@ -25,44 +23,11 @@ import {
   XrayMode,
 } from "../types";
 import { usePlatformCapabilities } from "../platform";
-import { ChevronIcon } from "../icons";
 import { t, useT, type TranslationKey } from "../i18n";
 import { BACKEND_LABEL_KEYS } from "../i18n/labels";
+import { ChevronIcon } from "../icons";
 
-const BACKEND_EXTENSIONS: Record<TunnelBackend, string[]> = {
-  none: [],
-  wireGuard: ["conf", "dpapi"],
-  openVpn: ["ovpn", "conf"],
-  xray: ["json"],
-  mihomo: ["yaml", "yml", "json"],
-};
-
-const PROXY_BYPASS_PLACEHOLDER = "10.*, *.corp.local";
-
-const RULE_SETS = [
-  {
-    id: "proxy",
-    field: "rulesProxy",
-    titleKey: "rules.proxy",
-    placeholder: "geosite:youtube\ndomain:example.com",
-  },
-  {
-    id: "direct",
-    field: "rulesDirect",
-    titleKey: "rules.direct",
-    placeholder: "geosite:private\n# my services\n10.0.0.0/8",
-  },
-  {
-    id: "block",
-    field: "rulesBlock",
-    titleKey: "rules.block",
-    placeholder: "geosite:category-ads\ndomain:tracker.io",
-  },
-] as const;
-
-type RulesSetId = (typeof RULE_SETS)[number]["id"];
-
-const ROUTE_CHECK_OUTBOUND_KEYS: Record<RouteCheckOutbound, TranslationKey> = {
+const ROUTE_CHECK_OUTBOUND_KEYS: Record<Exclude<RouteCheckOutbound, "unknown">, TranslationKey> = {
   proxy: "rules.proxy",
   direct: "rules.direct",
   block: "rules.block",
@@ -77,13 +42,16 @@ const ROUTE_CHECK_SOURCE_KEYS: Record<RouteCheckSource, TranslationKey> = {
   privateLan: "rules.srcPrivateLan",
   default: "rules.srcDefault",
 };
+const BACKEND_EXTENSIONS: Record<TunnelBackend, string[]> = {
+  none: [],
+  wireGuard: ["conf", "dpapi"],
+  openVpn: ["ovpn", "conf"],
+  xray: ["json"],
+  mihomo: ["yaml", "yml", "json"],
+};
 
-/** Selector lines only — blank lines and # comments don't count. */
-function countRuleLines(text: string): number {
-  return text
-    .split("\n")
-    .filter((l) => l.trim() !== "" && !l.trim().startsWith("#")).length;
-}
+const PROXY_BYPASS_PLACEHOLDER = "10.*, *.corp.local";
+
 
 const EMPTY_WG_FIELDS: WireGuardFields = {
   privateKey: "",
@@ -135,10 +103,7 @@ export interface ProfileFormState {
   wgFields: WireGuardFields;
   xraySocksPort: number | null;
   xrayHttpPort: number | null;
-  /** One selector per line per target; `#` lines are comments. */
-  rulesProxy: string;
-  rulesDirect: string;
-  rulesBlock: string;
+  routing: RoutingPolicy;
   privateLanDirect: boolean;
   useSystemProxy: boolean;
   proxyBypass: string;
@@ -154,9 +119,6 @@ export interface ProfileFormState {
   xrayDomainMatcher: XrayDomainMatcher | "";
   /** Opaque pass-through: no editor yet, but a save must not wipe it. */
   xrayDns: XrayDnsConfig | null;
-  /** Opaque pass-through: the failover editor owns node pins; a form save
-   * carries them back unchanged. */
-  pinnedPolicies: PinnedRoute[];
   /** Linux TUN: def1 halves (0.0.0.0/1 + 128.0.0.0/1) instead of 0.0.0.0/0. */
   xraySplitDefault: boolean;
   /** Linux TUN: kernel-level UDP/443 reject so QUIC falls back to TCP fast. */
@@ -168,37 +130,6 @@ export interface ProfileFormState {
   endpointBypasses: string;
 }
 
-/** Group a profile's policies into per-target text (comments preserved). */
-function policiesToText(policies: DomainPolicy[], target: DomainRouteTarget): string {
-  return policies
-    .filter((p) => p.target === target)
-    .flatMap((p) => p.domains)
-    .join("\n");
-}
-
-/** Build policies from textarea content; ordering matches Happ's
- * block → proxy → direct precedence (first match wins in xray). */
-function textToPolicies(
-  rulesBlock: string,
-  rulesProxy: string,
-  rulesDirect: string,
-): DomainPolicy[] {
-  const parse = (text: string) =>
-    text
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-  const policies: DomainPolicy[] = [];
-  for (const [text, target] of [
-    [rulesBlock, "block"],
-    [rulesProxy, "proxy"],
-    [rulesDirect, "direct"],
-  ] as const) {
-    const domains = parse(text);
-    if (domains.length > 0) policies.push({ domains, target });
-  }
-  return policies;
-}
 
 export function newFormState(
   backend: TunnelBackend = "wireGuard",
@@ -223,9 +154,7 @@ export function newFormState(
     wgFields: { ...EMPTY_WG_FIELDS },
     xraySocksPort: null,
     xrayHttpPort: null,
-    rulesProxy: "",
-    rulesDirect: "",
-    rulesBlock: "",
+    routing: { base: [], user: [] },
     privateLanDirect: false,
     useSystemProxy: false,
     proxyBypass: "",
@@ -245,7 +174,6 @@ export function newFormState(
     xrayQuicReject: false,
     waitForInterface: false,
     endpointBypasses: "",
-    pinnedPolicies: [],
   };
 }
 
@@ -269,9 +197,7 @@ export function editFormState(profile: Profile, revision: string): ProfileFormSt
     wgFields: { ...EMPTY_WG_FIELDS },
     xraySocksPort: profile.xraySocksPort,
     xrayHttpPort: profile.xrayHttpPort,
-    rulesProxy: policiesToText(profile.domainPolicies, "proxy"),
-    rulesDirect: policiesToText(profile.domainPolicies, "direct"),
-    rulesBlock: policiesToText(profile.domainPolicies, "block"),
+    routing: structuredClone(profile.routing ?? { base: [], user: [] }),
     privateLanDirect: profile.privateLanDirect,
     useSystemProxy: profile.useSystemProxy,
     proxyBypass: profile.proxyBypass.join(", "),
@@ -289,7 +215,6 @@ export function editFormState(profile: Profile, revision: string): ProfileFormSt
     xrayQuicReject: profile.xrayQuicReject ?? false,
     waitForInterface: profile.waitForInterface ?? false,
     endpointBypasses: (profile.endpointBypasses ?? []).join(", "),
-    pinnedPolicies: profile.pinnedPolicies ?? [],
   };
 }
 
@@ -331,7 +256,6 @@ export default function ProfileFormModal({
   const [routeCheckResult, setRouteCheckResult] = useState<RouteCheckResult | null>(null);
   const [routeCheckError, setRouteCheckError] = useState<string | null>(null);
   const [tab, setTab] = useState<FormTab>("general");
-  const [rulesEditor, setRulesEditor] = useState<RulesSetId | null>(null);
   const [mihomoGroups, setMihomoGroups] = useState<MihomoGroupInfo[]>([]);
   const [mihomoGroupsError, setMihomoGroupsError] = useState<string | null>(null);
   const tr = useT();
@@ -345,11 +269,9 @@ export default function ProfileFormModal({
       setHappPayload("");
       setHappOpen(false);
       setHappNotice(null);
-      setRouteCheckTarget("");
       setRouteCheckResult(null);
       setRouteCheckError(null);
       setTab("general");
-      setRulesEditor(null);
       setProbeResults(null);
       setProbeNotice(null);
     }
@@ -392,13 +314,8 @@ export default function ProfileFormModal({
     setFormError(message);
     setTab(targetTab);
   };
+  const routingCount = current.routes.length + current.routing.user.length + current.routing.base.length;
 
-  const policyRuleCount =
-    textToPolicies(current.rulesBlock, current.rulesProxy, current.rulesDirect)
-      .reduce((n, p) => n + p.domains.length, 0);
-  const routingCount = current.routes.length + policyRuleCount;
-  const rulesEditorSet =
-    RULE_SETS.find((s) => s.id === rulesEditor) ?? null;
 
   const browseConfig = async () => {
     try {
@@ -513,19 +430,19 @@ export default function ProfileFormModal({
         dns.outboundKey != null ||
         dns.outbound != null;
       update({
-        // A profile with any lists replaces all three buckets — absent
-        // buckets are empty in Happ semantics. A DNS-only import leaves
-        // the rule text alone.
         ...(imported.domainPolicies.length > 0
           ? {
-              rulesBlock: policiesToText(imported.domainPolicies, "block"),
-              rulesProxy: policiesToText(imported.domainPolicies, "proxy"),
-              rulesDirect: policiesToText(imported.domainPolicies, "direct"),
+              routing: {
+                ...current.routing,
+                base: imported.domainPolicies.map((policy) => ({
+                  selectors: policy.domains,
+                  target: { kind: policy.target } as const,
+                })),
+              },
             }
           : {}),
         privateLanDirect: imported.privateLanDirect ?? current.privateLanDirect,
-        xrayDomainStrategy:
-          imported.domainStrategy ?? current.xrayDomainStrategy,
+        xrayDomainStrategy: imported.domainStrategy ?? current.xrayDomainStrategy,
         xrayDomainMatcher: imported.domainMatcher ?? current.xrayDomainMatcher,
         xrayDns: hasDns ? { ...current.xrayDns, ...dns } : current.xrayDns,
         xrayGeoipUrl: imported.geoipUrl ?? current.xrayGeoipUrl,
@@ -543,7 +460,6 @@ export default function ProfileFormModal({
       setHappBusy(false);
     }
   };
-
   const runRouteCheck = async () => {
     const target = routeCheckTarget.trim();
     if (!target) return;
@@ -553,21 +469,10 @@ export default function ProfileFormModal({
       const result = await invoke<RouteCheckResult>("xray_test_route", {
         request: {
           target,
-          domainPolicies: textToPolicies(
-            current.rulesBlock,
-            current.rulesProxy,
-            current.rulesDirect,
-          ),
+          routing: current.routing,
           privateLanDirect: current.privateLanDirect,
-          domainStrategy: current.xrayDomainStrategy || null,
-          dns: current.xrayDns ?? {
-            servers: [],
-            hosts: {},
-            fakeDns: false,
-            queryStrategy: null,
-          },
-          geoipUrl: current.xrayGeoipUrl || null,
-          geositeUrl: current.xrayGeositeUrl || null,
+          xrayDomainStrategy: current.xrayDomainStrategy || null,
+          xrayDns: current.xrayDns ?? undefined,
         },
       });
       setRouteCheckResult(result);
@@ -578,6 +483,7 @@ export default function ProfileFormModal({
       setRouteCheckBusy(false);
     }
   };
+
 
   const save = async () => {
     for (const route of current.routes) {
@@ -623,11 +529,7 @@ export default function ProfileFormModal({
         }
       }
     }
-    const domainPolicies = textToPolicies(
-      current.rulesBlock,
-      current.rulesProxy,
-      current.rulesDirect,
-    );
+    const routing = current.routing;
     if (isVlessImport) {
       if (!current.vlessUrl.trim()) {
         fail(tr("form.errShareRequired"), "connection");
@@ -680,7 +582,7 @@ export default function ProfileFormModal({
         via: r.via?.trim() || null,
       })),
       autoConnect: current.autoConnect,
-      domainPolicies: isXray || current.backend === "mihomo" ? domainPolicies : [],
+      routing,
       privateLanDirect: (isXray || current.backend === "mihomo") && current.privateLanDirect,
       xraySocksPort: !isXray
         ? null
@@ -721,9 +623,6 @@ export default function ProfileFormModal({
       waitForInterface: current.backend === "none" && current.waitForInterface,
       endpointBypasses:
         current.backend === "none" || isXray ? endpointBypasses : [],
-      // Linux multinode: the failover editor owns these; carry them back so a
-      // form save cannot drop them (the backend re-restores either way).
-      pinnedPolicies: isXray ? current.pinnedPolicies : [],
       xrayServiceChecks: isXray ? current.preservedProfile?.xrayServiceChecks ?? [] : [],
       // `netorch proxy` owns named exits; carry them back unchanged.
       xrayProxyExits: isXray ? current.preservedProfile?.xrayProxyExits ?? [] : [],
@@ -851,9 +750,7 @@ export default function ProfileFormModal({
             update({
               backend,
               configPath: "",
-              rulesProxy: backend === "xray" ? current.rulesProxy : "",
-              rulesDirect: backend === "xray" ? current.rulesDirect : "",
-              rulesBlock: backend === "xray" ? current.rulesBlock : "",
+              routing: current.routing,
               privateLanDirect: backend === "xray" && current.privateLanDirect,
               xraySource: "json",
               xraySocksPort:
@@ -1324,42 +1221,7 @@ export default function ProfileFormModal({
       </div>
       )}
 
-      {tab === "routing" && rulesEditorSet !== null && (
-      <div className="modal-tab-body rules-editor" role="tabpanel">
-        <div className="rules-editor-head">
-          <button
-            type="button"
-            className="rules-back"
-            onClick={() => setRulesEditor(null)}
-          >
-            <span className="rules-back-icon">
-              <ChevronIcon size={13} />
-            </span>
-            {tr("rules.back")}
-          </button>
-          <span className={`rules-editor-title rules-fg-${rulesEditorSet.id}`}>
-            {tr(rulesEditorSet.titleKey)}
-          </span>
-          <span className="rules-summary-count">
-            {tr("rules.entryCount", {
-              count: countRuleLines(current[rulesEditorSet.field]),
-            })}
-          </span>
-        </div>
-        <span className="profile-routes-hint">{tr("form.rulesHint")}</span>
-        <textarea
-          className="rules-editor-textarea"
-          value={current[rulesEditorSet.field]}
-          onChange={(e) =>
-            update({ [rulesEditorSet.field]: e.target.value } as Partial<ProfileFormState>)
-          }
-          placeholder={rulesEditorSet.placeholder}
-          spellCheck={false}
-        />
-      </div>
-      )}
-
-      {tab === "routing" && rulesEditorSet === null && (
+      {tab === "routing" && (
       <div className="modal-tab-body" role="tabpanel">
       {!daemonManagedInterface && <label>
         {tr("form.targetIface")}
@@ -1530,27 +1392,8 @@ export default function ProfileFormModal({
             <span>{tr("form.domainRouting")}</span>
           </div>
           <span className="profile-routes-hint">
-            {tr("form.rulesHint")}
+            {tr("Manage ordered routing rules in the profile’s routing editor.")}
           </span>
-          <div className="rules-summary">
-            {RULE_SETS.map((set) => (
-              <button
-                type="button"
-                key={set.id}
-                className="rules-summary-row"
-                onClick={() => setRulesEditor(set.id)}
-              >
-                <span className={`rules-dot rules-dot-${set.id}`} />
-                <span className="rules-summary-title">{tr(set.titleKey)}</span>
-                <span className="rules-summary-count">
-                  {tr("rules.entryCount", {
-                    count: countRuleLines(current[set.field]),
-                  })}
-                </span>
-                <ChevronIcon size={13} collapsed />
-              </button>
-            ))}
-          </div>
           <label className="profile-proxy-toggle">
             <input
               type="checkbox"
@@ -1559,69 +1402,59 @@ export default function ProfileFormModal({
             />
             {tr("form.privateLanDirect")}
           </label>
-          {current.backend === "xray" && <>
-          <div className="route-check">
-            <div className="route-check-row">
-              <input
-                type="text"
-                value={routeCheckTarget}
-                onChange={(e) => setRouteCheckTarget(e.target.value)}
-                placeholder={tr("rules.testPlaceholder")}
-                spellCheck={false}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void runRouteCheck();
-                  }
-                }}
-              />
-              <button
-                type="button"
-                onClick={() => void runRouteCheck()}
-                disabled={routeCheckBusy || !routeCheckTarget.trim()}
-              >
-                {routeCheckBusy ? tr("rules.testChecking") : tr("rules.testCheck")}
-              </button>
-            </div>
-            {routeCheckError && (
-              <span className="profile-routes-hint">{routeCheckError}</span>
-            )}
-            {routeCheckResult && (
-              <div className="route-check-result">
-                <span
-                  className={`route-check-verdict rules-fg-${routeCheckResult.outbound}`}
+          {current.backend === "xray" && (
+            <div className="route-check">
+              <div className="route-check-row">
+                <input
+                  type="text"
+                  value={routeCheckTarget}
+                  onChange={(event) => setRouteCheckTarget(event.target.value)}
+                  placeholder={tr("rules.testPlaceholder")}
+                  spellCheck={false}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void runRouteCheck();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => void runRouteCheck()}
+                  disabled={routeCheckBusy || !routeCheckTarget.trim()}
                 >
-                  {routeCheckResult.target}
-                  {routeCheckResult.port != null
-                    ? `:${routeCheckResult.port}`
-                    : ""}
-                  {" → "}
-                  {tr(ROUTE_CHECK_OUTBOUND_KEYS[routeCheckResult.outbound])}
-                </span>
-                <span className="profile-routes-hint">
-                  {routeCheckResult.source === "policy" &&
-                  routeCheckResult.policyIndex != null
-                    ? tr("rules.srcPolicy", {
-                        index: routeCheckResult.policyIndex + 1,
-                      })
-                    : tr(ROUTE_CHECK_SOURCE_KEYS[routeCheckResult.source])}
-                  {routeCheckResult.matchedSelector
-                    ? ` · ${routeCheckResult.matchedSelector}`
-                    : ""}
-                </span>
-                {routeCheckResult.certainty === "probable" && (
-                  <span className="profile-routes-hint">
-                    {tr("rules.testProbable")}
-                  </span>
-                )}
-                {routeCheckResult.notes.map((note, index) => (
-                  <span key={index} className="profile-routes-hint">
-                    {note}
-                  </span>
-                ))}
+                  {routeCheckBusy ? tr("rules.testChecking") : tr("rules.testCheck")}
+                </button>
               </div>
-            )}
-          </div>
+              {routeCheckError && <span className="profile-routes-hint">{routeCheckError}</span>}
+              {routeCheckResult && (
+                <div className="route-check-result">
+                  <span className={`route-check-verdict rules-fg-${routeCheckResult.outbound}`}>
+                    {routeCheckResult.target}
+                    {routeCheckResult.port != null ? `:${routeCheckResult.port}` : ""}
+                    {" → "}
+                    {routeCheckResult.outbound === "unknown"
+                      ? "Unknown"
+                      : tr(ROUTE_CHECK_OUTBOUND_KEYS[routeCheckResult.outbound])}
+                  </span>
+                  <span className="profile-routes-hint">
+                    {routeCheckResult.layer
+                      ? `${routeCheckResult.layer === "user" ? "User" : "Base"} · ${routeCheckResult.ruleIndex != null ? `#${routeCheckResult.ruleIndex + 1}` : ""}`
+                      : tr(ROUTE_CHECK_SOURCE_KEYS[routeCheckResult.source])}
+                    {routeCheckResult.matchedSelector ? ` · ${routeCheckResult.matchedSelector}` : ""}
+                    {routeCheckResult.policyPath ? ` · ${routeCheckResult.policyPath}` : ""}
+                  </span>
+                  {routeCheckResult.certainty === "probable" && (
+                    <span className="profile-routes-hint">{tr("rules.testProbable")}</span>
+                  )}
+                  {routeCheckResult.notes.map((note, index) => (
+                    <span key={index} className="profile-routes-hint">{note}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {current.backend === "xray" && <>
           <button
             type="button"
             className="connection-detail-toggle"
@@ -1673,6 +1506,7 @@ export default function ProfileFormModal({
               <option value="ipOnDemand">IPOnDemand</option>
             </select>
           </label>
+          <span className="profile-routes-hint">{tr("IP selectors require IPOnDemand, regardless of this preference.")}</span>
           <label>
             {tr("rules.domainMatcher")}
             <select

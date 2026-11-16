@@ -342,7 +342,7 @@ export interface HappRoutingImport {
 }
 
 /** Result of `xray_test_route` — which generated rule decides a target. */
-export type RouteCheckOutbound = "proxy" | "direct" | "block" | "dns";
+export type RouteCheckOutbound = "proxy" | "direct" | "block" | "dns" | "unknown";
 export type RouteCheckSource =
   | "dnsCapture"
   | "policy"
@@ -364,7 +364,8 @@ export interface RouteCheckResult {
   targetKind: "domain" | "ip";
   outbound: RouteCheckOutbound;
   source: RouteCheckSource;
-  policyIndex?: number;
+  layer?: RoutingLayer;
+  ruleIndex?: number;
   matchedSelector?: string;
   certainty: "certain" | "probable";
   policyPath?: string;
@@ -509,6 +510,22 @@ export interface MihomoGroupInfo {
   selected: string | null;
 }
 
+export type RoutingLayer = "base" | "user";
+export type RoutingTarget =
+  | { kind: "proxy" | "direct" | "block" }
+  | { kind: "node"; endpointKey: string; missing?: boolean }
+  | { kind: "interface"; interfaceName: string; domainStrategy?: string };
+export interface RoutingRule {
+  selectors: string[];
+  target: RoutingTarget;
+  port?: number;
+  network?: string;
+}
+export interface RoutingPolicy {
+  base: RoutingRule[];
+  user: RoutingRule[];
+}
+
 export interface Profile {
   id: string;
   name: string;
@@ -518,7 +535,7 @@ export interface Profile {
   interfaceName: string;
   routes: PolicyRoute[];
   autoConnect: boolean;
-  domainPolicies: DomainPolicy[];
+  routing: RoutingPolicy;
   privateLanDirect: boolean;
   xraySocksPort: number | null;
   xrayHttpPort: number | null;
@@ -526,8 +543,6 @@ export interface Profile {
   proxyBypass: string[];
   subscription: SubscriptionMeta | null;
   xrayMode: XrayMode;
-  /** Linux: domain selectors fail-closed to a specific subscription node. */
-  pinnedPolicies?: PinnedRoute[];
   xrayServiceChecks?: ServiceCheck[];
   /** macOS: a secondary connection carries only `tunnelNetworks`. */
   tunnelRole?: "primary" | "secondary";
@@ -548,8 +563,6 @@ export interface Profile {
    * blackhole a plain routing rule gives). */
   xrayQuicReject?: boolean;
   xraySockopts?: XraySockopts | null;
-  xrayTrafficRules?: XrayTrafficRule[];
-  xrayInterfaceRoutes?: XrayInterfaceRoute[];
   xrayConnectionIdleSecs?: number | null;
   xrayTunMtu?: number | null;
   xrayTunDnsServers?: string[];

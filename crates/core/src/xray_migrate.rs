@@ -14,7 +14,7 @@
 use crate::{
     config_vault::SubscriptionEndpoint,
     models::{
-        DomainPolicy, DomainRouteTarget, PinnedRoute, Profile, XrayDnsConfig,
+        DomainPolicy, DomainRouteTarget, PinnedRoute, Profile, RoutingPolicy, XrayDnsConfig,
         XrayDnsOutboundSettings, XrayDnsQueryStrategy, XrayDnsRoute, XrayDnsServer,
         XrayDomainMatcher, XrayDomainStrategy, XraySockopts, XrayTrafficRule,
     },
@@ -1686,33 +1686,18 @@ pub fn apply_xray_policy_migration(
             "imported default pool requires a subscription profile",
         ));
     }
-    let mut pins = profile.pinned_policies.clone();
-    for imported in migration.pinned_routes {
-        if pins.iter().any(|existing| {
-            existing.endpoint_key != imported.endpoint_key
-                && existing
-                    .selectors
-                    .iter()
-                    .any(|selector| imported.selectors.contains(selector))
-        }) {
-            return Err(invalid(
-                "imported pinned route conflicts with an existing explicit pin",
-            ));
-        }
-        if !pins.iter().any(|existing| {
-            existing.endpoint_key == imported.endpoint_key
-                && existing.selectors == imported.selectors
-        }) {
-            pins.push(imported);
-        }
-    }
-    xray::validate_pinned_routes(&pins)?;
+    xray::validate_pinned_routes(&migration.pinned_routes)?;
+    profile.routing.base = RoutingPolicy::imported(
+        migration.domain_policies,
+        migration.pinned_routes,
+        migration.traffic_rules,
+        migration.interface_routes,
+    )
+    .base;
     if let (Some(subscription), Some(backups)) = (&mut profile.subscription, migration.backup_keys)
     {
         subscription.backup_keys = backups;
     }
-    profile.domain_policies = migration.domain_policies;
-    profile.pinned_policies = pins;
     profile.xray_dns = migration.dns;
     profile.xray_domain_strategy = migration.domain_strategy;
     profile.xray_domain_matcher = migration.domain_matcher;
@@ -1722,8 +1707,6 @@ pub fn apply_xray_policy_migration(
     profile.xray_sockopts = migration.sockopts;
     profile.xray_geoip_url = migration.geoip_url;
     profile.xray_geosite_url = migration.geosite_url;
-    profile.xray_traffic_rules = migration.traffic_rules;
-    profile.xray_interface_routes = migration.interface_routes;
     profile.xray_connection_idle_secs = migration.connection_idle_secs;
     profile.xray_tun_mtu = migration.tun_mtu;
     profile.xray_tun_dns_servers = migration.tun_dns_servers;

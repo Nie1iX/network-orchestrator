@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildProfileGraph,
+  changeRoutingRuleLayer,
   connectDocumentNode,
   documentDiff,
+  moveRoutingRule,
   parseProfileDocument,
   removeDocumentValue,
   setDocumentValue,
@@ -30,8 +32,8 @@ test("non-finite JSON numbers are rejected instead of silently normalizing", () 
 });
 
 test("graph marks duplicate endpoint keys ambiguous without exposing credentials", () => {
-  const graph = buildProfileGraph(document({ pinnedPolicies: [{ selectors: ["domain:bank.test"], endpointKey: endpoints[0]!.key, password: "secret" }] }), endpoints);
-  assert.ok(graph.issues.some((issue) => issue.path === "/profile/pinnedPolicies/0/endpointKey" && /ambiguous/i.test(issue.message)));
+  const graph = buildProfileGraph(document({ routing: { user: [{ selectors: ["domain:bank.test"], target: { kind: "node", endpointKey: endpoints[0]!.key }, password: "secret" }] } }), endpoints);
+  assert.ok(graph.issues.some((issue) => issue.path === "/profile/routing/user/0/target/endpointKey" && /ambiguous/i.test(issue.message)));
   assert.equal(graph.nodes.some((node) => node.label.includes("secret") || node.detail.includes("secret")), false);
 });
 
@@ -63,21 +65,20 @@ test("patch rejects inherited prototype paths without polluting objects", () => 
   assert.equal(({} as Record<string, unknown>).polluted, undefined);
 });
 
-test("domain policies update their target field without changing other values", () => {
-  const source = document({ domainPolicies: [{ domains: ["a.test"], target: "direct", extra: { keep: 1 } }] });
-  const edited = connectDocumentNode(source, "/profile/domainPolicies/0", "block");
-  assert.deepEqual(edited.profile.domainPolicies, [{ domains: ["a.test"], target: "block", extra: { keep: 1 } }]);
+test("canonical routing target edits retain all other rule values", () => {
+  const source = document({ routing: { user: [{ selectors: ["a.test"], target: { kind: "direct" }, extra: { keep: 1 } }], base: [] } });
+  const edited = connectDocumentNode(source, "/profile/routing/user/0", "block");
+  assert.deepEqual((edited.profile.routing as { user: unknown[] }).user, [{ selectors: ["a.test"], target: { kind: "block" }, extra: { keep: 1 } }]);
 });
 
 test("missing endpoint references are reported", () => {
-  const graph = buildProfileGraph(document({ pinnedPolicies: [{ selectors: ["domain:bank.test"], endpointKey: "deadbeefdeadbeef" }] }), endpoints);
-  assert.ok(graph.issues.some((issue) => issue.path === "/profile/pinnedPolicies/0/endpointKey" && issue.severity === "error"));
+  const graph = buildProfileGraph(document({ routing: { user: [{ selectors: ["domain:bank.test"], target: { kind: "node", endpointKey: "deadbeefdeadbeef" } }] } }), endpoints);
+  assert.ok(graph.issues.some((issue) => issue.path === "/profile/routing/user/0/target/endpointKey" && issue.severity === "error"));
 });
 
 test("minimal defaults do not create empty feature or target nodes", () => {
   const graph = buildProfileGraph(document({
-    backend: "xray", routes: [], domainPolicies: [], xrayProxyExits: [], xrayServiceChecks: [],
-    xrayDns: { servers: [], fakeDns: false, queryStrategy: null },
+    backend: "xray", routes: [], routing: { base: [], user: [] }, xrayProxyExits: [], xrayServiceChecks: [],
     subscription: { activeKey: endpoints[0]!.key, backupKeys: [], poolKeys: [], nodePool: null },
   }), [endpoints[0]!, { ...endpoints[1]!, key: "unused" }]);
   assert.deepEqual(graph.nodes.filter((node) => node.kind === "endpoint").map((node) => node.label), ["Alpha"]);
@@ -92,19 +93,19 @@ test("referenced pool endpoints are connected while unused endpoints stay hidden
 });
 
 test("missing used endpoint remains visible with an issue", () => {
-  const graph = buildProfileGraph(document({ pinnedPolicies: [{ selectors: [], endpointKey: "missing" }] }), []);
-  assert.ok(graph.issues.some((issue) => issue.path === "/profile/pinnedPolicies/0/endpointKey"));
-  assert.ok(graph.nodes.some((node) => node.path === "/profile/pinnedPolicies/0"));
+  const graph = buildProfileGraph(document({ routing: { user: [{ selectors: [], target: { kind: "node", endpointKey: "missing" } }] } }), []);
+  assert.ok(graph.issues.some((issue) => issue.path === "/profile/routing/user/0/target/endpointKey"));
+  assert.ok(graph.nodes.some((node) => node.path === "/profile/routing/user/0"));
 });
 
 test("custom DNS and incomplete added entries remain visible", () => {
   const graph = buildProfileGraph(document({
     xrayDns: { servers: [], fakeDns: true, queryStrategy: null },
-    domainPolicies: [{ domains: [], target: "proxy" }],
+    routing: { user: [{ selectors: [], target: { kind: "proxy" } }], base: [] },
     xrayServiceChecks: [{ name: "", endpointKey: "" }],
   }), []);
   assert.ok(graph.nodes.some((node) => node.path === "/profile/xrayDns"));
-  assert.ok(graph.nodes.some((node) => node.path === "/profile/domainPolicies/0"));
+  assert.ok(graph.nodes.some((node) => node.path === "/profile/routing/user/0"));
   assert.ok(graph.nodes.some((node) => node.path === "/profile/xrayServiceChecks/0"));
 });
 
@@ -127,8 +128,7 @@ test("unknown nonempty DNS configuration is retained", () => {
 test("serialized null optional sections and empty routing do not create placeholders", () => {
   const graph = buildProfileGraph(document({
     backend: "xray", subscription: null, xrayDns: null, xrayProxyExits: null,
-    xrayServiceChecks: [], routes: [], domainPolicies: [], pinnedPolicies: [],
-    xrayTrafficRules: [], xrayInterfaceRoutes: [], routing: { rules: [] },
+    xrayServiceChecks: [], routes: [], routing: { base: [], user: [] },
   }), []);
   assert.deepEqual(graph.nodes.map((node) => node.path), ["/profile"]);
 });
@@ -153,21 +153,59 @@ test("Mihomo graph shows configured selections without exposing unused groups or
   assert.ok(!JSON.stringify(graph).includes("password"));
 });
 
-test("routing blocks identify their selectors and retain individual edit paths", () => {
-  const source = document({ domainPolicies: [
-    { domains: ["domain:work.test"], target: "proxy" },
-    { domains: ["domain:local.test"], target: "direct" },
-  ] });
+test("canonical routing graph preserves layer order and supports in-place target edits", () => {
+  const second = { selectors: ["domain:local.test"], target: { kind: "node", endpointKey: "deadbeefdeadbeef" } };
+  const base = [{ selectors: ["geoip:private"], target: { kind: "block" } }];
+  const source = document({ routing: { user: [
+    { selectors: ["domain:work.test"], target: { kind: "direct" } }, second,
+  ], base } });
   const graph = buildProfileGraph(source, []);
   const rules = graph.nodes.filter((node) => node.kind === "selector");
   assert.deepEqual(rules.map((node) => node.path), [
-    "/profile/domainPolicies/0", "/profile/domainPolicies/1",
+    "/profile/routing/user/0", "/profile/routing/user/1", "/profile/routing/base/0",
   ]);
   assert.equal(rules[0]!.detail, "domain:work.test");
-  assert.equal(rules[1]!.detail, "domain:local.test");
-  const changed = connectDocumentNode(source, rules[1]!.path, "block");
-  assert.deepEqual(changed.profile.domainPolicies, [
-    { domains: ["domain:work.test"], target: "proxy" },
-    { domains: ["domain:local.test"], target: "block" },
+  assert.ok(graph.issues.some((issue) => issue.path === "/profile/routing/user/1/target/endpointKey"));
+  const changed = connectDocumentNode(source, rules[0]!.path, "block");
+  assert.deepEqual(changed.profile.routing, { base, user: [
+    { selectors: ["domain:work.test"], target: { kind: "block" } }, second,
+  ] });
+});
+test("routing rows move within their layer and change layers without rewriting content", () => {
+  const first = { selectors: ["one"], target: { kind: "direct" } };
+  const second = { selectors: ["two"], target: { kind: "block" } };
+  const source = document({ routing: { user: [first, second], base: [] } });
+  const moved = moveRoutingRule(source, "user", 0, 1);
+  assert.deepEqual(moved.profile.routing, { user: [second, first], base: [] });
+  const layered = changeRoutingRuleLayer(moved, "user", 0, "base");
+  assert.deepEqual(layered.profile.routing, { user: [first], base: [second] });
+  assert.deepEqual(changeRoutingRuleLayer(layered, "base", 0, "base").profile.routing, layered.profile.routing);
+});
+
+test("rewiring an interface preserves its DNS family and traffic conditions", () => {
+  const source = document({ routing: { base: [], user: [{
+    selectors: ["domain:corp.test"], port: 443, network: "tcp",
+    target: { kind: "interface", interfaceName: "wg0", domainStrategy: "ForceIPv4" },
+  }] } });
+  const changed = connectDocumentNode(source, "/profile/routing/user/0", "interface:wg1");
+  assert.deepEqual(changed.profile.routing, { base: [], user: [{
+    selectors: ["domain:corp.test"], port: 443, network: "tcp",
+    target: { kind: "interface", interfaceName: "wg1", domainStrategy: "ForceIPv4" },
+  }] });
+});
+
+test("known missing servers stay editable without accepting unknown references", () => {
+  const missing = { ...endpoints[0]!, key: "1111111111111111", name: "Unavailable", active: false, isMissing: true };
+  const graph = buildProfileGraph(document({
+    backend: "xray",
+    routing: { base: [], user: [{
+      selectors: ["domain:bank.test"],
+      target: { kind: "node", endpointKey: missing.key, missing: true },
+    }] },
+    subscription: { activeKey: endpoints[0]!.key, backupKeys: [{ key: missing.key }] },
+  }), [endpoints[0]!, missing]);
+  assert.deepEqual(graph.issues.map(({ path, severity }) => ({ path, severity })), [
+    { path: "/profile/routing/user/0/target/endpointKey", severity: "warning" },
+    { path: "/profile/subscription/backupKeys/0/key", severity: "warning" },
   ]);
 });

@@ -86,7 +86,7 @@ function profile(id: string, bypasses: string[]): Profile {
     interfaceName: `tun-${id}`,
     routes: [],
     autoConnect: false,
-    domainPolicies: [],
+    routing: { base: [], user: [] },
     privateLanDirect: false,
     xraySocksPort: null,
     xrayHttpPort: null,

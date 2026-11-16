@@ -3,6 +3,7 @@
 //! apart unnoticed.
 #![cfg(target_os = "linux")]
 use net_manager_core::daemon_protocol::XrayConnectParams;
+use net_manager_core::models::{RoutingPolicy, RoutingRule, RoutingTarget};
 use net_manager_core::xray;
 use network_orchestrator_daemon::xray::prepare_xray;
 use serde_json::{json, Value};
@@ -117,7 +118,6 @@ fn provider_balancer_survives_core_to_daemon_preparation() {
         &[],
         &[xray::PinnedOutbound {
             key: pin.into(),
-            selectors: vec!["domain:pinned.test".into()],
             outbound: Some(graph),
         }],
     )
@@ -144,10 +144,24 @@ fn multinode_preserves_proxy_policies_and_accepts_missing_pinned_nodes() {
     let base = xray::generate_share_link_config_with_http(uri, 10808, 10809).unwrap();
     let routed = xray::apply_profile_routing(
         &base,
-        &[DomainPolicy {
-            domains: vec!["domain:default.test".into()],
-            target: DomainRouteTarget::Proxy,
-        }],
+        &RoutingPolicy {
+            user: vec![
+                DomainPolicy {
+                    domains: vec!["domain:default.test".into()],
+                    target: DomainRouteTarget::Proxy,
+                }
+                .into(),
+                RoutingRule {
+                    selectors: vec!["domain:pinned.test".into()],
+                    target: RoutingTarget::Node {
+                        endpoint_key: "ffffffffffffffff".into(),
+                        missing: true,
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
         &Default::default(),
     )
     .unwrap();
@@ -157,7 +171,6 @@ fn multinode_preserves_proxy_policies_and_accepts_missing_pinned_nodes() {
         &[],
         &[xray::PinnedOutbound {
             key: "ffffffffffffffff".into(),
-            selectors: vec!["domain:pinned.test".into()],
             outbound: None,
         }],
     )
@@ -191,15 +204,16 @@ fn profile_interface_policy_survives_provider_graph_preparation() {
     let normalized = xray::tun_compatible_config(&source).unwrap();
     let routed = xray::apply_profile_routing(
         &normalized,
-        &[],
-        &xray::ProfileRoutingOptions {
-            interface_routes: vec![XrayInterfaceRoute {
+        &RoutingPolicy {
+            user: vec![XrayInterfaceRoute {
                 interface_name: "wt0".into(),
                 selectors: vec!["domain:corp.example".into()],
                 domain_strategy: None,
-            }],
+            }
+            .into()],
             ..Default::default()
         },
+        &Default::default(),
     )
     .unwrap();
     let plan = prepare_xray(1000, params(&routed), 51820).unwrap();

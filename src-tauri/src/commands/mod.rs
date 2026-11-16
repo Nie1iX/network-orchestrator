@@ -54,7 +54,7 @@ pub(crate) use profiles::{
     measure_subscription_endpoint_delay, preview_xray_policy_migration,
     rebuild_subscription_node_pool, refresh_subscription, reorder_profiles,
     run_xray_service_checks, save_profile, save_vless_profile, save_wireguard_profile,
-    set_pinned_routes, set_subscription_auto_return, set_subscription_backups,
+    set_routing_policy, set_subscription_auto_return, set_subscription_backups,
     set_subscription_node_pool, set_subscription_refresh_interval, set_tunnel_networks,
     set_tunnel_role, set_xray_service_checks, switch_subscription_endpoint,
     verify_subscription_exits,

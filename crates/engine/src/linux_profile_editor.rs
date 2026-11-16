@@ -122,8 +122,10 @@ impl ProfileService {
                 lookup(&item.key)?;
             }
         }
-        for pin in &candidate.pinned_policies {
-            lookup(&pin.endpoint_key)?;
+        for rule in candidate.routing.iter() {
+            if let Some(key) = rule.target.endpoint_key() {
+                lookup(key)?;
+            }
         }
         for check in &candidate.xray_service_checks {
             lookup(&check.endpoint_key)?;

@@ -20,12 +20,11 @@ function profile(id: string, name: string, backend: Profile["backend"], cidr?: s
     id, name, backend, configPath: backend === "none" ? "" : `/sandbox/${id}.${backend === "mihomo" ? "yaml" : backend === "xray" ? "json" : backend === "openVpn" ? "ovpn" : "conf"}`,
     interfaceName: backend === "none" ? "qa-ethernet" : `qa-${id}`,
     routes: cidr ? [{ destination: cidr, metric: 5, via: null }] : [],
-    autoConnect: false, domainPolicies: [], privateLanDirect: false,
+    autoConnect: false, routing: { base: [], user: [] }, privateLanDirect: false,
     xraySocksPort: backend === "xray" ? 10808 : null,
     xrayHttpPort: backend === "xray" ? 10809 : null,
     useSystemProxy: false, proxyBypass: [], subscription: null,
     xrayMode: "socks", xrayTunInterface: null, xrayTunIp: null,
-    pinnedPolicies: [],
     xrayServiceChecks: [],
     xrayProxyExits: [],
     endpointBypasses,
@@ -234,7 +233,7 @@ export class SandboxBackend {
 
   private serviceBindings(p: Profile): Set<string> {
     return new Set([
-      ...(p.pinnedPolicies ?? []).map((route) => route.endpointKey),
+      ...p.routing.user.concat(p.routing.base).flatMap((rule) => rule.target.kind === "node" ? [rule.target.endpointKey] : []),
       p.xrayDns?.outboundKey,
     ].filter((key): key is string => Boolean(key)));
   }
@@ -305,7 +304,7 @@ export class SandboxBackend {
       p.backend,
       p.configPath,
       p.xrayServiceChecks ?? [],
-      p.pinnedPolicies ?? [],
+      p.routing,
       p.xrayDns?.outboundKey ?? null,
       p.xraySockopts ?? null,
       p.subscription?.activeKey ?? null,
@@ -592,9 +591,9 @@ export class SandboxBackend {
       userInfo: { uploadBytes: 1048576, downloadBytes: 2097152, totalBytes: 1073741824, expiresAtUnix: Math.floor(Date.now() / 1000) + 5 * 86400 },
     };
     // One pinned route, plus one whose node left the list (fail-closed demo).
-    sub.pinnedPolicies = [
-      { selectors: ["domain:bank.example", "geosite:category-gov"], endpointKey: this.endpointKeys[4] },
-      { selectors: ["domain:only-pl.example"], endpointKey: "deadbeefdeadbeef", missing: true },
+    sub.routing.user = [
+      { selectors: ["domain:bank.example", "geosite:category-gov"], target: { kind: "node", endpointKey: this.endpointKeys[4] } },
+      { selectors: ["domain:only-pl.example"], target: { kind: "node", endpointKey: "deadbeefdeadbeef", missing: true } },
     ];
     // Linux subscription profiles run as daemon TUN tunnels — needed for the
     // QUIC-reject toggle to be visible in the sandbox.
@@ -607,7 +606,7 @@ export class SandboxBackend {
     const explicit = new Set([
       sub.activeKey ?? this.endpointKeys[sub.activeIndex],
       ...(sub.backupKeys ?? []).map((node) => node.key),
-      ...(profile.pinnedPolicies ?? []).map((route) => route.endpointKey),
+      ...profile.routing.user.concat(profile.routing.base).flatMap((rule) => rule.target.kind === "node" ? [rule.target.endpointKey] : []),
       profile.xrayDns?.outboundKey,
       ...this.namedExitKeys(profile),
     ]);
@@ -628,7 +627,7 @@ export class SandboxBackend {
     if (!subscription || !pool) throw new Error("Set backup-pool filters before rebuilding the pool");
     const primary = subscription.activeKey ?? this.endpointKeys[subscription.activeIndex];
     const explicit = new Set([primary, ...(subscription.backupKeys ?? []).map((node) => node.key),
-      ...(p.pinnedPolicies ?? []).map((route) => route.endpointKey), p.xrayDns?.outboundKey,
+      ...p.routing.user.concat(p.routing.base).flatMap((rule) => rule.target.kind === "node" ? [rule.target.endpointKey] : []), p.xrayDns?.outboundKey,
       ...this.namedExitKeys(p)]);
     const capacity = Math.max(0, 8 - 1 - (subscription.backupKeys?.length ?? 0));
     let selected = 0;
@@ -671,8 +670,8 @@ export class SandboxBackend {
   }
 
   private migrationPreview(p: Profile, path: string): XrayPolicyPreview {
-    const conflict = (p.pinnedPolicies ?? []).some((route) =>
-      route.selectors.includes("domain:ai.example") && route.endpointKey !== this.endpointKeys[0]);
+    const conflict = p.routing.user.some((rule) =>
+      rule.target.kind === "node" && rule.selectors.includes("domain:ai.example") && rule.target.endpointKey !== this.endpointKeys[0]);
     return {
       direct: 2, proxy: 1, block: 0, pinnedCount: p.subscription ? 1 : 0,
       privateLanDirect: false, quicReject: true,
@@ -720,7 +719,7 @@ export class SandboxBackend {
       ])].filter((key) => this.endpointKeys.includes(key)).slice(0, 8) : [];
       const multinode = (sub?.backupKeys?.length ?? 0) > 0 ||
         this.poolMembers(p).length > 0 ||
-        (p.pinnedPolicies?.length ?? 0) > 0 || Boolean(p.xrayDns?.outboundKey);
+        p.routing.user.concat(p.routing.base).some((rule) => rule.target.kind === "node") || Boolean(p.xrayDns?.outboundKey);
       const failover = running && sub && multinode
         ? {
             primaryKey: keys[0],
@@ -794,7 +793,7 @@ export class SandboxBackend {
       profileId: p.id, osRoutes: p.routes.map((r) => ({ destination: r.destination, source: "profile" })),
       internalRoutes: [], listeners: p.backend === "xray" ? [{ address: "127.0.0.1", port: p.xraySocksPort ?? 10808, protocol: "socks" }] : [],
       endpoints: p.backend === "none" ? [] : [{ address: "vpn.example.invalid", port: 443, protocol: p.backend }],
-      domainPatterns: p.domainPolicies.flatMap((d) => d.domains), warnings: ["Synthetic configuration: no network traffic is sent."], routeKnowledgeComplete: true,
+      domainPatterns: p.routing.user.concat(p.routing.base).flatMap((rule) => rule.selectors), warnings: ["Synthetic configuration: no network traffic is sent."], routeKnowledgeComplete: true,
       peers: p.backend === "wireGuard" ? [{
         endpoint: { address: "vpn.example.invalid", port: 51820, protocol: "wireGuard" },
         routes: p.routes.map((r) => ({ destination: r.destination, source: "WireGuard AllowedIPs" })),
@@ -905,6 +904,17 @@ export class SandboxBackend {
         return [{ name: "Auto", kind: "select", members: ["Netherlands", "Germany"], selected: p.mihomo?.groupSelections.Auto ?? null }];
       }
       case "get_profile_document": return this.editorSnapshot(args.id);
+      case "set_routing_policy": {
+        const p = this.find(args.profileId);
+        if (this.editRevisions.get(String(args.expectedRevision)) !== JSON.stringify(p)) {
+          throw new Error("The profile changed. Reload the saved profile before applying this draft.");
+        }
+        if (!args.routing || typeof args.routing !== "object") throw new Error("Invalid routing policy");
+        p.routing = structuredClone(args.routing) as Profile["routing"];
+        p.privateLanDirect = args.privateLanDirect === true;
+        this.resetServiceWorker(p);
+        return this.profiles;
+      }
       case "explain_profile_document": {
         const candidate = this.editorCandidate(args);
         return explainProfileDocument({ ...candidate.document, profile: candidate.profile as unknown as Record<string, JsonValue> }, String(args.target ?? ""));
@@ -965,7 +975,7 @@ export class SandboxBackend {
         // Mirrors the Tauri command: failover settings are owned by their own
         // commands, a generic form save never drops them.
         p.subscription = existing?.subscription ?? p.subscription;
-        p.pinnedPolicies = existing?.pinnedPolicies ?? p.pinnedPolicies;
+        if (existing) p.routing.base = structuredClone(existing.routing.base);
         p.xrayProxyExits = p.backend === "xray"
           ? structuredClone(existing?.backend === "xray" ? existing.xrayProxyExits ?? [] : p.xrayProxyExits ?? [])
           : [];
@@ -1077,10 +1087,14 @@ export class SandboxBackend {
         const p = this.find(args.profileId);
         if (!p.subscription) throw new Error("Not a subscription profile");
         const listed = new Set(this.endpointKeys);
-        p.pinnedPolicies = ((args.routes as PinnedRoute[]) ?? []).map((route) => ({
-          ...route,
-          missing: !listed.has(route.endpointKey),
+        const pins = ((args.routes as PinnedRoute[]) ?? []).map((route) => ({
+          selectors: [...route.selectors],
+          target: { kind: "node" as const, endpointKey: route.endpointKey, missing: !listed.has(route.endpointKey) },
         }));
+        let nextPin = 0;
+        p.routing.user = p.routing.user.flatMap((rule) => rule.target.kind !== "node"
+          ? [rule] : pins[nextPin] ? [pins[nextPin++]] : []);
+        p.routing.user.push(...pins.slice(nextPin));
         this.resetServiceWorker(p);
         return this.profiles;
       }
@@ -1151,21 +1165,20 @@ export class SandboxBackend {
         if (p.backend !== "xray") throw new Error("Policy migration requires an Xray profile");
         const preview = this.migrationPreview(p, String(args.path ?? ""));
         if (preview.refused.length) throw new Error("Policy migration refused unsupported or conflicting settings");
-        p.domainPolicies = [
-          { domains: ["domain:home.example", "domain:gov.example"], target: "direct" },
-          { domains: ["domain:video.example"], target: "proxy" },
+        p.routing.user = [
+          { selectors: ["domain:home.example", "domain:gov.example"], target: { kind: "direct" } },
+          { selectors: ["domain:video.example"], target: { kind: "proxy" } },
         ];
         p.privateLanDirect = false;
         p.xrayQuicReject = true;
         p.xrayDomainStrategy = "ipIfNonMatch";
         p.xraySockopts = { tcpKeepAliveIdle: 30, tcpKeepAliveInterval: 10,
           tcpUserTimeout: 20000, tcpNoDelay: true };
-        p.xrayTrafficRules = [
-          { ips: ["203.0.113.53"], port: 53, network: "tcp,udp", target: "direct" },
-          { ips: ["203.0.113.54"], port: 853, network: "tcp", target: "direct" },
-        ];
-        p.xrayInterfaceRoutes = [{ selectors: ["domain:mesh.example", "10.9.0.0/16"],
-          interfaceName: "qa-mesh", domainStrategy: "ForceIPv4" }];
+        p.routing.user.push(
+          { selectors: ["203.0.113.53"], port: 53, network: "tcp,udp", target: { kind: "direct" } },
+          { selectors: ["203.0.113.54"], port: 853, network: "tcp", target: { kind: "direct" } },
+          { selectors: ["domain:mesh.example", "10.9.0.0/16"], target: { kind: "interface", interfaceName: "qa-mesh", domainStrategy: "ForceIPv4" } },
+        );
         p.xrayConnectionIdleSecs = 120;
         p.xrayTunMtu = 8500;
         p.xrayTunDnsServers = ["1.1.1.1", "8.8.8.8"];
@@ -1188,9 +1201,9 @@ export class SandboxBackend {
             key: this.endpointKeys[index], name: this.endpoints[index],
           }));
           const route = { selectors: ["domain:ai.example"], endpointKey: this.endpointKeys[0] };
-          if (!p.pinnedPolicies?.some((existing) => existing.endpointKey === route.endpointKey &&
-            existing.selectors.includes("domain:ai.example"))) {
-            p.pinnedPolicies = [...(p.pinnedPolicies ?? []), route];
+          if (!p.routing.user.some((existing) => existing.target.kind === "node" &&
+            existing.target.endpointKey === route.endpointKey && existing.selectors.includes("domain:ai.example"))) {
+            p.routing.user.push({ selectors: route.selectors, target: { kind: "node", endpointKey: route.endpointKey } });
           }
         }
         return this.profiles;
@@ -1338,69 +1351,23 @@ export class SandboxBackend {
         };
       }
       case "xray_test_route": {
-        // Lite simulator: literal domain/keyword selectors only — geo
-        // lookups and DNS pins are native-side.
         const req = args.request as {
           target: string;
-          domainPolicies: DomainPolicy[];
-          privateLanDirect: boolean;
+          routing: Profile["routing"];
+          privateLanDirect?: boolean;
+          xrayDomainStrategy?: Profile["xrayDomainStrategy"];
+          xrayDns?: Profile["xrayDns"];
         };
-        const host = String(req.target).split("://").pop()!.split("/")[0].split("@").pop()!;
-        const bare = host.replace(/^\[|\].*$/g, "").split(":")[0].toLowerCase();
-        const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(bare) || bare.includes(":") || /^[0-9a-f:]+$/i.test(bare) && bare.includes(":");
-        const matchSel = (sel: string): boolean | null => {
-          if (sel.startsWith("geosite:") || sel.startsWith("geoip:") || sel.startsWith("regexp:")) return null;
-          if (sel.startsWith("keyword:")) return !isIp && bare.includes(sel.slice(8));
-          if (sel.startsWith("full:")) return !isIp && bare === sel.slice(5);
-          const pat = sel.startsWith("domain:") ? sel.slice(7) : sel;
-          if (isIp) {
-            if (pat.includes("/")) {
-              const [net, bits] = pat.split("/");
-              const toInt = (s: string) => s.split(".").reduce((a, o) => (a << 8) + Number(o), 0) >>> 0;
-              if (!/^\d+\.\d+\.\d+\.\d+$/.test(net)) return false;
-              const mask = bits === "0" ? 0 : (0xffffffff << (32 - Number(bits))) >>> 0;
-              return (toInt(bare) & mask) === (toInt(net) & mask);
-            }
-            return bare === pat;
-          }
-          return bare === pat || bare.endsWith(`.${pat}`);
-        };
-        let outcome: { outbound: string; source: string; policyIndex?: number; selector?: string } =
-          { outbound: "proxy", source: "default" };
-        let sawUnknown = false;
-        const steps: { label: string; selector?: string; outcome: string }[] = [];
-        outer: for (const [index, policy] of (req.domainPolicies ?? []).entries()) {
-          let unknown = false;
-          for (const raw of policy.domains) {
-            const sel = raw.trim();
-            if (!sel || sel.startsWith("#")) continue;
-            const hit = matchSel(sel);
-            if (hit === true) {
-              steps.push({ label: `${policy.target} rules #${index + 1}`, selector: sel, outcome: "match" });
-              outcome = { outbound: policy.target, source: "policy", policyIndex: index, selector: sel };
-              break outer;
-            }
-            if (hit === null) { unknown = true; sawUnknown = true; }
-          }
-          steps.push({ label: `${policy.target} rules #${index + 1}`, outcome: unknown ? "unknown" : "miss" });
-        }
-        if (outcome.source === "default") {
-          if (req.privateLanDirect && isIp && /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|169\.254\.)/.test(bare)) {
-            outcome = { outbound: "direct", source: "privateLan", selector: "privateLanDirect" };
-          }
-          steps.push({ label: "default", outcome: "match" });
-        }
-        return {
-          target: bare,
-          targetKind: isIp ? "ip" : "domain",
-          outbound: outcome.outbound,
-          source: outcome.source,
-          policyIndex: outcome.policyIndex,
-          matchedSelector: outcome.selector,
-          certainty: sawUnknown ? "probable" : "certain",
-          steps,
-          notes: sawUnknown ? ["geoip/geosite selectors could not be evaluated: no geo assets on disk"] : [],
-        };
+        return explainProfileDocument({
+          version: 1,
+          profile: {
+            backend: "xray",
+            routing: req.routing as unknown as JsonValue,
+            privateLanDirect: req.privateLanDirect ?? false,
+            ...(req.xrayDomainStrategy ? { xrayDomainStrategy: req.xrayDomainStrategy } : {}),
+            ...(req.xrayDns ? { xrayDns: req.xrayDns as unknown as JsonValue } : {}),
+          },
+        }, req.target);
       }
       case "get_net_tables": return {
         available: true,

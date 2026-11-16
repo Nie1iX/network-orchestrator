@@ -8,7 +8,7 @@
     "dev:app": "cargo build -p net-manager-cli && NETWORK_ORCHESTRATOR_SOCKET=/run/network-orchestrator-dev/daemon.sock tauri dev --config src-tauri/tauri.dev.conf.json",
     "build:macos": "bash scripts/build-macos-native.sh",
     "test": "npm run test:format && npm run test:i18n && npm run test:sandbox && npm run test:subscriptions && npm run test:doctor && npm run test:diagnostics && npm run test:profile-document && npm run test:menus",
-    "test:sandbox": "node --experimental-strip-types --test tests/sandbox.test.ts",
+    "test:sandbox": "node --experimental-strip-types --test tests/sandbox.test.ts tests/sandboxRouting.test.ts",
     "test:menus": "node --experimental-strip-types --test tests/nativeMenu.test.ts",
     "test:format": "node --experimental-strip-types --test tests/format.test.ts",
     "test:subscriptions": "node --experimental-strip-types --test tests/subscriptions.test.ts",

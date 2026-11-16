@@ -19,6 +19,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   directory, including loopback Xray, connection state and system-proxy ownership.
 - Private credential/setup-key file and pipe input; terminal secret stdin is
   rejected before reading. Lookup errors do not echo sensitive input.
+- Edit ordered User/Base routing rows in the native client and CLI, including
+  explicit row moves/layer transfers and revision-protected saves.
 
 ### Changed
 

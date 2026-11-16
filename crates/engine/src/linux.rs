@@ -309,7 +309,7 @@ pub(crate) fn prepare_linux_xray_tun_params_with_base(
     }
     let config = net_manager_core::xray::apply_profile_routing(
         &base,
-        &profile.domain_policies,
+        &profile.routing,
         &net_manager_core::xray::ProfileRoutingOptions::from(profile),
     )
     .map_err(|_| "invalid Xray routing rules".to_string())?;
@@ -319,7 +319,10 @@ pub(crate) fn prepare_linux_xray_tun_params_with_base(
     let multinode = profile.subscription.as_ref().is_some_and(|subscription| {
         !subscription.backup_keys.is_empty()
             || subscription.node_pool.is_some() && !subscription.pool_keys.is_empty()
-    }) || !profile.pinned_policies.is_empty()
+    }) || profile
+        .routing
+        .iter()
+        .any(|rule| rule.target.endpoint_key().is_some())
         || profile.xray_dns.outbound_key.is_some();
     let (mut config, failover) = if multinode {
         build_multinode(vault, profile)?
@@ -334,8 +337,9 @@ pub(crate) fn prepare_linux_xray_tun_params_with_base(
     if profile.xray_dns.fake_dns {
         configure_linux_fake_dns(&mut config, &routes, profile.xray_dns.query_strategy)?;
     }
-    let mut dns_bypass = net_manager_core::xray::dns_bypass_hosts(&profile.xray_dns);
-    if default_route {
+    let mut dns_bypass =
+        net_manager_core::xray::dns_bypass_hosts(&profile.xray_dns, &profile.routing);
+    if default_route && !profile.routing.protects_dns() {
         for ip in ["1.1.1.1", "8.8.8.8", "9.9.9.9"] {
             dns_bypass.push(ip.to_string());
         }
@@ -448,7 +452,7 @@ fn build_multinode(
     .map_err(str::to_string)?;
     primary_config = net_manager_core::xray::apply_profile_routing(
         &primary_config,
-        &profile.domain_policies,
+        &profile.routing,
         &net_manager_core::xray::ProfileRoutingOptions::from(profile),
     )
     .map_err(|_| "invalid Xray routing rules".to_string())?;
@@ -487,7 +491,6 @@ fn build_multinode(
         pinned_outbounds.push(PinnedOutbound {
             key: route.endpoint_key.clone(),
             outbound,
-            selectors: route.selectors.clone(),
         });
     }
     if let Some(key) = &profile.xray_dns.outbound_key {
@@ -506,7 +509,6 @@ fn build_multinode(
             pinned_outbounds.push(PinnedOutbound {
                 key: key.clone(),
                 outbound,
-                selectors: Vec::new(),
             });
         }
     }
@@ -1010,11 +1012,14 @@ mod tests {
                             name: "Second".into(),
                         })
                 }
-                "Pinned" => candidate.pinned_policies.push(PinnedRoute {
-                    endpoint_key: id.clone(),
-                    selectors: vec!["domain:example.test".into()],
-                    missing: false,
-                }),
+                "Pinned" => candidate.routing.user.push(
+                    PinnedRoute {
+                        endpoint_key: id.clone(),
+                        selectors: vec!["domain:example.test".into()],
+                        missing: false,
+                    }
+                    .into(),
+                ),
                 "DNS" => candidate.xray_dns.outbound_key = Some(id.clone()),
                 _ => unreachable!(),
             }

@@ -1018,8 +1018,13 @@ import OSLog
   }
   /// Saves the rule sets and DNS options; a running connection restarts to apply them.
   func setRoutingRules(_ profile: Profile, options: RoutingOptions) async -> Bool {
+    guard let expectedRevision = options.editRevision else {
+      error = "Routing revision is missing; reload before saving."
+      return false
+    }
     var args = options.bridgeArgs
     args["id"] = profile.id
+    args["expectedRevision"] = expectedRevision
     return await change("set_routing_rules", args: args)
   }
   func routingOptions(_ profile: Profile) async -> RoutingOptions? {

@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-pub const PROFILE_DOCUMENT_VERSION: u32 = 1;
+pub const PROFILE_DOCUMENT_VERSION: u32 = 2;
 
 pub fn profile_edit_revision(profile: &Profile) -> io::Result<String> {
     use sha2::{Digest, Sha256};
@@ -48,15 +48,17 @@ impl ProfileStore {
             }
             Err(err) => return Err(err),
         };
-        let document: ProfileDocument =
+        let mut document: ProfileDocument =
             serde_json::from_str(&raw).map_err(|_| invalid_data("invalid profile document"))?;
-        if document.version != PROFILE_DOCUMENT_VERSION {
+        if !matches!(document.version, 1 | PROFILE_DOCUMENT_VERSION) {
             return Err(invalid_data(format!(
                 "unsupported profile document version {}",
                 document.version
             )));
         }
+        document.version = PROFILE_DOCUMENT_VERSION;
         for profile in &document.profiles {
+            crate::routing_policy::validate(&profile.routing)?;
             crate::service_checks::validate_profile_service_checks(profile)?;
             crate::proxy_exits::validate_profile_proxy_exits(profile)?;
         }
@@ -64,8 +66,12 @@ impl ProfileStore {
     }
 
     pub fn save(&self, document: &ProfileDocument) -> io::Result<()> {
+        if !matches!(document.version, 1 | PROFILE_DOCUMENT_VERSION) {
+            return Err(invalid_data("unsupported profile document version"));
+        }
         // Reject invalid input before creating even the transaction lock.
         for profile in &document.profiles {
+            crate::routing_policy::validate(&profile.routing)?;
             crate::service_checks::validate_profile_service_checks(profile)?;
             crate::proxy_exits::validate_profile_proxy_exits(profile)?;
         }
@@ -101,7 +107,11 @@ impl ProfileStore {
     }
 
     pub(crate) fn save_locked(&self, document: &ProfileDocument) -> io::Result<()> {
+        if !matches!(document.version, 1 | PROFILE_DOCUMENT_VERSION) {
+            return Err(invalid_data("unsupported profile document version"));
+        }
         for profile in &document.profiles {
+            crate::routing_policy::validate(&profile.routing)?;
             crate::service_checks::validate_profile_service_checks(profile)?;
             crate::proxy_exits::validate_profile_proxy_exits(profile)?;
         }
@@ -109,8 +119,16 @@ impl ProfileStore {
             fs::create_dir_all(parent)?;
             crate::config_security::protect_path(parent)?;
         }
-        let json = serde_json::to_string_pretty(document)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        #[derive(Serialize)]
+        struct CanonicalDocument<'a> {
+            version: u32,
+            profiles: &'a [Profile],
+        }
+        let json = serde_json::to_string_pretty(&CanonicalDocument {
+            version: PROFILE_DOCUMENT_VERSION,
+            profiles: &document.profiles,
+        })
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let mut temp_name = self.path.clone().into_os_string();
         temp_name.push(".tmp");
         let temp_path = PathBuf::from(temp_name);
@@ -393,18 +411,18 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
         return Err(invalid_data("Mihomo options require a Mihomo profile"));
     }
     if !matches!(profile.backend, TunnelBackend::Xray | TunnelBackend::Mihomo)
-        && !profile.domain_policies.is_empty()
+        && !profile.routing.is_empty()
     {
-        return Err(invalid_data("domain policies require Xray or Mihomo"));
+        return Err(invalid_data("routing policies require Xray or Mihomo"));
     }
     if profile.backend == TunnelBackend::Xray {
-        crate::xray::validate_routing_policy_selectors(&profile.domain_policies)
+        crate::routing_policy::validate(&profile.routing)
             .map_err(|error| invalid_data(error.to_string()))?;
         crate::xray::validate_dns_config(&profile.xray_dns)
             .map_err(|error| invalid_data(error.to_string()))?;
         crate::xray::validate_advanced_routing_options(
-            &profile.xray_traffic_rules,
-            &profile.xray_interface_routes,
+            &[],
+            &[],
             profile.xray_sockopts.as_ref(),
             profile.xray_connection_idle_secs,
             profile.xray_direct_domain_strategy.as_deref(),
@@ -415,16 +433,6 @@ pub fn validate_profile(profile: &Profile) -> io::Result<()> {
             &profile.xray_tun_dns_servers,
         )
         .map_err(|error| invalid_data(error.to_string()))?;
-        crate::xray::validate_pinned_routes(&profile.pinned_policies)
-            .map_err(|error| invalid_data(error.to_string()))?;
-        for policy in &profile.domain_policies {
-            if policy.domains.is_empty() {
-                return Err(invalid_data("domain policy must list at least one domain"));
-            }
-            if policy.domains.iter().any(|domain| domain.trim().is_empty()) {
-                return Err(invalid_data("domain policy must not contain blank domains"));
-            }
-        }
         if matches!(profile.xray_socks_port, Some(0)) {
             return Err(invalid_data("xray socks port must be nonzero"));
         }
@@ -498,7 +506,9 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{DomainPolicy, DomainRouteTarget, PolicyRoute, TunnelBackend};
+    use crate::models::{
+        DomainPolicy, DomainRouteTarget, PolicyRoute, RoutingPolicy, TunnelBackend,
+    };
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -830,11 +840,14 @@ mod tests {
         assert!(store.upsert(bad.clone()).is_err(), "exit count budget");
         // A 34th distinct pin key exceeds the daemon pin-listener budget.
         let mut over = xray_sub_profile();
-        over.pinned_policies = (0..32)
-            .map(|i| crate::models::PinnedRoute {
-                selectors: vec![format!("domain:{i}.test")],
-                endpoint_key: format!("{i:016x}"),
-                missing: false,
+        over.routing.user = (0..32)
+            .map(|i| {
+                crate::models::PinnedRoute {
+                    selectors: vec![format!("domain:{i}.test")],
+                    endpoint_key: format!("{i:016x}"),
+                    missing: false,
+                }
+                .into()
             })
             .collect();
         over.xray_dns.outbound_key = Some("eeeeeeeeeeeeeeee".into());
@@ -1257,10 +1270,14 @@ mod tests {
             backend: TunnelBackend::Xray,
             config_path: PathBuf::from(r"C:\configs\work.json"),
             interface_name: String::new(),
-            domain_policies: vec![DomainPolicy {
-                domains: vec!["example.com".into()],
-                target: DomainRouteTarget::Proxy,
-            }],
+            routing: RoutingPolicy {
+                user: vec![DomainPolicy {
+                    domains: vec!["example.com".into()],
+                    target: DomainRouteTarget::Proxy,
+                }
+                .into()],
+                ..Default::default()
+            },
             xray_socks_port: Some(10808),
             ..Default::default()
         }
@@ -1296,7 +1313,7 @@ mod tests {
             "autoConnect": false
         }"#;
         let profile: Profile = serde_json::from_str(json).unwrap();
-        assert!(profile.domain_policies.is_empty());
+        assert!(profile.routing.is_empty());
         assert_eq!(profile.xray_socks_port, None);
         assert!(validate_profile(&profile).is_ok());
     }
@@ -1304,10 +1321,11 @@ mod tests {
     #[test]
     fn domain_policies_rejected_for_non_xray_backends() {
         let mut profile = wg_profile();
-        profile.domain_policies = vec![DomainPolicy {
+        profile.routing.user = vec![DomainPolicy {
             domains: vec!["example.com".into()],
             target: DomainRouteTarget::Direct,
-        }];
+        }
+        .into()];
         let err = validate_profile(&profile).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
@@ -1315,20 +1333,22 @@ mod tests {
     #[test]
     fn xray_domain_policies_require_nonblank_domains() {
         let mut empty_list = xray_profile();
-        empty_list.domain_policies = vec![DomainPolicy {
+        empty_list.routing.user = vec![DomainPolicy {
             domains: vec![],
             target: DomainRouteTarget::Proxy,
-        }];
+        }
+        .into()];
         assert_eq!(
             validate_profile(&empty_list).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
 
         let mut blank = xray_profile();
-        blank.domain_policies = vec![DomainPolicy {
+        blank.routing.user = vec![DomainPolicy {
             domains: vec!["example.com".into(), "   ".into()],
             target: DomainRouteTarget::Direct,
-        }];
+        }
+        .into()];
         assert_eq!(
             validate_profile(&blank).unwrap_err().kind(),
             io::ErrorKind::InvalidData
@@ -1395,7 +1415,15 @@ mod tests {
     fn load_rejects_unsupported_version() {
         let dir = unique_dir("version");
         let path = dir.join("profiles.json");
-        fs::write(&path, r#"{"version":2,"profiles":[]}"#).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": PROFILE_DOCUMENT_VERSION + 1,
+                "profiles": [],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let store = ProfileStore::new(&path);
 
         let err = store.load().unwrap_err();

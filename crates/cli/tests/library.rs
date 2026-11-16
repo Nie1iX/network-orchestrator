@@ -92,9 +92,16 @@ fn routing_rules_round_trip_and_decide_a_host() {
         "--direct",
         "domain:corp.example",
     ]);
-    let options = sandbox.json(&["route", "show", "r"]);
-    assert_eq!(options["block"], "domain:ads.example");
-    assert_eq!(options["direct"], "domain:corp.example");
+    assert_eq!(
+        options["routing"]["user"][0]["selectors"][0],
+        "domain:ads.example"
+    );
+    assert_eq!(options["routing"]["user"][0]["target"]["kind"], "block");
+    assert_eq!(
+        options["routing"]["user"][1]["selectors"][0],
+        "domain:corp.example"
+    );
+    assert_eq!(options["routing"]["user"][1]["target"]["kind"], "direct");
     let verdict = sandbox.json(&["route", "check", "ads.example", "--profile", "r"]);
     assert_eq!(verdict["outbound"], "block");
     let verdict = sandbox.json(&["route", "check", "www.corp.example", "--profile", "r"]);

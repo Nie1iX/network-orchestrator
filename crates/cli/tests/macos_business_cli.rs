@@ -60,8 +60,29 @@ fn actual_business_edits_routing_and_mode_round_trip() {
     let rows = s.json(&["ls"]);
     assert_eq!(rows[0]["name"], "Work");
     s.json(&["route", "set", "work", "--block", "domain:ads.example"]);
+    let routing = s.json(&["route", "show", "work"]);
+    assert_eq!(
+        routing["routing"]["user"][0]["selectors"][0],
+        "domain:ads.example"
+    );
+    assert_eq!(routing["routing"]["user"][0]["target"]["kind"], "block");
+    s.json(&["route", "add", "work", "--proxy", "domain:video.example"]);
+    s.json(&["route", "move", "work", "2", "1"]);
+    let routing = s.json(&["route", "show", "work"]);
+    assert_eq!(
+        routing["routing"]["user"][0]["selectors"][0],
+        "domain:video.example"
+    );
+    s.json(&["route", "layer", "work", "1", "--to", "base"]);
+    let routing = s.json(&["route", "show", "work"]);
+    assert_eq!(
+        routing["routing"]["base"][0]["selectors"][0],
+        "domain:video.example"
+    );
+    s.json(&["route", "rm", "work", "--block", "domain:ads.example"]);
     let verdict = s.json(&["route", "check", "ads.example", "--profile", "work"]);
     assert_eq!(verdict["outbound"], "block");
+    s.json(&["route", "rm", "work", "--block", "domain:ads.example"]);
     assert_eq!(
         s.json(&["mode", "set", "orchestrator"])["appMode"],
         "orchestrator"

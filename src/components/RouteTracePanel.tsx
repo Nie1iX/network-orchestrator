@@ -111,6 +111,9 @@ export default function RouteTracePanel({ mode, context, profile }: {
           <strong>{decision.certainty === "certain" ? tr("Configured path") : tr("Possible path — not confirmed")}</strong>
           <span>{decision.target}</span><span className="network-flow-connector" aria-hidden="true" /><span>{output}</span>
         </div>
+        {decision.layer && decision.ruleIndex != null && <p className="row-hint">
+          {decision.layer === "user" ? tr("User rule {number}", { number: decision.ruleIndex + 1 }) : tr("Base rule {number}", { number: decision.ruleIndex + 1 })}
+        </p>}
         {decision.matchedSelector && <p className="row-hint">{tr("Matched condition: {selector}", { selector: decision.matchedSelector })}</p>}
         <details><summary>{tr("Decision details")}</summary>
         <ol className="network-trace-steps">{decision.steps.map((step, index) => <li key={index} data-outcome={step.outcome}>

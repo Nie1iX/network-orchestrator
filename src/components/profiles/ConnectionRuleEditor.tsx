@@ -1,7 +1,7 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { tr } from "../../i18n";
 import type { NetworkInterface, SubscriptionEndpointInfo } from "../../types";
-import { type JsonValue, type ProfileDocument, removeDocumentValue, setDocumentValue } from "../../profileDocument";
+import { type JsonValue, type ProfileDocument, changeRoutingRuleLayer, connectDocumentNode, moveRoutingRule, removeDocumentValue, setDocumentValue } from "../../profileDocument";
 import "./ConnectionRuleEditor.css";
 
 interface Props {
@@ -20,29 +20,33 @@ type Wire = { x1: number; y1: number; x2: number; y2: number };
 type Drag = { kind: "card" | "wire"; id: string; pointerId: number; x: number; y: number; start: Point; scroll: Point };
 const CONDITION_SIZE = { width: 280, height: 120 };
 const OUTPUT_SIZE = { width: 240, height: 72 };
-const categories = [
-  ["pinnedPolicies", "Selected-server rules"], ["xrayTrafficRules", "IP and port rules"],
-  ["xrayInterfaceRoutes", "Interface rules"], ["domainPolicies", "Site and network rules"], ["routes", "IP network routes"],
-] as const;
+const categories = [["routes", "Policy route"]] as const;
 function getRules(document: ProfileDocument): Rule[] {
-  return categories.flatMap(([key, kind]) => {
+  const routing = document.profile.routing;
+  if (routing === null || typeof routing !== "object" || Array.isArray(routing)) return [];
+  return (["user", "base"] as const).flatMap((layer) => {
+    const values = routing[layer];
+    return Array.isArray(values) ? values.flatMap((value, index) => value !== null && typeof value === "object" && !Array.isArray(value)
+      ? [{ path: `/profile/routing/${layer}/${index}`, key: "routing", index, kind: layer === "user" ? "User rule" : "Base rule", value: value as Record<string, JsonValue> }] : []) : [];
+  }).concat(categories.flatMap(([key, kind]) => {
     const values = document.profile[key];
     return Array.isArray(values) ? values.flatMap((value, index) => value !== null && typeof value === "object" && !Array.isArray(value)
-      ? [{ path: `/profile/${key}/${index}`, key, index, kind, value }] : []) : [];
-  });
+      ? [{ path: `/profile/${key}/${index}`, key, index, kind, value: value as Record<string, JsonValue> }] : []) : [];
+  }));
 }
-function selectorKey(rule: Rule): string {
-  return rule.key === "routes" ? "destination" : rule.key === "domainPolicies" ? "domains" : rule.key === "xrayTrafficRules" ? "ips" : "selectors";
-}
+function selectorKey(rule: Rule): string { return rule.key === "routes" ? "destination" : "selectors"; }
 function selector(rule: Rule): string {
   const value = rule.value[selectorKey(rule)];
-  return Array.isArray(value) ? value.join(", ") : String(value ?? "");
+  return Array.isArray(value) ? value.join(", ") : String(value ?? rule.value.destination ?? "");
 }
 function outputId(rule: Rule): string {
-  if (rule.key === "routes") return "proxy";
-  if (typeof rule.value.endpointKey === "string") return `node:${rule.value.endpointKey}`;
-  if (typeof rule.value.interfaceName === "string") return `interface:${rule.value.interfaceName}`;
-  return typeof rule.value.target === "string" ? rule.value.target : "";
+  const target = rule.value.target;
+  if (target !== null && typeof target === "object" && !Array.isArray(target)) {
+    if (target.kind === "node") return `node:${target.endpointKey}`;
+    if (target.kind === "interface") return `interface:${target.interfaceName}`;
+    if (typeof target.kind === "string") return target.kind;
+  }
+  return rule.key === "routes" ? "proxy" : "";
 }
 function newSelectors(text: string): string[] {
   return text.split(/[\n,]/).map((value) => value.trim()).filter(Boolean).map((value) => {
@@ -68,11 +72,9 @@ export default function ConnectionRuleEditor({ document, endpoints, interfaces, 
   const [drag, setDrag] = useState<Drag | null>(null);
   const [viewportWidth, setViewportWidth] = useState(0);
   const [adding, setAdding] = useState(false);
-  const [draftKind, setDraftKind] = useState(xray ? "domainPolicies" : "routes");
+  const [draftKind, setDraftKind] = useState(xray ? "routing" : "routes");
   const [draftSelector, setDraftSelector] = useState("");
   const [draftExit, setDraftExit] = useState("proxy");
-  const [draftPort, setDraftPort] = useState(443);
-  const [draftNetwork, setDraftNetwork] = useState("tcp");
   const [notice, setNotice] = useState<string | null>(null);
   const [selectorDraft, setSelectorDraft] = useState<{ path: string; text: string; encoded: string } | null>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -82,7 +84,9 @@ export default function ConnectionRuleEditor({ document, endpoints, interfaces, 
   const subscription = subscriptionValue !== null && typeof subscriptionValue === "object" && !Array.isArray(subscriptionValue) ? subscriptionValue : null;
   const dnsValue = document.profile.xrayDns;
   const dns = dnsValue !== null && typeof dnsValue === "object" && !Array.isArray(dnsValue) ? dnsValue : null;
-  const selectedList = selected ? document.profile[selected.key] : null;
+  const selectedLayer = selected?.path.match(/^\/profile\/routing\/(base|user)\//)?.[1] as "base" | "user" | undefined;
+  const selectedList = selectedLayer && document.profile.routing !== null && typeof document.profile.routing === "object" && !Array.isArray(document.profile.routing)
+    ? document.profile.routing[selectedLayer] : selected ? document.profile[selected.key] : null;
   const selectedListLength = Array.isArray(selectedList) ? selectedList.length : 0;
   const activeEndpoint = endpoints.find((endpoint) => endpoint.key === subscription?.activeKey);
   const exits: Exit[] = [
@@ -104,7 +108,7 @@ export default function ConnectionRuleEditor({ document, endpoints, interfaces, 
     const kind = exit.id === "proxy" ? tr("Connection") : exit.id.startsWith("node:") ? tr("Subscription server") : exit.id.startsWith("interface:") ? tr("Interface") : null;
     return kind ? `${kind}: ${exit.label}` : exit.label;
   };
-  const availableKinds = xray ? [["domainPolicies", "Site or network"], ["xrayTrafficRules", "IP and port"]] : mihomo ? [] : [["routes", "IP network"]];
+  const availableKinds = xray ? [["routing", "Site or network"]] : mihomo ? [] : [["routes", "IP network"]];
   const pointFor = (id: string, index: number, output = false): Point => positions[id] ?? { x: output ? Math.max(520, viewportWidth - 272) : 16, y: 48 + index * (output ? 88 : 144) };
   const wires: Record<string, Wire> = {};
   rules.forEach((rule, index) => {
@@ -116,62 +120,46 @@ export default function ConnectionRuleEditor({ document, endpoints, interfaces, 
       x2: to.x, y2: to.y + OUTPUT_SIZE.height / 2 };
   });
   const updateField = (rule: Rule, key: string, value: JsonValue) => onChange(setDocumentValue(document, `${rule.path}/${key}`, value));
-  const canRewire = (rule: Rule) => xray && rule.key !== "routes";
-  const choicesFor = (rule: Rule) => exits.filter((exit) => rule.key !== "xrayTrafficRules" || !exit.id.includes(":"));
+  const canRewire = (rule: Rule) => xray && rule.key === "routing";
+  const choicesFor = (_rule: Rule) => exits;
   const convertExit = (rule: Rule, id: string) => {
-    if (disabled || !canRewire(rule)) return;
-    const exit = exits.find((item) => item.id === id);
-    if (!exit || exit.unavailable) return;
-    if (rule.key === "xrayTrafficRules") {
-      if (id.includes(":")) { setNotice(tr("IP and port rules can only use the connection, direct internet, or block without losing their port condition.")); return; }
-      updateField(rule, "target", id); return;
-    }
-    const key = id.startsWith("node:") ? "pinnedPolicies" : id.startsWith("interface:") ? "xrayInterfaceRoutes" : "domainPolicies";
-    const targetField = key === "pinnedPolicies" ? "endpointKey" : key === "xrayInterfaceRoutes" ? "interfaceName" : "target";
-    const target = id.startsWith("node:") ? id.slice(5) : id.startsWith("interface:") ? id.slice(10) : id;
-    if (key === rule.key) { updateField(rule, targetField, target); return; }
-    if (rule.key === "xrayInterfaceRoutes" && rule.value.domainStrategy != null && rule.value.domainStrategy !== document.profile.xrayDomainStrategy) {
-      setNotice(tr("This rule has its own domain resolution strategy. Change it in JSON before moving it to another output type.")); return;
-    }
-    const value: Record<string, JsonValue> = { ...rule.value };
-    const selectors = value[selectorKey(rule)] ?? [];
-    for (const field of ["domains", "selectors", "ips", "target", "endpointKey", "interfaceName"]) delete value[field];
-    value[key === "domainPolicies" ? "domains" : "selectors"] = selectors;
-    value[targetField] = target;
-    const destination = document.profile[key];
-    const list = Array.isArray(destination) ? [...destination, value] : [value];
-    const source = document.profile[rule.key];
-    let next = setDocumentValue(document, `/profile/${key}`, list);
-    if (Array.isArray(source)) next = setDocumentValue(next, `/profile/${rule.key}`, source.filter((_, index) => index !== rule.index));
-    onChange(next); onSelect(`/profile/${key}/${list.length - 1}`); setPositions({});
-    setNotice(tr("The output changed this rule's backend priority group. Check its order before applying."));
+    if (disabled || !canRewire(rule) || !exits.some((exit) => exit.id === id && !exit.unavailable)) return;
+    onChange(connectDocumentNode(document, rule.path, id));
   };
   const addRule = () => {
-    if (disabled || !availableKinds.some(([key]) => key === draftKind)) return;
+    if (disabled || !availableKinds.length) return;
     try {
       const selectors = newSelectors(draftSelector);
       const exit = exits.find((item) => item.id === draftExit);
       if (!selectors.length || !exit || exit.unavailable) return;
-      const key = draftKind === "routes" ? "routes" : draftKind === "xrayTrafficRules" ? draftKind : draftExit.startsWith("node:") ? "pinnedPolicies" : draftExit.startsWith("interface:") ? "xrayInterfaceRoutes" : "domainPolicies";
-      if (key === "xrayTrafficRules" && (draftExit.includes(":") || draftPort < 1 || draftPort > 65535 || !Number.isInteger(draftPort))) return;
-      const current = document.profile[key];
-      const list = Array.isArray(current) ? current : [];
-      const values: JsonValue[] = key === "routes" ? selectors.map((destination) => ({ destination, metric: 0 }))
-        : [key === "pinnedPolicies" ? { selectors, endpointKey: draftExit.slice(5) }
-          : key === "xrayInterfaceRoutes" ? { selectors, interfaceName: draftExit.slice(10) }
-          : key === "xrayTrafficRules" ? { ips: selectors, port: draftPort, network: draftNetwork, target: draftExit }
-          : { domains: selectors, target: draftExit }];
-      onChange(setDocumentValue(document, `/profile/${key}`, [...list, ...values]));
-      onSelect(`/profile/${key}/${list.length}`); setAdding(false); setDraftSelector(""); setNotice(null);
+      if (draftKind === "routes") {
+        const current = document.profile.routes;
+        const list = Array.isArray(current) ? current : [];
+        onChange(setDocumentValue(document, "/profile/routes", [...list, ...selectors.map((destination) => ({ destination, metric: 0 }))]));
+        onSelect(`/profile/routes/${list.length}`);
+      } else {
+        const target: Record<string, JsonValue> = draftExit.startsWith("node:") ? { kind: "node", endpointKey: draftExit.slice(5) }
+          : draftExit.startsWith("interface:") ? { kind: "interface", interfaceName: draftExit.slice(10) } : { kind: draftExit };
+        const routing = document.profile.routing;
+        const hasRouting = routing !== null && typeof routing === "object" && !Array.isArray(routing);
+        const user = hasRouting && Array.isArray(routing.user) ? routing.user : [];
+        const withRouting = hasRouting ? document : setDocumentValue(document, "/profile/routing", { base: [], user: [] });
+        onChange(setDocumentValue(withRouting, "/profile/routing/user", [...user, { selectors, target }]));
+        onSelect(`/profile/routing/user/${user.length}`);
+      }
+      setAdding(false); setDraftSelector(""); setNotice(null);
     } catch { setNotice(tr("Enter a site or network without credentials.")); }
   };
   const reorder = (rule: Rule, offset: number) => {
-    const values = document.profile[rule.key];
-    if (disabled || rule.key === "routes" || !Array.isArray(values) || rule.index + offset < 0 || rule.index + offset >= values.length) return;
-    const next = [...values];
-    [next[rule.index], next[rule.index + offset]] = [next[rule.index + offset], next[rule.index]];
-    onChange(setDocumentValue(document, `/profile/${rule.key}`, next));
-    onSelect(`/profile/${rule.key}/${rule.index + offset}`); setPositions({});
+    if (disabled || rule.key !== "routing" || !selectedLayer) {
+      if (disabled || rule.key !== "routes" || !Array.isArray(document.profile.routes)) return;
+      const list = document.profile.routes;
+      if (rule.index + offset < 0 || rule.index + offset >= list.length) return;
+      const next = [...list]; [next[rule.index], next[rule.index + offset]] = [next[rule.index + offset], next[rule.index]];
+      onChange(setDocumentValue(document, "/profile/routes", next)); onSelect(`/profile/routes/${rule.index + offset}`); return;
+    }
+    onChange(moveRoutingRule(document, selectedLayer, rule.index, offset));
+    onSelect(`${rule.path.replace(/\/\d+$/, `/${rule.index + offset}`)}`); setPositions({});
   };
   useLayoutEffect(() => {
     const viewport = viewportRef.current;
@@ -204,15 +192,15 @@ export default function ConnectionRuleEditor({ document, endpoints, interfaces, 
   const extent = Object.values(positions).reduce((size, point) => ({ x: Math.max(size.x, point.x + 312), y: Math.max(size.y, point.y + 160) }), { x: Math.max(800, viewportWidth), y: Math.max(360, rules.length * 144 + 64, usedExits.length * 88 + 64) });
   const selectedText = selected && selectorDraft?.path === selected.path && selectorDraft.encoded === JSON.stringify(selected.value[selectorKey(selected)]) ? selectorDraft.text : selected ? selector(selected) : "";
   return <section className="connection-rule-editor">
-    <header><div><h2>{tr("Connection rules")}</h2><p>{tr(xray ? "Rules use fixed backend priority groups. Moving cards only changes the layout." : "IP routes use kernel prefix and metric precedence, not card order.")}</p></div>
+    <header><div><h2>{tr("Connection rules")}</h2><p>{tr(xray ? "User rules run before Base, in the listed order. Moving cards only changes the layout." : "IP routes use kernel prefix and metric precedence, not card order.")}</p></div>
       <button type="button" className="btn-sm" disabled={disabled || !availableKinds.length} onClick={() => setAdding((value) => !value)}>{tr("Add rule")}</button></header>
     {mihomo && <p className="runtime-notice">{tr("Mihomo routing remains in its native configuration; Xray rules are not added here.")}</p>}
+    {xray && <p className="runtime-notice">{tr("IP selectors use IPOnDemand. Required User IP checks fail closed when DNS is unavailable. Proxy overrides and explicit server rules protect application DNS through the proxy, even when resolver settings request direct.")}</p>}
     {notice && <p className="save-notice" role="status">{notice}</p>}
     {adding && <div className="connection-rule-add">
       <label>{tr("Condition type")}<select disabled={disabled} value={draftKind} onChange={(event) => { setDraftKind(event.target.value); setDraftExit("proxy"); }}>{availableKinds.map(([key, label]) => <option key={key} value={key}>{tr(label)}</option>)}</select></label>
-      <label>{tr("Site or network")}<textarea disabled={disabled} value={draftSelector} onChange={(event) => setDraftSelector(event.target.value)} placeholder={draftKind === "domainPolicies" ? tr("example.com or 10.10.0.0/16") : tr("10.10.0.0/16")}/></label>
-      {draftKind !== "routes" && <label>{tr("Output")}<select disabled={disabled} value={draftExit} onChange={(event) => setDraftExit(event.target.value)}>{exits.filter((exit) => draftKind !== "xrayTrafficRules" || !exit.id.includes(":")).map((exit) => <option key={exit.id} value={exit.id} disabled={exit.unavailable}>{optionLabel(exit)}</option>)}</select></label>}
-      {draftKind === "xrayTrafficRules" && <><label>{tr("Port")}<input type="number" min="1" max="65535" disabled={disabled} value={draftPort} onChange={(event) => setDraftPort(Number(event.target.value))}/></label><label>{tr("Network")}<select disabled={disabled} value={draftNetwork} onChange={(event) => setDraftNetwork(event.target.value)}><option value="tcp">TCP</option><option value="udp">UDP</option></select></label></>}
+      <label>{tr("Site or network")}<textarea disabled={disabled} value={draftSelector} onChange={(event) => setDraftSelector(event.target.value)} placeholder={draftKind === "routing" ? tr("example.com or 10.10.0.0/16") : tr("10.10.0.0/16")}/></label>
+      {draftKind === "routing" && <label>{tr("Output")}<select disabled={disabled} value={draftExit} onChange={(event) => setDraftExit(event.target.value)}>{exits.map((exit) => <option key={exit.id} value={exit.id} disabled={exit.unavailable}>{optionLabel(exit)}</option>)}</select></label>}
       <button type="button" className="btn-sm" disabled={disabled || !draftSelector.trim()} onClick={addRule}>{tr("Create rule")}</button>
     </div>}
     <div className={`connection-rule-workspace${selected ? " with-inspector" : ""}`}>
@@ -233,7 +221,6 @@ export default function ConnectionRuleEditor({ document, endpoints, interfaces, 
           onClick={() => onSelect(rule.path)} onPointerDown={(event) => { if ((event.target as HTMLElement).closest("button")) return; beginDrag(event, "card", id, point); onSelect(rule.path); }}
           onKeyDown={(event) => { moveWithKeyboard(event, id, point); if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelect(rule.path); } }}>
           <strong title={selector(rule)}>{selector(rule) || tr("Empty condition")}</strong><small>{tr(rule.kind)} · {rule.index + 1}</small>
-          {rule.key === "xrayTrafficRules" && <small>{tr("Port {port}; {network}", { port: String(rule.value.port ?? 0), network: String(rule.value.network ?? "tcp") })}</small>}
           {rule.key === "routes" && <small>{tr("Metric {metric}", { metric: Number(rule.value.metric ?? 0) })}</small>}
           <button type="button" className="connection-rule-wire" data-condition-port={rule.path} disabled={disabled || !canRewire(rule)} aria-label={tr("Drag to rewire output")} onPointerDown={(event) => { if (canRewire(rule)) beginDrag(event, "wire", rule.path, point); }}/>
         </article>;
@@ -254,9 +241,15 @@ export default function ConnectionRuleEditor({ document, endpoints, interfaces, 
         setSelectorDraft({ path: selected.path, text, encoded: JSON.stringify(value) }); updateField(selected, key, value);
       }}/></label>
       {selected.key !== "routes" && <label>{tr("Output")}<select disabled={disabled || !canRewire(selected)} value={outputId(selected)} onChange={(event) => convertExit(selected, event.target.value)}>{choicesFor(selected).map((exit) => <option key={exit.id} value={exit.id} disabled={exit.unavailable}>{optionLabel(exit)}</option>)}</select></label>}
-      {selected.key === "xrayTrafficRules" && <><label>{tr("Port")}<input type="number" min="1" max="65535" disabled={disabled} value={Number(selected.value.port ?? 0)} onChange={(event) => updateField(selected, "port", Number(event.target.value))}/></label><label>{tr("Network")}<select disabled={disabled} value={String(selected.value.network ?? "tcp")} onChange={(event) => updateField(selected, "network", event.target.value)}><option value="tcp">TCP</option><option value="udp">UDP</option></select></label></>}
       {selected.key === "routes" && <><label>{tr("Metric")}<input type="number" min="0" disabled={disabled} value={Number(selected.value.metric ?? 0)} onChange={(event) => updateField(selected, "metric", Number(event.target.value))}/></label><label>{tr("Gateway")}<input disabled={disabled} value={String(selected.value.via ?? "")} onChange={(event) => updateField(selected, "via", event.target.value || null)}/></label></>}
       <div className="connection-rule-actions">
+        {selected.key === "routing" && selectedLayer && <label>{tr("Layer")}<select disabled={disabled} value={selectedLayer} onChange={(event) => {
+          const destination = event.target.value as "base" | "user";
+          const next = changeRoutingRuleLayer(document, selectedLayer, selected.index, destination);
+          const nextRouting = next.profile.routing;
+          const nextRows = nextRouting !== null && typeof nextRouting === "object" && !Array.isArray(nextRouting) ? nextRouting[destination] : null;
+          onChange(next); onSelect(`/profile/routing/${destination}/${Array.isArray(nextRows) ? nextRows.length - 1 : 0}`); setPositions({});
+        }}><option value="user">{tr("User layer")}</option><option value="base">{tr("Base layer")}</option></select></label>}
         {selected.key !== "routes" && <><button type="button" className="btn-sm" disabled={disabled || selected.index === 0} onClick={() => reorder(selected, -1)}>{tr("Move up")}</button><button type="button" className="btn-sm" disabled={disabled || selected.index + 1 >= selectedListLength} onClick={() => reorder(selected, 1)}>{tr("Move down")}</button></>}
         <button type="button" className="btn-sm" disabled={disabled} onClick={() => { onChange(removeDocumentValue(document, selected.path)); onSelect(""); setPositions({}); }}>{tr("Remove rule")}</button>
       </div>

@@ -539,15 +539,22 @@ fn pinned_routes_of(ctx: &Ctx, profile: &Profile) -> Value {
     }
     Value::Array(
         profile
-            .pinned_policies
+            .routing
             .iter()
-            .map(|route| {
-                let (name, missing) = names
-                    .get(&route.endpoint_key)
+            .filter_map(|rule| {
+                let net_manager_core::models::RoutingTarget::Node {
+                    endpoint_key,
+                    missing,
+                } = &rule.target
+                else {
+                    return None;
+                };
+                let (name, unavailable) = names
+                    .get(endpoint_key)
                     .cloned()
-                    .unwrap_or_else(|| (route.endpoint_key.clone(), true));
-                json!({"endpointKey": route.endpoint_key, "server": name,
-                    "missing": missing, "selectors": route.selectors})
+                    .unwrap_or_else(|| (endpoint_key.clone(), true));
+                Some(json!({"endpointKey": endpoint_key, "server": name,
+                    "missing": *missing || unavailable, "selectors": rule.selectors}))
             })
             .collect(),
     )

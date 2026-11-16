@@ -221,6 +221,20 @@ pub enum SubscriptionCommand {
     ImportLog,
     Hwid,
 }
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum RoutingLayerArg {
+    Base,
+    #[default]
+    User,
+}
+impl From<RoutingLayerArg> for net_manager_core::models::RoutingLayer {
+    fn from(layer: RoutingLayerArg) -> Self {
+        match layer {
+            RoutingLayerArg::Base => Self::Base,
+            RoutingLayerArg::User => Self::User,
+        }
+    }
+}
 #[derive(Subcommand, Debug)]
 pub enum RouteCommand {
     Lookup {
@@ -244,12 +258,51 @@ pub enum RouteCommand {
         direct: Vec<String>,
         #[arg(long)]
         lan_direct: bool,
-        /// Typed AdvancedRouting JSON (strategy, matcher, DNS); omitted preserves existing settings.
+        #[arg(long, value_enum, default_value_t = RoutingLayerArg::User)]
+        layer: RoutingLayerArg,
+        /// Typed AdvancedRouting JSON; omitted preserves existing settings.
         #[arg(long)]
         advanced: Option<PathBuf>,
-        /// Typed GeoUrls JSON; null fields clear custom URLs.
+        /// Typed GeoUrls JSON.
         #[arg(long)]
         geo: Option<PathBuf>,
+    },
+    Add {
+        profile: String,
+        #[arg(long)]
+        block: Vec<String>,
+        #[arg(long)]
+        proxy: Vec<String>,
+        #[arg(long)]
+        direct: Vec<String>,
+        #[arg(long, value_enum, default_value_t = RoutingLayerArg::User)]
+        layer: RoutingLayerArg,
+    },
+    Rm {
+        profile: String,
+        #[arg(long)]
+        block: Vec<String>,
+        #[arg(long)]
+        proxy: Vec<String>,
+        #[arg(long)]
+        direct: Vec<String>,
+        #[arg(long, value_enum, default_value_t = RoutingLayerArg::User)]
+        layer: RoutingLayerArg,
+    },
+    Move {
+        profile: String,
+        index: usize,
+        to: usize,
+        #[arg(long, value_enum, default_value_t = RoutingLayerArg::User)]
+        layer: RoutingLayerArg,
+    },
+    Layer {
+        profile: String,
+        index: usize,
+        #[arg(long, value_enum, default_value_t = RoutingLayerArg::User)]
+        from: RoutingLayerArg,
+        #[arg(long, value_enum)]
+        to: RoutingLayerArg,
     },
     /// Merge Happ/Incy routing import, preserving omitted fields.
     Import {

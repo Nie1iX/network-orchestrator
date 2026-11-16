@@ -191,7 +191,7 @@ pub fn run() {
             switch_subscription_endpoint,
             set_subscription_backups,
             set_subscription_auto_return,
-            set_pinned_routes,
+            set_routing_policy,
             set_xray_service_checks,
             run_xray_service_checks,
             set_subscription_node_pool,

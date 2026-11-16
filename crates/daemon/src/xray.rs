@@ -2,6 +2,7 @@ use crate::validate::validate_owner;
 use net_manager_core::connect_plan::full_coverage;
 use net_manager_core::daemon_protocol::XrayConnectParams;
 use net_manager_core::models::PolicyRoute;
+use net_manager_core::xray::{POLICY_DNS_RELAY_TAG, POLICY_DNS_TAG};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::io;
@@ -9,6 +10,8 @@ use std::net::IpAddr;
 mod provider_graph;
 
 pub const MAX_XRAY_CONFIG_BYTES: usize = 512 * 1024;
+const FAILOVER_DEFAULT_OUTBOUND: &str = "failover-default";
+pub(crate) const FAILOVER_DEFAULT_INBOUND: &str = "failover-default-in";
 
 pub struct XrayPlan {
     pub profile_id: String,
@@ -219,7 +222,12 @@ fn validate_generated(config: &Value) -> io::Result<()> {
             return Err(rejected());
         }
         port(&inbound["port"])?;
-        string(&inbound["tag"])?;
+        if matches!(
+            string(&inbound["tag"])?,
+            FAILOVER_DEFAULT_INBOUND | POLICY_DNS_TAG | POLICY_DNS_RELAY_TAG
+        ) {
+            return Err(rejected());
+        }
         if let Some(sniffing) = map.get("sniffing") {
             validate_sniffing(sniffing)?;
         }
@@ -245,7 +253,14 @@ fn validate_generated(config: &Value) -> io::Result<()> {
     }
     // Tags the daemon injects itself; a client-supplied one would collide
     // (or smuggle a fake API/blackhole handler).
-    const RESERVED_TAGS: [&str; 4] = ["api", "api-in", "tun-in", "unavailable"];
+    const RESERVED_TAGS: [&str; 6] = [
+        "api",
+        "api-in",
+        "tun-in",
+        "unavailable",
+        FAILOVER_DEFAULT_OUTBOUND,
+        FAILOVER_DEFAULT_INBOUND,
+    ];
     let mut tags = HashSet::new();
     let mut proxies = 0usize;
     let mut freedom = false;
@@ -266,6 +281,17 @@ fn validate_generated(config: &Value) -> io::Result<()> {
             return Err(rejected());
         }
         if RESERVED_TAGS.contains(&tag) || tag.starts_with("probe-") {
+            return Err(rejected());
+        }
+        if tag == POLICY_DNS_TAG
+            || (tag == POLICY_DNS_RELAY_TAG
+                && outbound
+                    != &serde_json::json!({
+                        "tag": POLICY_DNS_RELAY_TAG,
+                        "protocol": "loopback",
+                        "settings": {"inboundTag": POLICY_DNS_TAG}
+                    }))
+        {
             return Err(rejected());
         }
         // `node-`/`pin-` tags carry a stable endpoint key and only appear
@@ -414,7 +440,7 @@ fn validate_generated(config: &Value) -> io::Result<()> {
             }
             for item in items {
                 let item = string(item)?;
-                if item.len() > 64 {
+                if item.len() > 64 || item == FAILOVER_DEFAULT_INBOUND {
                     return Err(rejected());
                 }
             }
@@ -1325,10 +1351,16 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         let rules = config["routing"]["rules"]
             .as_array_mut()
             .ok_or_else(rejected)?;
-        // Control and probe traffic must win over every user rule, including
-        // the failover catch-all; otherwise a fresh tunnel cannot probe or
-        // install its first override.
+        // Control, probes and internal default dispatch must win over user
+        // rules so a fresh tunnel can probe and install its first override.
         let api_rule = json!({"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"});
+        let default_rule = failover.as_ref().map(|_| {
+            json!({
+                "type": "field",
+                "inboundTag": [FAILOVER_DEFAULT_INBOUND],
+                "balancerTag": net_manager_core::xray::FAILOVER_BALANCER,
+            })
+        });
         let probe_rules = failover
             .iter()
             .flat_map(|plan| plan.nodes.iter())
@@ -1349,27 +1381,26 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
             0..0,
             std::iter::once(api_rule)
                 .chain(probe_rules)
-                .chain(pin_rules),
+                .chain(pin_rules)
+                .chain(default_rule),
         );
-        if failover.is_some() {
-            // Everything that matched no rule goes through the failover
-            // balancer; the probe supervisor pins it to the first healthy
-            // node or the `unavailable` blackhole — never direct.
-            rules.push(json!({
-                "type": "field",
-                "network": "tcp,udp",
-                "balancerTag": net_manager_core::xray::FAILOVER_BALANCER,
-            }));
-        }
     }
     if failover.is_some() {
-        config["outbounds"]
-            .as_array_mut()
-            .ok_or_else(rejected)?
-            .push(json!({
-                "tag": net_manager_core::xray::UNAVAILABLE_TAG,
-                "protocol": "blackhole",
-            }));
+        // Xray selects its first outbound only after IPIfNonMatch's DNS pass.
+        // Recirculate that default through the health-controlled balancer.
+        let outbounds = config["outbounds"].as_array_mut().ok_or_else(rejected)?;
+        outbounds.insert(
+            0,
+            json!({
+                "tag": FAILOVER_DEFAULT_OUTBOUND,
+                "protocol": "loopback",
+                "settings": {"inboundTag": FAILOVER_DEFAULT_INBOUND},
+            }),
+        );
+        outbounds.push(json!({
+            "tag": net_manager_core::xray::UNAVAILABLE_TAG,
+            "protocol": "blackhole",
+        }));
     }
     crate::proxy_exits::inject(&mut config, &proxy_exits, mark)?;
     for outbound in config["outbounds"].as_array_mut().ok_or_else(rejected)? {
@@ -1658,6 +1689,129 @@ mod tests {
             mtu: None,
             service_checks: Vec::new(),
             proxy_exits: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn clients_cannot_shadow_failover_default_dispatch() {
+        let base: Value = serde_json::from_str(&params().config).unwrap();
+        for tag in ["failover-default", "failover-default-in"] {
+            let mut config = base.clone();
+            config["outbounds"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"tag": tag, "protocol": "blackhole"}));
+            assert_eq!(
+                validate_generated(&config)
+                    .expect_err("caller must not replace a daemon-owned fallback")
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let mut config = base.clone();
+        config["inbounds"][0]["tag"] = json!("failover-default-in");
+        assert_eq!(
+            validate_generated(&config)
+                .expect_err("caller must not declare the internal fallback marker")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let mut config = base;
+        config["routing"]["rules"] = json!([{
+            "type": "field",
+            "inboundTag": ["failover-default-in"],
+            "outboundTag": "direct",
+        }]);
+        assert_eq!(
+            validate_generated(&config)
+                .expect_err("caller must not route the internal fallback marker")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn protected_dns_relay_accepts_compiler_output_and_rejects_forgery() {
+        use net_manager_core::models::{RoutingPolicy, RoutingRule, RoutingTarget};
+        use net_manager_core::xray::{
+            apply_profile_routing, ProfileRoutingOptions, POLICY_DNS_RELAY_TAG, POLICY_DNS_TAG,
+        };
+
+        let base: Value = serde_json::from_str(&params().config).unwrap();
+        let policy = RoutingPolicy {
+            user: vec![RoutingRule {
+                selectors: vec!["domain:example.test".into()],
+                target: RoutingTarget::Proxy,
+                ..Default::default()
+            }],
+            base: vec![],
+        };
+        let config =
+            apply_profile_routing(&base, &policy, &ProfileRoutingOptions::default()).unwrap();
+        assert!(validate_generated(&config).is_ok());
+        let relay = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|outbound| outbound["tag"] == POLICY_DNS_RELAY_TAG)
+            .unwrap();
+        let dns = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|outbound| outbound["protocol"] == "dns")
+            .unwrap();
+        let dispatch = config["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|rule| rule["inboundTag"] == json!([POLICY_DNS_TAG]))
+            .unwrap();
+        let mut cases = Vec::new();
+        let mut bad = config.clone();
+        bad["outbounds"][relay]["settings"]["inboundTag"] = json!("src-proxy-in");
+        cases.push(bad);
+        let mut bad = config.clone();
+        bad["outbounds"][relay]["protocol"] = json!("freedom");
+        cases.push(bad);
+        let mut bad = config.clone();
+        bad["outbounds"][relay]["settings"]["extra"] = json!(true);
+        cases.push(bad);
+        let mut bad = config.clone();
+        bad["outbounds"][0]["streamSettings"]["sockopt"] =
+            json!({"dialerProxy": POLICY_DNS_RELAY_TAG});
+        cases.push(bad);
+        let mut bad = config.clone();
+        bad["outbounds"][dns]["proxySettings"] = json!({"tag": POLICY_DNS_RELAY_TAG});
+        cases.push(bad);
+        let mut bad = config.clone();
+        bad["routing"]["rules"][dispatch]["outboundTag"] = json!("direct");
+        cases.push(bad);
+        let mut bad = config.clone();
+        bad["routing"]["rules"][dispatch]["outboundTag"] = json!(POLICY_DNS_RELAY_TAG);
+        cases.push(bad);
+        let mut bad = config.clone();
+        bad["inbounds"][0]["tag"] = json!(POLICY_DNS_TAG);
+        cases.push(bad);
+        let mut bad = config.clone();
+        bad["routing"]["rules"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"inboundTag":[POLICY_DNS_TAG], "outboundTag":"direct"}));
+        cases.push(bad);
+        let mut bad = config.clone();
+        bad["outbounds"][dns]["streamSettings"]["sockopt"]["dialerProxy"] = json!("missing");
+        cases.push(bad);
+        let mut bad = config.clone();
+        bad["outbounds"].as_array_mut().unwrap().push(json!({
+            "tag":"forged", "protocol":"loopback", "settings":{"inboundTag":POLICY_DNS_TAG}
+        }));
+        cases.push(bad);
+        let mut bad = config.clone();
+        bad["dns"]["tag"] = json!(POLICY_DNS_RELAY_TAG);
+        cases.push(bad);
+        for (index, candidate) in cases.iter().enumerate() {
+            assert!(validate_generated(candidate).is_err(), "forgery {index}");
         }
     }
 
@@ -2101,7 +2255,7 @@ mod tests {
         };
         let configured = net_manager_core::xray::apply_profile_routing(
             &generated,
-            &[],
+            &profile.routing,
             &net_manager_core::xray::ProfileRoutingOptions::from(&profile),
         )
         .unwrap();

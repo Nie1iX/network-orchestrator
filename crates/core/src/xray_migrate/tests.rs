@@ -1,5 +1,5 @@
 use super::*;
-use crate::models::Profile;
+use crate::models::{Profile, RoutingRule, RoutingTarget};
 
 const PRIMARY_LINK: &str = "vless://u@ca1.test:443?security=tls&sni=a.test&type=tcp#Canada";
 const NL_LINK: &str = "vless://u@nl1.test:443?security=tls&sni=a.test&type=tcp#Netherlands";
@@ -175,9 +175,22 @@ fn personal_policy_shape_preserves_dns_guards_pins_and_runtime_settings() {
             .unwrap();
     assert!(migration.refused.is_empty(), "{:#?}", migration.refused);
     let mut profile = Profile::default();
+    profile.routing.user.push(RoutingRule {
+        selectors: vec!["geoip:manual".into()],
+        target: RoutingTarget::Direct,
+        port: None,
+        network: None,
+    });
     apply_xray_policy_migration(&mut profile, migration).unwrap();
-    assert!(profile.xray_quic_reject);
-    assert_eq!(profile.pinned_policies[0].endpoint_key, pinned);
+    assert_eq!(profile.routing.user[0].selectors, ["geoip:manual"]);
+    assert_eq!(
+        profile
+            .routing
+            .base
+            .iter()
+            .find_map(|rule| rule.target.endpoint_key()),
+        Some(pinned.as_str())
+    );
     assert_eq!(
         profile.xray_dns.outbound_key.as_deref(),
         Some(pinned.as_str())
@@ -205,19 +218,17 @@ fn personal_policy_shape_preserves_dns_guards_pins_and_runtime_settings() {
         profile.xray_sockopts.as_ref().unwrap().tcp_user_timeout,
         Some(20000)
     );
-    assert!(profile
-        .xray_traffic_rules
-        .iter()
-        .any(|rule| rule.port == 853
-            && rule.network == "tcp"
-            && rule.target == DomainRouteTarget::Block
-            && rule.ips == ["1.1.1.1", "8.8.8.8"]));
+    assert!(profile.routing.base.iter().any(|rule| {
+        rule.port == Some(853)
+            && rule.network.as_deref() == Some("tcp")
+            && matches!(rule.target, RoutingTarget::Block)
+            && rule.selectors == ["1.1.1.1", "8.8.8.8"]
+    }));
     assert_eq!(profile.xray_dns.hosts["corp.internal"], ["10.1.1.1"]);
-    assert!(profile
-        .domain_policies
-        .iter()
-        .any(|rule| rule.target == DomainRouteTarget::Direct
-            && rule.domains == ["geoip:ru", "geoip:by"]));
+    assert!(profile.routing.base.iter().any(|rule| {
+        matches!(rule.target, RoutingTarget::Direct) && rule.selectors == ["geoip:ru", "geoip:by"]
+    }));
+    assert_eq!(profile.xray_dns.hosts["corp.internal"], ["10.1.1.1"]);
 }
 
 #[test]
@@ -251,7 +262,7 @@ fn unknown_and_nonequivalent_constructs_refuse_not_drop() {
     // Apply refuses outright — nothing silently lands.
     let mut profile = Profile::default();
     assert!(apply_xray_policy_migration(&mut profile, migration).is_err());
-    assert!(profile.domain_policies.is_empty());
+    assert!(profile.routing.is_empty());
 }
 
 #[test]
@@ -294,7 +305,7 @@ fn dns_resolver_bypass_does_not_widen_to_other_ports() {
     let base = xray::generate_share_link_config(PRIMARY_LINK, 1080).unwrap();
     let generated = xray::apply_profile_routing(
         &base,
-        &profile.domain_policies,
+        &profile.routing,
         &xray::ProfileRoutingOptions::from(&profile),
     )
     .unwrap();

@@ -6,7 +6,7 @@
 //! degrade the verdict to `probable`.
 
 #[cfg(not(target_os = "linux"))]
-use net_manager_core::models::{DomainPolicy, XrayDnsConfig, XrayDomainStrategy};
+use net_manager_core::models::{RoutingPolicy, XrayDnsConfig, XrayDomainStrategy};
 use net_manager_core::route_check::RouteCheckResult;
 #[cfg(not(target_os = "linux"))]
 use net_manager_core::route_check::{check_route, GeoDbs, GeoIpDb, GeoSiteDb};
@@ -26,10 +26,9 @@ pub(crate) use net_manager_engine::linux_network::RouteCheckRequest;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RouteCheckRequest {
-    /// `host`, `host:port`, `scheme://host/…` or a literal IP.
-    pub target: String,
+    /// Canonical routing policy, evaluated user layer before base.
     #[serde(default)]
-    pub domain_policies: Vec<DomainPolicy>,
+    pub routing: RoutingPolicy,
     #[serde(default)]
     pub private_lan_direct: bool,
     #[serde(default)]
@@ -127,7 +126,7 @@ pub(crate) fn xray_test_route(
             dns: request.dns,
             ..ProfileRoutingOptions::default()
         };
-        check_route(&request.domain_policies, &options, &request.target, &geo)
+        check_route(&request.routing, &options, &request.target, &geo)
             .map_err(|err| err.to_string())
     }
 }

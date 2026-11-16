@@ -5,6 +5,7 @@ Run from the repository root after building the daemon. No host route, DNS,
 service or app-data mutation occurs. Uses the existing netorch-e2e-client image
 and the pinned Xray already staged by the package build.
 """
+import base64
 import json
 import os
 from pathlib import Path
@@ -21,13 +22,14 @@ from http.client import HTTPResponse
 from struct import pack, unpack
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import BaseRequestHandler, ThreadingUDPServer
 
 
 def run(*args, **kwargs):
     return subprocess.run(args, check=True, text=True, capture_output=True, **kwargs).stdout.strip()
 
 
-def driver(service_checks_only=False, named_proxies=False):
+def driver(service_checks_only=False, named_proxies=False, geoip_regression=False, routing_layers=False):
     root = Path(__file__).resolve().parents[2]
     binary = root / "target/debug/network-orchestrator-daemon"
     cli = root / "target/debug/netorch"
@@ -53,7 +55,9 @@ def driver(service_checks_only=False, named_proxies=False):
             name + ":/usr/share/polkit-1/actions/com.netmanager.app.policy")
         result = subprocess.run(["docker", "exec", "--env", "NETORCH_MULTINODE_E2E=1",
             "--env", f"NETORCH_SERVICE_CHECKS_E2E={int(service_checks_only)}",
-            "--env", f"NETORCH_NAMED_PROXIES_E2E={int(named_proxies)}", name,
+            "--env", f"NETORCH_NAMED_PROXIES_E2E={int(named_proxies)}",
+            "--env", f"NETORCH_GEOIP_REGRESSION_E2E={int(geoip_regression)}",
+            "--env", f"NETORCH_ROUTING_LAYERS_E2E={int(routing_layers)}", name,
             "python3", "-u", "/tmp/multinode_scenarios.py", "--inside"], text=True, timeout=600)
         if result.returncode:
             raise SystemExit(result.returncode)
@@ -82,7 +86,7 @@ def inside():
             "-keyout", str(key), "-out", str(csr))
         extension = directory / "extensions"
         extension.write_text(chr(10).join([
-            "subjectAltName=DNS:localhost,DNS:default.test,DNS:pinned.test,DNS:direct.test,DNS:blocked.test,DNS:api.country.is,DNS:ipinfo.io,IP:198.51.100.50",
+            "subjectAltName=DNS:localhost,DNS:default.test,DNS:pinned.test,DNS:direct.test,DNS:blocked.test,DNS:geo-only.test,DNS:non-ru.test,DNS:api.country.is,DNS:ipinfo.io,DNS:cidr.google.com,DNS:geo.google.com,DNS:pin.test,DNS:order.test,DNS:missing.test,DNS:dns-failure.test,IP:198.51.100.50",
             "basicConstraints=CA:FALSE", "extendedKeyUsage=serverAuth",
             "keyUsage=digitalSignature,keyEncipherment", "",
         ]))
@@ -101,7 +105,7 @@ def inside():
         def capture_managed_logs():
             seen = set()
             while not log_capture_stop.wait(.005):
-                for path in Path("/run/network-orchestrator/0").glob("xray-*/xray.log"):
+                for path in Path("/run/network-orchestrator").glob("[0-9]*/xray-*/xray.log"):
                     try:
                         inode = path.stat().st_ino
                         if inode not in seen and len(seen) < 16:
@@ -175,9 +179,10 @@ def inside():
         try:
             # Synthetic underlay: all routes, peers and packet filters stay
             # inside this disposable namespace.
-            run("ip", "link", "add", "e2e-uplink", "type", "dummy")
+            run("ip", "link", "add", "e2e-uplink", "type", "veth", "peer", "name", "e2e-peer")
             run("ip", "address", "add", "10.7.0.1/24", "dev", "e2e-uplink")
             run("ip", "link", "set", "e2e-uplink", "up")
+            run("ip", "link", "set", "e2e-peer", "up")
             run("ip", "route", "add", "default", "via", "10.7.0.254", "dev", "e2e-uplink", "metric", "10")
             run("nft", "add", "table", "ip", "e2e_peers")
             run("nft", "add", "chain", "ip", "e2e_peers", "output",
@@ -185,8 +190,12 @@ def inside():
             run("nft", "add", "rule", "ip", "e2e_peers", "output",
                 "ip", "daddr", "10.8.0.20", "dnat", "to", "127.0.0.1")
             with open("/etc/hosts", "a") as hosts:
-                hosts.write("\n198.51.100.10 default.test pinned.test\n")
-                hosts.write("198.51.100.50 direct.test blocked.test\n")
+                hosts.write("\n198.51.100.10 default.test pinned.test non-ru.test\n")
+                hosts.write("198.51.100.50 direct.test blocked.test geo-only.test\n")
+                hosts.write("195.245.249.50 cidr.google.com\n")
+                hosts.write("195.245.249.52 pin.test\n195.245.249.53 order.test\n")
+                hosts.write("195.245.249.54 missing.test\n195.245.249.55 dns-failure.test\n")
+                hosts.write("195.245.249.51 geo.google.com\n")
 
             def managed_pid():
                 managed = [path.parent for path in Path("/proc").glob("[0-9]*/cmdline")
@@ -199,6 +208,32 @@ def inside():
             outbounds = []
             subscription_links = []
             countries = {"primary": "NL", "backup": "CA", "reserve": "RU", "pinned": "JP"}
+            dns_failure = None
+            if os.environ.get("NETORCH_ROUTING_LAYERS_E2E") == "1":
+                class DnsFailureHandler(BaseRequestHandler):
+                    rcode = 2
+                    def handle(self):
+                        packet, transport = self.request
+                        if len(packet) < 12 or packet[4:6] != b"\0\1":
+                            return
+                        cursor, labels = 12, []
+                        while cursor < len(packet) and 0 < packet[cursor] <= 63:
+                            size = packet[cursor]
+                            labels.append(packet[cursor + 1:cursor + 1 + size])
+                            cursor += size + 1
+                        if cursor + 5 > len(packet) or packet[cursor] != 0:
+                            return
+                        if b".".join(labels).lower() == b"dns-failure.test":
+                            records["dnsFailureQueries"] = records.get("dnsFailureQueries", 0) + 1
+                        counter = "underlayDnsQueries" if self.rcode == 3 else "proxiedDnsQueries"
+                        records[counter] = records.get(counter, 0) + 1
+                        # Immediate valid SERVFAIL, not a timeout that could
+                        # mask an eventual direct-routing leak.
+                        transport.sendto(packet[:2] + bytes([0x81, 0x80 | self.rcode]) + b"\0\1" + b"\0" * 6
+                            + packet[12:cursor + 5], self.client_address)
+                dns_failure = ThreadingUDPServer(("127.0.0.1", 0), DnsFailureHandler)
+                servers.append(dns_failure)
+                threading.Thread(target=dns_failure.serve_forever, daemon=True).start()
             for name in keys:
                 class Handler(BaseHTTPRequestHandler):
                     marker = name
@@ -238,11 +273,12 @@ def inside():
                     def log_message(self, *_):
                         pass
                 http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-                http.socket = context.wrap_socket(http.socket, server_side=True)
+                http.socket = context.wrap_socket(
+                    http.socket, server_side=True, do_handshake_on_connect=False)
                 servers.append(http)
                 threading.Thread(target=http.serve_forever, daemon=True).start()
                 listen, ident = port(), str(uuid.uuid4())
-                records[name] = {"port": listen}
+                records[name] = {"port": listen, "httpsPort": http.server_port}
                 subscription_links.append(
                     f"vless://{ident}@10.8.0.20:{listen}?security=none&type=tcp#"
                     + quote("🇨🇦 Canada " + name))
@@ -254,6 +290,17 @@ def inside():
                         "redirect": f"127.0.0.1:{http.server_port}",
                         "finalRules": [{"action": "allow", "ip": ["127.0.0.1"]}],
                     }}]}
+                if dns_failure is not None:
+                    config["outbounds"][0]["tag"] = "https-peer"
+                    config["outbounds"].append({
+                        "tag": "dns-failure", "protocol": "freedom", "settings": {
+                            "redirect": f"127.0.0.1:{dns_failure.server_address[1]}",
+                            "finalRules": [{"action": "allow", "ip": ["127.0.0.1"]}],
+                        }})
+                    config["routing"] = {"rules": [{
+                        "type": "field", "ip": ["203.0.113.53"], "port": 53,
+                        "network": "udp", "outboundTag": "dns-failure",
+                    }]}
                 (directory / (name + ".json")).write_text(json.dumps(config))
                 start_node(name)
                 tag = ("pin-" if name == "pinned" else "node-") + keys[name]
@@ -283,7 +330,9 @@ def inside():
             run("dbus-daemon", "--system", "--fork")
             polkit = next(path for path in ("/usr/lib/polkit-1/polkitd", "/usr/libexec/polkitd")
                 if Path(path).exists())
-            if os.environ.get("NETORCH_SERVICE_CHECKS_E2E") in ("1", "2") or os.environ.get("NETORCH_NAMED_PROXIES_E2E") == "1":
+            if (os.environ.get("NETORCH_SERVICE_CHECKS_E2E") in ("1", "2")
+                    or os.environ.get("NETORCH_NAMED_PROXIES_E2E") == "1"
+                    or os.environ.get("NETORCH_ROUTING_LAYERS_E2E") == "1"):
                 rules = Path("/etc/polkit-1/rules.d")
                 rules.mkdir(parents=True, exist_ok=True)
                 (rules / "99-netorch-e2e.rules").write_text(
@@ -314,7 +363,197 @@ def inside():
                 if result.returncode:
                     raise AssertionError("synthetic CLI failed: " + result.stderr)
                 return json.loads(result.stdout)
-            cli("add", f"https://localhost:{servers[0].server_port}/subscription", "--name", "country-proof")
+            cli("add", f"https://localhost:{records['primary']['httpsPort']}/subscription", "--name", "country-proof")
+            if os.environ.get("NETORCH_ROUTING_LAYERS_E2E") == "1":
+                document_path = cli_data / "profiles.json"
+                cli("use", "country-proof", "1")
+                endpoint_rows = cli("endpoints", "country-proof")
+                if not isinstance(endpoint_rows, list):
+                    endpoint_rows = endpoint_rows["endpoints"]
+                real_keys = {name: next(row["key"] for row in endpoint_rows
+                    if name in row["name"]) for name in keys}
+                def node(name):
+                    return {"kind": "node", "endpointKey": real_keys[name]}
+                def rule(selector, target):
+                    return {"selectors": [selector], "target": target}
+                direct, proxy = {"kind": "direct"}, {"kind": "proxy"}
+                document = json.loads(document_path.read_text())
+                profile = document["profiles"][0]
+                profile["xrayMode"] = "tun"
+                profile["routes"] = []
+                profile["privateLanDirect"] = False
+                profile["xrayTunDnsServers"] = []
+                profile["xrayDomainStrategy"] = "ipIfNonMatch"
+                profile["xrayDns"] = {
+                    "servers": [{"address": "203.0.113.53"}],
+                    "outbound": {"rules": [{"action": "direct"}]},
+                    "hosts": {name: [address] for name, address in [
+                        ("cidr.google.com", "195.245.249.50"),
+                        ("geo.google.com", "195.245.249.51"),
+                        ("pin.test", "195.245.249.52"),
+                        ("order.test", "195.245.249.53"),
+                        ("missing.test", "195.245.249.54"),
+                    ]},
+                }
+                profile["subscription"]["probeUrl"] = "https://198.51.100.50:9443/"
+                profile["routing"] = {
+                    "base": [
+                        rule("geosite:google", proxy),
+                        rule("full:pin.test", node("pinned")),
+                        rule("full:dns-failure.test", direct),
+                    ],
+                    "user": [
+                        rule("195.245.249.50/32", direct),
+                        rule("full:pin.test", proxy),
+                        rule("full:order.test", proxy),
+                        rule("full:order.test", node("pinned")),
+                        rule("full:missing.test", node("pinned")),
+                    ],
+                }
+                document_path.write_text(json.dumps(document))
+                cli("route", "add", "country-proof", "--direct", "geoip:ru")
+                before = json.loads(document_path.read_text())["profiles"][0]["routing"]["user"]
+                assert any("geoip:ru" in row["selectors"] for row in before), before
+                cli("refresh", "country-proof")
+                refreshed = json.loads(document_path.read_text())["profiles"][0]["routing"]
+                assert refreshed["user"] == before, "refresh changed manual user rows"
+                assert any("geosite:google" in row["selectors"] for row in refreshed["base"]), refreshed
+                cli("proxy", "set", "default", "--profile", "country-proof", "--rules")
+
+                class UnderlayHandler(Handler):
+                    marker = "underlay"
+                physical = ThreadingHTTPServer(("127.0.0.1", 0), UnderlayHandler)
+                physical.socket = context.wrap_socket(
+                    physical.socket, server_side=True, do_handshake_on_connect=False)
+                servers.append(physical)
+                threading.Thread(target=physical.serve_forever, daemon=True).start()
+                for address in ("198.51.100.50", *(f"195.245.249.{n}" for n in range(50, 56))):
+                    run("nft", "add", "rule", "ip", "e2e_peers", "output",
+                        "oifname", "e2e-uplink", "meta", "mark", "!=", "0",
+                        "ip", "daddr", address, "tcp", "dport", "9443",
+                        "dnat", "to", f"127.0.0.1:{physical.server_port}")
+                class UnderlayDnsHandler(DnsFailureHandler):
+                    rcode = 3
+                physical_dns = ThreadingUDPServer(("127.0.0.1", 0), UnderlayDnsHandler)
+                servers.append(physical_dns)
+                threading.Thread(target=physical_dns.serve_forever, daemon=True).start()
+                run("nft", "add", "rule", "ip", "e2e_peers", "output",
+                    "meta", "mark", "!=", "0", "ip", "daddr", "203.0.113.53",
+                    "udp", "dport", "53", "dnat", "to", f"127.0.0.1:{physical_dns.server_address[1]}")
+                dns_query = (pack("!HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+                    + b"\x0bdns-service\x04test\0" + pack("!HH", 1, 1))
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as canary:
+                    canary.settimeout(3)
+                    canary.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, 1)
+                    canary.sendto(dns_query, ("203.0.113.53", 53))
+                    assert canary.recv(512)[3] & 15 == 3, "physical DNS canary is unreachable"
+                records["underlayDnsQueries"] = 0
+
+                def layer_request(host):
+                    result = subprocess.run(["curl", "-sS", "--max-time", "8", "--noproxy", "*",
+                        "--cacert", str(ca), f"https://{host}:9443/"],
+                        capture_output=True, text=True, env=cli_env, user=65534, group=65534, timeout=12)
+                    records["lastRequest"] = {"host": host, "code": result.returncode,
+                        "body": result.stdout, "error": result.stderr}
+                    return result.stdout if result.returncode == 0 else None
+
+                def captured_dns_response():
+                    result = subprocess.run([
+                        "python3", "-c",
+                        "import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); "
+                        "s.settimeout(5); s.sendto(bytes.fromhex(sys.argv[1]),('203.0.113.53',53)); "
+                        "print(s.recv(512)[3]&15)", dns_query.hex(),
+                    ], capture_output=True, text=True, env=cli_env, user=65534, group=65534, timeout=8)
+                    assert result.returncode == 0, result.stderr
+                    return int(result.stdout.strip())
+
+                # Reachability control plus a non-applicable earlier IP rule:
+                # UDP/53 must not gate a later TCP/9443 domain decision.
+                document = json.loads(document_path.read_text())
+                ordered_user = document["profiles"][0]["routing"]["user"]
+                document["profiles"][0]["routing"]["user"] = []
+                resolver = document["profiles"][0]["xrayDns"]["servers"][0]
+                previous_route = resolver.get("route", "none")
+                resolver["route"] = "proxy"
+                document_path.write_text(json.dumps(document))
+                cli("up", "country-proof")
+                until(lambda: layer_request("order.test") == "primary", "Base-only default proxy is healthy")
+                assert layer_request("pin.test") == "pinned", records["lastRequest"]
+                base_dns = captured_dns_response()
+                assert base_dns == 2, (
+                    "Base node pin allowed direct DNS forwarding",
+                    {"rcode": base_dns, "directQueries": records.get("underlayDnsQueries", 0)})
+                assert records.get("underlayDnsQueries", 0) == 0, "Base node DNS leaked to direct"
+                cli("down", "country-proof")
+                resolver["route"] = previous_route
+                print("PASS explicit Base node pins also protect controlled DNS", flush=True)
+                irrelevant_ip = rule("203.0.113.0/24", {"kind": "block"})
+                irrelevant_ip.update(port=53, network="udp")
+                document["profiles"][0]["routing"]["user"] = [
+                    irrelevant_ip, rule("full:dns-failure.test", direct),
+                ]
+                document_path.write_text(json.dumps(document))
+                cli("up", "country-proof")
+                assert layer_request("dns-failure.test") == "underlay", (
+                    "reachable direct peer or irrelevant-port handling failed", records["lastRequest"])
+                cli("down", "country-proof")
+                document["profiles"][0]["routing"]["user"] = ordered_user
+                document_path.write_text(json.dumps(document))
+                print("PASS physical canary is reachable; wrong-port IP checks do not gate TCP", flush=True)
+                def connect_layers():
+                    cli("up", "country-proof")
+                    until(lambda: layer_request("cidr.google.com") == "underlay",
+                        "user CIDR beats base GeoSite on the real tunnel")
+
+                connect_layers()
+                until(lambda: layer_request("pin.test") == "primary", "default proxy pool is healthy")
+                assert layer_request("geo.google.com") == "underlay", records["lastRequest"]
+                assert layer_request("order.test") == "primary", records["lastRequest"]
+                assert layer_request("missing.test") == "pinned", records["lastRequest"]
+                assert captured_dns_response() == 2, "captured DNS did not reach the protected proxy resolver"
+                assert records.get("underlayDnsQueries", 0) == 0, "controlled DNS leaked to direct"
+                assert records.get("proxiedDnsQueries", 0) > 0, "proxy DNS canary was not reached"
+                print("PASS legacy DNS forwarding uses the proxy; reachable direct resolver sees no query", flush=True)
+                records["dnsFailureQueries"] = 0
+                assert layer_request("dns-failure.test") is None, (
+                    "unknown user IP match leaked to base direct", records["lastRequest"])
+                assert records.get("dnsFailureQueries", 0) > 0, "DNS failure path was not exercised"
+                print("PASS user domain, CIDR and refreshed GeoIP override Base; DNS failure does not leak", flush=True)
+                cli("down", "country-proof")
+                cli("route", "move", "country-proof", "--layer", "user", "4", "3")
+                moved = json.loads(document_path.read_text())["profiles"][0]["routing"]["user"]
+                assert (moved[2]["target"]["kind"] == "node"
+                    and moved[2]["target"]["endpointKey"] == real_keys["pinned"]
+                    and moved[3]["target"] == proxy), moved
+                connect_layers()
+                assert layer_request("order.test") == "pinned", records["lastRequest"]
+                cli("down", "country-proof")
+                document = json.loads(document_path.read_text())
+                rows = document["profiles"][0]["routing"]["user"]
+                rows[2]["target"] = direct
+                document_path.write_text(json.dumps(document))
+                assert json.loads(document_path.read_text())["profiles"][0]["routing"]["user"][2]["target"] == direct
+                connect_layers()
+                assert layer_request("order.test") == "underlay", records["lastRequest"]
+                stop_node("pinned")
+                assert layer_request("missing.test") is None, (
+                    "unavailable explicitly selected node leaked", records["lastRequest"])
+                cli("down", "country-proof")
+                print("PASS ordered User rows and output edits select real exits; unavailable node fails closed", flush=True)
+                records["subscriptionBody"] = "\n".join(
+                    link for link in subscription_links if not link.endswith("pinned"))
+                cli("refresh", "country-proof")
+                refreshed_rows = json.loads(document_path.read_text())["profiles"][0]["routing"]
+                removed_pins = [row for layer in ("user", "base") for row in refreshed_rows[layer]
+                    if row["target"].get("endpointKey") == real_keys["pinned"]]
+                assert removed_pins and all(row["target"].get("missing") for row in removed_pins), removed_pins
+                connect_layers()
+                until(lambda: layer_request("pin.test") == "primary", "User override survives removed Base node")
+                assert layer_request("missing.test") is None, (
+                    "removed explicitly selected node retargeted traffic", records["lastRequest"])
+                cli("down", "country-proof")
+                print("PASS removed node references stay fail-closed in both layers", flush=True)
+                return
             if os.environ.get("NETORCH_NAMED_PROXIES_E2E") == "1":
                 # All setup and mutations below remain in this disposable
                 # namespace and the UID-65534 temporary data directory.
@@ -325,9 +564,9 @@ def inside():
                 profile["routes"] = []
                 profile["privateLanDirect"] = False
                 profile["xrayTunDnsServers"] = []
-                profile["domainPolicies"] = [
-                    {"target": "block", "domains": ["full:blocked.test"]},
-                    {"target": "direct", "domains": ["full:direct.test"]},
+                profile["routing"]["user"] = [
+                    {"target": {"kind": "block"}, "selectors": ["full:blocked.test"]},
+                    {"target": {"kind": "direct"}, "selectors": ["full:direct.test"]},
                 ]
                 profile["xrayDns"] = {"hosts": {
                     "direct.test": ["198.51.100.50"], "blocked.test": ["198.51.100.50"]}}
@@ -530,7 +769,10 @@ def inside():
             saved = json.loads((cli_data / "profiles.json").read_text())["profiles"][0]
             assert saved["xrayTunMtu"] == 8500 and saved["xrayConnectionIdleSecs"] == 120
             assert saved["xraySockopts"]["tcpUserTimeout"] == 20000
-            assert len(saved["pinnedPolicies"]) == 1 and len(saved["subscription"]["backupKeys"]) == 2
+            pin_rules = [row for row in saved["routing"]["base"]
+                if row["target"]["kind"] == "node"]
+            assert len(pin_rules) == 1 and len(saved["subscription"]["backupKeys"]) == 2
+            imported_pin_key = pin_rules[0]["target"]["endpointKey"]
             assert policy_path.read_bytes() == source_bytes, "migration changed its source"
             print("PASS actual CLI preview/apply preserves mapped policy and leaves its source unchanged", flush=True)
             connect_params = {"profileId": "multinode-e2e", "config": json.dumps(config),
@@ -541,6 +783,75 @@ def inside():
                 "failover": {"nodes": [{"key": keys[name]} for name in ("primary", "backup", "reserve")],
                     "primaryKey": keys["primary"], "autoReturnPrimary": True,
                     "probeUrl": "https://localhost:9443", "intervalSecs": 2}}
+            if os.environ.get("NETORCH_GEOIP_REGRESSION_E2E") == "1":
+                def varint(value):
+                    result = bytearray()
+                    while value > 127:
+                        result.append((value & 127) | 128)
+                        value >>= 7
+                    result.append(value)
+                    return bytes(result)
+
+                def field(number, value):
+                    return varint((number << 3) | 2) + varint(len(value)) + value
+
+                cidr = field(1, socket.inet_aton("198.51.100.50")) + varint(0x10) + varint(32)
+                geoip = field(1, b"RU") + field(2, cidr)
+                geoip_dat = field(1, geoip)
+                config["dns"]["hosts"].update({
+                    "geo-only.test": "198.51.100.50", "non-ru.test": "198.51.100.10",
+                    "pinned.test": "198.51.100.50", "blocked.test": "198.51.100.50"})
+                config["routing"]["domainStrategy"] = "IPIfNonMatch"
+                # Generated client configs leave the default to the daemon.
+                config["routing"]["rules"].pop()
+                config["routing"]["rules"].extend([
+                    {"type": "field", "domain": ["full:blocked.test"], "outboundTag": "blocked"},
+                    {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"},
+                ])
+                connect_params["geoAssets"] = {"geoipDatB64": base64.b64encode(geoip_dat).decode()}
+                connect_params["routes"] = [{"destination": "0.0.0.0/0", "metric": 5}]
+                connect_params["config"] = json.dumps(config)
+                class UnderlayHandler(Handler):
+                    marker = "underlay"
+                physical = ThreadingHTTPServer(("127.0.0.1", 0), UnderlayHandler)
+                # An idle TLS peer must not block the accept loop or shutdown.
+                physical.socket = context.wrap_socket(
+                    physical.socket, server_side=True, do_handshake_on_connect=False)
+                servers.append(physical)
+                threading.Thread(target=physical.serve_forever, daemon=True).start()
+                for address in ("198.51.100.10", "198.51.100.50"):
+                    run("nft", "add", "rule", "ip", "e2e_peers", "output",
+                        "oifname", "e2e-uplink", "meta", "mark", "!=", "0",
+                        "ip", "daddr", address, "tcp", "dport", "9443",
+                        "dnat", "to", f"127.0.0.1:{physical.server_port}")
+                rpc("xray.connect", connect_params)
+
+                def geo_request(host):
+                    result = subprocess.run(["curl", "--silent", "--show-error", "--max-time", "5",
+                        "--noproxy", "*", "--cacert", str(ca), "--resolve",
+                        f"{host}:9443:198.51.100.50", f"https://{host}:9443/"],
+                        capture_output=True, text=True)
+                    records["lastRequest"] = {"host": host, "code": result.returncode,
+                        "body": result.stdout, "error": result.stderr}
+                    return result.stdout if result.returncode == 0 else None
+
+                until(lambda: active() == keys["primary"] and request("non-ru.test") == "primary",
+                    "non-RU domain uses healthy failover")
+                observed = geo_request("geo-only.test")
+                assert observed == "underlay", (
+                    f"RU GeoIP must reach the physical peer, got {observed!r}: {records['lastRequest']}")
+                print("PASS RU GeoIP reaches the physical HTTPS peer without a domain exception", flush=True)
+                assert geo_request("pinned.test") == "pinned", "explicit pin did not override RU GeoIP"
+                assert geo_request("blocked.test") is None, "explicit block did not override RU GeoIP"
+                print("PASS explicit pin and block still override RU GeoIP", flush=True)
+                for name in ("primary", "backup", "reserve"):
+                    stop_node(name)
+                until(lambda: active() == "unavailable", "all unhealthy nodes select fail-closed outbound")
+                assert request("non-ru.test") is None, "all unhealthy nodes leaked fallback traffic direct"
+                assert geo_request("geo-only.test") == "underlay", "unhealthy proxy nodes stopped RU direct traffic"
+                rpc("xray.disconnect", {"profileId": "multinode-e2e"})
+                print("PASS IPIfNonMatch GeoIP physical fallback, precedence and all-down safety", flush=True)
+                return
             rpc("xray.connect", connect_params)
             until(lambda: active() == keys["primary"] and request("default.test") == "primary", "HTTPS probes select primary")
             until(lambda: request("pinned.test") == "pinned", "pinned route uses independent node")
@@ -555,7 +866,7 @@ def inside():
                 finally:
                     Path(xray + ".disabled").rename(xray)
                 assert records["serviceRequests"] == [], "empty checks caused network traffic"
-                cli("checks", "add", "country-proof", "--via", saved["pinnedPolicies"][0]["endpointKey"],
+                cli("checks", "add", "country-proof", "--via", imported_pin_key,
                     "--name", "Service denial", "--url", "https://localhost:9443/denied-service?fixture=private")
                 listed = cli("checks", "list", "country-proof")
                 assert len(listed) == 1 and listed[0]["background"] is False
@@ -568,14 +879,14 @@ def inside():
                 assert records["serviceRequests"][-1]["node"] == "pinned"
                 assert records["serviceRequests"][-1]["authorization"] is None
                 assert records["serviceRequests"][-1]["cookie"] is None
-                cli("checks", "add", "country-proof", "--via", saved["pinnedPolicies"][0]["endpointKey"],
+                cli("checks", "add", "country-proof", "--via", imported_pin_key,
                     "--name", "Service redirect", "--url", "https://localhost:9443/redirect-service")
                 redirected = cli("checks", "run", "country-proof")
                 assert {row["httpStatus"] for row in redirected} == {302, 403}
                 assert all(row["cookie"] is None for row in records["serviceRequests"])
                 assert not any(row["path"] == "/unexpected-redirect-follow" for row in records["serviceRequests"])
                 print("PASS real CLI checks are explicit HEAD requests on the pin, without credentials, cookie reuse or redirects", flush=True)
-                cli("checks", "add", "country-proof", "--via", saved["pinnedPolicies"][0]["endpointKey"],
+                cli("checks", "add", "country-proof", "--via", imported_pin_key,
                     "--name", "Service TLS rejection", "--url", "https://127.0.0.1:9443/tls-service")
                 classified = cli("checks", "run", "country-proof")
                 tls = next(row for row in classified if row["name"] == "Service TLS rejection")
@@ -600,7 +911,8 @@ def inside():
                 document_path.write_text(json.dumps(document))
                 cli("up", "country-proof")
                 first_id = user_profile["xrayServiceChecks"][0]["id"]
-                pin_key = user_profile["pinnedPolicies"][0]["endpointKey"]
+                pin_key = next(row["target"]["endpointKey"] for row in user_profile["routing"]["base"]
+                    if row["target"]["kind"] == "node")
                 heads_before = len(records["serviceRequests"])
                 cli("checks", "background", "country-proof", first_id, "on")
                 until(lambda: len(records["serviceRequests"]) > heads_before,
@@ -887,5 +1199,9 @@ if __name__ == "__main__":
         driver(service_checks_only=2)
     elif sys.argv[1:] == ["--named-proxies"]:
         driver(named_proxies=True)
+    elif sys.argv[1:] == ["--geoip-regression"]:
+        driver(geoip_regression=True)
+    elif sys.argv[1:] == ["--routing-layers"]:
+        driver(routing_layers=True)
     else:
-        raise SystemExit("usage: python3 e2e/linux/multinode_scenarios.py [--service-checks|--service-checks-client|--named-proxies]")
+        raise SystemExit("usage: python3 e2e/linux/multinode_scenarios.py [--service-checks|--service-checks-client|--named-proxies|--geoip-regression|--routing-layers]")

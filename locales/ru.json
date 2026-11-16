@@ -58,6 +58,18 @@
     }
   ],
   "messages": {
+    "DNS and strategy": "DNS и стратегия",
+    "Advanced routing JSON": "Расширенные настройки маршрутизации в JSON",
+    "Manage ordered routing rules in the profile’s routing editor.": "Управляйте порядком правил в редакторе маршрутизации подключения.",
+    "The saved server is unavailable. Its explicit rules remain blocked.": "Сохранённый сервер недоступен. Его явные правила останутся заблокированными.",
+    "User rule": "Пользовательское правило",
+    "Base rule": "Базовое правило",
+    "Routing changed elsewhere. Refresh the connection before editing.": "Маршрутизация была изменена в другом месте. Обновите подключение перед редактированием.",
+    "Layer": "Слой",
+    "User layer": "Пользовательский слой",
+    "Base layer": "Базовый слой",
+    "Base rule {number}": "Базовое правило {number}",
+    "User rule {number}": "Пользовательское правило {number}",
     "10.10.0.0/16": "10.10.0.0/16",
     "A different connection owns the active user system proxy; refusing to probe directly.": "Системный прокси занят другим подключением. Проверка напрямую не запускалась.",
     "A user system proxy is active but is not owned by this connection; refusing to probe directly.": "Активный системный прокси не принадлежит этому подключению. Проверка напрямую не запускалась.",
@@ -1883,6 +1895,9 @@
     "pool": "Упорядоченный пул",
     "proxy": "Прокси",
     "block": "Блокировать",
+    "User rules run before Base, in the listed order. Moving cards only changes the layout.": "Пользовательские правила выполняются до базовых, в указанном порядке. Перетаскивание карточек меняет только расположение.",
+    "IP selectors use IPOnDemand. Required User IP checks fail closed when DNS is unavailable. Proxy overrides and explicit server rules protect application DNS through the proxy, even when resolver settings request direct.": "IP-селекторы используют IPOnDemand. Если DNS недоступен, обязательная проверка пользовательского IP-правила блокирует запрос. Явные серверные привязки и пользовательские правила Proxy защищают DNS приложения через прокси, даже если в настройках резолвера выбран direct.",
+    "IP selectors require IPOnDemand, regardless of this preference.": "При наличии IP-селекторов используется IPOnDemand независимо от этой настройки.",
     "JSON": "JSON"
   }
 }

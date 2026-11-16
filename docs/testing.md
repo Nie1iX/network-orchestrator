@@ -70,6 +70,55 @@ Tauri native-menu resource-lock deadlock. Windows keeps native menus.
 - Repeat menu interactions in the packaged Linux GUI with an existing connection.
   Restart only the GUI; the daemon/runtime and running connection must remain.
 
+## Linux GeoIP with failover
+
+Run `python3 e2e/linux/multinode_scenarios.py --geoip-regression` after building
+the daemon and CLI in `target/debug` and staging the pinned Xray assets. The
+runner uses the existing disposable `netorch-e2e-client` image with
+`--network none`; never run its `--inside` scenario on the host.
+
+The fixture mirrors a primary full-capture TUN: `IPIfNonMatch`, TLS sniffing,
+synthetic RU GeoIP data, static DNS, and a physical HTTPS response marker.
+No domain-direct exception is added for the GeoIP-only target. It must reach
+the physical marker; a non-RU target must use healthy failover. Explicit pins
+and blocks still win. With every proxy node down, default traffic must fail
+closed while intentional RU direct traffic remains available.
+
+The daemon's first outbound recirculates unmatched traffic through an internal,
+reserved marker to the health-controlled failover balancer. Unlike an
+unconditional routing catch-all, this runs after Xray's DNS/IP second pass and
+does not change the profile's selected domain strategy.
+
+## Ordered Xray layers
+
+Run `python3 e2e/linux/multinode_scenarios.py --routing-layers` with the same
+disposable-image/binary prerequisites as the GeoIP regression above. It uses the
+actual CLI/profile compiler, full-capture TUN and pinned Xray, not a replacement
+handwritten routing configuration.
+
+- User CIDR beats Base GeoSite; User domain beats a Base node pin; manually added
+  User GeoIP survives subscription refresh.
+- Moving mixed-target User rows changes the observed HTTPS exit. Editing only an
+  output retains position. An unavailable explicitly chosen node never goes direct.
+- A reachable physical HTTPS canary proves that required DNS failure blocks a
+  lower Base/direct decision rather than merely contacting an absent destination.
+  An unrelated UDP/53 IP rule must not gate a TCP/9443 domain choice.
+- Proxied and physical DNS canaries return distinct response codes. Legacy DNS
+  forwarding must reach the proxy resolver without contacting the reachable
+  physical resolver, including Base-only node pins. Resolver failure returns
+  immediate SERVFAIL; removing a pinned node on refresh preserves fail-closed
+  references in both layers.
+
+Browser acceptance: add a manual GeoIP rule, verify User source, move rows with
+explicit controls, change an output in place, and promote/demote a row. Inspect
+canonical JSON and save without reconnecting. Imports must replace only Base.
+Known unavailable server references remain visible warnings and fail-closed;
+unknown/ambiguous new references still block saving. A stale editor must reject
+the save rather than overwrite another client's changes.
+
+Native macOS/Windows runtime acceptance requires those platforms; Linux and the
+browser sandbox are not evidence of native parity.
+
 ## Linux CLI-first architecture acceptance
 
 ```bash

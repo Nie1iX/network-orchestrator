@@ -1246,10 +1246,20 @@ mod tests {
         assert!(text.contains("Beta NL"), "{text}");
         assert_eq!(value["selectors"].as_array().unwrap().len(), 2);
         let profile = ctx.find("sub1").unwrap();
-        assert_eq!(profile.pinned_policies.len(), 1);
-        assert_eq!(profile.pinned_policies[0].selectors.len(), 2);
-        // Addresses and geoip selectors do not pin; domain rules do.
-        assert!(route::run(
+        let pins = profile
+            .routing
+            .iter()
+            .filter(|rule| {
+                matches!(
+                    &rule.target,
+                    net_manager_core::models::RoutingTarget::Node { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pins.len(), 2);
+        assert!(pins.iter().all(|rule| rule.selectors.len() == 1));
+        // IP addresses can be pinned too.
+        let (value, _) = route::run(
             &ctx,
             super::super::args::RouteCommand::Pin {
                 profile: "sub1".into(),
@@ -1257,8 +1267,9 @@ mod tests {
                 selector: vec!["203.0.113.9".into()],
             },
         )
-        .is_err());
-        // The same selector cannot follow two routes.
+        .unwrap();
+        assert_eq!(value["selectors"].as_array().unwrap().len(), 1);
+        // Explicit row order permits the same selector in another user row.
         assert!(route::run(
             &ctx,
             super::super::args::RouteCommand::Add {
@@ -1269,7 +1280,7 @@ mod tests {
                 },
             },
         )
-        .is_err());
+        .is_ok());
         let (_, text) = route::run(
             &ctx,
             super::super::args::RouteCommand::Unpin {
@@ -1280,7 +1291,12 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains("Unpinned"), "{text}");
-        assert!(ctx.find("sub1").unwrap().pinned_policies.is_empty());
+        assert!(!ctx.find("sub1").unwrap().routing.iter().any(|rule| {
+            matches!(
+                &rule.target,
+                net_manager_core::models::RoutingTarget::Node { .. }
+            )
+        }));
     }
 
     #[test]
@@ -1422,7 +1438,7 @@ mod tests {
         )
         .is_err());
         // The refused apply changed nothing.
-        assert!(ctx.find("sub1").unwrap().domain_policies.is_empty());
+        assert!(ctx.find("sub1").unwrap().routing.is_empty());
     }
 
     #[test]

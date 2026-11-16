@@ -515,7 +515,7 @@ fn prepared_routing_config(profile: &Profile) -> io::Result<serde_json::Value> {
     })?;
     crate::xray::apply_profile_routing(
         &base,
-        &profile.domain_policies,
+        &profile.routing,
         &crate::xray::ProfileRoutingOptions::from(profile),
     )
     .map_err(|_| invalid_data("failed to apply Xray routing policies"))
@@ -2151,43 +2151,6 @@ mod tests {
     }
 
     #[test]
-    fn prepare_xray_config_applies_domain_policies() {
-        let dir = unique_dir("xray-prepare");
-        let path = dir.join("node.json");
-        fs::write(
-            &path,
-            r#"{"outbounds":[{"tag":"proxy","protocol":"vless"}],"routing":{"rules":[]}}"#,
-        )
-        .unwrap();
-        let mut profile = xray_profile();
-        profile.config_path = path.clone();
-        profile.domain_policies = vec![
-            DomainPolicy {
-                domains: vec![" example.com ".into()],
-                target: DomainRouteTarget::Proxy,
-            },
-            DomainPolicy {
-                domains: vec!["internal.lan".into()],
-                target: DomainRouteTarget::Direct,
-            },
-        ];
-
-        let bytes = prepare_xray_config(&profile).unwrap();
-        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let rules = doc["routing"]["rules"].as_array().unwrap();
-        assert_eq!(rules.len(), 3);
-        assert_eq!(rules[0]["domain"], serde_json::json!(["example.com"]));
-        assert_eq!(rules[0]["outboundTag"], "proxy");
-        assert_eq!(rules[1]["outboundTag"], "network-orchestrator-direct");
-        assert_eq!(
-            rules[2]["ip"],
-            serde_json::json!(["224.0.0.0/4", "ff00::/8"])
-        );
-        assert!(!String::from_utf8_lossy(&bytes).contains(&path.display().to_string()));
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn prepare_xray_config_applies_private_lan_preset_after_user_rules() {
         let dir = unique_dir("xray-private-lan");
         let path = dir.join("node.json");
@@ -2195,10 +2158,13 @@ mod tests {
         let mut profile = xray_profile();
         profile.config_path = path;
         profile.private_lan_direct = true;
-        profile.domain_policies = vec![DomainPolicy {
+        profile.routing.base = vec![DomainPolicy {
             domains: vec!["geoip:us".into()],
             target: DomainRouteTarget::Block,
-        }];
+        }]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         let config: serde_json::Value =
             serde_json::from_slice(&prepare_xray_config(&profile).unwrap()).unwrap();
         assert_eq!(
@@ -2225,10 +2191,13 @@ mod tests {
         let mut profile = xray_profile();
         profile.config_path = path;
         profile.xray_mode = crate::models::XrayMode::Tun;
-        profile.domain_policies = vec![DomainPolicy {
-            domains: vec!["a.com".into()],
-            target: DomainRouteTarget::Direct,
-        }];
+        profile.routing.user.push(
+            DomainPolicy {
+                domains: vec!["a.com".into()],
+                target: DomainRouteTarget::Direct,
+            }
+            .into(),
+        );
 
         let doc: serde_json::Value =
             serde_json::from_slice(&prepare_xray_config_base(&profile).unwrap()).unwrap();

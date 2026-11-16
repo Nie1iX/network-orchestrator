@@ -1,6 +1,6 @@
 use crate::models::{
-    DomainPolicy, DomainRouteTarget, XrayDnsConfig, XrayDnsRoute, XrayDnsServer, XrayDomainMatcher,
-    XrayDomainStrategy, XraySockopts, XrayTrafficRule,
+    DomainPolicy, RoutingPolicy, RoutingTarget, XrayDnsConfig, XrayDnsRoute, XrayDnsServer,
+    XrayDomainMatcher, XrayDomainStrategy, XraySockopts, XrayTrafficRule,
 };
 use ipnet::IpNet;
 use serde_json::{json, Map, Value};
@@ -12,6 +12,10 @@ use url::Url;
 #[path = "endpoint_graph.rs"]
 mod endpoint_graph;
 pub use endpoint_graph::{append_endpoint_graph, multinode_endpoint, EndpointGraph};
+
+pub const POLICY_DNS_TAG: &str = "network-orchestrator-dns";
+pub const POLICY_DNS_RELAY_TAG: &str = "network-orchestrator-dns-relay";
+
 pub fn endpoint_probe_config(uri: &str, port: u16) -> io::Result<Value> {
     let graph = multinode_endpoint(uri, "probe")?;
     let mut config = json!({
@@ -601,28 +605,24 @@ pub const UNAVAILABLE_TAG: &str = "unavailable";
 /// runtime with `xray api bo`.
 pub const FAILOVER_BALANCER: &str = "failover";
 
-/// One resolved pinned route for [`apply_multinode_config`]: selectors plus
-/// either a real outbound (the endpoint is in the subscription) or a
-/// blackhole (it left — the pinned selectors drop, never reroute).
+/// A fixed endpoint graph, or a blackhole when the endpoint is unavailable.
 pub struct PinnedOutbound {
     pub key: String,
     /// `None` → the outbound for this key is a blackhole.
     pub outbound: Option<EndpointGraph>,
-    pub selectors: Vec<String>,
 }
 
 /// Rebuild a generated single-endpoint config for multinode operation:
 ///
 /// - `base`'s primary outbound is retagged `node-<primary>` and the ordered
 ///   `backups` join it (same order → strict priority);
-/// - each resolved pinned route adds a `pin-<key>` outbound and a domain
-///   rule after explicit domain policies, but before broad/default policies;
+/// - each resolved pinned endpoint adds a `pin-<key>` outbound;
 /// - a missing pinned key adds only a blackhole `pin-<key>` outbound —
 ///   fail-closed;
 /// - routing gets `balancers: [{tag: failover, selector: [unavailable]}]`:
-///   the daemon adds the `unavailable` blackhole outbound and the catch-all
-///   rule, and pins the balancer to a real node only after a probe says it
-///   is healthy. Before that, default traffic drops — never leaks.
+///   the daemon adds the `unavailable` blackhole and a loopback default
+///   outbound targeting that balancer after normal domain/IP matching.
+///   It selects a real node only after a successful probe; otherwise it drops.
 ///
 /// `freedom`/`blackhole` auxiliaries from the base config are preserved.
 pub fn apply_multinode_config(
@@ -674,17 +674,6 @@ pub fn apply_multinode_config(
         .and_then(|root| root.get_mut("routing"))
         .and_then(Value::as_object_mut)
         .ok_or_else(|| invalid_data("xray config routing must be an object"))?;
-    let mut merged: Vec<Value> = Vec::new();
-    for route in pinned {
-        if route.selectors.is_empty() {
-            continue;
-        }
-        merged.push(json!({
-            "type": "field",
-            "domain": route.selectors,
-            "outboundTag": pin_tag(&route.key),
-        }));
-    }
     let rules = routing
         .entry("rules")
         .or_insert_with(|| json!([]))
@@ -701,28 +690,6 @@ pub fn apply_multinode_config(
             object.insert("balancerTag".into(), json!(FAILOVER_BALANCER));
         }
     }
-    // Explicit domain choices override pins; broad GeoSite policies do not.
-    // Port guards, DNS capture and scoped dispatch keep their precedence.
-    let guard_count = rules
-        .iter()
-        .take_while(|rule| {
-            rule.get("port").is_some()
-                || rule["inboundTag"].as_array().is_some_and(|tags| {
-                    tags.iter()
-                        .any(|tag| tag.as_str().is_some_and(|tag| tag.starts_with("src-")))
-                })
-                || (!rule["outboundTag"]
-                    .as_str()
-                    .is_some_and(|tag| tag.starts_with("network-orchestrator-interface"))
-                    && rule["domain"].as_array().is_some_and(|domains| {
-                        !domains.is_empty()
-                            && domains.iter().all(|value| {
-                                value.as_str().is_some_and(is_explicit_domain_selector)
-                            })
-                    }))
-        })
-        .count();
-    rules.splice(guard_count..guard_count, merged);
     routing
         .entry("balancers")
         .or_insert_with(|| json!([]))
@@ -970,9 +937,6 @@ pub struct ProfileRoutingOptions {
     /// `streamSettings.sockopt` keepalive/timeouts applied to the node and
     /// direct outbounds (`None` keeps xray defaults).
     pub sockopts: Option<XraySockopts>,
-    pub pinned_routes: Vec<crate::models::PinnedRoute>,
-    pub traffic_rules: Vec<XrayTrafficRule>,
-    pub interface_routes: Vec<crate::models::XrayInterfaceRoute>,
     pub connection_idle_secs: Option<u32>,
     pub direct_domain_strategy: Option<String>,
 }
@@ -985,17 +949,10 @@ impl From<&crate::models::Profile> for ProfileRoutingOptions {
             domain_matcher: profile.xray_domain_matcher,
             dns: profile.xray_dns.clone(),
             sockopts: profile.xray_sockopts.clone(),
-            pinned_routes: profile.pinned_policies.clone(),
-            traffic_rules: profile.xray_traffic_rules.clone(),
-            interface_routes: profile.xray_interface_routes.clone(),
             connection_idle_secs: profile.xray_connection_idle_secs,
             direct_domain_strategy: profile.xray_direct_domain_strategy.clone(),
         }
     }
-}
-
-pub fn apply_domain_policies(base: &Value, policies: &[DomainPolicy]) -> io::Result<Value> {
-    apply_profile_routing(base, policies, &ProfileRoutingOptions::default())
 }
 
 pub fn validate_routing_policy_selectors(policies: &[DomainPolicy]) -> io::Result<()> {
@@ -1008,10 +965,6 @@ pub fn validate_routing_policy_selectors(policies: &[DomainPolicy]) -> io::Resul
         }
     }
     Ok(())
-}
-pub(crate) fn is_explicit_domain_selector(selector: &str) -> bool {
-    let selector = selector.trim();
-    selector.starts_with("domain:") || selector.starts_with("full:")
 }
 
 /// Returns `Ok(None)` for comments (`# …`) and blank selectors so the UI can
@@ -1069,6 +1022,17 @@ pub fn classify_routing_selector(selector: &str) -> io::Result<Option<(&'static 
         return Ok(Some(("ip", net.to_string())));
     }
     Ok(Some(("domain", selector.to_string())))
+}
+
+impl crate::models::RoutingRule {
+    pub(crate) fn has_ip_selector(&self) -> bool {
+        self.selectors.iter().any(|selector| {
+            let selector = selector.trim();
+            selector.starts_with("geoip:")
+                || selector.parse::<IpAddr>().is_ok()
+                || IpNet::from_str(selector).is_ok()
+        })
+    }
 }
 
 const DNS_SCHEMES: &[&str] = &["udp", "tcp", "tls", "https", "https+local", "quic+local"];
@@ -1195,11 +1159,13 @@ fn dns_server_host(address: &str) -> Option<&str> {
 }
 
 /// Resolver hosts that must stay reachable through the physical uplink when
-/// the tunnel fully captures their family — every configured resolver that
-/// is not pinned to the proxy outbound (a `Proxy` resolver is meant to be
-/// reached *inside* the tunnel, so bypassing it would defeat the point).
+/// the tunnel fully captures their family. Protected DNS must stay in the
+/// tunnel; otherwise only resolvers not pinned to proxy need bypass routes.
 /// Returned as a deduped list of literal IPs or resolvable names.
-pub fn dns_bypass_hosts(dns: &XrayDnsConfig) -> Vec<String> {
+pub fn dns_bypass_hosts(dns: &XrayDnsConfig, policies: &RoutingPolicy) -> Vec<String> {
+    if policies.protects_dns() {
+        return Vec::new();
+    }
     let mut hosts = Vec::new();
     for server in &dns.servers {
         if matches!(server.route, crate::models::XrayDnsRoute::Proxy) {
@@ -1229,27 +1195,7 @@ pub(crate) fn dns_server_route_target(address: &str) -> Option<(&'static str, St
     Some(("domain", host.to_string()))
 }
 
-/// Block-target selectors that can also be null-routed through the DNS
-/// `hosts` table — plain names and `domain:`/`full:` literals only (a
-/// geosite/keyword/regexp matcher cannot be expressed as a hosts key).
-fn dns_hosts_key(selector: &str) -> Option<String> {
-    let selector = selector.trim();
-    if selector.is_empty() || selector.starts_with('#') {
-        return None;
-    }
-    for prefix in ["domain:", "full:"] {
-        if let Some(rest) = selector.strip_prefix(prefix) {
-            let rest = rest.trim();
-            return (!rest.is_empty()).then(|| rest.to_string());
-        }
-    }
-    if selector.contains(':') || selector.parse::<IpAddr>().is_ok() {
-        return None;
-    }
-    Some(selector.to_string())
-}
-
-fn dns_server_entry(server: &XrayDnsServer, policies: &[DomainPolicy]) -> Value {
+fn dns_server_entry(server: &XrayDnsServer, policies: &RoutingPolicy) -> Value {
     let mut entry = Map::new();
     entry.insert("address".into(), json!(server.address.trim()));
     if let Some(port) = server.port {
@@ -1261,13 +1207,13 @@ fn dns_server_entry(server: &XrayDnsServer, policies: &[DomainPolicy]) -> Value 
     // lists stay on their own resolver.
     if domains.is_empty() {
         let target = match server.route {
-            XrayDnsRoute::Proxy => Some(DomainRouteTarget::Proxy),
-            XrayDnsRoute::Direct => Some(DomainRouteTarget::Direct),
+            XrayDnsRoute::Proxy => Some(RoutingTarget::Proxy),
+            XrayDnsRoute::Direct => Some(RoutingTarget::Direct),
             XrayDnsRoute::None => None,
         };
         if let Some(target) = target {
             for policy in policies.iter().filter(|policy| policy.target == target) {
-                for selector in &policy.domains {
+                for selector in &policy.selectors {
                     if let Ok(Some(("domain", value))) = classify_routing_selector(selector) {
                         domains.push(value);
                     }
@@ -1284,7 +1230,7 @@ fn dns_server_entry(server: &XrayDnsServer, policies: &[DomainPolicy]) -> Value 
     Value::Object(entry)
 }
 
-fn dns_servers_json(dns: &XrayDnsConfig, policies: &[DomainPolicy]) -> Vec<Value> {
+fn dns_servers_json(dns: &XrayDnsConfig, policies: &RoutingPolicy) -> Vec<Value> {
     let mut servers = Vec::new();
     if dns.fake_dns {
         servers.push(json!("fakedns"));
@@ -1324,7 +1270,7 @@ pub fn validate_stream_sockopts(sockopts: &XraySockopts) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_outbound_domain_strategy(strategy: Option<&str>) -> io::Result<()> {
+pub(crate) fn validate_outbound_domain_strategy(strategy: Option<&str>) -> io::Result<()> {
     if strategy.is_some_and(|strategy| {
         !matches!(
             strategy,
@@ -1462,15 +1408,15 @@ pub fn validate_pinned_routes(routes: &[crate::models::PinnedRoute]) -> io::Resu
 
 pub fn apply_profile_routing(
     base: &Value,
-    policies: &[DomainPolicy],
+    policies: &RoutingPolicy,
     options: &ProfileRoutingOptions,
 ) -> io::Result<Value> {
     let dns_active = !options.dns.is_empty();
-    let rules_active = !policies.is_empty()
-        || options.private_lan_direct
-        || dns_active
-        || !options.traffic_rules.is_empty()
-        || !options.interface_routes.is_empty();
+    let has_user_ip = policies.user.iter().any(|rule| rule.has_ip_selector());
+    let has_ip = has_user_ip || policies.base.iter().any(|rule| rule.has_ip_selector());
+    let strict_dns = policies.protects_dns();
+    let rules_active =
+        !policies.is_empty() || options.private_lan_direct || dns_active || strict_dns;
     if !rules_active
         && options.domain_strategy.is_none()
         && options.domain_matcher.is_none()
@@ -1480,11 +1426,11 @@ pub fn apply_profile_routing(
     {
         return Ok(base.clone());
     }
-    validate_routing_policy_selectors(policies)?;
+    crate::routing_policy::validate(policies)?;
     validate_dns_config(&options.dns)?;
     validate_advanced_routing_options(
-        &options.traffic_rules,
-        &options.interface_routes,
+        &[],
+        &[],
         options.sockopts.as_ref(),
         options.connection_idle_secs,
         options.direct_domain_strategy.as_deref(),
@@ -1498,33 +1444,24 @@ pub fn apply_profile_routing(
         .and_then(Value::as_array_mut)
         .ok_or_else(|| invalid_data("xray config outbounds must be an array"))?;
 
-    let needs_proxy = policies
-        .iter()
-        .any(|policy| policy.target == DomainRouteTarget::Proxy)
+    let needs_proxy = strict_dns
+        || policies
+            .iter()
+            .any(|rule| matches!(rule.target, RoutingTarget::Proxy))
         || options
             .dns
             .servers
             .iter()
             .any(|server| server.route == XrayDnsRoute::Proxy);
-    let needs_proxy = needs_proxy
-        || options
-            .traffic_rules
-            .iter()
-            .any(|rule| rule.target == DomainRouteTarget::Proxy);
     let needs_direct = options.private_lan_direct
         || policies
             .iter()
-            .any(|policy| policy.target == DomainRouteTarget::Direct)
+            .any(|rule| matches!(rule.target, RoutingTarget::Direct))
         || options
             .dns
             .servers
             .iter()
             .any(|server| server.route == XrayDnsRoute::Direct);
-    let needs_direct = needs_direct
-        || options
-            .traffic_rules
-            .iter()
-            .any(|rule| rule.target == DomainRouteTarget::Direct);
     // Any customised rule set also drops multicast, so the blackhole
     // outbound is always required once rules are emitted.
     let needs_block = rules_active;
@@ -1539,6 +1476,11 @@ pub fn apply_profile_routing(
         *counts.entry(tag.to_string()).or_default() += 1;
     }
     let mut used: HashSet<String> = counts.keys().cloned().collect();
+    if strict_dns && used.contains(POLICY_DNS_RELAY_TAG) {
+        return Err(invalid_data(
+            "reserved DNS relay outbound tag already exists",
+        ));
+    }
 
     let proxy_tag = if needs_proxy {
         let index = outbounds
@@ -1607,7 +1549,7 @@ pub fn apply_profile_routing(
         None
     };
 
-    let dns_tag = if dns_active {
+    let dns_tag = if dns_active || strict_dns {
         let index = match outbounds
             .iter()
             .position(|outbound| outbound["protocol"].as_str() == Some("dns"))
@@ -1635,7 +1577,33 @@ pub fn apply_profile_routing(
             outbounds[index]["settings"] = json!(settings);
         }
     }
-    if let Some(key) = &options.dns.outbound_key {
+    if strict_dns {
+        for outbound in outbounds
+            .iter_mut()
+            .filter(|outbound| outbound["protocol"] == "dns")
+        {
+            let object = outbound
+                .as_object_mut()
+                .ok_or_else(|| invalid_data("invalid DNS outbound"))?;
+            object.remove("proxySettings");
+            let stream = object
+                .entry("streamSettings")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or_else(|| invalid_data("invalid DNS stream settings"))?;
+            let sockopt = stream
+                .entry("sockopt")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or_else(|| invalid_data("invalid DNS socket options"))?;
+            sockopt.insert("dialerProxy".into(), json!(POLICY_DNS_RELAY_TAG));
+        }
+        outbounds.push(json!({
+            "tag": POLICY_DNS_RELAY_TAG,
+            "protocol": "loopback",
+            "settings": {"inboundTag": POLICY_DNS_TAG}
+        }));
+    } else if let Some(key) = &options.dns.outbound_key {
         if let Some(index) = outbounds
             .iter()
             .position(|outbound| outbound["protocol"] == "dns")
@@ -1666,16 +1634,20 @@ pub fn apply_profile_routing(
     }
 
     let mut interface_tags = HashMap::new();
-    for route in &options.interface_routes {
-        let identity = (
-            route.interface_name.as_str(),
-            route.domain_strategy.as_deref(),
-        );
+    for rule in policies.iter() {
+        let RoutingTarget::Interface {
+            interface_name,
+            domain_strategy,
+        } = &rule.target
+        else {
+            continue;
+        };
+        let identity = (interface_name.as_str(), domain_strategy.as_deref());
         if interface_tags.contains_key(&identity) {
             continue;
         }
-        let mut outbound = json!({"protocol": "freedom", "streamSettings": {"sockopt": {"interface": route.interface_name}}});
-        if let Some(strategy) = &route.domain_strategy {
+        let mut outbound = json!({"protocol": "freedom", "streamSettings": {"sockopt": {"interface": interface_name}}});
+        if let Some(strategy) = domain_strategy {
             outbound["streamSettings"]["sockopt"]["domainStrategy"] = json!(strategy);
         }
         let tag = resolve_outbound_tag(
@@ -1696,6 +1668,17 @@ pub fn apply_profile_routing(
             apply_stream_sockopts(outbound, sockopts)?;
         }
     }
+    let default_tag = if has_user_ip {
+        Some(
+            outbounds
+                .first()
+                .and_then(|outbound| outbound["tag"].as_str())
+                .ok_or_else(|| invalid_data("xray primary outbound has no tag"))?
+                .to_owned(),
+        )
+    } else {
+        None
+    };
     if let Some(seconds) = options.connection_idle_secs {
         root.insert(
             "policy".into(),
@@ -1707,7 +1690,9 @@ pub fn apply_profile_routing(
     let routing = routing
         .as_object_mut()
         .ok_or_else(|| invalid_data("xray config routing must be an object"))?;
-    if let Some(strategy) = options.domain_strategy {
+    if has_ip {
+        routing.insert("domainStrategy".into(), json!("IPOnDemand"));
+    } else if let Some(strategy) = options.domain_strategy {
         routing.insert("domainStrategy".into(), json!(strategy.as_xray_str()));
     }
     if let Some(matcher) = options.domain_matcher {
@@ -1719,97 +1704,68 @@ pub fn apply_profile_routing(
         .ok_or_else(|| invalid_data("xray config routing.rules must be an array"))?;
 
     let mut merged = Vec::new();
-    for guard in &options.traffic_rules {
-        let tag = match guard.target {
-            DomainRouteTarget::Proxy => proxy_tag.as_deref().unwrap_or_default(),
-            DomainRouteTarget::Direct => direct_tag.as_deref().unwrap_or_default(),
-            DomainRouteTarget::Block => block_tag.as_deref().unwrap_or_default(),
-        };
-        merged.push(
-            json!({"type": "field", "ip": guard.ips, "port": guard.port.to_string(),
-            "network": guard.network, "outboundTag": tag}),
-        );
+    if strict_dns {
+        let tag = options
+            .dns
+            .outbound_key
+            .as_ref()
+            .map(|key| pin_tag(key))
+            .unwrap_or_else(|| proxy_tag.clone().expect("strict DNS requires proxy"));
+        merged.push(json!({"type":"field", "inboundTag":[POLICY_DNS_TAG], "outboundTag":tag}));
     }
-    // DNS capture comes first: port-53 traffic is answered by the dns
-    // outbound so static hosts / split resolvers / fake-DNS apply even to
-    // plain system resolvers (TUN mode).
+    // Resolver dispatch must precede port-53 capture to avoid recursion.
     if let Some(tag) = dns_tag.as_deref() {
         merged.push(json!({"type": "field", "port": "53", "outboundTag": tag}));
     }
-    if !options.pinned_routes.is_empty() {
-        for policy in policies {
-            let domains: Vec<_> = policy
-                .domains
-                .iter()
-                .map(|selector| selector.trim())
-                .filter(|selector| is_explicit_domain_selector(selector))
-                .collect();
-            if domains.is_empty() {
-                continue;
-            }
-            let tag = match policy.target {
-                DomainRouteTarget::Proxy => proxy_tag.as_deref().unwrap_or_default(),
-                DomainRouteTarget::Direct => direct_tag.as_deref().unwrap_or_default(),
-                DomainRouteTarget::Block => block_tag.as_deref().unwrap_or_default(),
+    let mut requirements = crate::xray_layers::IpRequirements::default();
+    for (is_user, rows) in [(true, &policies.user), (false, &policies.base)] {
+        for row in rows {
+            let tag = match &row.target {
+                RoutingTarget::Proxy => proxy_tag.as_deref().unwrap_or_default().to_owned(),
+                RoutingTarget::Direct => direct_tag.as_deref().unwrap_or_default().to_owned(),
+                RoutingTarget::Block => block_tag.as_deref().unwrap_or_default().to_owned(),
+                RoutingTarget::Node { endpoint_key, .. } => pin_tag(endpoint_key),
+                RoutingTarget::Interface {
+                    interface_name,
+                    domain_strategy,
+                } => interface_tags[&(interface_name.as_str(), domain_strategy.as_deref())].clone(),
             };
-            merged.push(json!({"type": "field", "domain": domains, "outboundTag": tag}));
-        }
-    }
-    for route in &options.interface_routes {
-        let tag = &interface_tags[&(
-            route.interface_name.as_str(),
-            route.domain_strategy.as_deref(),
-        )];
-        let mut domains = Vec::new();
-        let mut ips = Vec::new();
-        for selector in &route.selectors {
-            if let Some((kind, value)) = classify_routing_selector(selector)? {
-                if kind == "ip" {
-                    ips.push(value);
-                } else {
-                    domains.push(value);
+            let mut domains = Vec::new();
+            let mut ips = Vec::new();
+            for selector in &row.selectors {
+                if let Some((kind, value)) = classify_routing_selector(selector)? {
+                    if kind == "ip" {
+                        ips.push(value);
+                    } else {
+                        domains.push(value);
+                    }
                 }
             }
-        }
-        if !domains.is_empty() {
-            merged.push(json!({"type": "field", "domain": domains, "outboundTag": tag}));
-        }
-        if !ips.is_empty() {
-            merged.push(json!({"type": "field", "ip": ips, "outboundTag": tag}));
-        }
-    }
-    for policy in policies {
-        let tag = match policy.target {
-            DomainRouteTarget::Proxy => proxy_tag.as_deref().unwrap_or_default(),
-            DomainRouteTarget::Direct => direct_tag.as_deref().unwrap_or_default(),
-            DomainRouteTarget::Block => block_tag.as_deref().unwrap_or_default(),
-        };
-        let mut domains = Vec::new();
-        let mut ips = Vec::new();
-        for selector in &policy.domains {
-            if !options.pinned_routes.is_empty() && is_explicit_domain_selector(selector) {
-                continue;
+            let mut template = json!({"type":"field", "outboundTag":tag});
+            if let Some(port) = row.port {
+                template["port"] = json!(port.to_string());
             }
-            let Some((kind, value)) = classify_routing_selector(selector)? else {
-                continue;
-            };
-            if kind == "ip" {
-                ips.push(value);
-            } else {
-                domains.push(value);
+            if let Some(network) = &row.network {
+                template["network"] = json!(network);
             }
-        }
-        if !domains.is_empty() {
-            merged.push(json!({"type": "field", "domain": domains, "outboundTag": tag}));
-        }
-        if !ips.is_empty() {
-            merged.push(json!({"type": "field", "ip": ips, "outboundTag": tag}));
+            if !domains.is_empty() {
+                let mut domain_rule = template.clone();
+                domain_rule["domain"] = json!(domains);
+                requirements.emit(domain_rule, row.port, row.network.as_deref(), &mut merged);
+            }
+            if !ips.is_empty() {
+                template["ip"] = json!(ips);
+                merged.push(template);
+                if is_user {
+                    requirements.add(row.port, row.network.as_deref());
+                }
+            }
         }
     }
     // Keep each resolver reachable on its own side of the tunnel: the
     // resolver pinned to `proxy` must not resolve via the local network and
     // vice versa.
-    for server in &options.dns.servers {
+    for server in options.dns.servers.iter().filter(|_| !strict_dns) {
         let tag = match server.route {
             XrayDnsRoute::Proxy => proxy_tag.as_deref().unwrap_or_default(),
             XrayDnsRoute::Direct => direct_tag.as_deref().unwrap_or_default(),
@@ -1841,6 +1797,18 @@ pub fn apply_profile_routing(
             "outboundTag": direct_tag.as_deref().unwrap_or_default(),
         }));
     }
+    if !requirements.is_empty() {
+        let default_tag = default_tag
+            .as_deref()
+            .expect("User IP checks require a tagged default");
+        requirements.emit(
+            json!({"type":"field", "network":"tcp,udp", "outboundTag":default_tag}),
+            None,
+            None,
+            &mut merged,
+        );
+        merged.push(json!({"type":"field", "network":"tcp,udp", "outboundTag":block_tag.as_deref().unwrap_or_default()}));
+    }
     let dispatch_count = rules
         .iter()
         .take_while(|rule| {
@@ -1852,31 +1820,60 @@ pub fn apply_profile_routing(
         .count();
     rules.splice(dispatch_count..dispatch_count, merged);
 
-    if dns_active {
-        let mut hosts = Map::new();
-        // Blocked literal domains are also null-routed at the resolver —
-        // a client ignoring routing still gets a dead answer.
-        for policy in policies
-            .iter()
-            .filter(|policy| policy.target == DomainRouteTarget::Block)
-        {
-            for selector in &policy.domains {
-                if let Some(host) = dns_hosts_key(selector) {
-                    hosts.entry(host).or_insert_with(|| json!(["127.0.0.1"]));
-                }
-            }
-        }
-        // Explicit host overrides win over the generated null routes.
+    if dns_active || strict_dns {
+        let mut dns_obj = root
+            .get("dns")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut hosts = dns_obj
+            .get("hosts")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
         for (name, values) in &options.dns.hosts {
             hosts.insert(name.clone(), json!(values));
         }
-        let mut dns_obj = Map::new();
         if !hosts.is_empty() {
             dns_obj.insert("hosts".into(), Value::Object(hosts));
         }
         let servers = dns_servers_json(&options.dns, policies);
         if !servers.is_empty() {
             dns_obj.insert("servers".into(), json!(servers));
+        }
+        if strict_dns {
+            dns_obj.insert("tag".into(), json!(POLICY_DNS_TAG));
+            let servers = dns_obj
+                .entry("servers")
+                .or_insert_with(|| json!(["1.1.1.1"]));
+            let servers = servers
+                .as_array_mut()
+                .ok_or_else(|| invalid_input("invalid DNS servers"))?;
+            if servers.is_empty() {
+                servers.push(json!("1.1.1.1"));
+            }
+            for server in servers {
+                let address = server
+                    .as_str()
+                    .or_else(|| server.get("address").and_then(Value::as_str))
+                    .ok_or_else(|| invalid_input("invalid DNS server"))?;
+                let lower = address.to_ascii_lowercase();
+                let host = dns_server_host(&lower).unwrap_or("");
+                if lower == "localhost"
+                    || lower.contains("+local://")
+                    || host == "localhost"
+                    || host
+                        .parse::<IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+                {
+                    return Err(invalid_input(
+                        "local DNS transport is incompatible with protected routing",
+                    ));
+                }
+                if let Some(object) = server.as_object_mut() {
+                    object.remove("tag");
+                }
+            }
         }
         if let Some(strategy) = options.dns.query_strategy {
             dns_obj.insert("queryStrategy".into(), json!(strategy.as_xray_str()));
@@ -2113,6 +2110,28 @@ pub fn apply_macos_dns_capture(
     local_resolvers: &[IpAddr],
     local_domains: &[String],
 ) -> io::Result<Value> {
+    // The canonical compiler's marker and relay identify its protected DNS service.
+    if base["dns"]["tag"] == POLICY_DNS_TAG
+        && base["outbounds"].as_array().is_some_and(|outbounds| {
+            outbounds.iter().any(|outbound| {
+                outbound["tag"] == POLICY_DNS_RELAY_TAG
+                    && outbound["protocol"] == "loopback"
+                    && outbound["settings"]["inboundTag"] == POLICY_DNS_TAG
+            }) && outbounds.iter().any(|outbound| {
+                outbound["protocol"] == "dns"
+                    && outbound["streamSettings"]["sockopt"]["dialerProxy"] == POLICY_DNS_RELAY_TAG
+                    && outbound["tag"].as_str().is_some_and(|tag| {
+                        base["routing"]["rules"].as_array().is_some_and(|rules| {
+                            rules
+                                .iter()
+                                .any(|rule| rule["port"] == "53" && rule["outboundTag"] == tag)
+                        })
+                    })
+            })
+        })
+    {
+        return Ok(base.clone());
+    }
     let mut doc = base.clone();
     let root = doc
         .as_object_mut()
@@ -2498,6 +2517,203 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    trait TestPolicy {
+        fn canonical(&self) -> RoutingPolicy;
+    }
+    impl TestPolicy for RoutingPolicy {
+        fn canonical(&self) -> RoutingPolicy {
+            self.clone()
+        }
+    }
+    impl TestPolicy for [DomainPolicy] {
+        fn canonical(&self) -> RoutingPolicy {
+            RoutingPolicy {
+                base: self.iter().cloned().map(Into::into).collect(),
+                user: vec![],
+            }
+        }
+    }
+    impl<const N: usize> TestPolicy for [DomainPolicy; N] {
+        fn canonical(&self) -> RoutingPolicy {
+            self.as_slice().canonical()
+        }
+    }
+    impl TestPolicy for Vec<DomainPolicy> {
+        fn canonical(&self) -> RoutingPolicy {
+            self.as_slice().canonical()
+        }
+    }
+    fn apply_profile_routing<P: TestPolicy + ?Sized>(
+        base: &Value,
+        policy: &P,
+        options: &ProfileRoutingOptions,
+    ) -> io::Result<Value> {
+        super::apply_profile_routing(base, &policy.canonical(), options)
+    }
+    fn apply_domain_policies(base: &Value, policies: &[DomainPolicy]) -> io::Result<Value> {
+        apply_profile_routing(base, policies, &ProfileRoutingOptions::default())
+    }
+
+    #[test]
+    fn protected_dns_preserves_rewrites_and_relays_all_dns_outbounds() {
+        let policy = RoutingPolicy {
+            user: vec![crate::models::RoutingRule {
+                selectors: vec!["domain:example.test".into()],
+                target: RoutingTarget::Proxy,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let settings = json!({"rules": [
+            {"action": "return", "qType": "28"},
+            {"action": "hijack", "domain": ["domain:example.test"]},
+            {"action": "direct"}
+        ]});
+        let dns = XrayDnsConfig {
+            servers: ["1.1.1.1", "8.8.8.8", "9.9.9.9", "8.8.4.4"]
+                .into_iter()
+                .map(|address| dns_server(address, XrayDnsRoute::None))
+                .collect(),
+            outbound: Some(serde_json::from_value(settings.clone()).unwrap()),
+            ..Default::default()
+        };
+        let mut base = base_config();
+        base["outbounds"].as_array_mut().unwrap().push(json!({
+            "tag": "other-dns", "protocol": "dns", "proxySettings": {"tag": "direct"},
+            "streamSettings": {"sockopt": {"dialerProxy": "direct"}}
+        }));
+        base["outbounds"].as_array_mut().unwrap().push(json!({
+            "tag": "second-dns", "protocol": "dns",
+            "streamSettings": {"sockopt": {"mark": 42}}
+        }));
+        let config = apply_profile_routing(&base, &policy, &dns_options(dns)).unwrap();
+        let outbounds = config["outbounds"].as_array().unwrap();
+        assert!(outbounds.iter().any(|o| *o
+            == json!({
+                "tag": "network-orchestrator-dns-relay", "protocol": "loopback",
+                "settings": {"inboundTag": "network-orchestrator-dns"}
+            })));
+        let dns_outbounds: Vec<_> = outbounds
+            .iter()
+            .filter(|o| o["protocol"] == "dns")
+            .collect();
+        assert_eq!(dns_outbounds.len(), 2);
+        assert_eq!(dns_outbounds[0]["settings"], settings);
+        assert_eq!(
+            dns_outbounds[0]["streamSettings"]["sockopt"]["dialerProxy"],
+            "network-orchestrator-dns-relay"
+        );
+        assert!(dns_outbounds[0].get("proxySettings").is_none());
+        assert_eq!(
+            dns_outbounds[1]["streamSettings"]["sockopt"]["dialerProxy"],
+            "network-orchestrator-dns-relay"
+        );
+        assert_eq!(dns_outbounds[1]["streamSettings"]["sockopt"]["mark"], 42);
+        assert_eq!(
+            config["routing"]["rules"][0]["inboundTag"],
+            json!(["network-orchestrator-dns"])
+        );
+        assert_eq!(config["routing"]["rules"][0]["outboundTag"], "proxy");
+        assert_eq!(config["routing"]["rules"][1]["port"], "53");
+    }
+
+    #[test]
+    fn protected_dns_captures_with_empty_options_and_rejects_relay_collision() {
+        let policy = RoutingPolicy {
+            user: vec![crate::models::RoutingRule {
+                selectors: vec!["domain:example.test".into()],
+                target: RoutingTarget::Proxy,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let config =
+            apply_profile_routing(&base_config(), &policy, &ProfileRoutingOptions::default())
+                .unwrap();
+        let dns = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["protocol"] == "dns")
+            .unwrap();
+        assert_eq!(
+            dns["streamSettings"]["sockopt"]["dialerProxy"],
+            "network-orchestrator-dns-relay"
+        );
+        assert_eq!(config["routing"]["rules"][1]["outboundTag"], dns["tag"]);
+        let mut base = base_config();
+        base["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"tag": "network-orchestrator-dns-relay", "protocol": "freedom"}));
+        assert!(apply_profile_routing(&base, &policy, &ProfileRoutingOptions::default()).is_err());
+    }
+
+    #[test]
+    fn protected_dns_rejects_local_transport_and_preserves_explicit_hosts() {
+        let policy = RoutingPolicy {
+            user: vec![crate::models::RoutingRule {
+                selectors: vec!["domain:example.test".into()],
+                target: RoutingTarget::Proxy,
+                ..Default::default()
+            }],
+            base: vec![crate::models::RoutingRule {
+                selectors: vec!["domain:example.test".into()],
+                target: RoutingTarget::Block,
+                ..Default::default()
+            }],
+        };
+        let mut dns = XrayDnsConfig::default();
+        dns.hosts
+            .insert("example.test".into(), vec!["192.0.2.1".into()]);
+        dns.servers.push(dns_server(
+            "https+local://1.1.1.1/dns-query",
+            XrayDnsRoute::Direct,
+        ));
+        assert!(apply_profile_routing(&base_config(), &policy, &dns_options(dns.clone())).is_err());
+        dns.servers[0].address = "https://1.1.1.1/dns-query".into();
+        let config = apply_profile_routing(&base_config(), &policy, &dns_options(dns)).unwrap();
+        assert_eq!(config["dns"]["hosts"]["example.test"], json!(["192.0.2.1"]));
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["inboundTag"], json!(["network-orchestrator-dns"]));
+        assert_eq!(rules[0]["outboundTag"], "proxy");
+    }
+
+    #[test]
+    fn layered_ip_guards_preserve_port_and_dns_privacy() {
+        let policy = RoutingPolicy {
+            user: vec![crate::models::RoutingRule {
+                selectors: vec!["10.0.0.0/8".into()],
+                target: RoutingTarget::Block,
+                port: Some(443),
+                network: Some("tcp".into()),
+            }],
+            base: vec![crate::models::RoutingRule {
+                selectors: vec!["domain:example.test".into()],
+                target: RoutingTarget::Direct,
+                ..Default::default()
+            }],
+        };
+        let config =
+            apply_profile_routing(&base_config(), &policy, &ProfileRoutingOptions::default())
+                .unwrap();
+        assert_eq!(config["routing"]["domainStrategy"], "IPOnDemand");
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        assert!(rules
+            .iter()
+            .any(|r| r["domain"] == json!(["domain:example.test"])
+                && r.get("ip").is_some()
+                && r["port"] == "443"));
+        assert!(rules
+            .iter()
+            .any(|r| r["domain"] == json!(["domain:example.test"]) && r.get("ip").is_none()));
+        assert_eq!(config["dns"]["tag"], "network-orchestrator-dns");
+        assert_eq!(
+            rules.last().unwrap()["outboundTag"],
+            "network-orchestrator-block"
+        );
+    }
+
     #[test]
     fn endpoint_protocol_labels_links_and_json_entries() {
         assert_eq!(
@@ -2549,7 +2765,7 @@ mod tests {
             .expect("profile id");
         let processed = apply_profile_routing(
             &base,
-            &profile.domain_policies,
+            &profile.routing,
             &ProfileRoutingOptions::from(profile),
         )
         .expect("apply_profile_routing");
@@ -3150,23 +3366,6 @@ mod tests {
     }
 
     #[test]
-    fn comments_and_blank_selectors_are_ignored() {
-        let policies = [DomainPolicy {
-            domains: vec![
-                "# custom".into(),
-                "".into(),
-                "   ".into(),
-                "domain:example.com".into(),
-            ],
-            target: DomainRouteTarget::Direct,
-        }];
-        let result = apply_domain_policies(&base_config(), &policies).unwrap();
-        let rules = result["routing"]["rules"].as_array().unwrap();
-        assert_eq!(rules[0]["domain"], json!(["domain:example.com"]));
-        assert_eq!(rules[0]["outboundTag"], "direct");
-    }
-
-    #[test]
     fn comment_only_policy_emits_no_rule() {
         let policies = [DomainPolicy {
             domains: vec!["# just a note".into()],
@@ -3571,6 +3770,45 @@ mod tests {
     }
 
     #[test]
+    fn macos_dns_capture_preserves_compiled_protected_dns() {
+        use crate::models::{RoutingRule, RoutingTarget};
+        let policy = RoutingPolicy {
+            user: vec![RoutingRule {
+                selectors: vec!["203.0.113.0/24".into()],
+                target: RoutingTarget::Block,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let compiled = apply_profile_routing(
+            &macos_dns_base(),
+            &policy,
+            &ProfileRoutingOptions::default(),
+        )
+        .unwrap();
+        let out = apply_macos_dns_capture(
+            &compiled,
+            &["10.0.0.1".parse().unwrap()],
+            &["corp.example".into()],
+        )
+        .unwrap();
+        assert_eq!(out, compiled);
+    }
+
+    #[test]
+    fn macos_dns_capture_does_not_trust_dns_tag_alone() {
+        let mut base = macos_dns_base();
+        base["dns"] = json!({"tag": POLICY_DNS_TAG, "servers": ["9.9.9.9"]});
+        let out = apply_macos_dns_capture(&base, &["10.0.0.1".parse().unwrap()], &[]).unwrap();
+        assert_ne!(out, base);
+        assert!(out["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["ip"] == json!(["10.0.0.1"])));
+    }
+
+    #[test]
     fn macos_dns_capture_answers_port_53_and_resolves_direct_names_locally() {
         let local: Vec<IpAddr> = vec!["10.228.32.2".parse().unwrap()];
         let out = apply_macos_dns_capture(&macos_dns_base(), &local, &[]).unwrap();
@@ -3927,7 +4165,7 @@ mod tests {
     }
 
     #[test]
-    fn block_domains_are_null_routed_through_dns_hosts() {
+    fn block_domains_do_not_override_dns_hosts() {
         let policies = [DomainPolicy {
             domains: vec![
                 "domain:ads.example".into(),
@@ -3940,12 +4178,12 @@ mod tests {
             servers: vec![dns_server("8.8.8.8", XrayDnsRoute::None)],
             ..XrayDnsConfig::default()
         };
-        // An explicit hosts entry beats the generated null route.
+        // Explicit hosts remain independent of routing decisions.
         dns.hosts
             .insert("telemetry.example".into(), vec!["10.0.0.7".into()]);
         let config = apply_profile_routing(&base_config(), &policies, &dns_options(dns)).unwrap();
         let hosts = &config["dns"]["hosts"];
-        assert_eq!(hosts["ads.example"], json!(["127.0.0.1"]));
+        assert!(hosts.get("ads.example").is_none());
         assert_eq!(hosts["telemetry.example"], json!(["10.0.0.7"]));
         // geosite categories cannot be expressed as hosts keys.
         assert!(hosts.get("geosite:category-ads").is_none());
@@ -4075,11 +4313,66 @@ mod tests {
                 server("localhost", XrayDnsRoute::Direct),
                 server("fakedns", XrayDnsRoute::Direct),
                 server("udp://9.9.9.9:53", XrayDnsRoute::Direct),
+                server("1.0.0.1", XrayDnsRoute::None),
             ],
             ..XrayDnsConfig::default()
         };
-        assert_eq!(dns_bypass_hosts(&dns), ["9.9.9.9", "dns.resolver.test"]);
-        assert!(dns_bypass_hosts(&XrayDnsConfig::default()).is_empty());
+        let base = RoutingPolicy::default();
+        assert_eq!(
+            dns_bypass_hosts(&dns, &base),
+            ["9.9.9.9", "dns.resolver.test", "1.0.0.1"]
+        );
+        assert!(dns_bypass_hosts(&XrayDnsConfig::default(), &base).is_empty());
+        for (selector, target) in [
+            ("203.0.113.0/24", crate::models::RoutingTarget::Block),
+            ("geoip:us", crate::models::RoutingTarget::Direct),
+            ("domain:example.com", crate::models::RoutingTarget::Proxy),
+            (
+                "domain:example.com",
+                crate::models::RoutingTarget::Node {
+                    endpoint_key: "node".into(),
+                    missing: false,
+                },
+            ),
+        ] {
+            let policy = RoutingPolicy {
+                user: vec![crate::models::RoutingRule {
+                    selectors: vec![selector.into()],
+                    target,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert!(dns_bypass_hosts(&dns, &policy).is_empty(), "{selector}");
+        }
+        let pinned_base = RoutingPolicy {
+            base: vec![crate::models::RoutingRule {
+                selectors: vec!["domain:private.test".into()],
+                target: RoutingTarget::Node {
+                    endpoint_key: "1111111111111111".into(),
+                    missing: false,
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(dns_bypass_hosts(&dns, &pinned_base).is_empty());
+        let annotations = RoutingPolicy {
+            user: vec![crate::models::RoutingRule {
+                selectors: vec!["  ".into(), " # note".into()],
+                target: crate::models::RoutingTarget::Proxy,
+                ..Default::default()
+            }],
+            base: vec![crate::models::RoutingRule {
+                selectors: vec!["203.0.113.1".into()],
+                target: crate::models::RoutingTarget::Proxy,
+                ..Default::default()
+            }],
+        };
+        assert_eq!(
+            dns_bypass_hosts(&dns, &annotations),
+            ["9.9.9.9", "dns.resolver.test", "1.0.0.1"]
+        );
     }
 
     fn panel_vless() -> Value {
@@ -4381,16 +4674,11 @@ mod tests {
         let pins = [PinnedOutbound {
             key: "1111111111111111".into(),
             outbound: None,
-            selectors: vec!["domain:pin.test".into()],
         }];
         let multi = apply_multinode_config(&routed, "2222222222222222", &[], &pins).unwrap();
         assert_eq!(
             multi["routing"]["rules"][0]["inboundTag"],
             json!(["src-proxy-in"])
-        );
-        assert_eq!(
-            multi["routing"]["rules"][2]["outboundTag"],
-            "pin-1111111111111111"
         );
         assert!(multi["outbounds"]
             .as_array()
@@ -4426,22 +4714,32 @@ mod tests {
     #[test]
     fn explicit_domain_policy_overrides_pinned_category_without_unpinning_others() {
         let base = json!({"outbounds":[{"tag":"proxy","protocol":"vless"}]});
-        let options = ProfileRoutingOptions {
-            pinned_routes: vec![crate::models::PinnedRoute {
-                endpoint_key: "1111111111111111".into(),
-                selectors: vec!["geosite:category-dev".into()],
-                missing: true,
+        let policies = RoutingPolicy {
+            user: vec![crate::models::RoutingRule {
+                selectors: vec!["domain:github.com".into()],
+                target: RoutingTarget::Direct,
+                ..Default::default()
             }],
-            ..ProfileRoutingOptions::default()
+            base: vec![
+                crate::models::RoutingRule {
+                    selectors: vec!["geosite:category-dev".into()],
+                    target: RoutingTarget::Node {
+                        endpoint_key: "1111111111111111".into(),
+                        missing: true,
+                    },
+                    ..Default::default()
+                },
+                crate::models::RoutingRule {
+                    selectors: vec!["geosite:private".into()],
+                    target: RoutingTarget::Direct,
+                    ..Default::default()
+                },
+            ],
         };
-        let policies = [DomainPolicy {
-            domains: vec!["geosite:private".into(), "domain:github.com".into()],
-            target: DomainRouteTarget::Direct,
-        }];
-        let routed = apply_profile_routing(&base, &policies, &options).unwrap();
+        let routed =
+            apply_profile_routing(&base, &policies, &ProfileRoutingOptions::default()).unwrap();
         let pins = [PinnedOutbound {
             key: "1111111111111111".into(),
-            selectors: vec!["geosite:category-dev".into()],
             outbound: None,
         }];
         let config = apply_multinode_config(&routed, "2222222222222222", &[], &pins).unwrap();
@@ -4452,11 +4750,25 @@ mod tests {
             .iter()
             .find(|outbound| outbound["protocol"] == "freedom")
             .unwrap();
-        assert_eq!(rules[0]["domain"], json!(["domain:github.com"]));
-        assert_eq!(rules[0]["outboundTag"], direct["tag"]);
-        assert_eq!(rules[1]["domain"], json!(["geosite:category-dev"]));
-        assert_eq!(rules[1]["outboundTag"], pin_tag(&pins[0].key));
-        assert_eq!(rules[2]["domain"], json!(["geosite:private"]));
+        let domain_rule = |selector: &str| {
+            rules
+                .iter()
+                .enumerate()
+                .find(|(_, rule)| {
+                    rule["domain"].as_array().is_some_and(|selectors| {
+                        selectors
+                            .iter()
+                            .any(|value| value.as_str() == Some(selector))
+                    })
+                })
+                .unwrap()
+        };
+        let (github_index, github) = domain_rule("domain:github.com");
+        let (category_index, category) = domain_rule("geosite:category-dev");
+        let (private_index, _) = domain_rule("geosite:private");
+        assert!(github_index < category_index && category_index < private_index);
+        assert_eq!(github["outboundTag"], direct["tag"]);
+        assert_eq!(category["outboundTag"], pin_tag(&pins[0].key));
         assert!(config["outbounds"]
             .as_array()
             .unwrap()
@@ -4475,7 +4787,6 @@ mod tests {
         ]}});
         let pins = [PinnedOutbound {
             key: "1111111111111111".into(),
-            selectors: vec!["domain:example.test".into()],
             outbound: Some(EndpointGraph {
                 entry: json!({"protocol":"vless"}),
                 outbounds: vec![],
@@ -4490,15 +4801,13 @@ mod tests {
         assert_eq!(rules[0]["port"], 853);
         assert_eq!(rules[1]["port"], 53);
         assert_eq!(rules[2]["balancerTag"], FAILOVER_BALANCER);
-        assert_eq!(rules[3]["outboundTag"], pin_tag(&pins[0].key));
     }
 
     #[test]
     fn multiple_domain_pins_share_one_endpoint_outbound() {
         let base = json!({"outbounds":[{"tag":"proxy","protocol":"vless"}],"routing":{"rules":[]}});
-        let pins = ["domain:first.test", "domain:second.test"].map(|selector| PinnedOutbound {
+        let pins = ["first", "second"].map(|_| PinnedOutbound {
             key: "1111111111111111".into(),
-            selectors: vec![selector.into()],
             outbound: Some(EndpointGraph {
                 entry: json!({"protocol":"vless"}),
                 outbounds: vec![],
@@ -4516,13 +4825,5 @@ mod tests {
             .filter_map(|outbound| outbound["tag"].as_str())
             .collect();
         assert_eq!(tags, ["node-2222222222222222", "pin-1111111111111111"]);
-        assert_eq!(
-            config["routing"]["rules"][0]["domain"],
-            json!(["domain:first.test"])
-        );
-        assert_eq!(
-            config["routing"]["rules"][1]["domain"],
-            json!(["domain:second.test"])
-        );
     }
 }

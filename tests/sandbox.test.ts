@@ -8,57 +8,86 @@ import type { ProfileDocument } from "../src/profileDocument.ts";
 
 const routeDocument = (profile: ProfileDocument["profile"]): ProfileDocument =>
   ({ version: 1, profile: { backend: "xray", ...profile } });
+const firstNodeKey = (profile: Profile): string => {
+  const target = profile.routing.user.map((rule) => rule.target)
+    .find((value): value is Extract<typeof value, { kind: "node" }> => value.kind === "node");
+  if (!target) throw new Error("Expected a synthetic node routing rule");
+  return target.endpointKey;
+};
 
-test("offline explanation matches literal suffix and IP prefix rules", () => {
-  const document = routeDocument({
-    domainPolicies: [
-      { domains: ["domain:example.test"], target: "direct" },
-      { domains: ["10.4.0.0/16"], target: "block" },
-    ],
-  });
-  assert.equal(explainProfileDocument(document, "www.example.test").outbound, "direct");
-  assert.equal(explainProfileDocument(document, "10.4.2.1").outbound, "block");
-  assert.equal(explainProfileDocument(document, "10.5.2.1").source, "default");
-});
 
-test("offline explanation leaves a later match probable after unknown earlier selector", () => {
+test("offline explanation evaluates canonical user rules before base rules", () => {
   const result = explainProfileDocument(routeDocument({
-    domainPolicies: [
-      { domains: ["geosite:not-cached"], target: "block" },
-      { domains: ["domain:example.test"], target: "direct" },
-    ],
-  }), "example.test");
+    routing: {
+      user: [
+        { selectors: ["domain:example.test"], target: { kind: "direct" } },
+        { selectors: ["10.4.0.0/16"], target: { kind: "block" } },
+      ],
+      base: [{ selectors: ["domain:example.test"], target: { kind: "block" } }],
+    },
+  }), "www.example.test");
   assert.equal(result.outbound, "direct");
-  assert.equal(result.certainty, "probable");
-  assert.equal(result.steps[0]?.outcome, "unknown");
-});
-test("explicit domain policy overrides pinned route selectors", () => {
-  const document = routeDocument({
-    pinnedPolicies: [{ selectors: ["geosite:category-dev"], endpointKey: "dev" }],
-    domainPolicies: [{ domains: ["domain:github.com"], target: "direct" }],
-  });
-  const exact = explainProfileDocument(document, "github.com");
-  assert.equal(exact.outbound, "direct");
-  assert.equal(exact.certainty, "certain");
-  assert.equal(exact.policyPath, "/profile/domainPolicies/0");
-
-  const suffix = explainProfileDocument(document, "api.github.com");
-  assert.equal(suffix.outbound, "direct");
-  assert.equal(suffix.certainty, "certain");
-  assert.equal(suffix.policyPath, "/profile/domainPolicies/0");
-
-  const other = explainProfileDocument(document, "example.com");
-  assert.equal(other.certainty, "probable");
-  assert.equal(other.source, "default");
+  assert.equal(result.policyPath, "/profile/routing/user/0");
   assert.equal(explainProfileDocument(routeDocument({
-    domainPolicies: [{ domains: ["domain:github.com"], target: "direct" }],
-  }), "github.com").certainty, "certain");
+    routing: { user: [], base: [{ selectors: ["10.4.0.0/16"], target: { kind: "block" } }] },
+  }), "10.4.2.1").outbound, "block");
+});
+
+test("offline explanation stops at an unknown higher-priority DNS-dependent rule", () => {
+  const result = explainProfileDocument(routeDocument({
+    xrayDomainStrategy: "ipIfNonMatch",
+    routing: {
+      user: [
+        { selectors: ["geoip:private"], target: { kind: "block" } },
+        { selectors: ["domain:example.test"], target: { kind: "direct" } },
+      ],
+      base: [],
+    },
+  }), "example.test");
+  assert.equal(result.outbound, "unknown");
+  assert.equal(result.certainty, "probable");
+  assert.equal(result.policyPath, "/profile/routing/user/0");
+  assert.equal(result.matchedSelector, "geoip:private");
+  assert.ok(result.steps.some((step) => step.outcome === "unknown"));
+});
+
+test("canonical rules preserve explicit order without target-based precedence", () => {
+  const document = routeDocument({
+    routing: { user: [
+      { selectors: ["domain:github.com"], target: { kind: "node", endpointKey: "dev" } },
+      { selectors: ["domain:github.com"], target: { kind: "direct" } },
+    ], base: [] },
+  });
+  const result = explainProfileDocument(document, "github.com");
+  assert.equal(result.outbound, "proxy");
+  assert.equal(result.endpointKey, "dev");
+  assert.equal(result.policyPath, "/profile/routing/user/0");
+});
+
+test("routing policy updates atomically preserve layer order and reject stale revisions", () => {
+  const backend = new SandboxBackend();
+  const profile = (backend.invoke("get_profiles") as Profile[]).find((item) => item.id === "xray")!;
+  const snapshot = backend.invoke("get_profile_document", { id: profile.id }) as { revision: string };
+  const routing = {
+    user: [{ selectors: ["domain:user.example"], target: { kind: "direct" as const } }],
+    base: [{ selectors: ["geoip:private"], target: { kind: "block" as const } }],
+  };
+  backend.invoke("set_routing_policy", {
+    profileId: profile.id, routing, privateLanDirect: true, expectedRevision: snapshot.revision,
+  });
+  const saved = (backend.invoke("get_profiles") as Profile[]).find((item) => item.id === profile.id)!;
+  assert.deepEqual(saved.routing, routing);
+  assert.equal(saved.privateLanDirect, true);
+  assert.throws(() => backend.invoke("set_routing_policy", {
+    profileId: profile.id, routing: { user: [], base: [] }, privateLanDirect: false,
+    expectedRevision: snapshot.revision,
+  }), /profile changed/);
 });
 
 test("offline explanation does not invent Xray routing for other backends", () => {
   assert.throws(() => explainProfileDocument(routeDocument({
     backend: "mihomo",
-    domainPolicies: [{ domains: ["domain:example.test"], target: "direct" }],
+    routing: { user: [{ selectors: ["domain:example.test"], target: { kind: "direct" } }], base: [] },
   }), "example.test"), Error);
 });
 test("share-link import derives a name and keeps networking unchanged", () => {
@@ -193,7 +222,7 @@ test("service results cannot be attributed to a URL changed during a manual chec
   const p = (backend.invoke("get_profiles") as Profile[]).find((p) => p.subscription)!;
   const check: ServiceCheck = {
     id: "service-race", name: "Synthetic service", url: "https://service.example/first",
-    endpointKey: p.pinnedPolicies![0].endpointKey, background: false,
+    endpointKey: firstNodeKey(p), background: false,
   };
   backend.invoke("set_xray_service_checks", { profileId: p.id, checks: [check] });
   const initial = await backend.invoke("run_xray_service_checks", { profileId: p.id }) as ServiceCheckResult[];
@@ -211,7 +240,7 @@ test("a stale ordinary profile edit rejects newer dedicated service settings", (
   const { profile: stale, revision } = backend.invoke("get_profile_for_edit", { id: "xray" }) as { profile: Profile; revision: string };
   const check: ServiceCheck = {
     id: "service-preserved", name: "Synthetic service", url: "https://service.example/health",
-    endpointKey: stale.pinnedPolicies![0].endpointKey, background: false,
+    endpointKey: firstNodeKey(stale), background: false,
   };
   backend.invoke("set_xray_service_checks", { profileId: stale.id, checks: [check] });
   stale.name = "Edited ordinary name";

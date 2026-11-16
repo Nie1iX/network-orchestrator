@@ -7,8 +7,8 @@ use net_manager_core::daemon_protocol::{
     SOCKET_ENV,
 };
 use net_manager_core::models::{
-    DomainPolicy, DomainRouteTarget, NamedProxyExit, PinnedRoute, Profile, ProxyTarget,
-    ServiceCheck, TunnelRole, XrayMode,
+    NamedProxyExit, Profile, ProxyTarget, RoutingPolicy, RoutingRule, RoutingTarget, ServiceCheck,
+    TunnelRole, XrayMode,
 };
 use net_manager_core::profiles::ProfileStore;
 use net_manager_core::subscription::{self, ResponseMeta, SubscriptionImport};
@@ -247,15 +247,23 @@ impl Sandbox {
         profile.xray_split_default = true;
         profile.xray_quic_reject = true;
         profile.xray_tun_mtu = Some(1360);
-        profile.domain_policies = vec![DomainPolicy {
-            target: DomainRouteTarget::Direct,
-            domains: vec!["domain:office.invalid".into()],
-        }];
-        profile.pinned_policies = vec![PinnedRoute {
-            selectors: vec!["domain:pinned.invalid".into()],
-            endpoint_key: key.clone(),
-            missing: false,
-        }];
+        profile.routing = RoutingPolicy {
+            base: vec![RoutingRule {
+                selectors: vec!["domain:office.invalid".into()],
+                target: RoutingTarget::Direct,
+                port: None,
+                network: None,
+            }],
+            user: vec![RoutingRule {
+                selectors: vec!["domain:pinned.invalid".into()],
+                target: RoutingTarget::Node {
+                    endpoint_key: key.clone(),
+                    missing: false,
+                },
+                port: None,
+                network: None,
+            }],
+        };
         profile.xray_service_checks = vec![ServiceCheck {
             id: "fixture-check".into(),
             name: "Fixture health".into(),
@@ -519,6 +527,119 @@ fn profile_show_redacts_subscription_credentials_and_raw_config_in_text_and_json
 }
 
 #[test]
+fn route_edits_persist_ordered_user_overrides_and_layer_moves_without_replacing_base() {
+    let sandbox = Sandbox::new();
+    sandbox.seed();
+    sandbox.ok(&[
+        "route",
+        "add",
+        PROFILE_ID,
+        "--proxy",
+        "domain:override.invalid",
+    ]);
+    sandbox.ok(&[
+        "route",
+        "add",
+        PROFILE_ID,
+        "--block",
+        "domain:blocked.invalid",
+    ]);
+    sandbox.ok(&["route", "move", PROFILE_ID, "--layer", "user", "3", "2"]);
+    sandbox.ok(&[
+        "route", "layer", PROFILE_ID, "2", "--from", "user", "--to", "base",
+    ]);
+
+    let output = sandbox.ok(&["--json", "route", "show", PROFILE_ID]);
+    let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let shown = &shown[0];
+    assert_eq!(
+        shown["routing"]["base"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["selectors"][0].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["domain:office.invalid", "domain:blocked.invalid"]
+    );
+    assert_eq!(
+        shown["routing"]["user"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["selectors"][0].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["domain:pinned.invalid", "domain:override.invalid"]
+    );
+    // Source is represented by membership in the separate ordered layers.
+    assert_eq!(shown["routing"]["base"][1]["target"]["kind"], "block");
+    assert_eq!(shown["routing"]["user"][1]["target"]["kind"], "proxy");
+
+    let stored = sandbox.profile(PROFILE_ID);
+    assert_eq!(stored.routing.base.len(), 2);
+    assert_eq!(stored.routing.user.len(), 2);
+    assert_eq!(stored.routing.base[0].selectors, ["domain:office.invalid"]);
+    assert_eq!(stored.routing.base[1].selectors, ["domain:blocked.invalid"]);
+    assert_eq!(stored.routing.user[0].selectors, ["domain:pinned.invalid"]);
+    assert_eq!(
+        stored.routing.user[1].selectors,
+        ["domain:override.invalid"]
+    );
+}
+
+#[test]
+fn migrate_apply_replaces_imported_base_and_preserves_user_overrides() {
+    let sandbox = Sandbox::new();
+    let profile = sandbox.seed();
+    sandbox.ok(&[
+        "route",
+        "add",
+        PROFILE_ID,
+        "--proxy",
+        "domain:first-override.invalid",
+    ]);
+    sandbox.ok(&[
+        "route",
+        "add",
+        PROFILE_ID,
+        "--block",
+        "domain:second-override.invalid",
+    ]);
+    let before = sandbox.profile(PROFILE_ID);
+    let source = sandbox.file(
+        "standalone-xray.json",
+        r#"{
+            "outbounds": [
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "block", "protocol": "blackhole"}
+            ],
+            "routing": {
+                "rules": [
+                    {"type": "field", "domain": ["domain:from-file.invalid"], "outboundTag": "direct"}
+                ]
+            }
+        }"#,
+    );
+    sandbox.ok(&[
+        "migrate",
+        "apply",
+        PROFILE_ID,
+        "--from",
+        source.to_str().unwrap(),
+    ]);
+
+    let migrated = sandbox.profile(PROFILE_ID);
+    assert_ne!(migrated.routing.base, before.routing.base);
+    assert_eq!(
+        migrated.routing.base[0].selectors,
+        ["domain:from-file.invalid"]
+    );
+    assert_eq!(migrated.routing.user, before.routing.user);
+    assert_eq!(migrated.routing.user.len(), 3);
+    assert_eq!(migrated.routing.base[0].target, RoutingTarget::Direct);
+    assert_eq!(profile.routing.base[0].selectors, ["domain:office.invalid"]);
+}
+
+#[test]
 fn profile_partial_edit_preserves_canonical_subscription_pins_checks_and_named_exits() {
     let sandbox = Sandbox::new();
     let mut expected = sandbox.seed();
@@ -649,6 +770,28 @@ fn serve_refreshes_without_gui_preserves_failed_catalog_and_excludes_concurrent_
 
     sandbox.ok(&["subscription", "interval", PROFILE_ID, "15"]);
     let mut pending = pending_http(&listener);
+    sandbox.ok(&[
+        "route",
+        "add",
+        PROFILE_ID,
+        "--proxy",
+        "domain:first-override.invalid",
+    ]);
+    sandbox.ok(&[
+        "route",
+        "add",
+        PROFILE_ID,
+        "--block",
+        "domain:second-override.invalid",
+    ]);
+    let user_overrides = sandbox.profile(PROFILE_ID).routing.user;
+    let base_before = sandbox.profile(PROFILE_ID).routing.base;
+    assert_eq!(user_overrides.len(), 3);
+    assert_eq!(
+        sandbox.profile(PROFILE_ID).routing.base[0].selectors,
+        ["domain:office.invalid"]
+    );
+
     // Changing an interval is not a refresh attempt; only its outcome advances the clock.
     assert_eq!(
         sandbox
@@ -686,6 +829,12 @@ fn serve_refreshes_without_gui_preserves_failed_catalog_and_excludes_concurrent_
     });
     let refreshed = sandbox.profile(PROFILE_ID);
     assert_eq!(
+        refreshed.subscription.as_ref().unwrap().last_refresh_error,
+        None
+    );
+    assert_eq!(refreshed.routing.base, base_before);
+    assert_eq!(refreshed.routing.user, user_overrides);
+    assert_eq!(
         sandbox
             .vault()
             .read_subscription_endpoints(PROFILE_ID)
@@ -694,10 +843,6 @@ fn serve_refreshes_without_gui_preserves_failed_catalog_and_excludes_concurrent_
             .map(|endpoint| endpoint.url.as_str())
             .collect::<Vec<_>>(),
         [FIRST]
-    );
-    assert_eq!(
-        refreshed.subscription.as_ref().unwrap().last_refresh_error,
-        None
     );
     let config = fs::read(&refreshed.config_path).unwrap();
 

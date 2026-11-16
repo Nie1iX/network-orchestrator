@@ -1,5 +1,5 @@
 //! Command line of `netorch` on Linux.
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -217,11 +217,27 @@ impl std::fmt::Debug for ChecksCommand {
     }
 }
 
+#[derive(Copy, Clone, Debug, Default, ValueEnum)]
+pub enum RoutingLayerArg {
+    Base,
+    #[default]
+    User,
+}
+
+impl From<RoutingLayerArg> for net_manager_core::models::RoutingLayer {
+    fn from(value: RoutingLayerArg) -> Self {
+        match value {
+            RoutingLayerArg::Base => Self::Base,
+            RoutingLayerArg::User => Self::User,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum RouteCommand {
     /// Show the rules of a profile (every Xray profile when none is given)
     Show { profile: Option<String> },
-    /// Replace all of a profile's rules
+    /// Replace the user rules of a profile
     Set {
         profile: String,
         #[command(flatten)]
@@ -269,11 +285,26 @@ pub enum RouteCommand {
         #[arg(long, value_name = "SELECTOR")]
         selector: Vec<String>,
     },
-    /// Whether the kernel rejects QUIC (UDP/443) on the tunnel interface —
-    /// `on` returns an immediate rejection; `off` removes this owned reject rule
+    /// Move a numbered row within a layer
+    Move {
+        profile: String,
+        #[arg(long, value_enum, default_value = "user")]
+        layer: RoutingLayerArg,
+        from: usize,
+        to: usize,
+    },
+    /// Move a numbered row between layers
+    Layer {
+        profile: String,
+        index: usize,
+        #[arg(long, value_enum)]
+        from: RoutingLayerArg,
+        #[arg(long, value_enum)]
+        to: RoutingLayerArg,
+    },
+    /// Whether the kernel rejects QUIC (UDP/443) on the tunnel interface
     Quic {
         profile: String,
-        /// `on` or `off`; omitted shows the current setting
         #[arg(value_parser = clap::value_parser!(BoolOnOff))]
         enabled: Option<BoolOnOff>,
     },

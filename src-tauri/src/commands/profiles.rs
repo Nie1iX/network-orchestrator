@@ -163,16 +163,17 @@ fn preserve_canonical_subscription(profile: &mut Profile, stored: Option<&Profil
     };
 }
 
-/// Linux multinode: the node pins live on the profile but are edited through
-/// `set_pinned_routes`, never through the generic form save — restore the
-/// stored value so editing other fields cannot drop them.
+/// User routing overrides are edited through `set_routing_policy`; preserve
+/// them across generic form saves while accepting imported base updates.
 #[cfg(not(target_os = "linux"))]
-fn preserve_pinned_policies(profile: &mut Profile, stored: Option<&Profile>) {
-    profile.pinned_policies = if profile.backend == TunnelBackend::Xray {
-        stored.map_or_else(Vec::new, |profile| profile.pinned_policies.clone())
+fn preserve_user_routing(profile: &mut Profile, stored: Option<&Profile>) {
+    if profile.backend == TunnelBackend::Xray {
+        if let Some(stored) = stored {
+            profile.routing.user.clone_from(&stored.routing.user);
+        }
     } else {
-        Vec::new()
-    };
+        profile.routing = RoutingPolicy::default();
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -204,8 +205,6 @@ fn preserve_named_proxy_exits(profile: &mut Profile, stored: Option<&Profile>) {
 fn preserve_migrated_xray_settings(profile: &mut Profile, stored: Option<&Profile>) {
     if profile.backend != TunnelBackend::Xray {
         profile.xray_sockopts = None;
-        profile.xray_traffic_rules.clear();
-        profile.xray_interface_routes.clear();
         profile.xray_connection_idle_secs = None;
         profile.xray_tun_mtu = None;
         profile.xray_tun_dns_servers.clear();
@@ -218,8 +217,6 @@ fn preserve_migrated_xray_settings(profile: &mut Profile, stored: Option<&Profil
         return;
     };
     profile.xray_sockopts = stored.xray_sockopts.clone();
-    profile.xray_traffic_rules = stored.xray_traffic_rules.clone();
-    profile.xray_interface_routes = stored.xray_interface_routes.clone();
     profile.xray_connection_idle_secs = stored.xray_connection_idle_secs;
     profile.xray_tun_mtu = stored.xray_tun_mtu;
     profile.xray_tun_dns_servers = stored.xray_tun_dns_servers.clone();
@@ -244,7 +241,7 @@ fn preserve_generated_xray_source(profile: &mut Profile, stored: Option<&Profile
 #[cfg(not(target_os = "linux"))]
 fn validate_xray_routing(profile: &Profile) -> Result<(), String> {
     if profile.backend == TunnelBackend::Xray {
-        net_manager_core::xray::validate_routing_policy_selectors(&profile.domain_policies)
+        net_manager_core::routing_policy::validate(&profile.routing)
             .map_err(|err| format!("invalid Xray routing rule: {err}"))?;
     }
     Ok(())
@@ -367,7 +364,7 @@ pub(crate) async fn save_profile(
         existing => existing.cloned(),
     };
     preserve_canonical_subscription(&mut profile, stored.as_ref());
-    preserve_pinned_policies(&mut profile, stored.as_ref());
+    preserve_user_routing(&mut profile, stored.as_ref());
     preserve_service_checks(&mut profile, stored.as_ref());
     preserve_named_proxy_exits(&mut profile, stored.as_ref());
     preserve_migrated_xray_settings(&mut profile, stored.as_ref());
@@ -463,7 +460,7 @@ pub(crate) async fn save_vless_profile(
     profile.xray_http_port = Some(http_port);
     let stored = existing_profile_for_update(&document, &profile.id).cloned();
     preserve_canonical_subscription(&mut profile, stored.as_ref());
-    preserve_pinned_policies(&mut profile, stored.as_ref());
+    preserve_user_routing(&mut profile, stored.as_ref());
     preserve_service_checks(&mut profile, stored.as_ref());
     preserve_named_proxy_exits(&mut profile, stored.as_ref());
     preserve_migrated_xray_settings(&mut profile, stored.as_ref());
@@ -566,7 +563,7 @@ pub(crate) async fn save_wireguard_profile(
     let document = state.profiles.load().map_err(|e| e.to_string())?;
     let stored = existing_profile_for_update(&document, &profile.id).cloned();
     preserve_canonical_subscription(&mut profile, stored.as_ref());
-    preserve_pinned_policies(&mut profile, stored.as_ref());
+    preserve_user_routing(&mut profile, stored.as_ref());
     preserve_service_checks(&mut profile, stored.as_ref());
     preserve_named_proxy_exits(&mut profile, stored.as_ref());
     preserve_migrated_xray_settings(&mut profile, stored.as_ref());
@@ -1359,41 +1356,40 @@ pub(crate) async fn set_subscription_auto_return(
     Ok(redact_profiles_for_ipc(doc.profiles))
 }
 
-/// Domain selectors pinned to one node: while that node is down or gone the
-/// selectors are blocked, never sent direct or through another node.
+/// Replace the complete ordered routing policy without regrouping its layers.
 #[cfg(not(target_os = "linux"))]
 #[tauri::command]
-pub(crate) async fn set_pinned_routes(
+pub(crate) async fn set_routing_policy(
     profile_id: String,
-    routes: Vec<PinnedRoute>,
+    routing: RoutingPolicy,
+    private_lan_direct: bool,
+    expected_revision: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
-    let _guard = SUBSCRIPTION_REFRESH_LOCK.lock().await;
-    let profile = migrated_subscription_profile(&state, &profile_id)?;
-    if profile.backend != TunnelBackend::Xray {
-        return Err("node-pinned rules need an Xray subscription".into());
+    let expected = migrated_subscription_profile(&state, &profile_id)?;
+    if expected.backend != TunnelBackend::Xray {
+        return Err("routing policy requires Xray".into());
     }
-    let _candidate = if profile
-        .xray_service_checks
-        .iter()
-        .any(|check| check.background)
-    {
-        let mut candidate = profile.clone();
-        candidate.pinned_policies = routes.clone();
-        net_manager_core::profiles::validate_profile(&candidate)
-            .map_err(|_| "The pinned-route configuration is invalid".to_string())?;
-        Some(candidate)
-    } else {
-        None
-    };
-    let saved = net_manager_core::subscription::set_pinned_routes(
-        &state.config_vault,
-        &state.profiles,
-        &profile_id,
-        routes,
-    );
-    let doc = saved.map_err(|e| e.to_string())?;
-    Ok(redact_profiles_for_ipc(doc.profiles))
+    net_manager_core::routing_policy::validate(&routing).map_err(|err| err.to_string())?;
+    let revision = net_manager_core::profiles::profile_edit_revision(&expected)
+        .map_err(|err| err.to_string())?;
+    if revision != expected_revision {
+        return Err("Profile changed before routing update".into());
+    }
+    let document = state
+        .profiles
+        .update_profile(&profile_id, |profile| {
+            if profile != &expected {
+                return Err(std::io::Error::other(
+                    "Profile changed during routing update",
+                ));
+            }
+            profile.routing = routing;
+            profile.private_lan_direct = private_lan_direct;
+            Ok(())
+        })
+        .map_err(|err| err.to_string())?;
+    Ok(redact_profiles_for_ipc(document.profiles))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1993,15 +1989,6 @@ pub(crate) async fn apply_xray_policy_migration(
             net_manager_core::xray_migrate::apply_xray_policy_migration(current, migration)
                 .map_err(|_| std::io::Error::other("Policy could not be applied"))?;
 
-            if current.subscription.is_some() {
-                let live = expected_endpoints
-                    .iter()
-                    .map(|endpoint| endpoint.id.clone())
-                    .collect::<HashSet<_>>();
-                for pin in &mut current.pinned_policies {
-                    pin.missing = !live.contains(&pin.endpoint_key);
-                }
-            }
             Ok(())
         })
         .map_err(|_| {
@@ -2421,13 +2408,15 @@ pub(crate) async fn set_subscription_auto_return(
 
 #[cfg(target_os = "linux")]
 #[tauri::command]
-pub(crate) async fn set_pinned_routes(
+pub(crate) async fn set_routing_policy(
     profile_id: String,
-    routes: Vec<PinnedRoute>,
+    routing: RoutingPolicy,
+    private_lan_direct: bool,
+    expected_revision: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Profile>, String> {
     linux_profiles_document(state.inner(), move |service| {
-        service.set_pinned_routes(&profile_id, routes)
+        service.set_routing(&profile_id, routing, private_lan_direct, &expected_revision)
     })
     .await
 }
@@ -4039,9 +4028,11 @@ mod native_tests {
     fn invalid_geo_rule_is_rejected_before_save_without_echoing_selector() {
         let mut profile = profile("geo-rule");
         profile.backend = TunnelBackend::Xray;
-        profile.domain_policies = vec![DomainPolicy {
-            domains: vec!["geosite:private-secret/../cn".into()],
-            target: DomainRouteTarget::Block,
+        profile.routing.user = vec![RoutingRule {
+            selectors: vec!["geosite:private-secret/../cn".into()],
+            target: RoutingTarget::Block,
+            port: None,
+            network: None,
         }];
         let err = validate_xray_routing(&profile).unwrap_err();
         assert!(!err.contains("private-secret"));

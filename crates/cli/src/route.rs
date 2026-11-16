@@ -1,10 +1,57 @@
 //! Typed routing configuration, imports and native lookups.
 use crate::{args::RouteCommand, ctx::Ctx, input};
-use net_manager_core::models::{DomainPolicy, DomainRouteTarget, Profile, TunnelBackend, XrayMode};
+use net_manager_core::models::{
+    DomainRouteTarget, RoutingLayer, RoutingPolicy, RoutingRule, RoutingTarget, TunnelBackend,
+    XrayMode,
+};
 use net_manager_engine::macos_services::ProfileRoutingUpdate;
 use serde_json::{json, Value};
-pub fn runs_locally(profile: &Profile) -> bool {
+pub fn runs_locally(profile: &net_manager_core::models::Profile) -> bool {
     profile.backend == TunnelBackend::Xray && profile.xray_mode == XrayMode::Socks
+}
+fn target(target: DomainRouteTarget) -> RoutingTarget {
+    match target {
+        DomainRouteTarget::Block => RoutingTarget::Block,
+        DomainRouteTarget::Proxy => RoutingTarget::Proxy,
+        DomainRouteTarget::Direct => RoutingTarget::Direct,
+    }
+}
+fn save(
+    ctx: &Ctx,
+    profile: &net_manager_core::models::Profile,
+    mut current: net_manager_engine::macos_services::ProfileRouting,
+    routing: RoutingPolicy,
+    advanced: Option<Value>,
+    geo: Option<Value>,
+) -> Result<(), String> {
+    current.routing = routing;
+    let services = ctx.services()?;
+    let revision = net_manager_core::profiles::profile_edit_revision(profile)
+        .map_err(|_| "Could not compute profile revision")?;
+    services.set_profile_routing(
+        &profile.id,
+        &revision,
+        ProfileRoutingUpdate {
+            routing: current.routing,
+            private_lan_direct: current.private_lan_direct,
+            advanced: advanced
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| "Invalid advanced routing")?,
+            geo_urls: geo
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| "Invalid geo URLs")?,
+        },
+    )?;
+    Ok(())
+}
+fn row_index(index: usize, len: usize) -> Result<usize, String> {
+    if index == 0 || index > len {
+        Err("Row index is out of range".into())
+    } else {
+        Ok(index - 1)
+    }
 }
 pub fn run(ctx: &Ctx, command: RouteCommand) -> Result<(), String> {
     let services = ctx.services()?;
@@ -18,24 +65,7 @@ pub fn run(ctx: &Ctx, command: RouteCommand) -> Result<(), String> {
         ),
         RouteCommand::Show { profile } => {
             let p = ctx.find(&profile)?;
-            let routing = services.profile_routing(&p.id)?;
-            // Retain the existing editor-friendly selector groups, alongside full typed options.
-            let mut value =
-                serde_json::to_value(&routing).map_err(|_| "Could not encode routing")?;
-            for (key, target) in [
-                ("block", DomainRouteTarget::Block),
-                ("proxy", DomainRouteTarget::Proxy),
-                ("direct", DomainRouteTarget::Direct),
-            ] {
-                value[key] = json!(routing
-                    .policies
-                    .iter()
-                    .filter(|p| p.target == target)
-                    .flat_map(|p| p.domains.iter().cloned())
-                    .collect::<Vec<_>>()
-                    .join("\n"));
-            }
-            ctx.output(&value)
+            ctx.output(&services.profile_routing(&p.id)?)
         }
         RouteCommand::Set {
             profile,
@@ -43,31 +73,128 @@ pub fn run(ctx: &Ctx, command: RouteCommand) -> Result<(), String> {
             proxy,
             direct,
             lan_direct,
+            layer,
             advanced,
             geo,
         } => {
             ctx.require_user()?;
             let p = ctx.find(&profile)?;
-            let policies = [
+            let p = services.profile(&p.id)?;
+            let mut current = net_manager_engine::macos_services::ProfileRouting::from(&p);
+            let layer: RoutingLayer = layer.into();
+            let rows = current.routing.layer_mut(layer);
+            rows.clear();
+            for (selectors, choice) in [
                 (block, DomainRouteTarget::Block),
                 (proxy, DomainRouteTarget::Proxy),
                 (direct, DomainRouteTarget::Direct),
-            ]
-            .into_iter()
-            .filter(|(v, _)| !v.is_empty())
-            .map(|(domains, target)| DomainPolicy { domains, target })
-            .collect();
+            ] {
+                if !selectors.is_empty() {
+                    rows.push(RoutingRule {
+                        selectors,
+                        target: target(choice),
+                        ..Default::default()
+                    });
+                }
+            }
+            current.private_lan_direct = lan_direct;
+            let revision = net_manager_core::profiles::profile_edit_revision(&p)
+                .map_err(|_| "Could not compute profile revision")?;
             services.set_profile_routing(
                 &p.id,
+                &revision,
                 ProfileRoutingUpdate {
-                    policies,
+                    routing: current.routing,
                     private_lan_direct: lan_direct,
                     advanced: advanced
                         .as_deref()
-                        .map(|p| input::json(p, false))
-                        .transpose()?,
-                    geo_urls: geo.as_deref().map(|p| input::json(p, false)).transpose()?,
+                        .map(|path| input::json(path, false))
+                        .transpose()?
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|_| "Invalid advanced routing")?,
+                    geo_urls: geo
+                        .as_deref()
+                        .map(|path| input::json(path, false))
+                        .transpose()?
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|_| "Invalid geo URLs")?,
                 },
+            )?;
+            ctx.emit(crate::ctx::ok_json(), || {
+                format!("Rules of \"{}\" saved", p.name)
+            });
+            Ok(())
+        }
+        RouteCommand::Add {
+            profile,
+            block,
+            proxy,
+            direct,
+            layer,
+        } => edit(ctx, profile, block, proxy, direct, layer.into(), false),
+        RouteCommand::Rm {
+            profile,
+            block,
+            proxy,
+            direct,
+            layer,
+        } => edit(ctx, profile, block, proxy, direct, layer.into(), true),
+        RouteCommand::Move {
+            profile,
+            index,
+            to,
+            layer,
+        } => {
+            ctx.require_user()?;
+            let p = ctx.find(&profile)?;
+            let p = services.profile(&p.id)?;
+            let mut current = net_manager_engine::macos_services::ProfileRouting::from(&p);
+            let rows = current.routing.layer_mut(layer.into());
+            let from = row_index(index, rows.len())?;
+            let to = row_index(to, rows.len())?;
+            let row = rows.remove(from);
+            rows.insert(to, row);
+            save(
+                ctx,
+                &p,
+                current.clone(),
+                current.routing.clone(),
+                None,
+                None,
+            )?;
+            ctx.emit(crate::ctx::ok_json(), || {
+                format!("Rules of \"{}\" saved", p.name)
+            });
+            Ok(())
+        }
+        RouteCommand::Layer {
+            profile,
+            index,
+            from,
+            to,
+        } => {
+            ctx.require_user()?;
+            let p = ctx.find(&profile)?;
+            let p = services.profile(&p.id)?;
+            let mut current = net_manager_engine::macos_services::ProfileRouting::from(&p);
+            let from: RoutingLayer = from.into();
+            let to: RoutingLayer = to.into();
+            if from == to {
+                return Err("Choose different layers".into());
+            }
+            let rows = current.routing.layer_mut(from);
+            let index = row_index(index, rows.len())?;
+            let row = rows.remove(index);
+            current.routing.layer_mut(to).push(row);
+            save(
+                ctx,
+                &p,
+                current.clone(),
+                current.routing.clone(),
+                None,
+                None,
             )?;
             ctx.emit(crate::ctx::ok_json(), || {
                 format!("Rules of \"{}\" saved", p.name)
@@ -89,6 +216,68 @@ pub fn run(ctx: &Ctx, command: RouteCommand) -> Result<(), String> {
             ctx.output(&services.profile_routing(&p.id)?)
         }
     }
+}
+fn edit(
+    ctx: &Ctx,
+    profile: String,
+    block: Vec<String>,
+    proxy: Vec<String>,
+    direct: Vec<String>,
+    layer: RoutingLayer,
+    remove: bool,
+) -> Result<(), String> {
+    ctx.require_user()?;
+    let p = ctx.find(&profile)?;
+    let p = ctx.services()?.profile(&p.id)?;
+    let mut current = net_manager_engine::macos_services::ProfileRouting::from(&p);
+    let rows = current.routing.layer_mut(layer);
+    let mut changed = false;
+    for (selectors, target) in [
+        (block, RoutingTarget::Block),
+        (proxy, RoutingTarget::Proxy),
+        (direct, RoutingTarget::Direct),
+    ] {
+        for selector in selectors {
+            if remove {
+                for row in rows.iter_mut().filter(|row| row.target == target) {
+                    let before = row.selectors.len();
+                    row.selectors.retain(|value| value != &selector);
+                    changed |= before != row.selectors.len();
+                }
+                rows.retain(|row| !row.selectors.is_empty());
+            } else if let Some(row) = rows
+                .iter_mut()
+                .find(|row| row.target == target && row.port.is_none() && row.network.is_none())
+            {
+                if !row.selectors.contains(&selector) {
+                    row.selectors.push(selector);
+                    changed = true;
+                }
+            } else {
+                rows.push(RoutingRule {
+                    selectors: vec![selector],
+                    target: target.clone(),
+                    ..Default::default()
+                });
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Err("No routing rules changed".into());
+    }
+    save(
+        ctx,
+        &p,
+        current.clone(),
+        current.routing.clone(),
+        None,
+        None,
+    )?;
+    ctx.emit(crate::ctx::ok_json(), || {
+        format!("Rules of \"{}\" saved", p.name)
+    });
+    Ok(())
 }
 fn describe_check(result: &Value) -> String {
     let mut out = format!(

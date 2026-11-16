@@ -751,7 +751,12 @@ struct ProfileDetailView: View {
       ).padding(.top, 6)
     }
     ForEach(RoutingRulesEditor.sets, id: \.target) { set in
-      let count = profile.rules(set.target).filter { !$0.hasPrefix("#") }.count
+      let count = profile.rules.filter { rule in
+        switch (set.target, rule.target) {
+        case ("block", .block), ("proxy", .proxy), ("direct", .direct): true
+        default: false
+        }
+      }.count
       HStack(spacing: 7) {
         Circle().fill(p[set.color]).frame(width: 7, height: 7)
         Text(L10n.text(set.title)).foregroundStyle(p.muted)
@@ -1410,12 +1415,6 @@ struct InspectionView: View {
 /// Full-size editor for the Xray rule sets (block → proxy → direct), split
 /// DNS and domain strategy, with a Happ/Incy import and an offline checker.
 struct RoutingRulesEditor: View {
-  struct RuleSet { let target: String; let title: String; let color: String }
-  static let sets = [
-    RuleSet(target: "block", title: "rules.block", color: "down"),
-    RuleSet(target: "proxy", title: "rules.proxy", color: "accent"),
-    RuleSet(target: "direct", title: "rules.direct", color: "up"),
-  ]
   private static let strategies = [
     ("", "rules.strategyDefault"), ("asIs", "AsIs"), ("ipIfNonMatch", "IPIfNonMatch"),
     ("ipOnDemand", "IPOnDemand"),
@@ -1430,8 +1429,8 @@ struct RoutingRulesEditor: View {
   @Bindable var model: AppModel
   let profile: Profile
   let onClose: () -> Void
-  @State private var selected = "proxy"
   @State private var options = RoutingOptions()
+  @State private var optionsLoaded = false
   @State private var importing = false
   @State private var happPayload = ""
   @State private var happWarnings: [String] = []
@@ -1439,29 +1438,73 @@ struct RoutingRulesEditor: View {
   @State private var checking = false
   @State private var verdict: RouteCheckResult?
 
-  private func text(_ target: String) -> Binding<String> {
+  @State private var showAdvancedRouting = false
+  private func layerRules(_ layer: RoutingLayer) -> [RoutingRule] {
+    layer == .base ? options.routing.base : options.routing.user
+  }
+  private func syncRoutingText() {
+    routingText = String(decoding: try! JSONEncoder().encode(options.routing), as: UTF8.self)
+  }
+  private func updateRule(_ layer: RoutingLayer, _ index: Int, _ update: (inout RoutingRule) -> Void) {
+    var rules = layerRules(layer)
+    guard rules.indices.contains(index) else { return }
+    update(&rules[index])
+    if layer == .base { options.routing.base = rules } else { options.routing.user = rules }
+    syncRoutingText()
+  }
+  private func addRule() {
+    options.routing.user.append(RoutingRule(selectors: [""], target: .proxy, port: nil, network: nil))
+    syncRoutingText()
+  }
+  private func targetName(_ target: RoutingTarget) -> String {
     switch target {
-    case "block": $options.block
-    case "direct": $options.direct
-    default: $options.proxy
+    case .proxy: "rules.proxy"
+    case .direct: "rules.direct"
+    case .block: "rules.block"
+    case .node: "Subscription server"
+    case .interface: "Interface"
     }
   }
-  private func count(_ target: String) -> Int {
-    text(target).wrappedValue.split(separator: "\n")
-      .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty && !$0.hasPrefix("#") }.count
+  private func ruleRow(_ layer: RoutingLayer, index: Int) -> some View {
+    let rule = layerRules(layer)[index]
+    return HStack(spacing: 6) {
+      Text("\(index + 1)").foregroundStyle(p.muted).frame(width: 22, alignment: .trailing)
+      TextField(L10n.text("Selector"), text: Binding(
+        get: { layerRules(layer)[index].selectors.joined(separator: ", ") },
+        set: { value in updateRule(layer, index) { $0.selectors = value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } } }
+      )).textFieldStyle(.roundedBorder).font(.system(size: 11.9, design: .monospaced))
+      Menu(L10n.text(targetName(rule.target))) {
+        Button(L10n.text("rules.proxy")) { updateRule(layer, index) { $0.target = .proxy } }
+        Button(L10n.text("rules.direct")) { updateRule(layer, index) { $0.target = .direct } }
+        Button(L10n.text("rules.block")) { updateRule(layer, index) { $0.target = .block } }
+      }
+      Button { options.routing.moveRule(at: index, from: layer, to: layer, insertionIndex: max(index - 1, 0)); syncRoutingText() } label: {
+        Image(systemName: "arrow.up")
+      }.disabled(index == 0).accessibilityLabel(L10n.text("Move up"))
+      Button { options.routing.moveRule(at: index, from: layer, to: layer, insertionIndex: index + 1); syncRoutingText() } label: {
+        Image(systemName: "arrow.down")
+      }.disabled(index + 1 == layerRules(layer).count).accessibilityLabel(L10n.text("Move down"))
+      Button(L10n.text(layer == .base ? "User layer" : "Base layer")) {
+        options.routing.moveRule(at: index, from: layer, to: layer == .base ? .user : .base)
+        syncRoutingText()
+      }
+      Button(role: .destructive) {
+        if layer == .base { options.routing.base.remove(at: index) } else { options.routing.user.remove(at: index) }
+        syncRoutingText()
+      } label: { Image(systemName: "minus") }.accessibilityLabel(L10n.text("Remove rule"))
+    }
   }
-  private func tab(_ id: String, title: String, color: String?, badge: String?) -> some View {
-    Button {
-      selected = id
-    } label: {
-      HStack(spacing: 6) {
-        if let color { Circle().fill(p[color]).frame(width: 7, height: 7) }
-        Text(L10n.text(title))
-        if let badge { Text(badge).foregroundStyle(p.muted) }
-      }.font(.system(size: 11.9, weight: selected == id ? .semibold : .regular))
-        .padding(.horizontal, 10).padding(.vertical, 5)
-        .background(selected == id ? p["bg-elev"] : .clear, in: RoundedRectangle(cornerRadius: 6))
-    }.buttonStyle(.plain)
+  private func layerSection(_ layer: RoutingLayer) -> some View {
+    VStack(alignment: .leading, spacing: 5) {
+      HStack {
+        Text(L10n.text(layer == .base ? "Base layer" : "User layer"))
+          .font(.system(size: 11.9, weight: .semibold))
+        Text("\(layerRules(layer).count)").foregroundStyle(p.muted)
+        Spacer()
+        if layer == .user { Button(L10n.text("Add rule"), action: addRule) }
+      }
+      ForEach(layerRules(layer).indices, id: \.self) { index in ruleRow(layer, index: index) }
+    }
   }
   private func editor(_ binding: Binding<String>, height: CGFloat, label: String) -> some View {
     TextEditor(text: binding)
@@ -1485,6 +1528,9 @@ struct RoutingRulesEditor: View {
   private var dnsPane: some View {
     VStack(alignment: .leading, spacing: 8) {
       picker("rules.domainStrategy", $options.domainStrategy, Self.strategies)
+      Text(L10n.text("IP selectors require IPOnDemand, regardless of this preference."))
+        .font(.system(size: 10.92)).foregroundStyle(p.muted)
+        .fixedSize(horizontal: false, vertical: true)
       picker("rules.domainMatcher", $options.domainMatcher, Self.matchers)
       picker("native.queryStrategy", $options.queryStrategy, Self.queryStrategies)
       Text(L10n.text("rules.outboundDns")).font(.system(size: 11.9, weight: .semibold))
@@ -1575,6 +1621,7 @@ struct RoutingRulesEditor: View {
           Task {
             guard let happ = await model.parseHappRouting(happPayload) else { return }
             options.apply(happ)
+            syncRoutingText()
             happWarnings = happ.warnings
             happPayload = ""
             importing = false
@@ -1589,32 +1636,29 @@ struct RoutingRulesEditor: View {
       VStack(alignment: .leading, spacing: 10.5) {
         if importing {
           happPane
-        } else {
-          HStack(spacing: 6) {
-            ForEach(Self.sets, id: \.target) { set in
-              tab(set.target, title: set.title, color: set.color, badge: "\(count(set.target))")
-            }
-            tab("dns", title: "DNS", color: nil, badge: nil)
-            Spacer()
-            Button(L10n.text("rules.importHapp")) {
-              model.error = nil
-              importing = true
-            }.font(.system(size: 11.9))
+        } else if optionsLoaded {
+          Text(L10n.text("IP selectors use IPOnDemand. Required User IP checks fail closed when DNS is unavailable. Proxy overrides and explicit server rules protect application DNS through the proxy, even when resolver settings request direct."))
+            .font(.system(size: 10.92)).foregroundStyle(p.muted)
+            .fixedSize(horizontal: false, vertical: true)
+          layerSection(.user)
+          layerSection(.base)
+          Button(L10n.text("rules.importHapp")) {
+            model.error = nil
+            importing = true
+          }.font(.system(size: 11.9))
+          DisclosureGroup(L10n.text("DNS and strategy")) { dnsPane }
+          DisclosureGroup(L10n.text("Advanced routing JSON"), isExpanded: $showAdvancedRouting) {
+            editor($routingText, height: 180, label: "detail.domainRules")
           }
-          if selected == "dns" {
-            dnsPane
-          } else {
-            editor(text(selected), height: 300, label: "detail.domainRules")
-            Text(L10n.text("form.rulesHint")).font(.system(size: 10.92)).foregroundStyle(p.muted)
-              .fixedSize(horizontal: false, vertical: true)
-            Toggle(L10n.text("form.privateLanDirect"), isOn: $options.privateLanDirect)
-              .toggleStyle(.checkbox).font(.system(size: 11.9))
-          }
+          Toggle(L10n.text("form.privateLanDirect"), isOn: $options.privateLanDirect)
+            .toggleStyle(.checkbox).font(.system(size: 11.9))
           Divider()
           checker
           ForEach(happWarnings, id: \.self) {
             Text($0).font(.system(size: 10.92)).foregroundStyle(p["warn"])
           }
+        } else {
+          ProgressView()
         }
         if let error = model.error {
           Text(L10n.text(error)).foregroundStyle(p["down"]).font(.system(size: 11.9))
@@ -1624,19 +1668,33 @@ struct RoutingRulesEditor: View {
             Spacer()
             Button(L10n.text("Cancel"), action: onClose)
             Button(L10n.text("Save")) {
+              guard let data = routingText.data(using: .utf8),
+                let routing = try? JSONDecoder().decode(RoutingPolicy.self, from: data)
+              else {
+                model.error = "Invalid routing JSON"
+                return
+              }
+              options.routing = routing
               Task { if await model.setRoutingRules(profile, options: options) { onClose() } }
-            }.buttonStyle(TauriButtonStyle(kind: .accent)).disabled(model.busy)
+            }.buttonStyle(TauriButtonStyle(kind: .accent))
+              .disabled(model.busy || !optionsLoaded || options.editRevision == nil)
           }
         }
       }.padding(14)
     }
     .onAppear {
       model.error = nil
-      options.block = profile.rules("block").joined(separator: "\n")
-      options.proxy = profile.rules("proxy").joined(separator: "\n")
-      options.direct = profile.rules("direct").joined(separator: "\n")
-      options.privateLanDirect = profile.privateLanDirect ?? false
-      Task { if let loaded = await model.routingOptions(profile) { options = loaded } }
+      optionsLoaded = false
+      options = RoutingOptions()
+      Task {
+        if let loaded = await model.routingOptions(profile), loaded.editRevision != nil {
+          options = loaded
+          syncRoutingText()
+          optionsLoaded = true
+        } else {
+          model.error = "Could not load routing options and revision."
+        }
+      }
     }
   }
 }

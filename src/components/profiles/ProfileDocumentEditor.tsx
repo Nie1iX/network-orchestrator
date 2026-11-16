@@ -53,7 +53,10 @@ export default function ProfileDocumentEditor({ profileId, status, interfaces, o
   const graph = useMemo(() => draft && snapshot ? buildProfileGraph(draft.lastValid, snapshot.endpoints) : null, [draft, snapshot]);
   const dirty = Boolean(snapshot && text !== JSON.stringify(snapshot.document, null, 2));
   const currentPreview = preview?.text === text && preview.revision === snapshot?.revision ? preview.result : null;
-  const issues = [...parsed.issues, ...(graph?.issues ?? []), ...(currentPreview?.issues ?? [])];
+  const issues = [...new Map(
+    [...parsed.issues, ...(graph?.issues ?? []), ...(currentPreview?.issues ?? [])]
+      .map((issue) => [JSON.stringify([issue.path, issue.severity, issue.message]), issue] as const),
+  ).values()];
   const hasErrors = issues.some((issue) => issue.severity === "error");
   const isRunning = status ? status.state === "running" : snapshot?.running ?? false;
 

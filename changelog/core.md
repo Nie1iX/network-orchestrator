@@ -14,15 +14,16 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 - Add revision-checked offline profile explanations and bounded, unprivileged
   current-path probes shared through the Linux engine.
+- Add canonical ordered User/Base routing rows with explicit proxy, direct, block,
+  node and interface targets; conditions and output edits retain row priority.
+- Add one-way profile-store schema 2 migration and revision-checked routing saves.
 
 ### Fixed
 
-- Let explicit `domain:` and `full:` profile rules override pinned Xray
-  categories; keep unrelated pinned traffic fail-closed and report the same
-  priority in offline route explanations.
-
-- Replay pinned, traffic, DNS, interface and domain-rule precedence in offline
-  Xray explanations; unresolved earlier selectors prevent a certain fallback.
+- Replace policy-bucket/literal-selector priority with User-before-Base order in
+  Xray generation and offline explanations. Imported policy updates only Base.
+- Resolve IP rules on demand and preserve Unknown instead of allowing a lower
+  direct fallback; protect app-controlled DNS forwarding through a service relay.
 
 
 ## [0.19.2] - 2026-11-12

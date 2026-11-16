@@ -15,9 +15,9 @@ import { providerPrefix } from "../../subscriptions";
 import {
   AlwaysOnKind,
   AlwaysOnListResult,
-  DomainPolicy,
   DomainRouteTarget,
-  PinnedRoute,
+  RoutingPolicy,
+  RoutingRule,
   Profile,
   ProfileInspection,
   SubscriptionDelayResult,
@@ -50,16 +50,14 @@ export const DOMAIN_TARGET_LABEL_KEYS: Record<
   direct: "rules.direct",
 };
 
-/** Counts real selectors; `#` comment lines are stored in `domains` for
- * round-trip through the editor but are not rules. */
 function countPolicyRules(
-  policies: DomainPolicy[],
+  rules: RoutingRule[],
   target?: DomainRouteTarget,
 ): number {
-  return policies
-    .filter((p) => target === undefined || p.target === target)
-    .flatMap((p) => p.domains)
-    .filter((d) => !d.trimStart().startsWith("#")).length;
+  return rules
+    .filter((rule) => target === undefined || rule.target.kind === target)
+    .flatMap((rule) => rule.selectors)
+    .filter((selector) => !selector.trimStart().startsWith("#")).length;
 }
 
 /** Same thresholds as the native client: <300 ms good, <800 ms fair. */
@@ -117,7 +115,7 @@ interface ProfileDetailProps {
   /** Linux failover: replace the ordered backup chain with these keys. */
   onSetBackups: (keys: string[]) => void;
   onSetAutoReturn: (enabled: boolean) => void;
-  onSetPinnedRoutes: (routes: PinnedRoute[]) => void;
+  onSetPinnedRoutes: (routing: RoutingPolicy) => void;
   /** One failover save in flight (backups, auto-return or pins). */
   failoverBusy: boolean;
   /** Edits were saved while the tunnel ran: they apply on reconnect. */
@@ -190,7 +188,8 @@ export default function ProfileDetail({
     alwaysOn?.supportedKinds.includes(alwaysOnKind) === true &&
     (alwaysOnKind === "wireGuard" ||
       (profile.interfaceName.length > 0 && profile.routes.length > 0));
-  const ruleCount = countPolicyRules(profile.domainPolicies);
+  const rules = [...profile.routing.user, ...profile.routing.base];
+  const ruleCount = countPolicyRules(rules);
   const detailCount = profile.routes.length + ruleCount;
   const isWireGuard = profile.backend === "wireGuard";
   const showConfig =
@@ -235,7 +234,8 @@ export default function ProfileDetail({
       .find((ref) => ref.key === key)?.name ?? key;
   };
   const failover = status.failover ?? null;
-  const pinnedRoutes = profile.pinnedPolicies ?? [];
+  const pinnedRoutes = profile.routing.user.flatMap((rule, index) =>
+    rule.target.kind === "node" ? [{ ...rule.target, selectors: rule.selectors, index }] : []);
   const liveEndpoints = endpoints?.filter((e) => !e.isMissing) ?? [];
 
   const moveBackup = (key: string, delta: number) => {
@@ -259,23 +259,14 @@ export default function ProfileDetail({
       .map((line) => line.trim())
       .filter((line) => line !== "" && !line.startsWith("#"));
     if (!pinVia || selectors.length === 0) return;
-    const routes = pinnedRoutes.map((route) => ({
-      ...route,
-      selectors: [...route.selectors],
-    }));
-    const existing = routes.find((route) => route.endpointKey === pinVia);
-    if (existing) {
-      for (const selector of selectors) {
-        if (!existing.selectors.includes(selector)) existing.selectors.push(selector);
-      }
-    } else {
-      routes.push({ selectors, endpointKey: pinVia });
-    }
-    onSetPinnedRoutes(routes);
+    onSetPinnedRoutes({
+      ...profile.routing,
+      user: [...profile.routing.user, { selectors, target: { kind: "node", endpointKey: pinVia } }],
+    });
     setPinSelectors("");
   };
-  const removePinnedRoute = (key: string) => {
-    onSetPinnedRoutes(pinnedRoutes.filter((route) => route.endpointKey !== key));
+  const removePinnedRoute = (index: number) => {
+    onSetPinnedRoutes({ ...profile.routing, user: profile.routing.user.filter((_, i) => i !== index) });
   };
 
   const openExternal = (url: string) => {
@@ -709,7 +700,7 @@ export default function ProfileDetail({
                     .map((target) => ({
                       target,
                       count: countPolicyRules(
-                        profile.domainPolicies,
+                        rules,
                         target,
                       ),
                     }))
@@ -938,7 +929,7 @@ export default function ProfileDetail({
                 )}
                 <ul className="pinned-list">
                   {pinnedRoutes.map((route) => (
-                    <li key={route.endpointKey}>
+                    <li key={route.index}>
                       <span className="pinned-node">
                         {endpointName(route.endpointKey)}
                         {route.missing && (
@@ -953,7 +944,7 @@ export default function ProfileDetail({
                       <button
                         type="button"
                         className="btn-ghost icon-btn"
-                        onClick={() => removePinnedRoute(route.endpointKey)}
+                        onClick={() => removePinnedRoute(route.index)}
                         disabled={failoverBusy || isBusy}
                         title={t("detail.unpinTitle")}
                       >

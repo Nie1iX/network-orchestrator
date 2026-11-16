@@ -17,22 +17,6 @@ fn lines(value: &str) -> impl Iterator<Item = &str> {
     value.lines().map(str::trim).filter(|line| !line.is_empty())
 }
 
-/// Xray matches the first rule, so blocks win over proxy over direct.
-pub(crate) fn policies_from_args(args: &Value) -> Result<Vec<DomainPolicy>, String> {
-    let mut policies = Vec::new();
-    for (key, target) in [
-        ("block", DomainRouteTarget::Block),
-        ("proxy", DomainRouteTarget::Proxy),
-        ("direct", DomainRouteTarget::Direct),
-    ] {
-        let domains: Vec<String> = lines(text(args, key)).map(str::to_string).collect();
-        if !domains.is_empty() {
-            policies.push(DomainPolicy { domains, target });
-        }
-    }
-    Ok(policies)
-}
-
 fn strategy_name(value: Option<XrayDomainStrategy>) -> &'static str {
     match value {
         None => "",
@@ -203,7 +187,8 @@ fn geo_url(args: &Value, key: &str) -> Option<String> {
 /// than turning an old editor's missing fields into destructive clears.
 pub(crate) fn draft(args: &Value) -> Result<ProfileRoutingUpdate, String> {
     Ok(ProfileRoutingUpdate {
-        policies: policies_from_args(args)?,
+        routing: serde_json::from_value(args.get("routing").cloned().ok_or("Routing is required")?)
+            .map_err(|_| "Invalid routing rules")?,
         private_lan_direct: text(args, "privateLanDirect") == "true",
         advanced: args
             .get("domainStrategy")
@@ -220,22 +205,6 @@ pub(crate) fn draft(args: &Value) -> Result<ProfileRoutingUpdate, String> {
     })
 }
 
-fn rules_json(policies: &[DomainPolicy]) -> Value {
-    let joined = |target| {
-        policies
-            .iter()
-            .filter(|policy| policy.target == target)
-            .flat_map(|policy| policy.domains.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    json!({
-        "block": joined(DomainRouteTarget::Block),
-        "proxy": joined(DomainRouteTarget::Proxy),
-        "direct": joined(DomainRouteTarget::Direct),
-    })
-}
-
 fn dns_json(value: &mut Value, dns: &XrayDnsConfig) {
     value["dnsServers"] = json!(format_dns_servers(&dns.servers));
     value["dnsHosts"] = json!(format_dns_hosts(&dns.hosts));
@@ -245,7 +214,8 @@ fn dns_json(value: &mut Value, dns: &XrayDnsConfig) {
 
 /// The editor's initial state for a profile, as plain text fields.
 pub(crate) fn options_json(profile: &ProfileRouting) -> Value {
-    let mut value = rules_json(&profile.policies);
+    let mut value = json!({"routing": profile.routing});
+    value["editRevision"] = json!(profile.edit_revision);
     value["privateLanDirect"] = json!(profile.private_lan_direct);
     value["domainStrategy"] = json!(strategy_name(profile.domain_strategy));
     value["domainMatcher"] = json!(matcher_name(profile.domain_matcher));
@@ -258,7 +228,10 @@ pub(crate) fn options_json(profile: &ProfileRouting) -> Value {
 /// Fields recovered from a pasted Happ/Incy routing export, as editor text.
 /// Fields the export does not mention are omitted so the editor keeps them.
 pub(crate) fn happ_json(import: happ_routing::HappRoutingImport) -> Value {
-    let mut value = rules_json(&import.domain_policies);
+    let mut value = json!({"routing": RoutingPolicy {
+        base: import.domain_policies.into_iter().map(RoutingRule::from).collect(),
+        user: Vec::new(),
+    }});
     if let Some(lan) = import.private_lan_direct {
         value["privateLanDirect"] = json!(lan);
     }
@@ -286,7 +259,7 @@ fn route_check(root: &std::path::Path, args: &Value) -> Result<Value, String> {
     let update = draft(args)?;
     let advanced = advanced_from_args(args)?;
     let routing = ProfileRouting {
-        policies: update.policies,
+        routing: update.routing,
         private_lan_direct: update.private_lan_direct,
         domain_strategy: advanced.domain_strategy,
         domain_matcher: advanced.domain_matcher,

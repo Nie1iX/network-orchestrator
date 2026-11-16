@@ -1,10 +1,5 @@
-//! Offline route-decision simulator. Given a profile's domain policies and
-//! DNS options plus a target host/IP, replays the rule chain that
-//! [`crate::xray::apply_profile_routing`] would generate and reports which
-//! rule decides the traffic. `geosite:`/`geoip:` selectors are resolved
-//! against parsed `geosite.dat`/`geoip.dat` assets when the caller has them
-//! on disk; `regexp:` selectors and missing assets degrade the step to
-//! `Unknown` and the verdict to `Probable`.
+//! Offline route-decision simulator for ordered routing layers.
+//! Geo selectors use locally parsed assets; unavailable evidence is indeterminate.
 
 use std::io;
 use std::net::IpAddr;
@@ -13,7 +8,7 @@ use std::str::FromStr;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
-use crate::models::{DomainPolicy, DomainRouteTarget, XrayDnsRoute, XrayDomainStrategy};
+use crate::models::{RoutingLayer, RoutingPolicy, RoutingTarget, XrayDnsRoute, XrayDomainStrategy};
 use crate::xray::ProfileRoutingOptions;
 
 fn invalid_input(msg: &str) -> io::Error {
@@ -507,6 +502,8 @@ pub enum RouteCheckOutbound {
     Block,
     /// Port-53 capture into the configured DNS resolvers.
     Dns,
+    /// A higher-priority rule cannot be evaluated with offline evidence.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -567,9 +564,11 @@ pub struct RouteCheckResult {
     pub target_kind: RouteCheckTargetKind,
     pub outbound: RouteCheckOutbound,
     pub source: RouteCheckSource,
-    /// Index into `domainPolicies` when `source` is `policy`.
+    /// Canonical layer and zero-based rule index, including an indeterminate rule.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub policy_index: Option<usize>,
+    pub layer: Option<RoutingLayer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_selector: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -602,253 +601,75 @@ fn any_net_contains(nets: &[&str], ip: IpAddr) -> bool {
         .any(|net| net.contains(&ip))
 }
 
-/// Replay the generated routing chain for `target`. `policies` and `options`
-/// are the same profile fields `apply_profile_routing` consumes — block →
-/// proxy → direct ordering is the caller's responsibility (the form already
-/// serializes rules in that order).
+/// Replay the generated routing chain without performing DNS or network calls.
 pub fn check_route(
-    policies: &[DomainPolicy],
+    routing: &RoutingPolicy,
     options: &ProfileRoutingOptions,
     target: &str,
     geo: &GeoDbs,
 ) -> io::Result<RouteCheckResult> {
     let (target, port) = parse_target(target)?;
-    let dns_active = !options.dns.is_empty();
-
     let (kind, target_label) = match &target {
         RouteTarget::Domain(host) => (RouteCheckTargetKind::Domain, host.clone()),
         RouteTarget::Ip(ip) => (RouteCheckTargetKind::Ip, ip.to_string()),
     };
-
-    let mut steps: Vec<RouteCheckStep> = Vec::new();
-    let mut notes: Vec<String> = Vec::new();
-    let mut saw_unknown = false;
-
-    let mut note = |reason: &'static str| {
-        let text = match reason {
-            "geo-asset-missing" => {
-                "geoip/geosite selectors could not be evaluated: no geo assets on disk"
-            }
-            "geo-category-missing" => "a geo category is absent from the loaded geo assets",
-            "geo-regex-records" => "a geo category contains regex records that were not evaluated",
-            "regexp-unsupported" => "regexp: selectors are not evaluated locally",
-            "resolved-ip-recheck" => {
-                "domainStrategy resolves unmatched names, so IP rules may still decide this target"
-            }
-            "traffic-protocol-unknown" => "traffic-rule transport protocol was not provided",
-            _ => return,
-        };
-        if !notes.iter().any(|n| n == text) {
-            notes.push(text.to_string());
-        }
+    let mut steps = Vec::new();
+    let mut notes = Vec::new();
+    let mut result = RouteCheckResult {
+        target: target_label,
+        port,
+        target_kind: kind,
+        outbound: RouteCheckOutbound::Proxy,
+        source: RouteCheckSource::Default,
+        layer: None,
+        rule_index: None,
+        matched_selector: None,
+        policy_path: None,
+        interface_name: None,
+        endpoint_key: None,
+        certainty: RouteCheckCertainty::Certain,
+        steps: Vec::new(),
+        notes: Vec::new(),
     };
+    let protected_dns = routing.protects_dns();
+    let dns_active = !options.dns.is_empty() || protected_dns;
+    let mut decided = false;
+    if dns_active && port == Some(53) {
+        steps.push(RouteCheckStep {
+            label: "dns capture (port 53)".into(),
+            selector: Some("port:53".into()),
+            outcome: RouteCheckStepOutcome::Match,
+        });
+        result.outbound = RouteCheckOutbound::Dns;
+        result.source = RouteCheckSource::DnsCapture;
+        decided = true;
+    }
 
-    let mut verdict: Option<(
-        RouteCheckOutbound,
-        RouteCheckSource,
-        Option<usize>,
-        Option<String>,
-    )> = None;
-
-    let mut interface_name: Option<String> = None;
-    let mut policy_path: Option<String> = None;
-    let mut endpoint_key: Option<String> = None;
-    let resolves = matches!(
-        options.domain_strategy,
-        Some(XrayDomainStrategy::IpIfNonMatch | XrayDomainStrategy::IpOnDemand)
-    );
-
-    // Traffic guards precede DNS capture. The offline target has no transport
-    // protocol, so a matching IP/port guard remains uncertain rather than a verdict.
-    if verdict.is_none() {
-        for (index, rule) in options.traffic_rules.iter().enumerate() {
-            if port.is_some_and(|target_port| target_port != rule.port) {
+    for layer in [RoutingLayer::User, RoutingLayer::Base] {
+        if decided {
+            break;
+        }
+        for (index, rule) in routing.layer(layer).iter().enumerate() {
+            let layer_name = match layer {
+                RoutingLayer::User => "user",
+                RoutingLayer::Base => "base",
+            };
+            let label = format!("{layer_name} rule #{}", index + 1);
+            if rule
+                .port
+                .zip(port)
+                .is_some_and(|(required, actual)| required != actual)
+            {
                 steps.push(RouteCheckStep {
-                    label: format!("traffic rule #{}", index + 1),
+                    label,
                     selector: None,
                     outcome: RouteCheckStepOutcome::Miss,
                 });
                 continue;
             }
-            let mut candidate = false;
-            let mut selector = None;
-            for ip_selector in &rule.ips {
-                let ip_selector = ip_selector.trim();
-                if ip_selector.is_empty() || ip_selector.starts_with('#') {
-                    continue;
-                }
-                let is_ip = matches!(
-                    crate::xray::classify_routing_selector(ip_selector),
-                    Ok(Some(("ip", _)))
-                );
-                let outcome = match (&target, is_ip) {
-                    (RouteTarget::Domain(_), true) if resolves => {
-                        SelectorEval::Unknown("resolved-ip-recheck")
-                    }
-                    (RouteTarget::Domain(_), true) | (RouteTarget::Ip(_), false) => {
-                        SelectorEval::Miss
-                    }
-                    (RouteTarget::Ip(ip), true) => eval_ip_selector(ip_selector, *ip, geo),
-                    (RouteTarget::Domain(_), false) => SelectorEval::Unknown("regexp-unsupported"),
-                };
-                match outcome {
-                    SelectorEval::Match => {
-                        candidate = true;
-                        selector = Some(ip_selector.to_string());
-                        break;
-                    }
-                    SelectorEval::Unknown(reason) => {
-                        candidate = true;
-                        note(reason);
-                        selector = Some(ip_selector.to_string());
-                    }
-                    SelectorEval::Miss => {}
-                }
-            }
-            let unknown = candidate;
-            if candidate {
-                note("traffic-protocol-unknown");
-            }
-            if unknown {
-                saw_unknown = true;
-                if policy_path.is_none() {
-                    policy_path = Some(format!("/profile/xrayTrafficRules/{index}"));
-                }
-            }
-            steps.push(RouteCheckStep {
-                label: format!("traffic rule #{} (protocol unavailable)", index + 1),
-                selector,
-                outcome: if unknown {
-                    RouteCheckStepOutcome::Unknown
-                } else {
-                    RouteCheckStepOutcome::Miss
-                },
-            });
-        }
-    }
-
-    // 1. DNS capture: the generated chain starts with `port:53 → dns-out`
-    // whenever the profile configures split DNS.
-    if dns_active {
-        let hit = port == Some(53);
-        steps.push(RouteCheckStep {
-            label: "dns capture (port 53)".to_string(),
-            selector: Some("port:53".to_string()),
-            outcome: if hit {
-                RouteCheckStepOutcome::Match
-            } else {
-                RouteCheckStepOutcome::Miss
-            },
-        });
-        if hit {
-            verdict = Some((
-                RouteCheckOutbound::Dns,
-                RouteCheckSource::DnsCapture,
-                None,
-                Some("port:53".to_string()),
-            ));
-        }
-    }
-    // Explicit domain choices are exceptions to broad and pinned policies.
-    if verdict.is_none() && !options.pinned_routes.is_empty() {
-        if let RouteTarget::Domain(host) = &target {
-            for (index, policy) in policies.iter().enumerate() {
-                let hit = policy.domains.iter().find(|selector| {
-                    crate::xray::is_explicit_domain_selector(selector)
-                        && matches!(
-                            eval_domain_selector(selector.trim(), host, geo),
-                            SelectorEval::Match
-                        )
-                });
-                let Some(selector) = hit else { continue };
-                steps.push(RouteCheckStep {
-                    label: format!("explicit domain rules #{}", index + 1),
-                    selector: Some(selector.trim().to_string()),
-                    outcome: RouteCheckStepOutcome::Match,
-                });
-                let outbound = match policy.target {
-                    DomainRouteTarget::Proxy => RouteCheckOutbound::Proxy,
-                    DomainRouteTarget::Direct => RouteCheckOutbound::Direct,
-                    DomainRouteTarget::Block => RouteCheckOutbound::Block,
-                };
-                verdict = Some((
-                    outbound,
-                    RouteCheckSource::Policy,
-                    Some(index),
-                    Some(selector.trim().to_string()),
-                ));
-                break;
-            }
-        }
-    }
-    // Pins follow transport guards, DNS capture and explicit domain choices.
-    for (index, pin) in options.pinned_routes.iter().enumerate() {
-        if verdict.is_some() {
-            break;
-        }
-        let mut hit = None;
-        let mut unknown = false;
-        for selector in &pin.selectors {
-            let selector = selector.trim();
-            if selector.is_empty() || selector.starts_with('#') {
-                continue;
-            }
-            let outcome = match &target {
-                RouteTarget::Domain(host) => eval_domain_selector(selector, host, geo),
-                RouteTarget::Ip(_) => SelectorEval::Miss,
-            };
-            match outcome {
-                SelectorEval::Match => {
-                    hit = Some(selector.to_string());
-                    break;
-                }
-                SelectorEval::Unknown(reason) => {
-                    unknown = true;
-                    note(reason);
-                }
-                SelectorEval::Miss => {}
-            }
-        }
-        if let Some(selector) = hit {
-            steps.push(RouteCheckStep {
-                label: format!("pinned route #{}", index + 1),
-                selector: Some(selector.clone()),
-                outcome: RouteCheckStepOutcome::Match,
-            });
-            if !saw_unknown {
-                endpoint_key = Some(pin.endpoint_key.clone());
-                policy_path = Some(format!("/profile/pinnedPolicies/{index}"));
-            }
-            verdict = Some((
-                RouteCheckOutbound::Proxy,
-                RouteCheckSource::Policy,
-                None,
-                Some(selector),
-            ));
-            break;
-        }
-        if unknown {
-            saw_unknown = true;
-            if policy_path.is_none() {
-                policy_path = Some(format!("/profile/pinnedPolicies/{index}"));
-            }
-        }
-        steps.push(RouteCheckStep {
-            label: format!("pinned route #{}", index + 1),
-            selector: None,
-            outcome: if unknown {
-                RouteCheckStepOutcome::Unknown
-            } else {
-                RouteCheckStepOutcome::Miss
-            },
-        });
-    }
-    // Interface routes follow DNS capture and precede domain policies.
-    if verdict.is_none() {
-        for (index, route) in options.interface_routes.iter().enumerate() {
             let mut hit = None;
-            let mut unknown = false;
-            for selector in &route.selectors {
+            let mut unknown = None;
+            for selector in &rule.selectors {
                 let selector = selector.trim();
                 if selector.is_empty() || selector.starts_with('#') {
                     continue;
@@ -857,269 +678,162 @@ pub fn check_route(
                     crate::xray::classify_routing_selector(selector),
                     Ok(Some(("ip", _)))
                 );
-                let outcome = match (&target, is_ip) {
+                let evaluation = match (&target, is_ip) {
                     (RouteTarget::Domain(host), false) => eval_domain_selector(selector, host, geo),
-                    (RouteTarget::Domain(_), true) if resolves => {
-                        SelectorEval::Unknown("resolved-ip-recheck")
-                    }
-                    (RouteTarget::Domain(_), true) | (RouteTarget::Ip(_), false) => {
-                        SelectorEval::Miss
+                    (RouteTarget::Domain(_), true) => {
+                        SelectorEval::Unknown("IP matching requires DNS resolution")
                     }
                     (RouteTarget::Ip(ip), true) => eval_ip_selector(selector, *ip, geo),
+                    (RouteTarget::Ip(_), false) => SelectorEval::Miss,
                 };
-                match outcome {
+                match evaluation {
                     SelectorEval::Match => {
                         hit = Some(selector.to_string());
                         break;
                     }
                     SelectorEval::Unknown(reason) => {
-                        unknown = true;
-                        note(reason);
+                        unknown = Some((selector.to_string(), reason));
                     }
                     SelectorEval::Miss => {}
                 }
             }
-            if let Some(selector) = hit {
-                steps.push(RouteCheckStep {
-                    label: format!("interface route #{}", index + 1),
-                    selector: Some(selector.clone()),
-                    outcome: RouteCheckStepOutcome::Match,
-                });
-                interface_name = Some(route.interface_name.clone());
-                if !saw_unknown {
-                    policy_path = Some(format!("/profile/xrayInterfaceRoutes/{index}"));
-                }
-                verdict = Some((
-                    RouteCheckOutbound::Direct,
-                    RouteCheckSource::Policy,
-                    None,
-                    Some(selector),
-                ));
-                break;
+            if hit.is_some() && rule.port.is_some() && port.is_none() {
+                unknown = Some((hit.take().unwrap(), "target port was not provided"));
             }
-            if unknown {
-                saw_unknown = true;
-                if policy_path.is_none() {
-                    policy_path = Some(format!("/profile/xrayInterfaceRoutes/{index}"));
-                }
+            if hit.is_some() && rule.network.is_some() {
+                unknown = Some((hit.take().unwrap(), "transport protocol was not provided"));
             }
-            steps.push(RouteCheckStep {
-                label: format!("interface route #{}", index + 1),
-                selector: None,
-                outcome: if unknown {
-                    RouteCheckStepOutcome::Unknown
-                } else {
-                    RouteCheckStepOutcome::Miss
-                },
-            });
-        }
-    }
-    if verdict.is_none() {
-        for (index, policy) in policies.iter().enumerate() {
-            let mut policy_hit: Option<String> = None;
-            let mut policy_unknown = false;
-            for selector in &policy.domains {
-                let selector = selector.trim();
-                if selector.is_empty() || selector.starts_with('#') {
-                    continue;
-                }
-                let is_ip_selector = matches!(
-                    crate::xray::classify_routing_selector(selector),
-                    Ok(Some(("ip", _)))
-                );
-                let outcome = match (&target, is_ip_selector) {
-                    (RouteTarget::Domain(host), false) => eval_domain_selector(selector, host, geo),
-                    (RouteTarget::Domain(_), true) => {
-                        if resolves {
-                            SelectorEval::Unknown("resolved-ip-recheck")
-                        } else {
-                            SelectorEval::Miss
-                        }
-                    }
-                    (RouteTarget::Ip(ip), true) => eval_ip_selector(selector, *ip, geo),
-                    (RouteTarget::Ip(_), false) => {
-                        // geosite/domain selectors cannot match a literal IP.
-                        SelectorEval::Miss
-                    }
-                };
-                match outcome {
-                    SelectorEval::Match => {
-                        policy_hit = Some(selector.to_string());
-                        break;
-                    }
-                    SelectorEval::Unknown(reason) => {
-                        policy_unknown = true;
-                        note(reason);
-                    }
-                    SelectorEval::Miss => {}
-                }
-            }
-            let label = format!(
-                "{} rules #{}",
-                match policy.target {
-                    DomainRouteTarget::Proxy => "proxy",
-                    DomainRouteTarget::Direct => "direct",
-                    DomainRouteTarget::Block => "block",
-                },
-                index + 1
-            );
-            if let Some(selector) = policy_hit {
-                steps.push(RouteCheckStep {
-                    label,
-                    selector: Some(selector.clone()),
-                    outcome: RouteCheckStepOutcome::Match,
-                });
-                let outbound = match policy.target {
-                    DomainRouteTarget::Proxy => RouteCheckOutbound::Proxy,
-                    DomainRouteTarget::Direct => RouteCheckOutbound::Direct,
-                    DomainRouteTarget::Block => RouteCheckOutbound::Block,
-                };
-                verdict = Some((
-                    outbound,
-                    RouteCheckSource::Policy,
-                    Some(index),
-                    Some(selector),
-                ));
-                break;
-            }
-            if policy_unknown {
-                saw_unknown = true;
-                if policy_path.is_none() {
-                    policy_path = Some(format!("/profile/domainPolicies/{index}"));
-                }
-            }
+            let (outcome, selector) = if let Some(selector) = hit {
+                (RouteCheckStepOutcome::Match, Some(selector))
+            } else if let Some((selector, reason)) = unknown {
+                notes.push(format!("rule cannot be evaluated: {reason}"));
+                (RouteCheckStepOutcome::Unknown, Some(selector))
+            } else {
+                (RouteCheckStepOutcome::Miss, None)
+            };
             steps.push(RouteCheckStep {
                 label,
-                selector: None,
-                outcome: if policy_unknown {
-                    RouteCheckStepOutcome::Unknown
-                } else {
-                    RouteCheckStepOutcome::Miss
-                },
+                selector: selector.clone(),
+                outcome,
             });
+            if outcome == RouteCheckStepOutcome::Miss {
+                continue;
+            }
+            result.layer = Some(layer);
+            result.rule_index = Some(index);
+            result.policy_path = Some(format!("/profile/routing/{layer_name}/{index}"));
+            result.matched_selector = selector;
+            result.source = RouteCheckSource::Policy;
+            if outcome == RouteCheckStepOutcome::Unknown {
+                result.outbound = RouteCheckOutbound::Unknown;
+                result.certainty = RouteCheckCertainty::Probable;
+            } else {
+                result.outbound = match &rule.target {
+                    RoutingTarget::Proxy => RouteCheckOutbound::Proxy,
+                    RoutingTarget::Direct => RouteCheckOutbound::Direct,
+                    RoutingTarget::Block => RouteCheckOutbound::Block,
+                    RoutingTarget::Node {
+                        endpoint_key,
+                        missing,
+                    } => {
+                        result.endpoint_key = Some(endpoint_key.clone());
+                        if *missing {
+                            RouteCheckOutbound::Block
+                        } else {
+                            RouteCheckOutbound::Proxy
+                        }
+                    }
+                    RoutingTarget::Interface { interface_name, .. } => {
+                        result.interface_name = Some(interface_name.clone());
+                        RouteCheckOutbound::Direct
+                    }
+                };
+            }
+            decided = true;
+            break;
         }
     }
 
-    // 3. Resolver pins keep each DNS server reachable on its own side.
-    if verdict.is_none() {
+    if !decided && !protected_dns {
         for (index, server) in options.dns.servers.iter().enumerate() {
-            let tag = match server.route {
+            let outbound = match server.route {
                 XrayDnsRoute::Proxy => RouteCheckOutbound::Proxy,
                 XrayDnsRoute::Direct => RouteCheckOutbound::Direct,
                 XrayDnsRoute::None => continue,
             };
-            let Some((kind_flag, value)) = crate::xray::dns_server_route_target(&server.address)
+            let Some((family, value)) = crate::xray::dns_server_route_target(&server.address)
             else {
                 continue;
             };
-            let outcome = match (&target, kind_flag) {
+            let evaluation = match (&target, family) {
                 (RouteTarget::Domain(host), "domain") => {
                     domain_suffix_match(host, &value.to_ascii_lowercase()).into()
                 }
                 (RouteTarget::Ip(ip), "ip") => eval_ip_selector(&value, *ip, geo),
-                // A domain resolver can still intercept a domain target
-                // after strategy resolution.
-                (RouteTarget::Domain(_), "ip") => {
-                    if resolves {
-                        SelectorEval::Unknown("resolved-ip-recheck")
-                    } else {
-                        SelectorEval::Miss
-                    }
+                (RouteTarget::Domain(_), "ip")
+                    if matches!(
+                        options.domain_strategy,
+                        Some(XrayDomainStrategy::IpIfNonMatch | XrayDomainStrategy::IpOnDemand)
+                    ) =>
+                {
+                    SelectorEval::Unknown("IP matching requires DNS resolution")
                 }
-                (RouteTarget::Ip(_), "domain") => SelectorEval::Miss,
                 _ => SelectorEval::Miss,
             };
-            if let SelectorEval::Unknown(reason) = outcome {
-                note(reason);
-                saw_unknown = true;
-                if policy_path.is_none() {
-                    policy_path = Some(format!("/profile/xrayDns/servers/{index}"));
+            let outcome = match evaluation {
+                SelectorEval::Match => RouteCheckStepOutcome::Match,
+                SelectorEval::Miss => RouteCheckStepOutcome::Miss,
+                SelectorEval::Unknown(reason) => {
+                    notes.push(format!("resolver pin cannot be evaluated: {reason}"));
+                    RouteCheckStepOutcome::Unknown
                 }
-            }
+            };
             steps.push(RouteCheckStep {
                 label: format!("resolver pin #{}", index + 1),
                 selector: Some(value.clone()),
-                outcome: match outcome {
-                    SelectorEval::Match => RouteCheckStepOutcome::Match,
-                    SelectorEval::Miss => RouteCheckStepOutcome::Miss,
-                    SelectorEval::Unknown(_) => RouteCheckStepOutcome::Unknown,
-                },
+                outcome,
             });
-            if outcome == SelectorEval::Match {
-                if policy_path.is_none() {
-                    policy_path = Some(format!("/profile/xrayDns/servers/{index}"));
+            if outcome != RouteCheckStepOutcome::Miss {
+                result.outbound = if outcome == RouteCheckStepOutcome::Unknown {
+                    RouteCheckOutbound::Unknown
+                } else {
+                    outbound
+                };
+                if outcome == RouteCheckStepOutcome::Unknown {
+                    result.certainty = RouteCheckCertainty::Probable;
                 }
-                verdict = Some((tag, RouteCheckSource::ResolverPin, None, Some(value)));
+                result.source = RouteCheckSource::ResolverPin;
+                result.policy_path = Some(format!("/profile/xrayDns/servers/{index}"));
+                result.matched_selector = Some(value);
+                decided = true;
                 break;
             }
         }
     }
-
-    // 4. Built-in rules, emitted only when some rule surface exists.
-    let rules_emitted = !policies.is_empty()
-        || options.private_lan_direct
-        || dns_active
-        || !options.traffic_rules.is_empty()
-        || !options.interface_routes.is_empty();
-    if verdict.is_none() && rules_emitted {
-        if let RouteTarget::Ip(ip) = target {
-            if any_net_contains(MULTICAST_NETS, ip) {
-                steps.push(RouteCheckStep {
-                    label: "multicast".to_string(),
-                    selector: Some("224.0.0.0/4, ff00::/8".to_string()),
-                    outcome: RouteCheckStepOutcome::Match,
-                });
-                verdict = Some((
-                    RouteCheckOutbound::Block,
-                    RouteCheckSource::Multicast,
-                    None,
-                    Some("multicast".to_string()),
-                ));
+    if !decided {
+        if let RouteTarget::Ip(ip) = &target {
+            if (!routing.is_empty() || options.private_lan_direct || dns_active)
+                && any_net_contains(MULTICAST_NETS, *ip)
+            {
+                result.outbound = RouteCheckOutbound::Block;
+                result.source = RouteCheckSource::Multicast;
+                decided = true;
+            } else if options.private_lan_direct && any_net_contains(PRIVATE_NETS, *ip) {
+                result.outbound = RouteCheckOutbound::Direct;
+                result.source = RouteCheckSource::PrivateLan;
+                decided = true;
             }
         }
-    }
-    if verdict.is_none() && options.private_lan_direct {
-        if let RouteTarget::Ip(ip) = target {
-            if any_net_contains(PRIVATE_NETS, ip) {
-                steps.push(RouteCheckStep {
-                    label: "private LAN".to_string(),
-                    selector: Some("private ranges".to_string()),
-                    outcome: RouteCheckStepOutcome::Match,
-                });
-                verdict = Some((
-                    RouteCheckOutbound::Direct,
-                    RouteCheckSource::PrivateLan,
-                    None,
-                    Some("privateLanDirect".to_string()),
-                ));
-            }
-        }
-    }
-
-    // 5. Nothing matched — the first outbound (proxy) takes it.
-    if verdict.is_none() {
         steps.push(RouteCheckStep {
-            label: "default".to_string(),
-            selector: None,
-            outcome: if saw_unknown {
-                RouteCheckStepOutcome::Unknown
+            label: if decided {
+                format!("{:?}", result.source)
             } else {
-                RouteCheckStepOutcome::Match
+                "default".into()
             },
+            selector: None,
+            outcome: RouteCheckStepOutcome::Match,
         });
-        verdict = Some((
-            RouteCheckOutbound::Proxy,
-            RouteCheckSource::Default,
-            None,
-            None,
-        ));
     }
-
-    if resolves && kind == RouteCheckTargetKind::Domain {
-        note("resolved-ip-recheck");
-    }
-    // DNS static hosts can still rewrite the answer a resolver returns —
-    // routing itself is unaffected, but the flag helps debugging.
     if let RouteTarget::Domain(host) = &target {
         for (name, _) in options
             .dns
@@ -1132,147 +846,136 @@ pub fn check_route(
             ));
         }
     }
-
-    let (outbound, source, policy_index, matched_selector) = verdict.unwrap();
-    let certainty = if saw_unknown {
-        RouteCheckCertainty::Probable
-    } else {
-        RouteCheckCertainty::Certain
-    };
-    Ok(RouteCheckResult {
-        target: target_label,
-        port,
-        target_kind: kind,
-        outbound,
-        source,
-        policy_path: policy_path
-            .or_else(|| policy_index.map(|index| format!("/profile/domainPolicies/{index}"))),
-        interface_name,
-        endpoint_key,
-        policy_index,
-        matched_selector,
-        certainty,
-        steps,
-        notes,
-    })
+    result.steps = steps;
+    result.notes = notes;
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{XrayDnsConfig, XrayDnsServer};
+    use crate::models::{
+        DomainPolicy, DomainRouteTarget, RoutingRule, XrayDnsConfig, XrayDnsServer,
+    };
 
-    fn policies(spec: &[(&[&str], DomainRouteTarget)]) -> Vec<DomainPolicy> {
-        spec.iter()
-            .map(|(selectors, target)| DomainPolicy {
-                domains: selectors.iter().map(|s| s.to_string()).collect(),
-                target: *target,
-            })
-            .collect()
+    fn policies(spec: &[(&[&str], DomainRouteTarget)]) -> RoutingPolicy {
+        RoutingPolicy {
+            user: spec
+                .iter()
+                .map(|(selectors, target)| {
+                    DomainPolicy {
+                        domains: selectors.iter().map(|s| s.to_string()).collect(),
+                        target: *target,
+                    }
+                    .into()
+                })
+                .collect(),
+            ..RoutingPolicy::default()
+        }
     }
 
     fn check(
-        policies: &[DomainPolicy],
+        routing: &RoutingPolicy,
         options: &ProfileRoutingOptions,
         target: &str,
     ) -> RouteCheckResult {
-        check_route(policies, options, target, &GeoDbs::default()).unwrap()
+        check_route(routing, options, target, &GeoDbs::default()).unwrap()
+    }
+
+    #[test]
+    fn user_ip_unknown_does_not_fall_through_to_base_geosite() {
+        let mut routing = policies(&[(&["10.0.0.0/8"], DomainRouteTarget::Block)]);
+        routing.base = policies(&[(&["geosite:cn"], DomainRouteTarget::Direct)]).user;
+        let db = sample_geo_site();
+        let geo = GeoDbs {
+            geo_site: Some(&db),
+            geo_ip: None,
+        };
+        let result =
+            check_route(&routing, &ProfileRoutingOptions::default(), "qq.com", &geo).unwrap();
+        assert_eq!(result.outbound, RouteCheckOutbound::Unknown);
+        assert_eq!(result.layer, Some(RoutingLayer::User));
+        assert_eq!(result.rule_index, Some(0));
+        assert_eq!(
+            result.policy_path.as_deref(),
+            Some("/profile/routing/user/0")
+        );
+    }
+
+    #[test]
+    fn user_ip_match_precedes_base_geosite() {
+        let mut routing = policies(&[(&["10.0.0.0/8"], DomainRouteTarget::Block)]);
+        routing.base = policies(&[(&["geosite:cn"], DomainRouteTarget::Direct)]).user;
+        let result = check(&routing, &ProfileRoutingOptions::default(), "10.1.2.3");
+        assert_eq!(result.outbound, RouteCheckOutbound::Block);
+        assert_eq!(result.layer, Some(RoutingLayer::User));
+    }
+
+    #[test]
+    fn ordered_targets_and_port_mismatch() {
+        let mut routing = policies(&[(&["10.0.0.0/8"], DomainRouteTarget::Block)]);
+        routing.user[0].port = Some(80);
+        routing.user.push(RoutingRule {
+            selectors: vec!["domain:example.com".into()],
+            target: RoutingTarget::Node {
+                endpoint_key: "node".into(),
+                missing: true,
+            },
+            ..RoutingRule::default()
+        });
+        routing.user.push(RoutingRule {
+            selectors: vec!["domain:example.com".into()],
+            target: RoutingTarget::Direct,
+            ..RoutingRule::default()
+        });
+        let result = check(
+            &routing,
+            &ProfileRoutingOptions::default(),
+            "https://example.com:443/",
+        );
+        assert_eq!(result.outbound, RouteCheckOutbound::Block);
+        assert_eq!(result.endpoint_key.as_deref(), Some("node"));
+        assert_eq!(result.layer, Some(RoutingLayer::User));
+        assert_eq!(result.rule_index, Some(1));
+        assert_eq!(
+            result.policy_path.as_deref(),
+            Some("/profile/routing/user/1")
+        );
+        assert_eq!(result.steps[0].outcome, RouteCheckStepOutcome::Miss);
+        if let RoutingTarget::Node { missing, .. } = &mut routing.user[1].target {
+            *missing = false;
+        }
+        let available = check(
+            &routing,
+            &ProfileRoutingOptions::default(),
+            "https://example.com:443/",
+        );
+        assert_eq!(available.outbound, RouteCheckOutbound::Proxy);
+        assert_eq!(available.endpoint_key.as_deref(), Some("node"));
+        assert_eq!(available.rule_index, Some(1));
+    }
+
+    #[test]
+    fn transport_constraint_is_unknown_without_protocol() {
+        let mut routing = policies(&[(&["10.0.0.0/8"], DomainRouteTarget::Block)]);
+        routing.user[0].port = Some(443);
+        routing.user[0].network = Some("tcp".into());
+        let result = check(&routing, &ProfileRoutingOptions::default(), "10.1.2.3:443");
+        assert_eq!(result.outbound, RouteCheckOutbound::Unknown);
+        assert_eq!(result.steps[0].outcome, RouteCheckStepOutcome::Unknown);
     }
 
     #[test]
     fn bare_domain_default_routes_proxy() {
-        let result = check(&[], &ProfileRoutingOptions::default(), "example.com");
+        let result = check(
+            &RoutingPolicy::default(),
+            &ProfileRoutingOptions::default(),
+            "example.com",
+        );
         assert_eq!(result.outbound, RouteCheckOutbound::Proxy);
         assert_eq!(result.source, RouteCheckSource::Default);
         assert_eq!(result.target_kind, RouteCheckTargetKind::Domain);
         assert_eq!(result.certainty, RouteCheckCertainty::Certain);
-    }
-
-    #[test]
-    fn interface_route_precedes_domain_policy() {
-        let policies = policies(&[(&["domain:example.com"], DomainRouteTarget::Block)]);
-        let options = ProfileRoutingOptions {
-            interface_routes: vec![crate::models::XrayInterfaceRoute {
-                selectors: vec!["domain:example.com".into()],
-                interface_name: "wg-test".into(),
-                domain_strategy: None,
-            }],
-            ..ProfileRoutingOptions::default()
-        };
-        let result = check(&policies, &options, "example.com");
-        assert_eq!(result.interface_name.as_deref(), Some("wg-test"));
-        assert_eq!(
-            result.policy_path.as_deref(),
-            Some("/profile/xrayInterfaceRoutes/0")
-        );
-        assert_eq!(result.steps[0].outcome, RouteCheckStepOutcome::Match);
-    }
-    #[test]
-    fn explicit_domain_policy_overrides_pinned_category() {
-        let options = ProfileRoutingOptions {
-            pinned_routes: vec![crate::models::PinnedRoute {
-                selectors: vec!["geosite:category-dev".into()],
-                endpoint_key: "aabb001122334455".into(),
-                missing: true,
-            }],
-            ..ProfileRoutingOptions::default()
-        };
-        let policies = policies(&[(
-            &["geosite:private", "domain:github.com"],
-            DomainRouteTarget::Direct,
-        )]);
-        for host in ["github.com", "api.github.com"] {
-            let result = check(&policies, &options, host);
-            assert_eq!(result.outbound, RouteCheckOutbound::Direct);
-            assert_eq!(result.certainty, RouteCheckCertainty::Certain);
-            assert_eq!(
-                result.policy_path.as_deref(),
-                Some("/profile/domainPolicies/0")
-            );
-            assert_eq!(result.endpoint_key, None);
-        }
-        let other = check(&policies, &options, "other.test");
-        assert_eq!(other.outbound, RouteCheckOutbound::Proxy);
-        assert_eq!(other.certainty, RouteCheckCertainty::Probable);
-    }
-
-    #[test]
-    fn explicit_block_policy_precedes_pinned_route() {
-        let mut options = ProfileRoutingOptions::default();
-        options.pinned_routes.push(crate::models::PinnedRoute {
-            selectors: vec!["domain:example.com".into()],
-            endpoint_key: "aabb001122334455".into(),
-            missing: false,
-        });
-        let policies = policies(&[(&["domain:example.com"], DomainRouteTarget::Block)]);
-        let result = check(&policies, &options, "example.com");
-        assert_eq!(
-            result.policy_path.as_deref(),
-            Some("/profile/domainPolicies/0")
-        );
-        assert_eq!(result.endpoint_key, None);
-        assert_eq!(result.outbound, RouteCheckOutbound::Block);
-    }
-
-    #[test]
-    fn traffic_rule_is_unknown_without_transport_protocol() {
-        let options = ProfileRoutingOptions {
-            traffic_rules: vec![crate::models::XrayTrafficRule {
-                ips: vec!["10.0.0.0/8".into()],
-                port: 443,
-                network: "tcp".into(),
-                target: DomainRouteTarget::Block,
-            }],
-            ..ProfileRoutingOptions::default()
-        };
-        let policies = policies(&[(&["10.0.0.0/8"], DomainRouteTarget::Direct)]);
-        let result = check(&policies, &options, "10.1.2.3:443");
-        assert_eq!(result.certainty, RouteCheckCertainty::Probable);
-        assert_eq!(
-            result.policy_path.as_deref(),
-            Some("/profile/xrayTrafficRules/0")
-        );
-        assert_eq!(result.steps[0].outcome, RouteCheckStepOutcome::Unknown);
     }
 
     #[test]
@@ -1281,7 +984,7 @@ mod tests {
         let result = check(&list, &ProfileRoutingOptions::default(), "a.b.example.com");
         assert_eq!(result.outbound, RouteCheckOutbound::Direct);
         assert_eq!(result.source, RouteCheckSource::Policy);
-        assert_eq!(result.policy_index, Some(0));
+        assert_eq!(result.rule_index, Some(0));
         assert_eq!(
             result.matched_selector.as_deref(),
             Some("domain:example.com")
@@ -1331,29 +1034,27 @@ mod tests {
     }
 
     #[test]
-    fn ip_selectors_skip_domain_targets_under_asis() {
+    fn ip_selectors_remain_unknown_for_domain_targets_under_asis() {
         let list = policies(&[(&["0.0.0.0/0"], DomainRouteTarget::Direct)]);
         let options = ProfileRoutingOptions {
             domain_strategy: Some(XrayDomainStrategy::AsIs),
             ..ProfileRoutingOptions::default()
         };
         let result = check(&list, &options, "anything.test");
-        // IP rules never see unresolved names under AsIs.
-        assert_eq!(result.outbound, RouteCheckOutbound::Proxy);
-        assert_eq!(result.certainty, RouteCheckCertainty::Certain);
+        assert_eq!(result.outbound, RouteCheckOutbound::Unknown);
+        assert_eq!(result.certainty, RouteCheckCertainty::Probable);
     }
 
     #[test]
-    fn resolving_strategy_degrades_certainty_for_domain_targets() {
-        let list = policies(&[(&["1.2.3.4"], DomainRouteTarget::Block)]);
+    fn resolving_strategy_alone_does_not_degrade_certainty() {
+        let list = policies(&[(&["domain:example.com"], DomainRouteTarget::Direct)]);
         let options = ProfileRoutingOptions {
             domain_strategy: Some(XrayDomainStrategy::IpIfNonMatch),
             ..ProfileRoutingOptions::default()
         };
-        let result = check(&list, &options, "maybe-blocked.test");
-        assert_eq!(result.outbound, RouteCheckOutbound::Proxy);
-        assert_eq!(result.certainty, RouteCheckCertainty::Probable);
-        assert!(result.notes.iter().any(|n| n.contains("resolv")));
+        let result = check(&list, &options, "example.com");
+        assert_eq!(result.outbound, RouteCheckOutbound::Direct);
+        assert_eq!(result.certainty, RouteCheckCertainty::Certain);
     }
 
     #[test]
@@ -1371,7 +1072,22 @@ mod tests {
             },
             ..ProfileRoutingOptions::default()
         };
-        let result = check(&[], &options, "dns.test:53");
+        let result = check(&RoutingPolicy::default(), &options, "dns.test:53");
+        assert_eq!(result.outbound, RouteCheckOutbound::Dns);
+        assert_eq!(result.source, RouteCheckSource::DnsCapture);
+    }
+
+    #[test]
+    fn protected_routing_captures_dns_without_explicit_dns_options() {
+        let routing = RoutingPolicy {
+            user: vec![crate::models::RoutingRule {
+                selectors: vec!["domain:private.test".into()],
+                target: RoutingTarget::Proxy,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let result = check(&routing, &ProfileRoutingOptions::default(), "8.8.8.8:53");
         assert_eq!(result.outbound, RouteCheckOutbound::Dns);
         assert_eq!(result.source, RouteCheckSource::DnsCapture);
     }
@@ -1385,15 +1101,26 @@ mod tests {
                     port: None,
                     domains: vec![],
                     skip_fallback: false,
-                    route: XrayDnsRoute::Proxy,
+                    route: XrayDnsRoute::Direct,
                 }],
                 ..XrayDnsConfig::default()
             },
             ..ProfileRoutingOptions::default()
         };
-        let result = check(&[], &options, "dns.remote.example");
-        assert_eq!(result.outbound, RouteCheckOutbound::Proxy);
+        let result = check(&RoutingPolicy::default(), &options, "dns.remote.example");
+        assert_eq!(result.outbound, RouteCheckOutbound::Direct);
         assert_eq!(result.source, RouteCheckSource::ResolverPin);
+        let protected = RoutingPolicy {
+            user: vec![crate::models::RoutingRule {
+                selectors: vec!["full:private.test".into()],
+                target: RoutingTarget::Proxy,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let protected_result = check(&protected, &options, "dns.remote.example");
+        assert_eq!(protected_result.outbound, RouteCheckOutbound::Proxy);
+        assert_eq!(protected_result.source, RouteCheckSource::Default);
     }
 
     #[test]
@@ -1402,10 +1129,10 @@ mod tests {
             private_lan_direct: true,
             ..ProfileRoutingOptions::default()
         };
-        let result = check(&[], &options, "192.168.1.20");
+        let result = check(&RoutingPolicy::default(), &options, "192.168.1.20");
         assert_eq!(result.outbound, RouteCheckOutbound::Direct);
         assert_eq!(result.source, RouteCheckSource::PrivateLan);
-        let other = check(&[], &options, "8.8.8.8");
+        let other = check(&RoutingPolicy::default(), &options, "8.8.8.8");
         assert_eq!(other.outbound, RouteCheckOutbound::Proxy);
     }
 
@@ -1416,7 +1143,11 @@ mod tests {
         assert_eq!(result.outbound, RouteCheckOutbound::Block);
         assert_eq!(result.source, RouteCheckSource::Multicast);
         // Without any rule surface no multicast rule is emitted.
-        let empty = check(&[], &ProfileRoutingOptions::default(), "224.0.0.251");
+        let empty = check(
+            &RoutingPolicy::default(),
+            &ProfileRoutingOptions::default(),
+            "224.0.0.251",
+        );
         assert_eq!(empty.outbound, RouteCheckOutbound::Proxy);
     }
 
@@ -1427,7 +1158,7 @@ mod tests {
             (&["later.test"], DomainRouteTarget::Block),
         ]);
         let result = check(&list, &ProfileRoutingOptions::default(), "later.test");
-        assert_eq!(result.outbound, RouteCheckOutbound::Block);
+        assert_eq!(result.outbound, RouteCheckOutbound::Unknown);
         assert_eq!(result.certainty, RouteCheckCertainty::Probable);
         assert!(result.notes.iter().any(|n| n.contains("geo")));
     }
@@ -1436,7 +1167,7 @@ mod tests {
     fn geoip_without_assets_is_probable() {
         let list = policies(&[(&["geoip:cn"], DomainRouteTarget::Direct)]);
         let result = check(&list, &ProfileRoutingOptions::default(), "1.2.3.4");
-        assert_eq!(result.outbound, RouteCheckOutbound::Proxy);
+        assert_eq!(result.outbound, RouteCheckOutbound::Unknown);
         assert_eq!(result.certainty, RouteCheckCertainty::Probable);
     }
 
@@ -1626,6 +1357,23 @@ mod tests {
         let opts = ProfileRoutingOptions::default();
         let hit = check_route(&list, &opts, "10.9.9.9", &geo).unwrap();
         assert_eq!(hit.outbound, RouteCheckOutbound::Direct);
+        let imported = RoutingPolicy::imported(
+            vec![DomainPolicy {
+                domains: vec!["geoip:private".into()],
+                target: DomainRouteTarget::Direct,
+            }],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let imported_hit = check_route(&imported, &opts, "10.9.9.9", &geo).unwrap();
+        assert_eq!(imported_hit.layer, Some(RoutingLayer::Base));
+        assert_eq!(
+            imported_hit.policy_path.as_deref(),
+            Some("/profile/routing/base/0")
+        );
+        assert_eq!(hit.layer, Some(RoutingLayer::User));
+        assert_eq!(hit.policy_path.as_deref(), Some("/profile/routing/user/0"));
         let cn = policies(&[(&["geoip:cn"], DomainRouteTarget::Block)]);
         let hit = check_route(&cn, &opts, "1.2.3.99", &geo).unwrap();
         assert_eq!(hit.outbound, RouteCheckOutbound::Block);
@@ -1645,7 +1393,7 @@ mod tests {
             },
             ..ProfileRoutingOptions::default()
         };
-        let result = check(&[], &options, "www.pinned.test");
+        let result = check(&RoutingPolicy::default(), &options, "www.pinned.test");
         assert!(result.notes.iter().any(|n| n.contains("hosts entry")));
     }
 

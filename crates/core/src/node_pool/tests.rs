@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     config_vault::ConfigVault,
-    models::{NodePoolFilter, PinnedRoute, SubscriptionMeta, TunnelBackend},
+    models::{NodePoolFilter, PinnedRoute, RoutingRule, SubscriptionMeta, TunnelBackend},
     profiles::ProfileStore,
     subscription,
 };
@@ -372,11 +372,11 @@ fn retained_pool_cannot_reintroduce_new_explicit_domain_or_dns_nodes() {
     let keep = endpoints[3].id.clone();
     store
         .update_profile("sub", |profile| {
-            profile.pinned_policies.push(PinnedRoute {
+            profile.routing.user.push(RoutingRule::from(PinnedRoute {
                 selectors: vec!["full:fixed.test".into()],
                 endpoint_key: endpoints[1].id.clone(),
                 missing: false,
-            });
+            }));
             profile.xray_dns.outbound_key = Some(endpoints[2].id.clone());
             Ok(())
         })

@@ -8,7 +8,8 @@ use net_manager_core::{
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileRouting {
-    pub policies: Vec<DomainPolicy>,
+    pub routing: RoutingPolicy,
+    pub edit_revision: String,
     pub private_lan_direct: bool,
     pub domain_strategy: Option<XrayDomainStrategy>,
     pub domain_matcher: Option<XrayDomainMatcher>,
@@ -18,7 +19,7 @@ pub struct ProfileRouting {
 }
 #[derive(Default)]
 pub struct ProfileRoutingUpdate {
-    pub policies: Vec<DomainPolicy>,
+    pub routing: RoutingPolicy,
     pub private_lan_direct: bool,
     pub advanced: Option<AdvancedRouting>,
     pub geo_urls: Option<GeoUrls>,
@@ -39,7 +40,8 @@ pub struct GeoUrls {
 impl From<&Profile> for ProfileRouting {
     fn from(p: &Profile) -> Self {
         Self {
-            policies: p.domain_policies.clone(),
+            routing: p.routing.clone(),
+            edit_revision: String::new(),
             private_lan_direct: p.private_lan_direct,
             domain_strategy: p.xray_domain_strategy,
             domain_matcher: p.xray_domain_matcher,
@@ -51,14 +53,19 @@ impl From<&Profile> for ProfileRouting {
 }
 impl<R: BusinessRuntime> MacosServices<R> {
     pub fn profile_routing(&self, id: &str) -> Result<ProfileRouting, String> {
-        Ok(ProfileRouting::from(&self.profile(id)?))
+        let profile = self.profile(id)?;
+        let mut routing = ProfileRouting::from(&profile);
+        routing.edit_revision =
+            net_manager_core::profiles::profile_edit_revision(&profile).map_err(store_error)?;
+        Ok(routing)
     }
     pub fn set_profile_routing(
         &self,
         id: &str,
+        expected_revision: &str,
         update: ProfileRoutingUpdate,
     ) -> Result<Profile, String> {
-        xray::validate_routing_policy_selectors(&update.policies)
+        net_manager_core::routing_policy::validate(&update.routing)
             .map_err(|_| "Invalid routing rule".to_string())?;
         if let Some(advanced) = &update.advanced {
             xray::validate_dns_config(&advanced.dns)
@@ -71,10 +78,15 @@ impl<R: BusinessRuntime> MacosServices<R> {
             }
         }
         self.change_profile(id, true, move |p| {
+            if net_manager_core::profiles::profile_edit_revision(p).map_err(store_error)?
+                != expected_revision
+            {
+                return Err(net_manager_core::profiles::PROFILE_EDIT_CONFLICT.into());
+            }
             if p.backend != TunnelBackend::Xray {
                 return Err("Routing rules are available for Xray connections".into());
             }
-            p.domain_policies = update.policies;
+            p.routing = update.routing;
             p.private_lan_direct = update.private_lan_direct;
             if let Some(advanced) = update.advanced {
                 p.xray_domain_strategy = advanced.domain_strategy;
@@ -101,7 +113,11 @@ impl<R: BusinessRuntime> MacosServices<R> {
             if profile.backend != TunnelBackend::Xray {
                 return Err("Routing rules are available for Xray connections".into());
             }
-            profile.domain_policies = import.domain_policies;
+            profile.routing.base = import
+                .domain_policies
+                .into_iter()
+                .map(RoutingRule::from)
+                .collect();
             if let Some(lan) = import.private_lan_direct {
                 profile.private_lan_direct = lan;
             }
@@ -120,7 +136,7 @@ impl<R: BusinessRuntime> MacosServices<R> {
             if let Some(url) = import.geosite_url {
                 profile.xray_geosite_url = Some(url);
             }
-            xray::validate_routing_policy_selectors(&profile.domain_policies)
+            net_manager_core::routing_policy::validate(&profile.routing)
                 .map_err(|_| "Invalid routing rule".to_string())?;
             xray::validate_dns_config(&profile.xray_dns)
                 .map_err(|_| "The DNS settings are not valid".to_string())?;
@@ -132,7 +148,7 @@ impl<R: BusinessRuntime> MacosServices<R> {
         target: &str,
         routing: &ProfileRouting,
     ) -> Result<route_check::RouteCheckResult, String> {
-        xray::validate_routing_policy_selectors(&routing.policies)
+        net_manager_core::routing_policy::validate(&routing.routing)
             .map_err(|_| "Invalid routing rule".to_string())?;
         xray::validate_dns_config(&routing.dns)
             .map_err(|_| "The DNS settings are not valid".to_string())?;
@@ -152,7 +168,7 @@ impl<R: BusinessRuntime> MacosServices<R> {
             ..Default::default()
         };
         route_check::check_route(
-            &routing.policies,
+            &routing.routing,
             &options,
             target,
             &GeoDbs {

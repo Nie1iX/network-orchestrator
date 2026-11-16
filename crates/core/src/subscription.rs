@@ -154,9 +154,9 @@ fn referenced_ids(profile: &Profile) -> std::collections::HashSet<String> {
     }
     keys.extend(
         profile
-            .pinned_policies
+            .routing
             .iter()
-            .map(|pin| pin.endpoint_key.clone()),
+            .filter_map(|rule| rule.target.endpoint_key().map(str::to_owned)),
     );
     keys.extend(profile.xray_dns.outbound_key.iter().cloned());
     keys.extend(
@@ -289,9 +289,11 @@ pub fn migrate_endpoint_ids(
             reference.key = id;
         }
     }
-    for pin in &mut profile.pinned_policies {
-        if let Some(id) = resolve(&pin.endpoint_key, None) {
-            pin.endpoint_key = id;
+    for rule in profile.routing.iter_mut() {
+        if let RoutingTarget::Node { endpoint_key, .. } = &mut rule.target {
+            if let Some(id) = resolve(endpoint_key, None) {
+                *endpoint_key = id;
+            }
         }
     }
     if let Some(key) = &mut profile.xray_dns.outbound_key {
@@ -1230,9 +1232,9 @@ pub fn list_endpoints(
                 && active_key.as_deref() != Some(member.key.as_str())
                 && !backup.contains(member.key.as_str())
                 && !profile
-                    .pinned_policies
+                    .routing
                     .iter()
-                    .any(|pin| pin.endpoint_key == member.key)
+                    .any(|rule| rule.target.endpoint_key() == Some(member.key.as_str()))
                 && profile.xray_dns.outbound_key.as_deref() != Some(member.key.as_str())
                 && !named.contains(member.key.as_str())
         })
@@ -1386,7 +1388,19 @@ pub fn set_pinned_routes(
             }
         }
     }
-    profile.pinned_policies = routes;
+    let mut routes = routes.into_iter();
+    let mut user = Vec::with_capacity(profile.routing.user.len());
+    for rule in profile.routing.user.drain(..) {
+        if matches!(rule.target, RoutingTarget::Node { .. }) {
+            if let Some(route) = routes.next() {
+                user.push(RoutingRule::from(route));
+            }
+        } else {
+            user.push(rule);
+        }
+    }
+    user.extend(routes.map(RoutingRule::from));
+    profile.routing.user = user;
     sync_endpoint_refs(&mut profile, &endpoints);
     store.upsert(profile)
 }
@@ -1423,9 +1437,9 @@ pub fn failover_plan(
         .chain(subscription.pool_keys.iter().filter(|node| {
             subscription.node_pool.is_some()
                 && !profile
-                    .pinned_policies
+                    .routing
                     .iter()
-                    .any(|pin| pin.endpoint_key == node.key)
+                    .any(|rule| rule.target.endpoint_key() == Some(node.key.as_str()))
                 && profile.xray_dns.outbound_key.as_deref() != Some(node.key.as_str())
                 && !named.contains(node.key.as_str())
         }))
@@ -1439,10 +1453,18 @@ pub fn failover_plan(
             }
         }
     }
-    let mut pinned = profile.pinned_policies.clone();
-    for route in &mut pinned {
-        route.missing = key_index(&endpoints, &route.endpoint_key).is_none();
-    }
+    let pinned = profile
+        .routing
+        .iter()
+        .filter_map(|rule| match &rule.target {
+            RoutingTarget::Node { endpoint_key, .. } => Some(PinnedRoute {
+                selectors: rule.selectors.clone(),
+                endpoint_key: endpoint_key.clone(),
+                missing: key_index(&endpoints, endpoint_key).is_none(),
+            }),
+            _ => None,
+        })
+        .collect();
     Ok((nodes, pinned))
 }
 
@@ -1779,8 +1801,14 @@ fn sync_endpoint_refs(profile: &mut Profile, endpoints: &[SubscriptionEndpoint])
             }
         }
     }
-    for pinned in &mut profile.pinned_policies {
-        pinned.missing = key_index(endpoints, &pinned.endpoint_key).is_none();
+    for rule in profile.routing.iter_mut() {
+        if let RoutingTarget::Node {
+            endpoint_key,
+            missing,
+        } = &mut rule.target
+        {
+            *missing = key_index(endpoints, endpoint_key).is_none();
+        }
     }
 }
 
@@ -2252,11 +2280,11 @@ mod tests {
         let key = before[1].key.clone();
         store
             .update_profile("nodes", |profile| {
-                profile.pinned_policies.push(PinnedRoute {
+                profile.routing.user.push(RoutingRule::from(PinnedRoute {
                     selectors: vec!["domain:service.test".into()],
                     endpoint_key: key.clone(),
                     missing: false,
-                });
+                }));
                 profile.xray_dns.outbound_key = Some(key.clone());
                 profile.xray_service_checks.push(ServiceCheck {
                     id: "health".into(),
@@ -2284,8 +2312,10 @@ mod tests {
         assert!(after[1].active);
         assert!(after[0].is_backup);
         let profile = store.load().unwrap().profiles.remove(0);
-        assert_eq!(profile.pinned_policies[0].endpoint_key, key);
-        assert!(!profile.pinned_policies[0].missing);
+        assert!(profile.routing.user.iter().any(|rule| {
+            rule.target.endpoint_key() == Some(key.as_str())
+                && matches!(rule.target, RoutingTarget::Node { missing: false, .. })
+        }));
         assert_eq!(profile.xray_dns.outbound_key.as_deref(), Some(key.as_str()));
         assert_eq!(profile.xray_service_checks[0].endpoint_key, key);
         assert_eq!(profile.xray_proxy_exits[0].target.endpoint_keys(), &[key]);
@@ -2324,11 +2354,11 @@ mod tests {
                 let meta = profile.subscription.as_mut().unwrap();
                 meta.active_key = Some(old.clone());
                 meta.active_index = 1;
-                profile.pinned_policies = vec![PinnedRoute {
+                profile.routing.user = vec![RoutingRule::from(PinnedRoute {
                     selectors: vec!["domain:service.test".into()],
                     endpoint_key: old.clone(),
                     missing: false,
-                }];
+                })];
                 Ok(())
             })
             .unwrap();
@@ -2347,8 +2377,14 @@ mod tests {
             migrated.subscription.unwrap().active_key.as_deref(),
             Some(old.as_str())
         );
-        assert_eq!(migrated.pinned_policies[0].endpoint_key, old);
-        assert!(migrated.pinned_policies[0].missing);
+        assert_eq!(
+            migrated.routing.user[0].target.endpoint_key(),
+            Some(old.as_str())
+        );
+        assert!(matches!(
+            migrated.routing.user[0].target,
+            RoutingTarget::Node { missing: true, .. }
+        ));
     }
 
     #[test]
@@ -2422,11 +2458,11 @@ mod tests {
                     key: b.clone(),
                     name: "Backup".into(),
                 }];
-                profile.pinned_policies = vec![PinnedRoute {
+                profile.routing.user = vec![RoutingRule::from(PinnedRoute {
                     selectors: vec!["domain:service.test".into()],
                     endpoint_key: b.clone(),
                     missing: false,
-                }];
+                })];
                 profile.xray_dns.outbound_key = Some(b.clone());
                 profile.xray_service_checks = vec![ServiceCheck {
                     id: "health".into(),
@@ -2481,8 +2517,14 @@ mod tests {
         assert_eq!(meta.active_key.as_deref(), Some(endpoints[0].id.as_str()));
         assert_eq!(meta.backup_keys[0].key, endpoints[1].id);
         assert_eq!(meta.pool_keys[0].key, endpoints[1].id);
-        assert_eq!(profile.pinned_policies[0].endpoint_key, endpoints[1].id);
-        assert!(!profile.pinned_policies[0].missing);
+        assert_eq!(
+            profile.routing.user[0].target.endpoint_key(),
+            Some(endpoints[1].id.as_str())
+        );
+        assert!(matches!(
+            profile.routing.user[0].target,
+            RoutingTarget::Node { missing: false, .. }
+        ));
         assert_eq!(
             profile.xray_dns.outbound_key.as_deref(),
             Some(endpoints[1].id.as_str())
@@ -2570,6 +2612,20 @@ mod tests {
             }],
         )
         .unwrap();
+        store
+            .update_profile("nodes", |profile| {
+                profile.routing.user.insert(
+                    0,
+                    RoutingRule {
+                        selectors: vec!["geoip:manual".into(), "geosite:manual".into()],
+                        target: RoutingTarget::Direct,
+                        port: None,
+                        network: None,
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
         refresh_body(&vault, &store, "nodes", "vless://new@two.test:443?security=tls#Renamed\nvless://new@one.test:443?security=tls#Primary", ResponseMeta::default(), false, |_| true).unwrap();
         let profile = store.load().unwrap().profiles.remove(0);
         let meta = profile.subscription.as_ref().unwrap();
@@ -2581,8 +2637,18 @@ mod tests {
             [pinned.as_str(), backup.as_str()]
         );
         assert_eq!(meta.backup_keys[1].name, "Renamed");
-        assert_eq!(profile.pinned_policies[0].endpoint_key, pinned);
-        assert!(profile.pinned_policies[0].missing);
+        assert_eq!(
+            profile.routing.user[0].selectors,
+            ["geoip:manual", "geosite:manual"]
+        );
+        assert_eq!(
+            profile.routing.user[1].target.endpoint_key(),
+            Some(pinned.as_str())
+        );
+        assert!(matches!(
+            profile.routing.user[1].target,
+            RoutingTarget::Node { missing: true, .. }
+        ));
         let (candidates, pins) = failover_plan(&vault, &profile).unwrap();
         assert_eq!(
             candidates

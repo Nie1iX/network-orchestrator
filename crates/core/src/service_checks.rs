@@ -281,9 +281,9 @@ async fn send_head(
 
 pub fn service_check_is_bound(profile: &Profile, key: &str) -> bool {
     profile
-        .pinned_policies
+        .routing
         .iter()
-        .any(|pin| pin.endpoint_key == key && !pin.selectors.is_empty())
+        .any(|rule| rule.target.endpoint_key() == Some(key) && !rule.selectors.is_empty())
         || profile.xray_dns.outbound_key.as_deref() == Some(key)
 }
 
@@ -528,7 +528,7 @@ pub async fn check_profile_services(
 mod tests {
     use super::*;
     use crate::{
-        models::{PinnedRoute, SubscriptionMeta},
+        models::SubscriptionMeta,
         profiles::{ProfileDocument, ProfileStore, PROFILE_DOCUMENT_VERSION},
     };
 
@@ -578,10 +578,14 @@ mod tests {
     }
 
     fn pin(profile: &mut Profile, key: &str) {
-        profile.pinned_policies.push(PinnedRoute {
+        profile.routing.user.push(crate::models::RoutingRule {
             selectors: vec!["domain:service.example.test".into()],
-            endpoint_key: key.into(),
-            missing: false,
+            target: crate::models::RoutingTarget::Node {
+                endpoint_key: key.into(),
+                missing: false,
+            },
+            port: None,
+            network: None,
         });
     }
 

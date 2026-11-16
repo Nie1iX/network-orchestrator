@@ -254,9 +254,9 @@ fn explicit_keys(
     endpoints: &[SubscriptionEndpoint],
 ) -> std::collections::HashSet<String> {
     let mut explicit: std::collections::HashSet<String> = profile
-        .pinned_policies
+        .routing
         .iter()
-        .map(|route| route.endpoint_key.clone())
+        .filter_map(|rule| rule.target.endpoint_key().map(str::to_owned))
         .collect();
     explicit.extend(profile.named_exit_keys());
     if let Some(key) = &profile.xray_dns.outbound_key {
@@ -603,7 +603,7 @@ where
             || current_subscription.active_key != subscription.active_key
             || current_subscription.active_index != subscription.active_index
             || current_subscription.backup_keys != subscription.backup_keys
-            || current.pinned_policies != profile.pinned_policies
+            || current.routing != profile.routing
             || current.xray_dns.outbound_key != profile.xray_dns.outbound_key
             || current.xray_proxy_exits != profile.xray_proxy_exits
         {

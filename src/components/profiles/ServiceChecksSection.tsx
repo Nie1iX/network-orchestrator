@@ -50,7 +50,8 @@ export default function ServiceChecksSection({ profile, status, endpoints, busy,
   const generation = useRef(0);
   const blocked = busy || operation !== null;
   const boundKeys = [...new Set([
-    ...(profile.pinnedPolicies ?? []).filter((pin) => pin.selectors.length > 0).map((pin) => pin.endpointKey),
+    ...[...profile.routing.user, ...profile.routing.base].flatMap((rule) =>
+      rule.selectors.length > 0 && rule.target.kind === "node" ? [rule.target.endpointKey] : []),
     profile.xrayDns?.outboundKey,
   ].filter((key): key is string => Boolean(key)))];
   const activeTun = profile.xrayMode === "tun" && status.state === "running";
