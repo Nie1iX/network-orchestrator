@@ -28,6 +28,9 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ### Fixed
 
+- Use in-app DOM menus on Linux to avoid a Tauri native-menu resource-lock
+  deadlock when overlapping popup/create requests block the GTK event loop.
+  Keep context menus compact and inside the viewport before their first paint.
 - Keep dragged condition/output cards at their displayed size without a browser
   drag preview, and preserve invalid JSON and drafts when navigation is canceled.
 - Compute fixed-card wire geometry directly during dragging instead of measuring

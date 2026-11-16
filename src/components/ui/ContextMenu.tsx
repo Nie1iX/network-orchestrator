@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import type { OverflowMenuItem } from "./OverflowMenu";
 
 interface ContextMenuProps {
@@ -31,20 +31,18 @@ export default function ContextMenu({ x, y, items, onClose }: ContextMenuProps) 
     };
   }, [onClose]);
 
-  // Keep the menu inside the viewport.
-  const style: React.CSSProperties = { left: x, top: y };
-  if (ref.current) {
-    const rect = ref.current.getBoundingClientRect();
-    if (x + rect.width > window.innerWidth) {
-      style.left = Math.max(4, window.innerWidth - rect.width - 4);
-    }
-    if (y + rect.height > window.innerHeight) {
-      style.top = Math.max(4, window.innerHeight - rect.height - 4);
-    }
-  }
+  // Measure the untransformed size and clamp before the first paint.
+  useLayoutEffect(() => {
+    const menu = ref.current;
+    if (!menu) return;
+    const left = Math.min(x, window.innerWidth - menu.offsetWidth - 4);
+    const top = Math.min(y, window.innerHeight - menu.offsetHeight - 4);
+    menu.style.left = `${Math.max(4, left)}px`;
+    menu.style.top = `${Math.max(4, top)}px`;
+  }, [x, y, items]);
 
   return (
-    <div className="overflow-menu-dropdown ctx-menu" style={style} ref={ref}>
+    <div className="overflow-menu-dropdown ctx-menu" style={{ left: x, top: y }} ref={ref}>
       {items.map((item, i) =>
         item === "separator" ? (
           <div key={i} className="ctx-menu-separator" />

@@ -56,6 +56,20 @@ an unqualified parallel quality-gate pass. Native tunnel/proxy operations and
 macOS/Windows runtime behavior were not exercised by the browser verification.
 
 
+## Linux in-app menus
+
+Linux uses DOM menus for profile overflow and right-click actions to avoid a
+Tauri native-menu resource-lock deadlock. Windows keeps native menus.
+
+- Run `npm run test:menus` for the Linux fallback regression.
+- In `npm run dev:sandbox`, repeatedly open and dismiss both menus with Escape
+  and click-away. Edit from each menu must open the selected profile; cancel
+  without saving or changing any connection.
+- At 900×600, right-click a profile near the bottom of the list. The menu must
+  stay compact and entirely inside the viewport from its first paint.
+- Repeat menu interactions in the packaged Linux GUI with an existing connection.
+  Restart only the GUI; the daemon/runtime and running connection must remain.
+
 ## Linux CLI-first architecture acceptance
 
 ```bash

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { PlatformCapabilities } from "./types";
+import type { PlatformCapabilities } from "./types";
 
 let cached: Promise<PlatformCapabilities> | null = null;
 
