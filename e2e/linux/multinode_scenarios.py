@@ -1039,15 +1039,21 @@ def inside():
             run("ip", "route", "replace", "default", "via", "10.7.0.254", "dev", "e2e-uplink", "metric", "10")
             time.sleep(3)
             assert managed_pid() == original and persistent_request() == "primary", "DHCP renewal reset a live stream"
-            tls.close()
             print("PASS unchanged DHCP identity preserves an existing TLS connection", flush=True)
+            previous_egress = watchdog().get("lastEgressChangeUnix")
+            previous_recovery = watchdog().get("lastRecoveryUnix")
             run("ip", "link", "add", "e2e-uplink-next", "type", "dummy")
             run("ip", "address", "add", "10.9.0.1/24", "dev", "e2e-uplink-next")
             run("ip", "link", "set", "e2e-uplink-next", "up")
             run("ip", "route", "replace", "default", "via", "10.9.0.254", "dev", "e2e-uplink-next", "metric", "10")
-            until(lambda: managed_pid() != original and request("default.test") == "primary",
-                "source, gateway and interface change respawns only the owned child")
-            assert watchdog()["lastRecoveryUnix"] is not None
+            until(lambda: watchdog().get("lastEgressChangeUnix") != previous_egress
+                and watchdog().get("httpsLatencyMs") is not None,
+                "changed uplink is verified by fresh HTTPS before recovery", timeout=50)
+            assert managed_pid() == original, "healthy changed uplink restarted the owned child"
+            assert persistent_request() == "primary", "healthy uplink change reset a live TLS stream"
+            assert watchdog().get("lastRecoveryUnix") == previous_recovery
+            tls.close()
+            print("PASS healthy underlay change preserves the child and existing TLS connection", flush=True)
             bypass = json.loads(run("ip", "-json", "route", "show", "10.8.0.20/32"))
             assert len(bypass) == 1 and bypass[0]["gateway"] == "10.9.0.254" and bypass[0]["dev"] == "e2e-uplink-next"
             print("PASS existing owned endpoint bypass migrates off the old gateway and interface", flush=True)
