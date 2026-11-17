@@ -70,6 +70,21 @@ Tauri native-menu resource-lock deadlock. Windows keeps native menus.
 - Repeat menu interactions in the packaged Linux GUI with an existing connection.
   Restart only the GUI; the daemon/runtime and running connection must remain.
 
+## Linux watchdog recovery
+
+Run `python3 e2e/linux/multinode_scenarios.py` in its disposable Docker harness.
+A source/gateway/interface change with working HTTPS must retain the managed
+Xray PID and an existing TLS connection while owned bypass routes migrate.
+Offline child recovery, confirmed HTTPS stalls and owned UDP leaks must still
+recover; DNS-only failures and application connection storms must not restart Xray.
+
+`cargo test -p network-orchestrator-daemon watchdog::tests` covers settling,
+fresh healthy cancellation, skipped verification, offline guards and cooldowns.
+The failover worker regression proves that primary selection and status are
+published before a trailing probe finishes. Unknown or failed nodes never
+authorize direct fallback.
+
+
 ## Linux GeoIP with failover
 
 Run `python3 e2e/linux/multinode_scenarios.py --geoip-regression` after building

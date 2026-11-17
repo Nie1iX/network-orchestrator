@@ -35,6 +35,11 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ### Fixed
 
+- Verify changed uplinks after settling instead of restarting a working Xray
+  child. Preserve healthy TLS streams; keep bounded recovery for confirmed
+  stalls and settled rebinding when no HTTPS probe is configured.
+- Activate the first healthy failover candidate immediately, without waiting
+  for unrelated slow candidates to finish their probes.
 - Let `IPIfNonMatch` resolve names and evaluate GeoIP before default failover.
   A loopback default replaces the unconditional catch-all while preserving
   explicit domain/pin rules and the unhealthy-node blackhole.
