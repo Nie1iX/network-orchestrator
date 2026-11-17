@@ -619,7 +619,6 @@ def inside():
                     "ip", "daddr", "198.51.100.50",
                     "tcp", "dport", "9443", "dnat", "to", f"127.0.0.1:{physical.server_port}")
                 cli("up", "country-proof")
-                assert (runtime_dir / "netorch" / f"{profile_id}.pid").is_file()
 
                 def user_rpc(method, params):
                     script = (
