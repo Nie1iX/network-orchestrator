@@ -19,7 +19,8 @@ use net_manager_core::daemon_protocol::{
     OpenVpnStatusResult, RoutesApplyParams, RoutesApplyResult, WireGuardConnectParams,
     WireGuardConnectResult, WireGuardDisconnectResult, WireGuardProfileParams,
     WireGuardStatusResult, XrayConnectParams, XrayConnectResult, XrayDisconnectResult,
-    XrayProfileParams, XrayStatusResult, DEFAULT_SOCKET_PATH, SOCKET_ENV,
+    XrayProfileParams, XrayStatusResult, XrayTestRouteParams, XrayTestRouteResult,
+    DEFAULT_SOCKET_PATH, SOCKET_ENV,
 };
 use net_manager_core::helper_client::{HelperClient, HelperError};
 use net_manager_core::models::{Profile, TunnelBackend, TunnelState, TunnelStatus, XrayMode};
@@ -49,6 +50,7 @@ fn diagnostic_read_method(name: &str) -> bool {
             | method::OPENVPN_STATUS
             | method::XRAY_STATUS
             | method::XRAY_VALIDATE
+            | method::XRAY_TEST_ROUTE
             | method::MIHOMO_STATUS
             | method::MIHOMO_VALIDATE
             | method::OPENVPN_PLAN
@@ -378,6 +380,27 @@ impl LinuxEngine {
             net_manager_core::daemon_protocol::XrayServiceChecksParams {
                 profile_id: profile_id.to_owned(),
                 checks,
+            },
+        )
+    }
+
+    /// Ask the daemon-owned live Xray core to evaluate one synthetic route.
+    pub fn xray_test_route(
+        &self,
+        profile_id: &str,
+        target: &str,
+        port: u16,
+        udp: bool,
+        protocol: Option<String>,
+    ) -> Result<XrayTestRouteResult, String> {
+        self.ask(
+            method::XRAY_TEST_ROUTE,
+            XrayTestRouteParams {
+                profile_id: profile_id.to_owned(),
+                target: target.to_owned(),
+                port,
+                udp,
+                protocol,
             },
         )
     }

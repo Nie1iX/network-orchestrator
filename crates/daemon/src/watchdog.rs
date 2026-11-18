@@ -1,5 +1,5 @@
 //! Read-only per-tunnel probes; only core may act on a recovery request.
-//! True underlay changes restart the owned child, never arbitrary sockets.
+//! Verify changed underlays before bounded recovery of the owned child.
 use crate::egress::{
     bind_device, fingerprint, set_mark, EgressEvent, EgressSampler, EgressSignature, EgressTracker,
 };
@@ -65,6 +65,8 @@ struct RecoveryState {
     status: WatchdogStatus,
     probe_after: Instant,
     pending_egress: bool,
+    egress_rebind_ready: bool,
+    has_https_probe: bool,
     pending_stall: Option<RecoveryReason>,
     confirmed_stall_streak: u32,
     last_egress_attempt: Option<Instant>,
@@ -74,11 +76,13 @@ struct RecoveryState {
     resources_unavailable: bool,
 }
 impl RecoveryState {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, has_https_probe: bool) -> Self {
         Self {
             status: WatchdogStatus::default(),
             probe_after: now + SETTLE_DELAY,
             pending_egress: false,
+            egress_rebind_ready: false,
+            has_https_probe,
             pending_stall: None,
             confirmed_stall_streak: 0,
             last_egress_attempt: None,
@@ -99,6 +103,7 @@ impl RecoveryState {
         self.status.egress_signature = signature.map(fingerprint);
         if matches!(event, EgressEvent::Changed | EgressEvent::Flap) {
             self.pending_egress = true;
+            self.egress_rebind_ready = false;
             self.last_egress_change = Some(now);
             self.probe_after = now + SETTLE_DELAY;
             self.status.last_egress_change_unix = Some(unix);
@@ -136,6 +141,17 @@ impl RecoveryState {
             }
             ProbeOutcome::Skipped => {}
         }
+        if self.pending_egress && self.status.uplink == Some(true) {
+            match https {
+                ProbeOutcome::Healthy(_) => {
+                    self.pending_egress = false;
+                    self.egress_rebind_ready = false;
+                }
+                // Without an HTTPS probe, preserve a settled one-shot rebind.
+                ProbeOutcome::Skipped => self.egress_rebind_ready = !self.has_https_probe,
+                _ => self.egress_rebind_ready = false,
+            }
+        }
         match dns {
             ProbeOutcome::Healthy(_) => self.status.dns_stall_streak = 0,
             ProbeOutcome::Stalled | ProbeOutcome::ConfirmedStall => {
@@ -157,11 +173,14 @@ impl RecoveryState {
             return None;
         }
         if self.pending_egress
+            && self.egress_rebind_ready
+            && now >= self.probe_after
             && self
                 .last_egress_attempt
                 .is_none_or(|last| now.duration_since(last) >= EGRESS_COOLDOWN)
         {
             self.pending_egress = false;
+            self.egress_rebind_ready = false;
             self.last_egress_attempt = Some(now);
             return Some(RecoveryReason::Egress);
         }
@@ -183,9 +202,10 @@ impl RecoveryState {
             self.pending_egress = false;
         }
         self.pending_stall = None;
+        self.egress_rebind_ready = false;
         self.last_egress_attempt = Some(when);
         self.stall_before_request = None;
-        self.probe_after = when + SETTLE_DELAY;
+        self.probe_after = self.probe_after.max(when + SETTLE_DELAY);
         self.status.https_stall_streak = 0;
         self.confirmed_stall_streak = 0;
         self.status.dns_stall_streak = 0;
@@ -202,10 +222,15 @@ impl RecoveryState {
                 matches!(https, ProbeOutcome::Healthy(_) | ProbeOutcome::Stalled)
             }
             RecoveryReason::UdpLeak => udp_sockets.is_some_and(|count| count <= UDP_LIMIT),
-            RecoveryReason::Egress => false,
+            RecoveryReason::Egress => matches!(https, ProbeOutcome::Healthy(_)),
         };
         if cleared {
-            self.last_stall_attempt = self.stall_before_request.take();
+            if *reason == RecoveryReason::Egress {
+                self.pending_egress = false;
+                self.egress_rebind_ready = false;
+            } else {
+                self.last_stall_attempt = self.stall_before_request.take();
+            }
         }
         cleared
     }
@@ -626,7 +651,7 @@ fn run(
         .transpose()?;
     let hostname = spec.probe_url.as_deref().and_then(probe_host);
     let mut tracker = EgressTracker::new();
-    let mut state = RecoveryState::new(Instant::now());
+    let mut state = RecoveryState::new(Instant::now(), probe.is_some());
     let mut next_egress = Instant::now();
     let mut next_probe = Instant::now();
     let mut rotation = 0usize;
@@ -638,7 +663,16 @@ fn run(
             match sampler.sample() {
                 Ok(sample) => {
                     let event = tracker.observe(&sample);
+                    let previous = state.status.egress_signature.take();
                     state.egress(event, sample.signature.as_ref(), Instant::now(), unix_now());
+                    if matches!(event, EgressEvent::Changed | EgressEvent::Flap) {
+                        eprintln!(
+                            "network-orchestrator-daemon: watchdog egress uid={} event={event:?} previous={} current={} action=verify_after_settle",
+                            spec.uid,
+                            previous.as_deref().unwrap_or("none"),
+                            state.status.egress_signature.as_deref().unwrap_or("none"),
+                        );
+                    }
                     authorized.store(sample.signature.is_some(), Ordering::Relaxed);
                     if let Ok(mut shared) = shared.lock() {
                         shared.observed_at = Some(Instant::now());
@@ -704,7 +738,14 @@ fn run(
             }
             let udp_sockets = resources.as_ref().map(|report| report.udp_sockets);
             crate::diagnostic_logging::trace(format_args!("watchdog observation online={online} https={https_result:?} dns={dns_result:?} node_reachable={node_reachable} udp_sockets={udp_sockets:?}"));
+            let verifying_egress = state.pending_egress;
             state.observe(https_result, dns_result, node_reachable, resources);
+            if verifying_egress && !state.pending_egress {
+                eprintln!(
+                    "network-orchestrator-daemon: watchdog egress verified uid={} action=keep_running",
+                    spec.uid,
+                );
+            }
             if let Ok(mut published) = shared.lock() {
                 if let Some(reason) = published.request.as_ref() {
                     if state.cancel_cleared_request(reason, https_result, udp_sockets) {
@@ -1019,7 +1060,7 @@ mod tests {
     #[test]
     fn node_outage_does_not_restart_xray_but_stalled_process_does_with_cooldown() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now);
+        let mut state = RecoveryState::new(now, true);
         online(&mut state, now);
         for _ in 0..3 {
             state.observe(
@@ -1052,7 +1093,7 @@ mod tests {
     #[test]
     fn dns_outage_does_not_turn_unconfirmed_https_failures_into_restarts() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now);
+        let mut state = RecoveryState::new(now, true);
         online(&mut state, now);
         for dns in [ProbeOutcome::Stalled, ProbeOutcome::Healthy(1)] {
             for _ in 0..STALL_LIMIT {
@@ -1092,25 +1133,49 @@ mod tests {
     #[test]
     fn offline_guard_defers_egress_recovery_and_churn_is_rate_limited() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now);
+        let mut state = RecoveryState::new(now, false);
         let signature = EgressSignature { paths: Vec::new() };
         state.egress(EgressEvent::Changed, Some(&signature), now, 1000);
         state.egress(EgressEvent::Lost, None, now, 1001);
         assert_eq!(state.recovery(now), None);
         state.egress(EgressEvent::Flap, Some(&signature), now, 1002);
-        assert_eq!(state.recovery(now), Some(RecoveryReason::Egress));
-        assert_eq!(state.probe_after, now + SETTLE_DELAY);
-        state.egress(EgressEvent::Changed, Some(&signature), now, 1003);
-        assert_eq!(state.recovery(now + Duration::from_secs(59)), None);
+        assert_eq!(state.recovery(now), None);
+        state.observe(
+            ProbeOutcome::Skipped,
+            ProbeOutcome::Skipped,
+            false,
+            Some(SocketReport::default()),
+        );
         assert_eq!(
-            state.recovery(now + EGRESS_COOLDOWN),
+            state.recovery(now + SETTLE_DELAY),
+            Some(RecoveryReason::Egress)
+        );
+        assert_eq!(state.probe_after, now + SETTLE_DELAY);
+        state.egress(
+            EgressEvent::Changed,
+            Some(&signature),
+            now + SETTLE_DELAY + Duration::from_secs(1),
+            1003,
+        );
+        state.observe(
+            ProbeOutcome::Skipped,
+            ProbeOutcome::Skipped,
+            false,
+            Some(SocketReport::default()),
+        );
+        assert_eq!(
+            state.recovery(now + SETTLE_DELAY + EGRESS_COOLDOWN - Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            state.recovery(now + SETTLE_DELAY + EGRESS_COOLDOWN),
             Some(RecoveryReason::Egress)
         );
     }
     #[test]
     fn crash_acknowledgment_does_not_spend_the_stall_recovery_budget() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now);
+        let mut state = RecoveryState::new(now, true);
         online(&mut state, now);
         state.acknowledge(now);
         for _ in 0..STALL_LIMIT {
@@ -1129,7 +1194,7 @@ mod tests {
     #[test]
     fn fresh_positive_proof_cancels_only_its_own_stall_without_spending_cooldown() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now);
+        let mut state = RecoveryState::new(now, true);
         online(&mut state, now);
         for _ in 0..STALL_LIMIT {
             state.observe(
@@ -1154,19 +1219,132 @@ mod tests {
             state.recovery(now + Duration::from_secs(5)),
             Some(RecoveryReason::HttpsStall)
         );
-        assert!(!state.cancel_cleared_request(
+        assert!(state.cancel_cleared_request(
             &RecoveryReason::Egress,
             ProbeOutcome::Healthy(1),
             Some(0)
         ));
+        assert_eq!(state.last_stall_attempt, Some(now + Duration::from_secs(5)));
+    }
+    #[test]
+    fn healthy_post_settle_probe_suppresses_egress_recovery() {
+        let now = Instant::now();
+        let mut state = RecoveryState::new(now, true);
+        let signature = EgressSignature { paths: Vec::new() };
+        state.egress(EgressEvent::Changed, Some(&signature), now, 1000);
+
+        assert_eq!(state.recovery(now), None);
+        let settled = now + SETTLE_DELAY;
+        assert_eq!(state.recovery(settled), None);
+
+        state.observe(
+            ProbeOutcome::Healthy(4),
+            ProbeOutcome::Skipped,
+            false,
+            Some(SocketReport::default()),
+        );
+        assert_eq!(state.recovery(settled), None);
+    }
+
+    #[test]
+    fn fresh_healthy_probe_clears_queued_egress_recovery() {
+        let now = Instant::now();
+        let mut state = RecoveryState::new(now, true);
+        let signature = EgressSignature { paths: Vec::new() };
+        state.egress(EgressEvent::Changed, Some(&signature), now, 1000);
+
+        assert!(state.cancel_cleared_request(
+            &RecoveryReason::Egress,
+            ProbeOutcome::Healthy(4),
+            Some(0),
+        ));
+        assert_eq!(state.recovery(now + SETTLE_DELAY), None);
+    }
+
+    #[test]
+    fn skipped_verification_does_not_authorize_a_configured_probe_restart() {
+        let now = Instant::now();
+        let mut state = RecoveryState::new(now, true);
+        let signature = EgressSignature { paths: Vec::new() };
+        state.egress(EgressEvent::Changed, Some(&signature), now, 1000);
+        state.observe(
+            ProbeOutcome::Skipped,
+            ProbeOutcome::Skipped,
+            false,
+            Some(SocketReport::default()),
+        );
+        assert_eq!(state.recovery(now + SETTLE_DELAY), None);
+    }
+
+    #[test]
+    fn changed_egress_uses_confirmed_stall_recovery_not_an_unreachable_server() {
+        let now = Instant::now();
+        let mut state = RecoveryState::new(now, true);
+        let signature = EgressSignature { paths: Vec::new() };
+        state.egress(EgressEvent::Changed, Some(&signature), now, 1000);
+        let settled = now + SETTLE_DELAY;
+        assert_eq!(state.recovery(settled), None);
+        for _ in 0..STALL_LIMIT {
+            state.observe(
+                ProbeOutcome::ConfirmedStall,
+                ProbeOutcome::Healthy(1),
+                false,
+                Some(SocketReport::default()),
+            );
+            assert_eq!(state.recovery(settled), None);
+        }
+        state.observe(
+            ProbeOutcome::ConfirmedStall,
+            ProbeOutcome::Healthy(1),
+            true,
+            Some(SocketReport::default()),
+        );
+        assert_eq!(state.recovery(settled), Some(RecoveryReason::HttpsStall));
+    }
+
+    #[test]
+    fn another_egress_change_requires_a_new_settle_window() {
+        let now = Instant::now();
+        let mut state = RecoveryState::new(now, false);
+        let signature = EgressSignature { paths: Vec::new() };
+        state.egress(EgressEvent::Changed, Some(&signature), now, 1000);
+        state.observe(
+            ProbeOutcome::Skipped,
+            ProbeOutcome::Skipped,
+            false,
+            Some(SocketReport::default()),
+        );
+        let changed = now + SETTLE_DELAY - Duration::from_secs(1);
+        state.egress(EgressEvent::Flap, Some(&signature), changed, 1001);
+        assert_eq!(state.recovery(now + SETTLE_DELAY), None);
+        state.observe(
+            ProbeOutcome::Skipped,
+            ProbeOutcome::Skipped,
+            false,
+            Some(SocketReport::default()),
+        );
+        assert_eq!(
+            state.recovery(changed + SETTLE_DELAY),
+            Some(RecoveryReason::Egress)
+        );
     }
     #[test]
     fn crash_respawn_satisfies_deferred_egress_but_not_a_newer_change() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now);
+        let mut state = RecoveryState::new(now, false);
         let signature = EgressSignature { paths: Vec::new() };
         state.egress(EgressEvent::Changed, Some(&signature), now, 1000);
-        assert_eq!(state.recovery(now), Some(RecoveryReason::Egress));
+        assert_eq!(state.recovery(now), None);
+        state.observe(
+            ProbeOutcome::Skipped,
+            ProbeOutcome::Skipped,
+            false,
+            Some(SocketReport::default()),
+        );
+        assert_eq!(
+            state.recovery(now + SETTLE_DELAY),
+            Some(RecoveryReason::Egress)
+        );
         state.egress(
             EgressEvent::Flap,
             Some(&signature),
@@ -1183,6 +1361,16 @@ mod tests {
         );
         state.acknowledge(now + Duration::from_secs(125));
         assert_eq!(
+            state.probe_after,
+            now + Duration::from_secs(130) + SETTLE_DELAY
+        );
+        state.observe(
+            ProbeOutcome::Skipped,
+            ProbeOutcome::Skipped,
+            false,
+            Some(SocketReport::default()),
+        );
+        assert_eq!(
             state.recovery(now + Duration::from_secs(185)),
             Some(RecoveryReason::Egress)
         );
@@ -1190,7 +1378,7 @@ mod tests {
     #[test]
     fn resource_thresholds_and_anomalies_clear_after_recovery() {
         let now = Instant::now();
-        let mut state = RecoveryState::new(now);
+        let mut state = RecoveryState::new(now, true);
         online(&mut state, now);
         state.observe(
             ProbeOutcome::Skipped,

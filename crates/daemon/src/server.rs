@@ -12,6 +12,8 @@ use crate::openvpn::{prepare_openvpn, OpenVpnPlan};
 use crate::settings::{DaemonSettings, SettingsStore};
 use crate::validate::{validate_apply, validate_attach, validate_iface_name, validate_owner};
 use crate::xray::prepare_xray;
+#[cfg(target_os = "linux")]
+use net_manager_core::daemon_protocol::XrayTestRouteParams;
 use net_manager_core::daemon_protocol::{
     encode_line, event, feature, from_value, method, read_frame, AlwaysOnKind, AlwaysOnListResult,
     AlwaysOnProfileInfo, AlwaysOnRemoveParams, AlwaysOnRemoveResult, AlwaysOnResumeResult,
@@ -378,7 +380,7 @@ async fn dispatch<A: Authorizer>(
             | method::XRAY_STATUS
             | method::MIHOMO_STATUS
             | method::MIHOMO_VALIDATE
-            | method::XRAY_PROXY_EXITS
+            | method::XRAY_TEST_ROUTE
             | method::TAILSCALE_STATUS
             | method::NM_LIST
             | method::NET_TABLES
@@ -914,6 +916,35 @@ async fn handle<A: Authorizer>(
                 core.set_xray_service_checks(uid, &params.profile_id, params.checks)
             })
             .await?;
+            to_value(&result)
+        }
+        #[cfg(target_os = "linux")]
+        method::XRAY_TEST_ROUTE => {
+            let params: XrayTestRouteParams = from_value(request.params)
+                .map_err(|_| invalid("invalid Xray route test parameters".into()))?;
+            validate_owner(&format!("xray:{}", params.profile_id)).map_err(invalid)?;
+            let profile_id = params.profile_id.clone();
+            let name = with_core(ctx, move |core| {
+                core.applied_xray_process(uid, &profile_id)
+                    .map(|process| process.name.clone())
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "Xray TUN profile is not running")
+                    })
+            })
+            .await?;
+            let result = crate::xray_route_test::test_route(uid, &name, params)
+                .await
+                .map_err(|status| {
+                    let code = match status.code() {
+                        tonic::Code::InvalidArgument => ErrorCode::InvalidParams,
+                        tonic::Code::FailedPrecondition => ErrorCode::Conflict,
+                        tonic::Code::DeadlineExceeded | tonic::Code::Unavailable => {
+                            ErrorCode::Unavailable
+                        }
+                        _ => ErrorCode::Internal,
+                    };
+                    (code, status.message().to_owned())
+                })?;
             to_value(&result)
         }
         method::XRAY_RELOAD => {

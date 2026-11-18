@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-18
+
+Core 0.20.0.
+
 ### Added
 
 - Replace Traffic flow and the JSON-shaped node view with one network scheme:
@@ -20,6 +24,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   probe the current DNS/kernel/HTTPS path only on an explicit user action.
 - Store routing as ordered User/Base layers, with explicit row ordering and layer
   transfer in the GUI/CLI. Manual GeoIP/GeoSite rules remain User on refresh.
+- Query the running Xray TUN router with `netorch route check --live`. The
+  saved-rule explanation remains available separately.
 
 ### Changed
 
@@ -32,9 +38,19 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 - Derive IPOnDemand for IP selectors and block indeterminate higher-priority User
   IP decisions instead of falling through to direct. Protect controlled DNS
   forwarding through the configured proxy/node, including legacy rewrite rules.
+- Apply compatible rules-only Xray reloads over a private Unix socket,
+  preserving established connections and the TUN. Keep explicit restarts for
+  changes the core cannot apply in place.
 
 ### Fixed
 
+- Verify changed uplinks after settling instead of restarting a working Xray
+  child. Preserve healthy TLS streams; keep bounded recovery for confirmed
+  stalls and settled rebinding when no HTTPS probe is configured.
+- Activate the first healthy failover candidate immediately, without waiting
+  for unrelated slow candidates to finish their probes.
+- Keep the primary outbound independent of fixed route or DNS pins when
+  there is no eligible backup; do not create a one-node failover pool.
 - Let `IPIfNonMatch` resolve names and evaluate GeoIP before default failover.
   A loopback default replaces the unconditional catch-all while preserving
   explicit domain/pin rules and the unhealthy-node blackhole.

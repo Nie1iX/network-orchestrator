@@ -10,7 +10,7 @@ use std::net::IpAddr;
 mod provider_graph;
 
 pub const MAX_XRAY_CONFIG_BYTES: usize = 512 * 1024;
-const FAILOVER_DEFAULT_OUTBOUND: &str = "failover-default";
+pub(crate) const FAILOVER_DEFAULT_OUTBOUND: &str = "failover-default";
 pub(crate) const FAILOVER_DEFAULT_INBOUND: &str = "failover-default-in";
 
 pub struct XrayPlan {
@@ -29,8 +29,6 @@ pub struct XrayPlan {
     pub full_ipv4: bool,
     pub full_ipv6: bool,
     pub mark: u32,
-    /// Loopback port of the injected `api-in` StatsService listener.
-    pub api_port: u16,
     /// Upstream host of every proxy outbound (`node-`/`pin-` and the
     /// primary): literal IPs or hostnames. The kernel keeps a direct route
     /// to each outside the tunnel — any node must be reachable while the
@@ -224,7 +222,7 @@ fn validate_generated(config: &Value) -> io::Result<()> {
         port(&inbound["port"])?;
         if matches!(
             string(&inbound["tag"])?,
-            FAILOVER_DEFAULT_INBOUND | POLICY_DNS_TAG | POLICY_DNS_RELAY_TAG
+            "api-in" | FAILOVER_DEFAULT_INBOUND | POLICY_DNS_TAG | POLICY_DNS_RELAY_TAG
         ) {
             return Err(rejected());
         }
@@ -1284,28 +1282,18 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         dest_override.push("fakedns");
     }
     // Caller inbounds are loopback socks/http listeners that a TUN tunnel
-    // replaces wholesale. The extra `api-in` dokodemo door feeds the local
-    // StatsService/RoutingService; it never leaves loopback. Each failover
-    // node gets its own loopback SOCKS inbound so a probe's health path
-    // really traverses that node.
-    let api_port = xray_api_port(mark);
-    let mut inbounds = vec![
-        json!({
-            "tag": "tun-in",
-            "protocol": "tun",
-            "settings": { "name": name, "mtu": mtu },
-            // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
-            // SNI / HTTP Host so domain and geosite routing rules can match.
-            "sniffing": { "enabled": true, "destOverride": dest_override },
-        }),
-        json!({
-            "tag": "api-in",
-            "protocol": "dokodemo-door",
-            "listen": "127.0.0.1",
-            "port": api_port,
-            "settings": { "address": "127.0.0.1" },
-        }),
-    ];
+    // replaces wholesale. The control API uses a private Unix socket in the
+    // root-owned staging directory; failover probes remain loopback SOCKS.
+    let api_listen = crate::xray_process::api_socket_path(uid, &name)?;
+    let api_listen = api_listen.to_string_lossy().into_owned();
+    let mut inbounds = vec![json!({
+        "tag": "tun-in",
+        "protocol": "tun",
+        "settings": { "name": name, "mtu": mtu },
+        // TUN traffic arrives as bare IP packets; sniffing recovers the TLS
+        // SNI / HTTP Host so domain and geosite routing rules can match.
+        "sniffing": { "enabled": true, "destOverride": dest_override },
+    })];
     if let Some(failover) = &failover {
         for (index, node) in failover.nodes.iter().enumerate() {
             inbounds.push(json!({
@@ -1335,25 +1323,15 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         "statsOutboundUplink": true,
         "statsOutboundDownlink": true,
     });
-    let services = if failover.is_some()
-        || proxy_exits.iter().any(|exit| {
-            matches!(
-                exit.target,
-                net_manager_core::models::ProxyTarget::Pool { .. }
-            )
-        }) {
-        vec!["StatsService", "RoutingService"]
-    } else {
-        vec!["StatsService"]
-    };
-    config["api"] = json!({"tag": "api", "services": services});
+    config["api"] = json!({
+        "tag": "api",
+        "listen": api_listen,
+        "services": ["StatsService", "RoutingService"],
+    });
     {
         let rules = config["routing"]["rules"]
             .as_array_mut()
             .ok_or_else(rejected)?;
-        // Control, probes and internal default dispatch must win over user
-        // rules so a fresh tunnel can probe and install its first override.
-        let api_rule = json!({"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"});
         let default_rule = failover.as_ref().map(|_| {
             json!({
                 "type": "field",
@@ -1377,13 +1355,7 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
                 "outboundTag":net_manager_core::xray::pin_tag(key),
             })
         });
-        rules.splice(
-            0..0,
-            std::iter::once(api_rule)
-                .chain(probe_rules)
-                .chain(pin_rules)
-                .chain(default_rule),
-        );
+        rules.splice(0..0, probe_rules.chain(pin_rules).chain(default_rule));
     }
     if failover.is_some() {
         // Xray selects its first outbound only after IPIfNonMatch's DNS pass.
@@ -1436,7 +1408,6 @@ pub fn prepare_xray(uid: u32, params: XrayConnectParams, mark: u32) -> io::Resul
         full_ipv4,
         full_ipv6,
         mark,
-        api_port,
         server_hosts,
         unpinned_hosts: Vec::new(),
         server_pinned: false,
@@ -1604,9 +1575,8 @@ pub fn pin_server_addresses(plan: &mut XrayPlan, resolve: impl Fn(&str) -> Vec<I
 }
 
 /// Loopback port of the `probe-<key>` SOCKS inbound for failover node
-/// `index` (0-based, same order as `failover.nodes`). The range sits one
-/// hundred ports above the per-slot `api-in` listener so tunnels never
-/// collide; `MAX_FAILOVER_NODES` keeps it inside the slot stride.
+/// `index` (0-based, same order as `failover.nodes`). The disjoint range and
+/// per-slot stride keep concurrent tunnels from colliding.
 pub fn xray_probe_port(mark: u32, index: usize) -> u16 {
     u16::try_from(
         PROBE_PORT_BASE + mark.saturating_sub(POLICY_MARK_BASE).min(127) * 8 + index.min(7) as u32,
@@ -1614,27 +1584,15 @@ pub fn xray_probe_port(mark: u32, index: usize) -> u16 {
     .unwrap_or(PROBE_PORT_BASE as u16)
 }
 
-/// Per-tunnel probe listeners take an 8-port stride per policy slot, in a
-/// range disjoint from `API_PORT_BASE` (api port + slot is shared across
-/// tunnels by design? no — one slot per tunnel; stride keeps indexes apart).
+/// Per-tunnel probe listeners take an 8-port stride per policy slot.
 const PROBE_PORT_BASE: u32 = 11185;
-
-/// Loopback port of the per-tunnel `api-in` listener, derived from the
-/// policy-routing slot so concurrently running tunnels never collide and a
-/// reload keeps the same endpoint.
-pub fn xray_api_port(mark: u32) -> u16 {
-    u16::try_from(API_PORT_BASE + mark.saturating_sub(POLICY_MARK_BASE).min(127))
-        .unwrap_or(API_PORT_BASE as u16)
-}
 
 pub fn xray_pin_probe_port(mark: u32, index: usize) -> u16 {
     (13_000 + mark.saturating_sub(POLICY_MARK_BASE).min(127) * 40 + index.min(32) as u32) as u16
 }
 
-/// Policy marks are allocated as `POLICY_MARK_BASE + slot` (0..128 slots); the
-/// API listeners take the same slot numbering on loopback.
+/// Policy marks are allocated as `POLICY_MARK_BASE + slot` (0..128 slots).
 pub const POLICY_MARK_BASE: u32 = 51820;
-const API_PORT_BASE: u32 = 10185;
 
 /// DNS resolvers whose family is fully captured by the tunnel need a direct
 /// host route through the physical gateway: without it, resolver queries
@@ -1844,10 +1802,13 @@ mod tests {
         assert!(plan.server_hosts.contains(&"example.test".to_owned()));
         assert!(plan.server_hosts.contains(&"second.example".to_owned()));
         let running: Value = serde_json::from_str(&plan.config).unwrap();
-        assert_eq!(running["routing"]["rules"][0]["outboundTag"], "api");
         assert_eq!(
-            running["routing"]["rules"][1]["inboundTag"][0],
+            running["routing"]["rules"][0]["inboundTag"][0],
             "src-proxy-in"
+        );
+        assert_eq!(
+            running["routing"]["rules"][0]["balancerTag"],
+            "src-proxy-b-0000"
         );
         assert!(running["outbounds"][0].get("streamSettings").is_none());
     }
@@ -2029,13 +1990,11 @@ mod tests {
         assert_eq!(plan.name, prepare_xray(1000, params(), 51820).unwrap().name);
         let config: Value = serde_json::from_str(&plan.config).unwrap();
         let inbounds = config["inbounds"].as_array().unwrap();
-        assert_eq!(inbounds.len(), 2);
+        assert_eq!(inbounds.len(), 1);
         assert_eq!(inbounds[0]["protocol"], "tun");
         assert_eq!(inbounds[0]["settings"]["name"], plan.name);
         assert_eq!(inbounds[0]["settings"]["mtu"], 1500);
-        assert_eq!(inbounds[1]["protocol"], "dokodemo-door");
-        assert_eq!(inbounds[1]["listen"], "127.0.0.1");
-        assert_eq!(inbounds[1]["port"], plan.api_port);
+        assert!(!plan.config.contains("api-in"));
         for index in [0, 1] {
             assert_eq!(
                 config["outbounds"][index]["streamSettings"]["sockopt"]["mark"],
@@ -2345,30 +2304,26 @@ mod tests {
     }
 
     #[test]
-    fn plan_injects_a_loopback_stats_listener_and_api_route() {
+    fn plan_injects_private_unix_api_without_control_inbound() {
         let plan = prepare_xray(1000, params(), 51820).unwrap();
         let config: Value = serde_json::from_str(&plan.config).unwrap();
-        assert_eq!(plan.api_port, xray_api_port(51820));
-        assert_eq!(xray_api_port(51821), plan.api_port + 1);
+        assert_eq!(config["api"]["tag"], "api");
         assert_eq!(
-            config["api"],
-            json!({"tag": "api", "services": ["StatsService"]})
+            config["api"]["services"],
+            json!(["StatsService", "RoutingService"])
         );
+        assert!(config["api"]["listen"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("{}/api.sock", plan.name)));
         assert!(config["stats"].is_object());
-        assert_eq!(
-            config["policy"]["system"]["statsInboundUplink"],
-            json!(true)
-        );
-        let api_in = &config["inbounds"][1];
-        assert_eq!(api_in["tag"], "api-in");
-        assert_eq!(api_in["listen"], "127.0.0.1");
-        assert_eq!(api_in["port"], json!(xray_api_port(51820)));
-        let rules = config["routing"]["rules"].as_array().unwrap();
-        let rule = rules
+        assert_eq!(config["policy"]["system"]["statsInboundUplink"], true);
+        assert_eq!(config["inbounds"].as_array().unwrap().len(), 1);
+        assert!(config["routing"]["rules"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|rule| rule["outboundTag"] == "api")
-            .expect("api route");
-        assert_eq!(rule["inboundTag"], json!(["api-in"]));
+            .all(|rule| rule["inboundTag"] != json!(["api-in"])));
     }
 
     #[test]

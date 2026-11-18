@@ -258,12 +258,24 @@ pub enum RouteCommand {
         #[command(flatten)]
         rules: RuleArgs,
     },
-    /// Which rule of a profile decides a host or address
+    /// Which rule decides a host or address; use --live to query the running Xray core
     Check {
         target: String,
-        /// Profile whose rules are replayed
+        /// Profile whose rules are checked
         #[arg(long)]
         profile: String,
+        /// Ask the running Xray core instead of replaying saved rules
+        #[arg(long)]
+        live: bool,
+        /// Destination port (default: 443)
+        #[arg(long, requires = "live")]
+        port: Option<u16>,
+        /// Model UDP traffic instead of TCP (default: TCP)
+        #[arg(long, requires = "live")]
+        udp: bool,
+        /// Sniffed protocol (http, tls, quic, or bittorrent; default: none)
+        #[arg(long, requires = "live")]
+        protocol: Option<String>,
     },
     /// Pin domains to one server (fail-closed unless an explicit domain/full policy overrides)
     Pin {

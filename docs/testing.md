@@ -70,6 +70,21 @@ Tauri native-menu resource-lock deadlock. Windows keeps native menus.
 - Repeat menu interactions in the packaged Linux GUI with an existing connection.
   Restart only the GUI; the daemon/runtime and running connection must remain.
 
+## Linux watchdog recovery
+
+Run `python3 e2e/linux/multinode_scenarios.py` in its disposable Docker harness.
+A source/gateway/interface change with working HTTPS must retain the managed
+Xray PID and an existing TLS connection while owned bypass routes migrate.
+Offline child recovery, confirmed HTTPS stalls and owned UDP leaks must still
+recover; DNS-only failures and application connection storms must not restart Xray.
+
+`cargo test -p network-orchestrator-daemon watchdog::tests` covers settling,
+fresh healthy cancellation, skipped verification, offline guards and cooldowns.
+The failover worker regression proves that primary selection and status are
+published before a trailing probe finishes. Unknown or failed nodes never
+authorize direct fallback.
+
+
 ## Linux GeoIP with failover
 
 Run `python3 e2e/linux/multinode_scenarios.py --geoip-regression` after building
@@ -88,6 +103,13 @@ The daemon's first outbound recirculates unmatched traffic through an internal,
 reserved marker to the health-controlled failover balancer. Unlike an
 unconditional routing catch-all, this runs after Xray's DNS/IP second pass and
 does not change the profile's selected domain strategy.
+
+The same fixture checks `xray.testRoute` against live GeoIP data and the
+current default failover decision, including `unavailable`. The Xray control
+socket must not be accessible to an unrelated local UID. A single-node reload
+with unchanged custom GeoIP must retain the PID and established TLS stream,
+change the route for new connections, and retain the new rules after the
+managed child is respawned.
 
 ## Ordered Xray layers
 

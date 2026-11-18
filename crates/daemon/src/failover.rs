@@ -109,23 +109,19 @@ pub struct BalancerTarget {
 /// `auto_return = false` can keep a healthy backup instead of snapping
 /// back to the primary. Returns a `node-<key>` tag or `unavailable`; the
 /// balancer can never point anywhere else.
-fn select_tag(
-    candidates: &[String],
+fn select_tag<'a>(
+    candidates: &'a [String],
     healthy: &[Option<bool>],
     current: Option<&str>,
     auto_return: bool,
-    kind: OutboundKind,
-) -> String {
+) -> &'a str {
     // Without auto-return a running backup stays selected while healthy —
     // but never beyond its own failure (primary then wins back).
     if !auto_return {
         if let Some(current) = current {
-            if let Some(index) = candidates
-                .iter()
-                .position(|key| current.strip_prefix(kind.prefix()) == Some(key.as_str()))
-            {
+            if let Some(index) = candidates.iter().position(|tag| current == tag) {
                 if healthy.get(index) == Some(&Some(true)) && index > 0 {
-                    return current.to_string();
+                    return candidates[index].as_str();
                 }
             }
         }
@@ -134,8 +130,8 @@ fn select_tag(
         .iter()
         .zip(healthy)
         .find(|(_, health)| **health == Some(true))
-        .map(|(key, _)| kind.tag(key))
-        .unwrap_or_else(|| net_manager_core::xray::UNAVAILABLE_TAG.to_string())
+        .map(|(tag, _)| tag.as_str())
+        .unwrap_or(net_manager_core::xray::UNAVAILABLE_TAG)
 }
 
 /// Status snapshot the daemon exposes over `xray.status`.
@@ -161,14 +157,18 @@ impl FailoverSupervisors {
         exits: &[net_manager_core::daemon_protocol::ProxyExitBinding],
         probe_url: Option<&str>,
         pinned_keys: &[String],
+        uid: u32,
+        name: &str,
         mark: u32,
     ) -> Self {
         let mut supervisors = Self::default();
-        let api_port = crate::xray::xray_api_port(mark);
+        let Ok(api_socket) = crate::xray_process::checked_api_socket_path(uid, name) else {
+            return supervisors;
+        };
         if let Some(params) = failover {
             supervisors.main = FailoverSupervisor::spawn(
                 params.clone(),
-                api_port,
+                api_socket.clone(),
                 BalancerTarget {
                     tag: net_manager_core::xray::FAILOVER_BALANCER.into(),
                     kind: OutboundKind::Node,
@@ -203,7 +203,7 @@ impl FailoverSupervisors {
                 .collect();
             match FailoverSupervisor::spawn(
                 params,
-                api_port,
+                api_socket.clone(),
                 BalancerTarget {
                     tag: crate::proxy_exits::balancer_tag(&exit.name),
                     kind: OutboundKind::Pin,
@@ -253,7 +253,7 @@ impl FailoverSupervisor {
     /// treats it as degraded (the balancer still holds its safe default).
     pub fn spawn(
         params: XrayFailoverParams,
-        api_port: u16,
+        api_socket: std::path::PathBuf,
         balancer: BalancerTarget,
         probe_port_of: impl Fn(usize) -> u16,
     ) -> std::io::Result<Self> {
@@ -285,7 +285,7 @@ impl FailoverSupervisor {
             let api_child = Arc::clone(&api_child);
             thread::Builder::new()
                 .name("xray-failover".into())
-                .spawn(move || run(params, api_port, balancer, nodes, stop, status, api_child))?
+                .spawn(move || run(params, api_socket, balancer, nodes, stop, status, api_child))?
         };
         Ok(Self {
             stop,
@@ -324,66 +324,77 @@ impl Drop for FailoverSupervisor {
 
 fn run(
     params: XrayFailoverParams,
-    api_port: u16,
+    api_socket: std::path::PathBuf,
     balancer: BalancerTarget,
-    mut nodes: Vec<TrackedNode>,
+    nodes: Vec<TrackedNode>,
     stop: Arc<AtomicBool>,
     status: SharedStatus,
     api_child: Arc<Mutex<Option<Child>>>,
 ) {
+    run_with(
+        params,
+        balancer.kind,
+        nodes,
+        stop,
+        status,
+        probe,
+        |tag, stop| api_override(&api_socket, &balancer.tag, tag, stop, &api_child),
+    )
+}
+
+fn run_with(
+    params: XrayFailoverParams,
+    kind: OutboundKind,
+    mut nodes: Vec<TrackedNode>,
+    stop: Arc<AtomicBool>,
+    status: SharedStatus,
+    mut probe_node: impl FnMut(u16, &str) -> ProbeSample,
+    mut apply: impl FnMut(&str, &AtomicBool) -> std::io::Result<()>,
+) {
     let interval = Duration::from_secs(u64::from(params.interval_secs.max(1)));
-    let mut applied: Option<String> = None;
+    let mut applied: Option<&str> = None;
     let mut next_round = Instant::now();
-    let keys: Vec<String> = nodes.iter().map(|node| node.key.clone()).collect();
-    let mut healthy = Vec::with_capacity(nodes.len());
-    let primary_tag = balancer.kind.tag(&params.primary_key);
+    let tags: Vec<String> = nodes.iter().map(|node| kind.tag(&node.key)).collect();
+    let mut healthy: Vec<_> = nodes.iter().map(|node| node.committed).collect();
     while !stop.load(Ordering::Relaxed) {
         if Instant::now() >= next_round {
-            for node in &mut nodes {
+            let mut attempted = None;
+            for index in 0..nodes.len() {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                node.observe(probe(node.probe_port, &params.probe_url));
-            }
-            healthy.clear();
-            healthy.extend(nodes.iter().map(|node| node.committed));
-            let wanted = select_tag(
-                &keys,
-                &healthy,
-                applied.as_deref(),
-                params.auto_return_primary,
-                balancer.kind,
-            );
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            let changed = applied.as_deref() != Some(wanted.as_str());
-            if changed {
-                match api_override(api_port, &balancer.tag, &wanted, &stop, &api_child) {
-                    Ok(()) => applied = Some(wanted),
-                    Err(err) => {
-                        eprintln!("network-orchestrator-daemon: failover override failed: {err}")
+                let node = &mut nodes[index];
+                node.observe(probe_node(node.probe_port, &params.probe_url));
+                healthy[index] = node.committed;
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let wanted = select_tag(&tags, &healthy, applied, params.auto_return_primary);
+                if applied != Some(wanted) && attempted != Some(wanted) {
+                    attempted = Some(wanted);
+                    match apply(wanted, &stop) {
+                        Ok(()) => applied = Some(wanted),
+                        Err(err) => {
+                            eprintln!(
+                                "network-orchestrator-daemon: failover override failed: {err}"
+                            )
+                        }
                     }
                 }
-            }
-            let report = FailoverStatus {
-                primary_key: params.primary_key.clone(),
-                active_key: applied
-                    .as_deref()
-                    .map(|tag| {
-                        tag.strip_prefix(balancer.kind.prefix())
-                            .unwrap_or(tag)
-                            .to_string()
-                    })
-                    .unwrap_or_else(|| net_manager_core::xray::UNAVAILABLE_TAG.to_string()),
-                auto_return_primary: params.auto_return_primary,
-                failover_active: applied.as_deref().is_some_and(|tag| {
-                    tag != net_manager_core::xray::UNAVAILABLE_TAG && tag != primary_tag
-                }),
-                nodes: nodes.iter().map(TrackedNode::health).collect(),
-            };
-            if let Ok(mut guard) = status.lock() {
-                *guard = report;
+                if let Ok(mut guard) = status.lock() {
+                    let reported = &mut guard.nodes[index];
+                    reported.healthy = node.committed;
+                    reported.last_probe_unix = node.last_probe_unix;
+                    reported.latency_ms = node.latency_ms;
+                    let active = applied.unwrap_or(net_manager_core::xray::UNAVAILABLE_TAG);
+                    let key = active.strip_prefix(kind.prefix()).unwrap_or(active);
+                    if guard.active_key != key {
+                        guard.active_key.clear();
+                        guard.active_key.push_str(key);
+                    }
+                    guard.failover_active = active != net_manager_core::xray::UNAVAILABLE_TAG
+                        && key != params.primary_key;
+                }
             }
             next_round = Instant::now() + interval;
         }
@@ -433,28 +444,29 @@ fn probe(probe_port: u16, url: &str) -> ProbeSample {
     }
 }
 
-/// Apply one balancer override; bounded like the statsquery helper.
 fn api_override(
-    api_port: u16,
+    api_socket: &std::path::Path,
     balancer_tag: &str,
     tag: &str,
     stop: &AtomicBool,
     slot: &Mutex<Option<Child>>,
 ) -> std::io::Result<()> {
     let binary = crate::xray_process::trusted_binary()?;
+    let endpoint = format!("unix://{}", api_socket.display());
     let mut command = Command::new(binary);
     command
         .args([
             "api",
             "bo",
             "-server",
-            &format!("127.0.0.1:{api_port}"),
+            &endpoint,
             "-t",
             "3",
             "-b",
             balancer_tag,
             tag,
         ])
+        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -540,6 +552,72 @@ mod tests {
     }
 
     #[test]
+    fn healthy_primary_is_applied_before_a_trailing_probe_finishes() {
+        let keys = ["aaaaaaaabbbbbbbb", "ccccccccdddddddd"];
+        let params = XrayFailoverParams {
+            nodes: keys
+                .iter()
+                .map(|key| net_manager_core::daemon_protocol::XrayFailoverNode {
+                    key: (*key).into(),
+                })
+                .collect(),
+            primary_key: keys[0].into(),
+            auto_return_primary: true,
+            probe_url: "https://probe.invalid/".into(),
+            interval_secs: 1,
+        };
+        let nodes: Vec<_> = keys.iter().map(|key| tracked(key, None)).collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(Mutex::new(FailoverStatus {
+            primary_key: keys[0].into(),
+            active_key: "unavailable".into(),
+            auto_return_primary: true,
+            failover_active: false,
+            nodes: nodes.iter().map(TrackedNode::health).collect(),
+        }));
+        let applied = std::cell::Cell::new(false);
+        let mut probes = 0;
+        run_with(
+            params,
+            OutboundKind::Node,
+            nodes,
+            Arc::clone(&stop),
+            Arc::clone(&status),
+            |_, _| {
+                probes += 1;
+                if probes == 1 {
+                    return ProbeSample {
+                        healthy: true,
+                        latency_ms: Some(2),
+                    };
+                }
+                stop.store(true, Ordering::Relaxed);
+                let snapshot = status.lock().unwrap();
+                assert_eq!(
+                    snapshot.active_key, keys[0],
+                    "a usable primary must not wait for an unrelated trailing probe"
+                );
+                assert!(
+                    applied.get(),
+                    "publish only after the routing override succeeds"
+                );
+                assert_eq!(snapshot.nodes[0].healthy, Some(true));
+                assert_eq!(snapshot.nodes[1].healthy, None);
+                ProbeSample {
+                    healthy: false,
+                    latency_ms: None,
+                }
+            },
+            |tag, _| {
+                assert_eq!(tag, "node-aaaaaaaabbbbbbbb");
+                applied.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(probes, 2);
+    }
+
+    #[test]
     fn first_observation_commits_immediately() {
         let mut node = tracked("aaaaaaaabbbbbbbb", None);
         node.observe(ProbeSample {
@@ -583,58 +661,37 @@ mod tests {
     #[test]
     fn selection_is_strictly_ordered_primary_first() {
         let keys = vec![
-            "aaaaaaaabbbbbbbb".to_string(),
-            "ccccccccdddddddd".to_string(),
+            "node-aaaaaaaabbbbbbbb".to_string(),
+            "node-ccccccccdddddddd".to_string(),
         ];
         assert_eq!(
-            select_tag(
-                &keys,
-                &[Some(true), Some(true)],
-                None,
-                true,
-                OutboundKind::Node
-            ),
+            select_tag(&keys, &[Some(true), Some(true)], None, true,),
             "node-aaaaaaaabbbbbbbb"
         );
         assert_eq!(
-            select_tag(
-                &keys,
-                &[Some(false), Some(true)],
-                None,
-                true,
-                OutboundKind::Node
-            ),
+            select_tag(&keys, &[Some(false), Some(true)], None, true,),
             "node-ccccccccdddddddd"
         );
         assert_eq!(
-            select_tag(
-                &keys,
-                &[Some(false), Some(false)],
-                None,
-                true,
-                OutboundKind::Node
-            ),
+            select_tag(&keys, &[Some(false), Some(false)], None, true,),
             "unavailable"
         );
         // Unprobed nodes never win — the balancer stays on the blackhole.
-        assert_eq!(
-            select_tag(&keys, &[None, None], None, true, OutboundKind::Node),
-            "unavailable"
-        );
+        assert_eq!(select_tag(&keys, &[None, None], None, true), "unavailable");
     }
 
     #[test]
     fn all_down_selects_blackhole_never_direct() {
-        let keys = vec!["aaaaaaaabbbbbbbb".to_string()];
-        let tag = select_tag(&keys, &[Some(false)], None, true, OutboundKind::Node);
+        let keys = vec!["node-aaaaaaaabbbbbbbb".to_string()];
+        let tag = select_tag(&keys, &[Some(false)], None, true);
         assert_eq!(tag, "unavailable");
         assert!(!tag.starts_with("node-"));
     }
     #[test]
     fn without_auto_return_a_healthy_backup_keeps_the_tunnel() {
         let keys = vec![
-            "aaaaaaaabbbbbbbb".to_string(),
-            "ccccccccdddddddd".to_string(),
+            "node-aaaaaaaabbbbbbbb".to_string(),
+            "node-ccccccccdddddddd".to_string(),
         ];
         // Failover already moved to the backup; primary recovers but
         // auto-return is off — stay put.
@@ -644,7 +701,6 @@ mod tests {
                 &[Some(true), Some(true)],
                 Some("node-ccccccccdddddddd"),
                 false,
-                OutboundKind::Node,
             ),
             "node-ccccccccdddddddd"
         );
@@ -656,7 +712,6 @@ mod tests {
                 &[Some(true), Some(false)],
                 Some("node-ccccccccdddddddd"),
                 false,
-                OutboundKind::Node,
             ),
             "node-aaaaaaaabbbbbbbb"
         );
@@ -667,7 +722,6 @@ mod tests {
                 &[Some(true), Some(true)],
                 Some("node-ccccccccdddddddd"),
                 true,
-                OutboundKind::Node,
             ),
             "node-aaaaaaaabbbbbbbb"
         );
@@ -675,14 +729,13 @@ mod tests {
 
     #[test]
     fn named_pool_selects_only_its_pinned_members_and_never_the_default_node() {
-        let keys = vec!["aaaaaaaabbbbbbbb".into(), "ccccccccdddddddd".into()];
+        let keys = vec!["pin-aaaaaaaabbbbbbbb".into(), "pin-ccccccccdddddddd".into()];
         assert_eq!(
             select_tag(
                 &keys,
                 &[Some(false), Some(true)],
                 Some("node-eeeeeeeeffffffff"),
                 false,
-                OutboundKind::Pin
             ),
             "pin-ccccccccdddddddd"
         );
@@ -692,7 +745,6 @@ mod tests {
                 &[None, Some(false)],
                 Some("pin-ccccccccdddddddd"),
                 false,
-                OutboundKind::Pin
             ),
             "unavailable"
         );

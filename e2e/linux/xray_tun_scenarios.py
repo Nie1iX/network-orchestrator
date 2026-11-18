@@ -468,9 +468,18 @@ try:
         assert reloaded["state"] == "running", "xray.reload dropped the tunnel"
         assert reloaded["interfaceName"] == interface, "xray.reload renamed the TUN"
         pid_after = docker_exec(client_name, "pgrep", "-x", "xray")
-        assert pid_after != pid_before, "xray.reload did not restart the child"
+        assert pid_after == pid_before, "routing-only xray.reload restarted the child"
         assert docker_exec(client_name, "python3", "-c", probe) == "netorch-e2e-server"
-        print("ok   xray.reload swapped config and kept the tunnel", flush=True)
+        print("ok   rules-only xray.reload preserved the Xray process and TUN", flush=True)
+
+        reload_config["routing"]["domainStrategy"] = "IPOnDemand"
+        restarted = rpc("xray.reload", {**params, "config": json.dumps(reload_config)})["status"]
+        assert restarted["state"] == "running" and restarted["interfaceName"] == interface
+        assert docker_exec(client_name, "pgrep", "-x", "xray") != pid_after, (
+            "domain strategy change did not restart the child"
+        )
+        assert docker_exec(client_name, "python3", "-c", probe) == "netorch-e2e-server"
+        print("ok   xray.reload restarted for a change that Xray cannot apply live", flush=True)
 
         try:
             rpc(
