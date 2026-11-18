@@ -122,16 +122,10 @@ fn provider_balancer_survives_core_to_daemon_preparation() {
         }],
     )
     .unwrap();
-    let mut request = params(&multinode);
-    request.failover = Some(net_manager_core::daemon_protocol::XrayFailoverParams {
-        nodes: vec![net_manager_core::daemon_protocol::XrayFailoverNode { key: key.into() }],
-        primary_key: key.into(),
-        auto_return_primary: true,
-        probe_url: "https://example.test/check".into(),
-        interval_secs: 10,
-    });
-    let plan = prepare_xray(1000, request, 51820).expect("scoped primary and pinned graph");
+    let plan =
+        prepare_xray(1000, params(&multinode), 51820).expect("scoped primary and pinned graph");
     assert_eq!(plan.pinned_keys, [pin]);
+    assert!(plan.failover.is_none());
 }
 
 #[test]
@@ -141,6 +135,12 @@ fn multinode_preserves_proxy_policies_and_accepts_missing_pinned_nodes() {
     let uri =
         "vless://00000000-0000-0000-0000-000000000001@primary.test:443?security=none&type=tcp";
     let key = "1111111111111111".to_string();
+    let backup_key = "2222222222222222";
+    let backup = xray::multinode_endpoint(
+        &uri.replace("primary.test", "backup.test"),
+        &xray::node_tag(backup_key),
+    )
+    .unwrap();
     let base = xray::generate_share_link_config_with_http(uri, 10808, 10809).unwrap();
     let routed = xray::apply_profile_routing(
         &base,
@@ -168,7 +168,7 @@ fn multinode_preserves_proxy_policies_and_accepts_missing_pinned_nodes() {
     let config = xray::apply_multinode_config(
         &routed,
         &key,
-        &[],
+        &[(backup_key.into(), backup)],
         &[xray::PinnedOutbound {
             key: "ffffffffffffffff".into(),
             outbound: None,
@@ -177,7 +177,12 @@ fn multinode_preserves_proxy_policies_and_accepts_missing_pinned_nodes() {
     .unwrap();
     let mut request = params(&config);
     request.failover = Some(XrayFailoverParams {
-        nodes: vec![XrayFailoverNode { key: key.clone() }],
+        nodes: vec![
+            XrayFailoverNode { key: key.clone() },
+            XrayFailoverNode {
+                key: backup_key.into(),
+            },
+        ],
         primary_key: key,
         auto_return_primary: true,
         probe_url: "https://example.test/check".into(),
@@ -185,6 +190,12 @@ fn multinode_preserves_proxy_policies_and_accepts_missing_pinned_nodes() {
     });
     let plan = prepare_xray(1000, request, 51820).expect("valid generated multinode policy");
     let running: Value = serde_json::from_str(&plan.config).unwrap();
+    assert!(running["routing"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|rule| rule["domain"] == json!(["domain:default.test"])
+            && rule["balancerTag"] == xray::FAILOVER_BALANCER));
     assert!(running["outbounds"]
         .as_array()
         .unwrap()

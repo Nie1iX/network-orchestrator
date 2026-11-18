@@ -313,9 +313,8 @@ pub(crate) fn prepare_linux_xray_tun_params_with_base(
         &net_manager_core::xray::ProfileRoutingOptions::from(profile),
     )
     .map_err(|_| "invalid Xray routing rules".to_string())?;
-    // Multinode: a subscription profile with backups or pinned routes needs
-    // one outbound per candidate plus the pinned outbounds, and the daemon
-    // probe/switch policy.
+    // Build independent pin/DNS outbounds as needed. Only an available
+    // backup turns the default path into a supervised pool.
     let multinode = profile.subscription.as_ref().is_some_and(|subscription| {
         !subscription.backup_keys.is_empty()
             || subscription.node_pool.is_some() && !subscription.pool_keys.is_empty()
@@ -444,7 +443,7 @@ fn build_multinode(
     let (nodes, pinned) = net_manager_core::subscription::failover_plan(vault, profile)
         .map_err(|_| "The subscription's failover endpoints could not be resolved".to_string())?;
     let primary_url = &nodes[0].url;
-    let primary_key = nodes[0].id.clone();
+    let primary_key = &nodes[0].id;
     let mut primary_config = net_manager_core::xray::tun_compatible_config(
         &net_manager_core::xray::generate_share_link_config(primary_url, 1)
             .map_err(|_| "The selected endpoint is invalid".to_string())?,
@@ -514,7 +513,7 @@ fn build_multinode(
     }
     let mut config = net_manager_core::xray::apply_multinode_config(
         &primary_config,
-        &primary_key,
+        primary_key,
         &backups,
         &pinned_outbounds,
     )
@@ -533,6 +532,9 @@ fn build_multinode(
             }
         }
     }
+    if backups.is_empty() {
+        return Ok((config, None));
+    }
     let subscription = profile.subscription.as_ref().expect("multinode checked");
     let failover = XrayFailoverParams {
         nodes: nodes
@@ -541,7 +543,7 @@ fn build_multinode(
                 key: node.id.clone(),
             })
             .collect(),
-        primary_key,
+        primary_key: primary_key.clone(),
         auto_return_primary: subscription.auto_return_primary.unwrap_or(true),
         probe_url: subscription
             .probe_url

@@ -40,6 +40,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   stalls and settled rebinding when no HTTPS probe is configured.
 - Activate the first healthy failover candidate immediately, without waiting
   for unrelated slow candidates to finish their probes.
+- Keep the primary outbound independent of fixed route or DNS pins when
+  there is no eligible backup; do not create a one-node failover pool.
 - Let `IPIfNonMatch` resolve names and evaluate GeoIP before default failover.
   A loopback default replaces the unconditional catch-all while preserving
   explicit domain/pin rules and the unhealthy-node blackhole.

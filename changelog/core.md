@@ -24,6 +24,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   Xray generation and offline explanations. Imported policy updates only Base.
 - Resolve IP rules on demand and preserve Unknown instead of allowing a lower
   direct fallback; protect app-controlled DNS forwarding through a service relay.
+- Keep fixed route and DNS nodes independent of the default Xray outbound
+  when there are no eligible backups.
 
 
 ## [0.19.2] - 2026-11-12

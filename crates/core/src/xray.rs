@@ -614,12 +614,13 @@ pub struct PinnedOutbound {
 
 /// Rebuild a generated single-endpoint config for multinode operation:
 ///
-/// - `base`'s primary outbound is retagged `node-<primary>` and the ordered
-///   `backups` join it (same order → strict priority);
+/// - When a backup is available, the primary is retagged `node-<primary>`
+///   and the ordered backups join it. Without a backup the original primary
+///   remains the first outbound, independently of any pins.
 /// - each resolved pinned endpoint adds a `pin-<key>` outbound;
 /// - a missing pinned key adds only a blackhole `pin-<key>` outbound —
 ///   fail-closed;
-/// - routing gets `balancers: [{tag: failover, selector: [unavailable]}]`:
+/// - With backups, routing gets a `failover` balancer targeting `unavailable`:
 ///   the daemon adds the `unavailable` blackhole and a loopback default
 ///   outbound targeting that balancer after normal domain/IP matching.
 ///   It selects a real node only after a successful probe; otherwise it drops.
@@ -640,9 +641,14 @@ pub fn apply_multinode_config(
     }
     let primary_tag = outbounds[0]["tag"]
         .as_str()
-        .ok_or_else(|| invalid_data("xray primary outbound has no tag"))?
-        .to_owned();
-    outbounds[0]["tag"] = json!(node_tag(primary_key));
+        .ok_or_else(|| invalid_data("xray primary outbound has no tag"))?;
+    let primary_tag = if backups.is_empty() {
+        None
+    } else {
+        let original = primary_tag.to_owned();
+        outbounds[0]["tag"] = json!(node_tag(primary_key));
+        Some(original)
+    };
     for (key, graph) in backups {
         let mut graph = graph.clone();
         graph.entry["tag"] = json!(node_tag(key));
@@ -679,6 +685,9 @@ pub fn apply_multinode_config(
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .ok_or_else(|| invalid_data("xray config routing rules must be an array"))?;
+    let Some(primary_tag) = primary_tag else {
+        return Ok(config);
+    };
     // Existing proxy policies must follow failover, not retain a dangling
     // reference to the primary's old tag after it becomes `node-<key>`.
     for rule in rules.iter_mut() {
@@ -4685,11 +4694,10 @@ mod tests {
             .unwrap()
             .iter()
             .any(|o| o["tag"] == "pin-1111111111111111" && o["protocol"] == "blackhole"));
-        assert!(multi["routing"]["balancers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|b| b["tag"] == "failover"));
+        assert_eq!(
+            multi["routing"]["balancers"],
+            routed["routing"]["balancers"]
+        );
         assert_eq!(multi["burstObservatory"], normalized["burstObservatory"]);
     }
 
@@ -4796,7 +4804,11 @@ mod tests {
                 burst_observatory: None,
             }),
         }];
-        let config = apply_multinode_config(&base, "2222222222222222", &[], &pins).unwrap();
+        let backups = [(
+            "3333333333333333".into(),
+            pins[0].outbound.as_ref().unwrap().clone(),
+        )];
+        let config = apply_multinode_config(&base, "2222222222222222", &backups, &pins).unwrap();
         let rules = config["routing"]["rules"].as_array().unwrap();
         assert_eq!(rules[0]["port"], 853);
         assert_eq!(rules[1]["port"], 53);
@@ -4824,6 +4836,6 @@ mod tests {
             .iter()
             .filter_map(|outbound| outbound["tag"].as_str())
             .collect();
-        assert_eq!(tags, ["node-2222222222222222", "pin-1111111111111111"]);
+        assert_eq!(tags, ["proxy", "pin-1111111111111111"]);
     }
 }

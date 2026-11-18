@@ -479,6 +479,9 @@ def inside():
                 cli("up", "country-proof")
                 until(lambda: layer_request("order.test") == "primary", "Base-only default proxy is healthy")
                 assert layer_request("pin.test") == "pinned", records["lastRequest"]
+                assert cli("status", "country-proof")[0].get("failover") is None, (
+                    "an independent pin created an implicit default pool"
+                )
                 base_dns = captured_dns_response()
                 assert base_dns == 2, (
                     "Base node pin allowed direct DNS forwarding",
