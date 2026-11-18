@@ -137,7 +137,22 @@ netorch status work
 
 Servers may be selected by number, name, or a unique name fragment.
 `backup add|rm|clear` edits the chain; `route unpin` removes a pin.
-Settings saved while connected take effect on reconnect.
+Saving changes does not alter a running tunnel. If only routing rules changed
+and there are no active balancers, `netorch reload work` can apply them
+without replacing Xray or the TUN. Changing kernel routes or link DNS requires
+reconnecting; Xray changes that cannot be applied live restart the child.
+
+`netorch route check` explains saved rules. To ask the running Xray core
+instead, use:
+
+```bash
+netorch route check github.com --profile work --live --protocol tls
+```
+
+This tests a synthetic TCP/443 flow by default. Use `--port` or `--udp` to
+change the flow. It reports the chosen outbound, not whether the site opens.
+An independent node pin or DNS node does not turn a single default node into
+a failover pool.
 
 The daemon probes each candidate through that node using HTTPS
 (`https://connectivitycheck.gstatic.com/generate_204` by default).

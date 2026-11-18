@@ -157,14 +157,18 @@ impl FailoverSupervisors {
         exits: &[net_manager_core::daemon_protocol::ProxyExitBinding],
         probe_url: Option<&str>,
         pinned_keys: &[String],
+        uid: u32,
+        name: &str,
         mark: u32,
     ) -> Self {
         let mut supervisors = Self::default();
-        let api_port = crate::xray::xray_api_port(mark);
+        let Ok(api_socket) = crate::xray_process::checked_api_socket_path(uid, name) else {
+            return supervisors;
+        };
         if let Some(params) = failover {
             supervisors.main = FailoverSupervisor::spawn(
                 params.clone(),
-                api_port,
+                api_socket.clone(),
                 BalancerTarget {
                     tag: net_manager_core::xray::FAILOVER_BALANCER.into(),
                     kind: OutboundKind::Node,
@@ -199,7 +203,7 @@ impl FailoverSupervisors {
                 .collect();
             match FailoverSupervisor::spawn(
                 params,
-                api_port,
+                api_socket.clone(),
                 BalancerTarget {
                     tag: crate::proxy_exits::balancer_tag(&exit.name),
                     kind: OutboundKind::Pin,
@@ -249,7 +253,7 @@ impl FailoverSupervisor {
     /// treats it as degraded (the balancer still holds its safe default).
     pub fn spawn(
         params: XrayFailoverParams,
-        api_port: u16,
+        api_socket: std::path::PathBuf,
         balancer: BalancerTarget,
         probe_port_of: impl Fn(usize) -> u16,
     ) -> std::io::Result<Self> {
@@ -281,7 +285,7 @@ impl FailoverSupervisor {
             let api_child = Arc::clone(&api_child);
             thread::Builder::new()
                 .name("xray-failover".into())
-                .spawn(move || run(params, api_port, balancer, nodes, stop, status, api_child))?
+                .spawn(move || run(params, api_socket, balancer, nodes, stop, status, api_child))?
         };
         Ok(Self {
             stop,
@@ -320,7 +324,7 @@ impl Drop for FailoverSupervisor {
 
 fn run(
     params: XrayFailoverParams,
-    api_port: u16,
+    api_socket: std::path::PathBuf,
     balancer: BalancerTarget,
     nodes: Vec<TrackedNode>,
     stop: Arc<AtomicBool>,
@@ -334,7 +338,7 @@ fn run(
         stop,
         status,
         probe,
-        |tag, stop| api_override(api_port, &balancer.tag, tag, stop, &api_child),
+        |tag, stop| api_override(&api_socket, &balancer.tag, tag, stop, &api_child),
     )
 }
 
@@ -440,28 +444,29 @@ fn probe(probe_port: u16, url: &str) -> ProbeSample {
     }
 }
 
-/// Apply one balancer override; bounded like the statsquery helper.
 fn api_override(
-    api_port: u16,
+    api_socket: &std::path::Path,
     balancer_tag: &str,
     tag: &str,
     stop: &AtomicBool,
     slot: &Mutex<Option<Child>>,
 ) -> std::io::Result<()> {
     let binary = crate::xray_process::trusted_binary()?;
+    let endpoint = format!("unix://{}", api_socket.display());
     let mut command = Command::new(binary);
     command
         .args([
             "api",
             "bo",
             "-server",
-            &format!("127.0.0.1:{api_port}"),
+            &endpoint,
             "-t",
             "3",
             "-b",
             balancer_tag,
             tag,
         ])
+        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

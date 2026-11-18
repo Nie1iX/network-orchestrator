@@ -198,8 +198,15 @@ def inside():
                 hosts.write("195.245.249.51 geo.google.com\n")
 
             def managed_pid():
-                managed = [path.parent for path in Path("/proc").glob("[0-9]*/cmdline")
-                    if b"/run/network-orchestrator/0/" in path.read_bytes()]
+                managed = []
+                for path in Path("/proc").glob("[0-9]*/cmdline"):
+                    try:
+                        args = path.read_bytes().split(b"\0")
+                    except FileNotFoundError:
+                        continue
+                    if (len(args) >= 4 and args[1:3] == [b"run", b"-config"]
+                            and args[3].startswith(b"/run/network-orchestrator/0/")):
+                        managed.append(path.parent)
                 assert len(managed) == 1, "expected exactly one daemon-owned Xray"
                 return int(managed[0].name)
 
@@ -507,6 +514,19 @@ def inside():
                     cli("up", "country-proof")
                     until(lambda: layer_request("cidr.google.com") == "underlay",
                         "user CIDR beats base GeoSite on the real tunnel")
+                    live = cli("route", "check", "cidr.google.com", "--profile", "country-proof",
+                        "--live", "--port", "9443", "--protocol", "tls")
+                    assert live["matched"] and live["outboundTag"] == "direct", live
+                    try:
+                        rpc("xray.testRoute", {
+                            "profileId": profile["id"], "target": "cidr.google.com", "port": 9443,
+                        })
+                    except AssertionError as error:
+                        assert error.args[0][1]["code"].lower() == "notfound"
+                    else:
+                        raise AssertionError("daemon let a different UID query the tunnel")
+                    assert cli_raw("route", "check", "https://cidr.google.com/",
+                        "--profile", "country-proof", "--live").returncode != 0
 
                 connect_layers()
                 until(lambda: layer_request("pin.test") == "primary", "default proxy pool is healthy")
@@ -839,6 +859,18 @@ def inside():
 
                 until(lambda: active() == keys["primary"] and request("non-ru.test") == "primary",
                     "non-RU domain uses healthy failover")
+                live_params = {"profileId": connect_params["profileId"], "port": 9443, "protocol": "tls"}
+                match = rpc("xray.testRoute", {**live_params, "target": "geo-only.test"})
+                assert match["matched"] and match["outboundTag"] == "direct", match
+                default = rpc("xray.testRoute", {**live_params, "target": "non-ru.test"})
+                assert not default["matched"] and default["outboundTag"] == "node-" + keys["primary"], default
+                interface = rpc("xray.status", {"profileId": connect_params["profileId"]})["interfaceName"]
+                socket_check = subprocess.run([
+                    "python3", "-c", "import errno,socket,sys; s=socket.socket(socket.AF_UNIX); "
+                    "assert s.connect_ex(sys.argv[1]) == errno.EACCES",
+                    f"/run/network-orchestrator/0/{interface}/api.sock",
+                ], user=65534, group=65534, timeout=3, capture_output=True, text=True)
+                assert socket_check.returncode == 0, "non-root process could reach Xray's control API"
                 observed = geo_request("geo-only.test")
                 assert observed == "underlay", (
                     f"RU GeoIP must reach the physical peer, got {observed!r}: {records['lastRequest']}")
@@ -849,9 +881,61 @@ def inside():
                 for name in ("primary", "backup", "reserve"):
                     stop_node(name)
                 until(lambda: active() == "unavailable", "all unhealthy nodes select fail-closed outbound")
+                failed_default = rpc("xray.testRoute", {**live_params, "target": "non-ru.test"})
+                assert not failed_default["matched"] and failed_default["outboundTag"] == "unavailable"
                 assert request("non-ru.test") is None, "all unhealthy nodes leaked fallback traffic direct"
                 assert geo_request("geo-only.test") == "underlay", "unhealthy proxy nodes stopped RU direct traffic"
                 rpc("xray.disconnect", {"profileId": "multinode-e2e"})
+
+                # A rules-only update must not recreate a single-node TUN.
+                single = {key: value for key, value in connect_params.items() if key != "failover"}
+                by_tag = {out["tag"]: out for out in config["outbounds"]}
+                config["outbounds"] = [
+                    {**by_tag["pin-" + keys["pinned"]], "tag": "proxy"},
+                    *(by_tag[tag] for tag in ("direct", "blocked", "dns")),
+                ]
+                del config["routing"]["balancers"]
+                config["routing"]["rules"] = [
+                    rule for rule in config["routing"]["rules"]
+                    if not rule["outboundTag"].startswith("pin-")
+                ]
+                single["config"] = json.dumps(config)
+                rpc("xray.connect", single)
+                assert geo_request("geo-only.test") == "underlay"
+                pid = managed_pid()
+                config["routing"]["rules"].insert(0, {
+                    "type": "field", "domain": ["full:geo-only.test"], "outboundTag": "blocked",
+                })
+                client_context = ssl.create_default_context(cafile=str(ca))
+                with socket.create_connection(("198.51.100.50", 9443), timeout=5) as raw:
+                    with client_context.wrap_socket(raw, server_hostname="geo-only.test") as tls:
+                        def on_existing_stream():
+                            tls.sendall(b"GET / HTTP/1.1\r\nHost: geo-only.test\r\n\r\n")
+                            stream_response = HTTPResponse(tls)
+                            stream_response.begin()
+                            return stream_response.read()
+
+                        assert on_existing_stream() == b"underlay"
+                        rpc("xray.reload", {**single, "config": json.dumps(config)})
+                        assert managed_pid() == pid, "rules-only reload restarted Xray"
+                        assert on_existing_stream() == b"underlay", "reload broke an established TLS stream"
+                assert geo_request("geo-only.test") is None, "new traffic ignored the updated rule"
+                live = rpc("xray.testRoute", {**live_params, "target": "geo-only.test"})
+                assert live["matched"] and live["outboundTag"] == "blocked"
+                os.kill(pid, signal.SIGKILL)
+                until(lambda: managed_pid() != pid and rpc("xray.status", {
+                    "profileId": single["profileId"],
+                })["state"] == "running", "watchdog respawns the hot-reloaded Xray")
+                assert rpc("xray.testRoute", {**live_params, "target": "geo-only.test"}) == live, (
+                    "respawn lost the applied routing rules"
+                )
+                restarted_pid = managed_pid()
+                config["routing"]["domainStrategy"] = "IPOnDemand"
+                rpc("xray.reload", {**single, "config": json.dumps(config)})
+                assert managed_pid() != restarted_pid, "changed strategy was incorrectly hot-reloaded"
+                assert rpc("xray.testRoute", {**live_params, "target": "geo-only.test"}) == live
+                rpc("xray.disconnect", {"profileId": single["profileId"]})
+                print("PASS rules-only reload preserves PID and live Xray reports the new route", flush=True)
                 print("PASS IPIfNonMatch GeoIP physical fallback, precedence and all-down safety", flush=True)
                 return
             rpc("xray.connect", connect_params)

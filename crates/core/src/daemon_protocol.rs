@@ -80,6 +80,7 @@ pub mod method {
     pub const XRAY_DISCONNECT: &str = "xray.disconnect";
     pub const XRAY_STATUS: &str = "xray.status";
     pub const XRAY_RELOAD: &str = "xray.reload";
+    pub const XRAY_TEST_ROUTE: &str = "xray.testRoute";
     pub const XRAY_SERVICE_CHECKS: &str = "xray.serviceChecks";
     pub const XRAY_PROXY_EXITS: &str = "xray.proxyExits";
     pub const XRAY_INSTALL: &str = "xray.install";
@@ -143,6 +144,7 @@ pub mod method {
         XRAY_CONNECT,
         XRAY_DISCONNECT,
         XRAY_STATUS,
+        XRAY_TEST_ROUTE,
         XRAY_RELOAD,
         XRAY_SERVICE_CHECKS,
         XRAY_PROXY_EXITS,
@@ -1311,6 +1313,26 @@ pub struct XrayConnectParams {
 pub struct XrayServiceChecksParams {
     pub profile_id: String,
     pub checks: Vec<crate::models::ServiceCheck>,
+}
+
+/// Read-only live routing query against the caller's applied Xray TUN.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct XrayTestRouteParams {
+    pub profile_id: String,
+    pub target: String,
+    pub port: u16,
+    #[serde(default)]
+    pub udp: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XrayTestRouteResult {
+    pub matched: bool,
+    pub outbound_tag: String,
 }
 
 /// One ordered failover candidate; `key` is the stable subscription

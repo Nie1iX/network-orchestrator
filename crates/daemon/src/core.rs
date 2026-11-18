@@ -2515,6 +2515,8 @@ impl DaemonCore {
             &plan.proxy_exits,
             plan.probe_url.as_deref(),
             &plan.pinned_keys,
+            uid,
+            &plan.name,
             plan.mark,
         );
         self.failovers.insert(key, supervisors);
@@ -2675,16 +2677,16 @@ impl DaemonCore {
             &process.proxy_exits,
             process.probe_url.as_deref(),
             &process.pinned_keys,
+            entry.uid,
+            &process.name,
             process.transport_mark,
         );
         self.failovers.insert(key, supervisors);
     }
 
-    /// Hot-reload the staged Xray config of an already connected profile:
-    /// kernel-level settings (routes, DNS, link name, full capture) must be
-    /// identical to the running tunnel — changing those requires a reconnect.
-    /// The child is restarted on the same staging directory; the journal
-    /// entry, ownership and restart bookkeeping stay in place.
+    /// Reload a connected tunnel without changing its kernel policy.
+    /// Rules-only changes keep the child and all link resources in place.
+    /// Other compatible changes restart Xray and rebind the journaled link.
     pub fn reload_xray(
         &mut self,
         uid: u32,
@@ -2714,51 +2716,60 @@ impl DaemonCore {
         let mut plan = prepare_xray(uid, params, process.transport_mark)?;
         crate::xray::pin_server_addresses(&mut plan, |host| resolve_host_addrs(Some(host)));
         self.ensure_xray_reload_compatible(index, &plan, &process)?;
-        self.failovers.remove(&(uid, owner.clone()));
-        self.watchdogs.remove(&(uid, owner.clone()));
-        self.service_checks.remove(&(uid, owner.clone()));
-        let runner = self.xray.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
-        })?;
-        eprintln!("network-orchestrator-daemon: xray restart uid={uid} cause=explicit_reload");
-        runner
-            .reload(uid, &plan.name, &plan.config, plan.geo_assets.as_ref())
-            .map_err(|err| xray_stage("reload", err))?;
-        let new_index = self
-            .xray
-            .as_ref()
-            .unwrap()
-            .link_index(&plan.name)
-            .map_err(|err| xray_stage("tun_lookup", err))?
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "Xray TUN link is unavailable")
+        let probe_metadata_matches = plan.failover == process.failover
+            && plan.probe_url == process.probe_url
+            && plan.pinned_keys == process.pinned_keys;
+        let hot_reload = if probe_metadata_matches {
+            self.xray
+                .as_mut()
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
+                })?
+                .reload_rules_only(uid, &plan.name, &plan.config, plan.geo_assets.as_ref())
+                .map_err(|err| xray_stage("routing_reload", err))?
+        } else {
+            false
+        };
+        if !hot_reload {
+            self.failovers.remove(&(uid, owner.clone()));
+            self.watchdogs.remove(&(uid, owner.clone()));
+            self.service_checks.remove(&(uid, owner.clone()));
+            let runner = self.xray.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "Xray executor is unavailable")
             })?;
-        if let Err(err) = self.rebind_xray_link(index, process.index, new_index) {
-            // Rebind journals the new ifindex before adding addresses, so
-            // teardown can remove a partially configured replacement link.
-            let _ = self.teardown_xray_entry(index);
-            self.persist();
-            self.tunnel_failed.insert((uid, owner));
-            return Err(xray_stage("rebind", err));
-        }
-        // Journal the probe policy the reload actually runs so a daemon
-        // restart resurrects the right supervisor.
-        for resource in &mut self.journal.entries[index].resources {
-            if let OwnedResource::XrayProcess(process) = resource {
-                process.failover = plan.failover.clone();
-                process.probe_url = plan.probe_url.clone();
-                process.pinned_keys = plan.pinned_keys.clone();
-                process.mtu = Some(plan.mtu);
+            eprintln!("network-orchestrator-daemon: xray restart uid={uid} cause=explicit_reload");
+            runner
+                .reload(uid, &plan.name, &plan.config, plan.geo_assets.as_ref())
+                .map_err(|err| xray_stage("reload", err))?;
+            let new_index = self
+                .xray
+                .as_ref()
+                .unwrap()
+                .link_index(&plan.name)
+                .map_err(|err| xray_stage("tun_lookup", err))?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, "Xray TUN link is unavailable")
+                })?;
+            if let Err(err) = self.rebind_xray_link(index, process.index, new_index) {
+                let _ = self.teardown_xray_entry(index);
+                self.persist();
+                self.tunnel_failed.insert((uid, owner));
+                return Err(xray_stage("rebind", err));
             }
+            for resource in &mut self.journal.entries[index].resources {
+                if let OwnedResource::XrayProcess(process) = resource {
+                    process.failover = plan.failover.clone();
+                    process.probe_url = plan.probe_url.clone();
+                    process.pinned_keys = plan.pinned_keys.clone();
+                    process.mtu = Some(plan.mtu);
+                }
+            }
+            self.store
+                .save(&self.journal)
+                .map_err(|err| xray_stage("journal_failover", err))?;
+            self.xray_restarts.remove(&(uid, owner.clone()));
+            self.start_failover(uid, &owner, &plan);
         }
-        self.store
-            .save(&self.journal)
-            .map_err(|err| xray_stage("journal_failover", err))?;
-        // A successful reload hands the child a fresh restart budget.
-        self.xray_restarts.remove(&(uid, owner.clone()));
-        // The reloaded child forgot the balancer override; a fresh
-        // supervisor (with the new probe set) re-installs it.
-        self.start_failover(uid, &owner, &plan);
         self.ensure_watchdog(index);
         if self
             .set_xray_service_checks(
@@ -3180,6 +3191,26 @@ impl DaemonCore {
             .ok_or_else(unavailable)
     }
 
+    pub(crate) fn applied_xray_process(
+        &self,
+        uid: u32,
+        profile_id: &str,
+    ) -> Option<&XrayProcessResource> {
+        let owner = format!("xray:{profile_id}");
+        self.journal
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.uid == uid && entry.owner == owner && entry.state == OwnedState::Applied
+            })?
+            .resources
+            .iter()
+            .find_map(|resource| match resource {
+                OwnedResource::XrayProcess(process) => Some(process),
+                _ => None,
+            })
+    }
+
     pub fn xray_status(&mut self, uid: u32, profile_id: &str) -> XrayStatusResult {
         let owner = format!("xray:{profile_id}");
         let entry = self
@@ -3209,18 +3240,10 @@ impl DaemonCore {
             }
             _ => TunnelState::Failed,
         };
-        // Live counters come from the stats api only while running; a failure
-        // (old staged config, missing listener) degrades to absent counters.
-        let stats_target = process.map(|process| (process.name.clone(), process.transport_mark));
+        // Fall back to the private stats API when link counters are unavailable.
         let (rx_bytes, tx_bytes) = if state == TunnelState::Running {
-            stats_target
-                .and_then(|(name, mark)| {
-                    self.xray.as_mut().and_then(|runner| {
-                        runner
-                            .query_stats(&name, crate::xray::xray_api_port(mark))
-                            .ok()
-                    })
-                })
+            process
+                .and_then(|process| self.xray.as_mut()?.query_stats(uid, &process.name).ok())
                 .map(|(rx, tx)| (Some(rx), Some(tx)))
                 .unwrap_or((None, None))
         } else {

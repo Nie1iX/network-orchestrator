@@ -20,6 +20,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   probe the current DNS/kernel/HTTPS path only on an explicit user action.
 - Store routing as ordered User/Base layers, with explicit row ordering and layer
   transfer in the GUI/CLI. Manual GeoIP/GeoSite rules remain User on refresh.
+- Query the running Xray TUN router with `netorch route check --live`. The
+  saved-rule explanation remains available separately.
 
 ### Changed
 
@@ -32,6 +34,9 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 - Derive IPOnDemand for IP selectors and block indeterminate higher-priority User
   IP decisions instead of falling through to direct. Protect controlled DNS
   forwarding through the configured proxy/node, including legacy rewrite rules.
+- Apply compatible rules-only Xray reloads over a private Unix socket,
+  preserving established connections and the TUN. Keep explicit restarts for
+  changes the core cannot apply in place.
 
 ### Fixed
 

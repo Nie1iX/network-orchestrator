@@ -48,5 +48,6 @@ pub mod validate;
 #[cfg(target_os = "linux")]
 pub mod watchdog;
 pub mod xray;
-#[cfg(target_os = "linux")]
 pub mod xray_process;
+#[cfg(target_os = "linux")]
+mod xray_route_test;

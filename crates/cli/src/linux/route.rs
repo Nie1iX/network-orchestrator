@@ -40,12 +40,32 @@ pub fn run(ctx: &Ctx, command: RouteCommand) -> Result<Output, String> {
         } => set(ctx, &profile, &rules, lan_direct),
         RouteCommand::Add { profile, rules } => edit(ctx, &profile, &rules, Edit::Add),
         RouteCommand::Rm { profile, rules } => edit(ctx, &profile, &rules, Edit::Remove),
-        RouteCommand::Check { target, profile } => check(
-            ctx,
-            &target,
-            &profile,
-            &Path::new(XRAY_DIR).join(XRAY_VERSION),
-        ),
+        RouteCommand::Check {
+            target,
+            profile,
+            live,
+            port,
+            udp,
+            protocol,
+        } => {
+            if live {
+                live_check(
+                    ctx,
+                    &target,
+                    &profile,
+                    port.unwrap_or(443),
+                    udp,
+                    protocol.as_deref(),
+                )
+            } else {
+                check(
+                    ctx,
+                    &target,
+                    &profile,
+                    &Path::new(XRAY_DIR).join(XRAY_VERSION),
+                )
+            }
+        }
         RouteCommand::Pin {
             profile,
             via,
@@ -258,11 +278,20 @@ fn save(
 
 fn saved_output(profile: &Profile, extra: Vec<String>) -> Output {
     let rules = rules_json(profile);
-    let mut text = format!(
-        "Rules of \"{}\" saved. They apply when the profile connects: \
-         `netorch down {0:?}` and `netorch up {0:?}` if it is already up.",
-        profile.name
-    );
+    let name = &profile.name;
+    let mut text = if cfg!(target_os = "linux")
+        && profile.xray_mode == net_manager_core::models::XrayMode::Tun
+    {
+        format!(
+            "Rules of {name:?} saved. They apply on connect. For a running tunnel, \
+             use `netorch reload {name:?}` or reconnect if network settings changed."
+        )
+    } else {
+        format!(
+            "Rules of {name:?} saved. They apply on connect. If it is already up, \
+             use `netorch down {name:?}` then `netorch up {name:?}`."
+        )
+    };
     for hint in extra {
         text.push_str(&format!("\n  note: {hint}"));
     }
@@ -639,6 +668,32 @@ fn check(ctx: &Ctx, target: &str, query: &str, geo_dir: &Path) -> Result<Output,
         check_route(&profile.routing, &options, target, &geo).map_err(|error| error.to_string())?;
     let value = serde_json::to_value(&result).map_err(|_| "The route check failed".to_string())?;
     let text = describe_check(&value);
+    Ok((value, text))
+}
+
+/// Ask the peer-UID-bound daemon to test the currently applied Xray route.
+fn live_check(
+    ctx: &Ctx,
+    target: &str,
+    query: &str,
+    port: u16,
+    udp: bool,
+    protocol: Option<&str>,
+) -> Result<Output, String> {
+    let profile = xray_profile(ctx, query)?;
+    if profile.xray_mode != net_manager_core::models::XrayMode::Tun {
+        return Err("Live route checks require an Xray TUN profile".into());
+    }
+    let result =
+        ctx.engine
+            .xray_test_route(&profile.id, target, port, udp, protocol.map(str::to_owned))?;
+    let value = serde_json::to_value(&result).map_err(|_| "The live route check failed")?;
+    let transport = if udp { "UDP" } else { "TCP" };
+    let text = format!(
+        "Xray live test: {target} port {port} {transport} -> {}{}",
+        result.outbound_tag,
+        if result.matched { "" } else { " (default)" }
+    );
     Ok((value, text))
 }
 

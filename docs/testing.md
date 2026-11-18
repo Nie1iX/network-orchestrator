@@ -104,6 +104,13 @@ reserved marker to the health-controlled failover balancer. Unlike an
 unconditional routing catch-all, this runs after Xray's DNS/IP second pass and
 does not change the profile's selected domain strategy.
 
+The same fixture checks `xray.testRoute` against live GeoIP data and the
+current default failover decision, including `unavailable`. The Xray control
+socket must not be accessible to an unrelated local UID. A single-node reload
+with unchanged custom GeoIP must retain the PID and established TLS stream,
+change the route for new connections, and retain the new rules after the
+managed child is respawned.
+
 ## Ordered Xray layers
 
 Run `python3 e2e/linux/multinode_scenarios.py --routing-layers` with the same

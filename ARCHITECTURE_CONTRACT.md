@@ -144,6 +144,12 @@ autostart or broader privileges to hide session lifetime limitations.
   profile-store lock; an editor must not refresh only the token before saving an
   older policy. Offline explanations report layer, canonical row path and
   uncertainty, not observed traffic.
+- Linux Xray live route checks query the peer-owned running core with a
+  synthetic flow, not observed traffic or the saved policy. The core's
+  management socket stays private to the daemon. Rules-only reloads that
+  preserve the running graph and kernel state keep the child and TUN;
+  replacing a balancer would discard its live override, so those changes
+  cannot use the rules-only path.
 
 ## Acceptance scenarios
 

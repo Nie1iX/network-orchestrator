@@ -13,7 +13,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::ExitStatusExt;
 #[cfg(target_os = "linux")]
@@ -41,9 +41,7 @@ const LOG_TAIL_BYTES: u64 = 4 * 1024;
 pub trait XrayProcessRunner: Send {
     fn verify_binary(&self) -> io::Result<()>;
     fn link_index(&self, name: &str) -> io::Result<Option<u32>>;
-    /// `geo_assets` optionally carries caller-provided `geoip.dat`/
-    /// `geosite.dat` contents (base64); they are staged into the root-owned
-    /// runtime directory before spawn.
+    /// Stage the validated config and optional GeoIP/GeoSite overlays, then start Xray.
     fn start(
         &mut self,
         uid: u32,
@@ -51,9 +49,7 @@ pub trait XrayProcessRunner: Send {
         config: &str,
         geo_assets: Option<&net_manager_core::daemon_protocol::XrayGeoAssets>,
     ) -> io::Result<()>;
-    /// Restart the child in place, reusing the already staged config and geo
-    /// assets. Runners without respawn support keep the default failure, and
-    /// the reconciler then tears the tunnel down as before.
+    /// Restart the child using the staged config and assets.
     fn respawn(&mut self, uid: u32, name: &str) -> io::Result<()> {
         let _ = (uid, name);
         Err(io::Error::new(
@@ -61,10 +57,7 @@ pub trait XrayProcessRunner: Send {
             "Xray respawn is unsupported",
         ))
     }
-    /// Swap the staged `config.json` (and staged geo assets when supplied) and
-    /// restart the child on the same staging directory. The TUN link briefly
-    /// disappears and comes back with a fresh ifindex; the caller re-applies
-    /// link-scoped resources once it reappears.
+    /// Replace the staged config and restart Xray. The TUN gets a new ifindex.
     fn reload(
         &mut self,
         uid: u32,
@@ -78,15 +71,22 @@ pub trait XrayProcessRunner: Send {
             "Xray reload is unsupported",
         ))
     }
+    /// Apply and stage rules without touching the child. `Ok(false)` means
+    /// incompatible; an API failure must not trigger a blind restart.
+    fn reload_rules_only(
+        &mut self,
+        uid: u32,
+        name: &str,
+        config: &str,
+        geo_assets: Option<&net_manager_core::daemon_protocol::XrayGeoAssets>,
+    ) -> io::Result<bool> {
+        let _ = (uid, name, config, geo_assets);
+        Ok(false)
+    }
     fn health(&mut self, name: &str) -> io::Result<bool>;
-    /// `(rx, tx)` bytes seen by the TUN inbound. The primary source is the
-    /// link's sysfs counters (a statsquery subprocess per poll is too slow
-    /// to run while the core mutex is held); the local StatsService
-    /// dokodemo door on `api_port` is the fallback when link stats are
-    /// missing. Runners without stats support keep the default failure and
-    /// the caller reports `None`.
-    fn query_stats(&mut self, name: &str, api_port: u16) -> io::Result<(u64, u64)> {
-        let _ = (name, api_port);
+    /// Read TUN counters, falling back to the private Xray API.
+    fn query_stats(&mut self, uid: u32, name: &str) -> io::Result<(u64, u64)> {
+        let _ = (uid, name);
         Err(io::Error::new(
             io::ErrorKind::NotConnected,
             "Xray statsquery is unsupported",
@@ -299,6 +299,7 @@ impl XrayProcessRunner for TrustedXrayProcess {
         } else {
             binary.parent().expect("fixed managed binary")
         };
+        remove_stale_api_socket(&directory)?;
         let child =
             self.spawn_xray_child(&binary, &directory, &config_path, asset_dir, name, false)?;
         self.children.insert(name.to_owned(), (uid, child));
@@ -333,7 +334,9 @@ impl XrayProcessRunner for TrustedXrayProcess {
         let binary = trusted_binary()?;
         let managed_dir = binary.parent().expect("fixed managed binary");
         match geo_assets {
-            Some(assets) => stage_geo_assets(assets, &directory, managed_dir)?,
+            Some(assets) => {
+                stage_geo_assets(assets, &directory, managed_dir)?;
+            }
             None => {
                 // Mirrors `start`: absent caller assets mean the managed
                 // files, so any previously staged copies must go or they
@@ -359,10 +362,124 @@ impl XrayProcessRunner for TrustedXrayProcess {
         } else {
             managed_dir
         };
+        remove_stale_api_socket(&directory)?;
         let child =
             self.spawn_xray_child(&binary, &directory, &config_path, asset_dir, name, false)?;
         self.children.insert(name.to_owned(), (uid, child));
         Ok(())
+    }
+
+    fn reload_rules_only(
+        &mut self,
+        uid: u32,
+        name: &str,
+        config: &str,
+        geo_assets: Option<&net_manager_core::daemon_protocol::XrayGeoAssets>,
+    ) -> io::Result<bool> {
+        if !valid_tun_name(name) || config.len() > MAX_XRAY_CONFIG_BYTES {
+            return Err(invalid_input());
+        }
+        if !self.children.contains_key(name) {
+            return Ok(false);
+        }
+        ensure_runtime_root()?;
+        let directory = assert_staging_dir(uid, name)?;
+        let config_path = directory.join("config.json");
+        let current = fs::read_to_string(&config_path)
+            .map_err(|_| io::Error::other("Xray staged config unavailable"))?;
+        let mut old: serde_json::Value = serde_json::from_str(&current)
+            .map_err(|_| io::Error::other("Xray staged config invalid"))?;
+        let mut new: serde_json::Value = serde_json::from_str(config)
+            .map_err(|_| io::Error::other("Xray staged config invalid"))?;
+        // Replacing the table rebuilds balancers and loses their active overrides.
+        if [&old, &new].into_iter().any(|config| {
+            config["routing"]["balancers"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        }) {
+            return Ok(false);
+        }
+        old["routing"]["rules"] = serde_json::Value::Null;
+        new["routing"]["rules"] = serde_json::Value::Null;
+        if old != new {
+            return Ok(false);
+        }
+        let binary = trusted_binary()?;
+        let managed_dir = binary.parent().expect("fixed managed binary");
+        for (file, encoded) in [
+            (
+                "geoip.dat",
+                geo_assets.and_then(|assets| assets.geoip_dat_b64.as_deref()),
+            ),
+            (
+                "geosite.dat",
+                geo_assets.and_then(|assets| assets.geosite_dat_b64.as_deref()),
+            ),
+        ] {
+            let staged = directory.join(file);
+            let current = match fs::symlink_metadata(&staged) {
+                Ok(metadata) => {
+                    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "Xray geo asset is unsafe",
+                        ));
+                    }
+                    fs::read(&staged).map_err(|_| io::Error::other("Xray geo asset read failed"))?
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if encoded.is_none() {
+                        continue;
+                    }
+                    effective_geo_asset(None, file, managed_dir)?
+                }
+                Err(_) => return Err(io::Error::other("Xray geo asset check failed")),
+            };
+            if current != effective_geo_asset(encoded, file, managed_dir)? {
+                return Ok(false);
+            }
+        }
+        let socket = checked_api_socket_path(uid, name)?;
+        let next = directory.join("config.next");
+        match fs::symlink_metadata(&next) {
+            Ok(metadata)
+                if metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o077 == 0 =>
+            {
+                fs::remove_file(&next)
+                    .map_err(|_| io::Error::other("Xray config staging failed"))?;
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Xray staged config is unsafe",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(io::Error::other("Xray config staging failed")),
+        }
+        write_private_file(&next, config.as_bytes())?;
+        let endpoint = format!("unix://{}", socket.display());
+        let asset_dir = if directory.join("geoip.dat").is_file() {
+            directory.as_path()
+        } else {
+            managed_dir
+        };
+        let mut command = Command::new(&binary);
+        command
+            .args(["api", "adrules", "-server", &endpoint, "-t", "2"])
+            .arg(&next)
+            .env_clear()
+            .env("XRAY_LOCATION_ASSET", asset_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Err(error) = run_bounded_command(command, Duration::from_secs(5)) {
+            let _ = fs::remove_file(&next);
+            return Err(error);
+        }
+        fs::rename(&next, &config_path)
+            .map_err(|_| io::Error::other("Xray staged config replacement failed"))?;
+        Ok(true)
     }
 
     fn health(&mut self, name: &str) -> io::Result<bool> {
@@ -386,7 +503,7 @@ impl XrayProcessRunner for TrustedXrayProcess {
         Ok(self.link_index(name)?.is_some())
     }
 
-    fn query_stats(&mut self, name: &str, api_port: u16) -> io::Result<(u64, u64)> {
+    fn query_stats(&mut self, uid: u32, name: &str) -> io::Result<(u64, u64)> {
         if !self.children.contains_key(name) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -396,9 +513,9 @@ impl XrayProcessRunner for TrustedXrayProcess {
         if let Ok(stats) = tun_byte_counters(&iface_stats_dir(name)) {
             return Ok(stats);
         }
-        let output = run_statsquery(&trusted_binary()?, api_port)?;
-        let stats = parse_statsquery(&output);
-        Ok(stats)
+        let socket = checked_api_socket_path(uid, name)?;
+        let output = run_statsquery(&trusted_binary()?, &socket)?;
+        Ok(parse_statsquery(&output))
     }
 
     fn stop(&mut self, name: &str) -> io::Result<()> {
@@ -604,17 +721,12 @@ fn iface_stats_dir(name: &str) -> PathBuf {
     Path::new("/sys/class/net").join(name).join("statistics")
 }
 
-/// `xray api statsquery -server=127.0.0.1:<port>` against the managed
-/// binary; the counter list is small enough to read after exit.
+/// `xray api statsquery` against the private Unix control socket.
 #[cfg(target_os = "linux")]
-fn run_statsquery(binary: &Path, api_port: u16) -> io::Result<String> {
+fn run_statsquery(binary: &Path, api_socket: &Path) -> io::Result<String> {
+    let endpoint = format!("unix://{}", api_socket.display());
     let mut child = Command::new(binary)
-        .args([
-            "api",
-            "statsquery",
-            "-server",
-            &format!("127.0.0.1:{api_port}"),
-        ])
+        .args(["api", "statsquery", "-server", &endpoint])
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -652,11 +764,35 @@ fn run_statsquery(binary: &Path, api_port: u16) -> io::Result<String> {
         thread::sleep(Duration::from_millis(10));
     }
 }
+#[cfg(target_os = "linux")]
+fn run_bounded_command(mut command: Command, timeout: Duration) -> io::Result<()> {
+    let mut child = command
+        .spawn()
+        .map_err(|_| io::Error::other("Xray API command launch failed"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => return Err(io::Error::other("Xray API command failed")),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = terminate_child(&mut child);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Xray API command timed out",
+                ));
+            }
+            Err(_) => {
+                let _ = terminate_child(&mut child);
+                return Err(io::Error::other("Xray API command wait failed"));
+            }
+        }
+    }
+}
 
 /// `statsquery` prints one `name>>>...>>>direction  value` line per counter;
 /// the TUN inbound's downlink is what the apps received (rx) and uplink is
-/// what they sent (tx). Other inbounds (api-in) and outbound counters are
-/// intentionally ignored here.
+/// what they sent (tx). Other counters are ignored here.
 #[cfg(target_os = "linux")]
 fn parse_statsquery(output: &str) -> (u64, u64) {
     let (mut rx, mut tx) = (0_u64, 0_u64);
@@ -689,6 +825,44 @@ fn xray_args(config: &Path) -> Vec<String> {
         "-config".into(),
         config.to_string_lossy().into_owned(),
     ]
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn api_socket_path(uid: u32, name: &str) -> io::Result<PathBuf> {
+    if !valid_tun_name(name) {
+        return Err(invalid_input());
+    }
+    Ok(crate::openvpn::stage_dir(uid, name).join("api.sock"))
+}
+#[cfg(target_os = "linux")]
+pub(crate) fn checked_api_socket_path(uid: u32, name: &str) -> io::Result<PathBuf> {
+    let directory = assert_staging_dir(uid, name)?;
+    let socket = directory.join("api.sock");
+    let metadata = fs::symlink_metadata(&socket)
+        .map_err(|_| io::Error::other("Xray API socket unavailable"))?;
+    if !metadata.file_type().is_socket() || metadata.uid() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Xray API socket is unsafe",
+        ));
+    }
+    Ok(socket)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn api_socket_path(uid: u32, name: &str) -> io::Result<std::path::PathBuf> {
+    if name.is_empty()
+        || name.len() > 15
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid Xray process input",
+        ));
+    }
+    Ok(crate::openvpn::stage_dir(uid, name).join("api.sock"))
 }
 
 #[cfg(target_os = "linux")]
@@ -737,6 +911,22 @@ fn stage_config_at(root: &Path, uid: u32, name: &str, config: &str) -> io::Resul
     Ok(directory)
 }
 
+#[cfg(target_os = "linux")]
+fn remove_stale_api_socket(directory: &Path) -> io::Result<()> {
+    let path = directory.join("api.sock");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_socket() && metadata.uid() == 0 => {
+            fs::remove_file(path).map_err(|_| io::Error::other("Xray API socket cleanup failed"))
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Xray API socket is unsafe",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(io::Error::other("Xray API socket check failed")),
+    }
+}
+
 /// Verify the staged directory for `uid`/`name` exists and is still
 /// root-owned and private before reusing it (respawn/reload).
 #[cfg(target_os = "linux")]
@@ -763,49 +953,73 @@ fn assert_staging_dir(uid: u32, name: &str) -> io::Result<PathBuf> {
 #[cfg(target_os = "linux")]
 const MAX_GEO_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Stage caller-provided dat contents (or the managed file for absent
-/// fields) into the root-owned staging dir so `XRAY_LOCATION_ASSET` can
-/// point at a single directory containing both files.
+/// Resolve a caller overlay against the installed stock data.
+#[cfg(target_os = "linux")]
+fn effective_geo_asset(
+    encoded: Option<&str>,
+    name: &str,
+    managed_dir: &Path,
+) -> io::Result<Vec<u8>> {
+    use base64::Engine;
+    let managed = fs::File::open(managed_dir.join(name))
+        .ok()
+        .map(|input| {
+            let mut bytes = Vec::new();
+            let _ = input.take(MAX_GEO_ASSET_BYTES + 1).read_to_end(&mut bytes);
+            bytes
+        })
+        .filter(|bytes| !bytes.is_empty() && bytes.len() as u64 <= MAX_GEO_ASSET_BYTES);
+    match encoded {
+        Some(data) => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|_| invalid_input())?;
+            if decoded.is_empty() || decoded.len() as u64 > MAX_GEO_ASSET_BYTES {
+                return Err(invalid_input());
+            }
+            Ok(match managed.as_deref() {
+                Some(stock) => {
+                    net_manager_core::geo_list::merge_geo_list(stock, &decoded).unwrap_or(decoded)
+                }
+                None => decoded,
+            })
+        }
+        None => managed.ok_or_else(|| io::Error::other("geo asset file is unreadable")),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn stage_geo_assets(
     assets: &net_manager_core::daemon_protocol::XrayGeoAssets,
     staging: &Path,
     managed_dir: &Path,
 ) -> io::Result<()> {
-    use base64::Engine;
     for (name, encoded) in [
         ("geoip.dat", assets.geoip_dat_b64.as_deref()),
         ("geosite.dat", assets.geosite_dat_b64.as_deref()),
     ] {
-        let managed = fs::File::open(managed_dir.join(name))
-            .ok()
-            .map(|input| {
-                let mut bytes = Vec::new();
-                let _ = input.take(MAX_GEO_ASSET_BYTES + 1).read_to_end(&mut bytes);
-                bytes
-            })
-            .filter(|bytes| !bytes.is_empty() && bytes.len() as u64 <= MAX_GEO_ASSET_BYTES);
-        let bytes = match encoded {
-            Some(data) => {
-                let decoded = base64::engine::general_purpose::STANDARD
-                    .decode(data)
-                    .map_err(|_| invalid_input())?;
-                if decoded.is_empty() || decoded.len() as u64 > MAX_GEO_ASSET_BYTES {
-                    return Err(invalid_input());
+        let bytes = effective_geo_asset(encoded, name, managed_dir)?;
+        let path = staging.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Xray geo asset is unsafe",
+                    ));
                 }
-                // Provider dats are minimal overlays (they carry only their
-                // own categories), so they are merged over the managed stock
-                // file; a missing or malformed stock file falls back to the
-                // overlay alone.
-                match managed.as_deref() {
-                    Some(stock) => net_manager_core::geo_list::merge_geo_list(stock, &decoded)
-                        .unwrap_or(decoded),
-                    None => decoded,
+                if fs::read(&path).map_err(|_| io::Error::other("Xray geo asset read failed"))?
+                    == bytes
+                {
+                    continue;
                 }
+                rewrite_private_file(&path, &bytes)?;
+                continue;
             }
-            None => managed.ok_or_else(|| io::Error::other("geo asset file is unreadable"))?,
-        };
-        write_private_file(&staging.join(name), &bytes)?;
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(io::Error::other("Xray geo asset check failed")),
+        }
+        write_private_file(&path, &bytes)?;
     }
     Ok(())
 }
@@ -917,6 +1131,12 @@ fn cleanup_stage_at(root: &Path, uid: u32, name: &str) -> io::Result<()> {
     }
     let root_metadata =
         fs::symlink_metadata(root).map_err(|_| io::Error::other("Xray staging cleanup failed"))?;
+    if !root_metadata.is_dir() || root_metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Xray runtime directory is unsafe",
+        ));
+    }
     let owner = root_metadata.uid();
     let user_dir = root.join(uid.to_string());
     let user = match fs::symlink_metadata(&user_dir) {
@@ -947,11 +1167,14 @@ fn cleanup_stage_at(root: &Path, uid: u32, name: &str) -> io::Result<()> {
     {
         let entry = entry.map_err(|_| io::Error::other("Xray staging cleanup failed"))?;
         let filename = entry.file_name();
+        let is_socket = filename == "api.sock";
         if filename != "config.json"
+            && filename != "config.next"
             && filename != "process"
             && filename != "geoip.dat"
             && filename != "geosite.dat"
             && filename != "xray.log"
+            && !is_socket
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -960,7 +1183,9 @@ fn cleanup_stage_at(root: &Path, uid: u32, name: &str) -> io::Result<()> {
         }
         let file = fs::symlink_metadata(entry.path())
             .map_err(|_| io::Error::other("Xray staging cleanup failed"))?;
-        if !file.is_file() || file.uid() != owner || file.mode() & 0o077 != 0 {
+        if (is_socket && (!file.file_type().is_socket() || file.uid() != owner))
+            || (!is_socket && (!file.is_file() || file.uid() != owner || file.mode() & 0o077 != 0))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "Xray staging file is unsafe",
