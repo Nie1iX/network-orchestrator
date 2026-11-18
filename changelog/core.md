@@ -10,6 +10,8 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-18
+
 ### Added
 
 - Add revision-checked offline profile explanations and bounded, unprivileged
@@ -26,7 +28,6 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
   direct fallback; protect app-controlled DNS forwarding through a service relay.
 - Keep fixed route and DNS nodes independent of the default Xray outbound
   when there are no eligible backups.
-
 
 ## [0.19.2] - 2026-11-12
 
