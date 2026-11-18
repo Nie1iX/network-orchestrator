@@ -10,6 +10,10 @@ Release rules: [`docs/versioning.md`](../docs/versioning.md). Everything up to
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-18
+
+Core 0.20.0.
+
 ### Added
 
 - Replace Traffic flow and the JSON-shaped node view with one network scheme:

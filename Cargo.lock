@@ -3003,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "network-orchestrator-daemon"
-version = "0.19.3"
+version = "0.20.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
